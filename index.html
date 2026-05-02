@@ -371,26 +371,55 @@ function Wizard({ user, onDone }) {
     e.preventDefault();
     setError(''); setLoading(true);
     try {
-      // Call the SECURITY DEFINER RPC — bypasses bootstrap RLS issues
-      const { data, error: rpcErr } = await sb.rpc('signup_create_plant', {
-        p_name: form.name,
-        p_legal_name: form.legal_name || '',
-        p_gstin: form.gstin || '',
-        p_iatf: form.iatf,
-        p_address: form.address,
-        p_city: form.city,
-        p_state: form.state,
-        p_pincode: form.pincode,
-        p_your_name: form.your_name,
-        p_your_phone: form.your_phone,
-        p_email: user.email,
+      // Direct inserts (RLS is disabled for now, will re-enable in Block 1.5)
+
+      // 1. Create plant
+      const { data: plant, error: plantErr } = await sb.from('plants').insert({
+        name: form.name,
+        legal_name: form.legal_name || null,
+        gstin: form.gstin || null,
+        iatf_certified: form.iatf,
+        address: form.address,
+        city: form.city,
+        state: form.state,
+        pincode: form.pincode,
+        subscription_tier: 'lite',
+        installed_mcps: ['production_pdc_v1']
+      }).select().single();
+      if (plantErr) throw plantErr;
+
+      // 2. Delete any existing user row first (in case of retry)
+      await sb.from('users').delete().eq('id', user.id);
+
+      // 3. Create user row linked to plant
+      const { error: userErr } = await sb.from('users').insert({
+        id: user.id,
+        plant_id: plant.id,
+        full_name: form.your_name,
+        phone: '+91' + form.your_phone,
+        email: user.email,
+        role: 'plant_head',
+        status: 'active',
+        can_install_mcps: true
       });
+      if (userErr) throw userErr;
 
-      if (rpcErr) throw rpcErr;
-      if (!data || !data.success) throw new Error(data?.error || 'Plant creation failed');
+      // 4. Set primary contact
+      await sb.from('plants').update({ primary_contact_user_id: user.id }).eq('id', plant.id);
 
-      // Fetch the created plant
-      const { data: plant } = await sb.from('plants').select('*').eq('id', data.plant_id).single();
+      // 5. Default chat groups
+      await sb.from('chat_groups').insert([
+        { plant_id: plant.id, name: '# All Hands', type: 'all_hands', members: [user.id] },
+        { plant_id: plant.id, name: '# Quality', type: 'department', members: [user.id] },
+        { plant_id: plant.id, name: '# Maintenance', type: 'department', members: [user.id] },
+      ]);
+
+      // 6. Default shifts
+      await sb.from('shifts').insert([
+        { plant_id: plant.id, name: 'Day Shift', start_time: '06:00', end_time: '14:00' },
+        { plant_id: plant.id, name: 'Evening Shift', start_time: '14:00', end_time: '22:00' },
+        { plant_id: plant.id, name: 'Night Shift', start_time: '22:00', end_time: '06:00' },
+      ]);
 
       showToast('Plant created!');
       onDone(plant);
