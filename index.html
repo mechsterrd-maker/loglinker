@@ -968,6 +968,10 @@ function Home({ plant, me, setTab, reload }) {
 
     <${DailyDigest} me=${me} setTab=${setTab} />
 
+    <${StagePendingBanner} plant=${plant} me=${me} setTab=${setTab} />
+
+    <${StockAlerts} plant=${plant} setTab=${setTab} />
+
     ${alerts > 0 && html`
       <div class="section-h">Needs attention</div>
       ${stats.openNcrs > 0 && html`
@@ -1089,11 +1093,14 @@ function Production({ plant, me }) {
 
     <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
       <button class=${'auth-tab' + (view === 'overview' ? ' active' : '')} onClick=${() => setView('overview')}>Overview</button>
+      <button class=${'auth-tab' + (view === 'stages' ? ' active' : '')} onClick=${() => setView('stages')}>📋 Stage Log</button>
       <button class=${'auth-tab' + (view === 'parts' ? ' active' : '')} onClick=${() => setView('parts')}>Parts</button>
       <button class=${'auth-tab' + (view === 'machines' ? ' active' : '')} onClick=${() => setView('machines')}>Machines</button>
       <button class=${'auth-tab' + (view === 'dies' ? ' active' : '')} onClick=${() => setView('dies')}>Dies</button>
       <button class=${'auth-tab' + (view === 'shots' ? ' active' : '')} onClick=${() => setView('shots')}>Shots</button>
     </div>
+
+    ${view === 'stages' && html`<${StageLog} plant=${plant} me=${me} parts=${parts} machines=${machines} dies=${dies} units=${units} shifts=${shifts} users=${users} />`}
 
     ${view === 'overview' && html`
       <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
@@ -2933,6 +2940,137 @@ function InviteViewModal({ invite, onClose, onCancel }) {
         <button class="btn secondary" style="margin-top:8px" onClick=${() => { navigator.clipboard.writeText(inviteUrl); showToast('Link copied'); }}>Copy link</button>
         <button class="btn danger" style="margin-top:8px" onClick=${onCancel}>Cancel invite</button>
       </div>
+    </div>
+  `;
+}
+
+// ============= STOCK ALERTS (low stock + reorder) =============
+function StockAlerts({ plant, setTab }) {
+  const [alerts, setAlerts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [collapsed, setCollapsed] = useState(false);
+
+  useEffect(() => { load(); }, [plant?.id]);
+
+  const load = async () => {
+    setLoading(true);
+    const { data } = await sb.from('mcp_stocks_items')
+      .select('id, code, name, current_qty, reorder_level, uom, category')
+      .not('reorder_level', 'is', null)
+      .order('name');
+    const lows = (data || []).filter(i => i.current_qty <= i.reorder_level);
+    setAlerts(lows);
+    setLoading(false);
+  };
+
+  // Live updates
+  useEffect(() => {
+    if (!plant?.id) return;
+    const channel = sb.channel('stock-alerts-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_stocks_items', filter:'plant_id=eq.' + plant.id }, () => load())
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [plant?.id]);
+
+  if (loading || alerts.length === 0) return null;
+
+  const critical = alerts.filter(a => parseFloat(a.current_qty) === 0).length;
+  const lblMap = { raw_material:'Raw', die_spares:'Die', consumables:'Cons.', tools:'Tools', packing:'Pack', bought_out:'Bought-out', general:'General' };
+
+  return html`
+    <div class="card" style="background:${critical > 0 ? 'var(--rose-50)' : 'var(--amber-50)'};border-color:${critical > 0 ? 'var(--rose-200)' : 'var(--amber-200)'};margin-bottom:14px">
+      <div onClick=${() => setCollapsed(!collapsed)} style="cursor:pointer;display:flex;justify-content:space-between;align-items:center">
+        <div style="font-weight:700;color:${critical > 0 ? 'var(--rose-700)' : 'var(--amber-700)'}">
+          ${critical > 0 ? '🚨' : '⚠️'} Stock alerts · ${alerts.length} item${alerts.length > 1 ? 's' : ''}${critical > 0 ? ' · ' + critical + ' OUT OF STOCK' : ''}
+        </div>
+        <span style="color:var(--slate-500);font-size:18px">${collapsed ? '›' : '▼'}</span>
+      </div>
+      ${!collapsed && html`
+        <div style="margin-top:10px;display:flex;flex-direction:column;gap:6px">
+          ${alerts.slice(0, 12).map(a => {
+            const isOut = parseFloat(a.current_qty) === 0;
+            return html`
+              <div key=${a.id} onClick=${() => setTab('stocks')} style="background:white;padding:10px 12px;border-radius:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:8px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${a.code} · ${a.name}</div>
+                  <div style="font-size:11px;color:var(--slate-500)">${lblMap[a.category || 'general']} · reorder at ${a.reorder_level}</div>
+                </div>
+                <span class=${'badge ' + (isOut ? 'rose' : 'amber')} style="flex-shrink:0">${isOut ? 'OUT' : fmtNum(a.current_qty) + ' ' + a.uom}</span>
+              </div>
+            `;
+          })}
+          ${alerts.length > 12 && html`<div style="font-size:11px;color:var(--slate-500);text-align:center;padding:6px">+ ${alerts.length - 12} more — tap any item to manage</div>`}
+          <button class="btn small ghost" style="margin-top:6px" onClick=${() => setTab('stocks')}>Open Stocks →</button>
+        </div>
+      `}
+    </div>
+  `;
+}
+
+// ============= STAGE PENDING BANNER (blocks supervisors with overdue entries) =============
+function StagePendingBanner({ plant, me, setTab }) {
+  const [pending, setPending] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [logTarget, setLogTarget] = useState(null);
+
+  useEffect(() => { load(); }, [plant?.id]);
+
+  const load = async () => {
+    setLoading(true);
+    const { data } = await sb.from('v_my_pending_stage_entries')
+      .select('*')
+      .eq('plant_id', plant.id)
+      .order('log_date');
+    setPending(data || []);
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    if (!plant?.id) return;
+    const channel = sb.channel('stage-pending-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_pdc_stage_log', filter:'plant_id=eq.' + plant.id }, () => load())
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [plant?.id]);
+
+  if (loading || pending.length === 0) return null;
+
+  // Anything past 11am next day is escalated
+  const escalated = pending.filter(p => p.hours_past_11am > 0);
+  const justPending = pending.filter(p => p.hours_past_11am <= 0);
+
+  return html`
+    <div class="card" style="background:${escalated.length > 0 ? 'var(--rose-50)' : 'var(--amber-50)'};border-color:${escalated.length > 0 ? 'var(--rose-200)' : 'var(--amber-200)'};margin-bottom:14px">
+      <div style="font-weight:700;color:${escalated.length > 0 ? 'var(--rose-700)' : 'var(--amber-700)'};margin-bottom:8px">
+        ${escalated.length > 0 ? '🚨 OVERDUE entries · ' + escalated.length : '⏰ Pending entries · ' + pending.length}
+      </div>
+      <div style="font-size:12px;color:var(--slate-700);margin-bottom:10px">
+        ${escalated.length > 0
+          ? 'These are past 11 AM next day. System will lock at 48 hours. Log now or contact Plant Head.'
+          : 'Downstream stage logged. Need your count to reconcile.'}
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        ${pending.slice(0, 10).map(p => {
+          const isEscalated = p.hours_past_11am > 0;
+          const hoursToLock = 48 - p.hours_pending;
+          return html`
+            <div key=${p.id} onClick=${() => setLogTarget(p)} style="background:white;padding:10px 12px;border-radius:8px;cursor:pointer">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:13px;font-weight:600">${p.stage.toUpperCase()} · ${p.part_label}</div>
+                  <div style="font-size:11px;color:var(--slate-500)">${p.shift_name} · ${p.log_date} · downstream: ${p.triggered_by_stage || 'manual'}</div>
+                </div>
+                <span class=${'badge ' + (isEscalated ? 'rose' : 'amber')} style="flex-shrink:0;font-size:10px">
+                  ${isEscalated ? 'OVERDUE' : Math.max(0, Math.round(hoursToLock)) + 'h to lock'}
+                </span>
+              </div>
+            </div>
+          `;
+        })}
+      </div>
+      <button class="btn small ghost" style="width:100%;margin-top:10px" onClick=${() => setTab('production')}>Open Production →</button>
+
+      ${logTarget && html`<${StageLogModal} plant=${plant} me=${me} pendingEntry=${logTarget} onClose=${() => setLogTarget(null)} onSaved=${() => { setLogTarget(null); load(); }} />`}
     </div>
   `;
 }
@@ -4890,6 +5028,352 @@ function VendorEditModal({ plant, me, vendor, onClose, onSaved }) {
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes || ''} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
           <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (vendor?.id ? 'Update' : 'Create')}</button>
         </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= STAGE LOG (per-stage daily log with reconciliation) =============
+function StageLog({ plant, me, parts, machines, dies, units, shifts, users }) {
+  const STAGES = ['pdc','trimming','cnc','vmc','lathe','press','drilling','tapping','deflashing','shot_blast','plating','painting','heat_treat','inspection','packing','dispatch','outsource','other'];
+  const [logs, setLogs] = useState([]);
+  const [summary, setSummary] = useState([]);
+  const [filterDate, setFilterDate] = useState(new Date().toISOString().slice(0,10));
+  const [filterPart, setFilterPart] = useState('all');
+  const [filterStatus, setFilterStatus] = useState('all');
+  const [logTarget, setLogTarget] = useState(null);
+  const [overrideTarget, setOverrideTarget] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    let q = sb.from('mcp_pdc_stage_log')
+      .select('*, mcp_pdc_parts(part_number, name), shifts(name), units(name), users:operator_user_id(full_name), entered:entered_by(full_name)')
+      .eq('log_date', filterDate)
+      .order('part_id').order('stage');
+    if (filterPart !== 'all') q = q.eq('part_id', filterPart);
+    if (filterStatus !== 'all') q = q.eq('status', filterStatus);
+    const { data: s } = await sb.from('v_daily_production_summary').select('*').eq('log_date', filterDate);
+    const { data } = await q;
+    setLogs(data || []);
+    setSummary(s || []);
+    setLoading(false);
+  }, [filterDate, filterPart, filterStatus]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  // Live updates
+  useEffect(() => {
+    if (!plant?.id) return;
+    const channel = sb.channel('stagelog-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_pdc_stage_log', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [plant?.id, refresh]);
+
+  // Group logs by part for display
+  const byPart = {};
+  for (const l of logs) {
+    const key = l.part_id;
+    if (!byPart[key]) byPart[key] = { part: l.mcp_pdc_parts, stages: {} };
+    if (!byPart[key].stages[l.stage]) byPart[key].stages[l.stage] = [];
+    byPart[key].stages[l.stage].push(l);
+  }
+
+  const totals = summary.reduce((acc, s) => {
+    acc.good += parseFloat(s.total_good || 0);
+    acc.rejected += parseFloat(s.total_rejected || 0);
+    acc.pending += parseInt(s.pending_count || 0);
+    acc.anomaly += parseInt(s.anomaly_count || 0);
+    return acc;
+  }, { good:0, rejected:0, pending:0, anomaly:0 });
+
+  return html`
+    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr)">
+      <div class="stat teal"><div class="stat-num">${fmtNum(totals.good)}</div><div class="stat-label">Good</div></div>
+      <div class="stat amber"><div class="stat-num">${fmtNum(totals.rejected)}</div><div class="stat-label">Reject</div></div>
+      <div class="stat ${totals.pending > 0 ? 'amber' : 'teal'}"><div class="stat-num">${totals.pending}</div><div class="stat-label">Pending</div></div>
+      <div class="stat ${totals.anomaly > 0 ? 'rose' : 'teal'}"><div class="stat-num">${totals.anomaly}</div><div class="stat-label">Anomaly</div></div>
+    </div>
+
+    <div class="card" style="margin-bottom:10px">
+      <div class="field-row">
+        <div class="field"><label>Date</label><input type="date" value=${filterDate} onChange=${e => setFilterDate(e.target.value)} /></div>
+        <div class="field"><label>Part</label>
+          <select value=${filterPart} onChange=${e => setFilterPart(e.target.value)}>
+            <option value="all">All parts</option>
+            ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number} · ${p.name}</option>`)}
+          </select>
+        </div>
+      </div>
+      <div class="field"><label>Status</label>
+        <select value=${filterStatus} onChange=${e => setFilterStatus(e.target.value)}>
+          <option value="all">All</option>
+          <option value="filled">Filled</option>
+          <option value="pending">Pending</option>
+          <option value="anomaly">Anomaly (overdue)</option>
+          <option value="locked">Locked (>48h)</option>
+          <option value="overridden">Overridden</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="section-h">Stage Log · ${filterDate}<button class="btn small" onClick=${() => setLogTarget({})} disabled=${parts.length === 0}>+ Log entry</button></div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      logs.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📋</div>No entries for this date. Tap "+ Log entry" to record production.${parts.length === 0 ? ' Add a part first.' : ''}</div></div>` :
+      Object.entries(byPart).map(([partId, info]) => html`
+        <details key=${partId} open style="margin-bottom:8px">
+          <summary style="cursor:pointer;padding:10px 12px;background:var(--slate-100);border-radius:10px;font-weight:600;font-size:14px">
+            🔩 ${info.part?.part_number} · ${info.part?.name}
+          </summary>
+          <div style="margin-top:6px">
+            ${Object.entries(info.stages).sort(([a],[b]) => STAGES.indexOf(a) - STAGES.indexOf(b)).map(([stage, entries]) => html`
+              ${entries.map(l => {
+                const isPending = l.status === 'pending';
+                const isAnomaly = l.status === 'anomaly';
+                const isLocked = l.status === 'locked';
+                const isOverridden = l.status === 'overridden';
+                const total = parseFloat(l.qty_good || 0) + parseFloat(l.qty_rejected || 0);
+                return html`
+                  <div class="list-item" key=${l.id} onClick=${() => isLocked ? setOverrideTarget(l) : setLogTarget(l)}>
+                    <div class="list-item-row">
+                      <div class="list-item-main">
+                        <div class="list-item-title">
+                          <span class="badge teal" style="margin-right:6px">${stage.toUpperCase()}</span>
+                          ${l.shifts?.name || '?'}${l.units?.name ? ' · ' + l.units.name : ''}
+                        </div>
+                        <div class="list-item-sub">
+                          ${isPending ? '⏰ Pending — downstream logged ' + (l.triggered_by_stage || '?') :
+                            isAnomaly ? '🚨 ANOMALY · entry overdue >48h' :
+                            isLocked ? '🔒 Locked · plant head can override' :
+                            isOverridden ? '🔓 Overridden by plant head' :
+                            (l.users?.full_name || l.entered?.full_name || '?') + (total > 0 ? ' · ' + fmtNum(total) + ' pcs' : '')}
+                        </div>
+                      </div>
+                      <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                        ${isPending || isAnomaly ? html`<button class="btn small" onClick=${(e) => { e.stopPropagation(); setLogTarget(l); }}>Log now</button>` :
+                          html`<span class="badge ${isAnomaly ? 'rose' : isLocked ? '' : isPending ? 'amber' : 'emerald'}">${fmtNum(l.qty_good || 0)}${l.qty_rejected > 0 ? ' / ' + l.qty_rejected : ''}</span>`}
+                      </div>
+                    </div>
+                  </div>
+                `;
+              })}
+            `)}
+          </div>
+        </details>
+      `)
+    }
+
+    ${logTarget && html`<${StageLogModal} plant=${plant} me=${me} pendingEntry=${logTarget.id ? logTarget : null} parts=${parts} machines=${machines} dies=${dies} units=${units} shifts=${shifts} users=${users} defaultDate=${filterDate} onClose=${() => setLogTarget(null)} onSaved=${() => { setLogTarget(null); refresh(); }} />`}
+    ${overrideTarget && html`<${StageOverrideModal} plant=${plant} me=${me} entry=${overrideTarget} onClose=${() => setOverrideTarget(null)} onSaved=${() => { setOverrideTarget(null); refresh(); }} />`}
+  `;
+}
+
+// ============= STAGE LOG ENTRY MODAL =============
+function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, shifts, users, defaultDate, onClose, onSaved }) {
+  const STAGE_OPTIONS = [
+    {v:'pdc', l:'PDC (casting)'},
+    {v:'trimming', l:'Trimming'},
+    {v:'cnc', l:'CNC'},
+    {v:'vmc', l:'VMC'},
+    {v:'lathe', l:'Lathe'},
+    {v:'press', l:'Press'},
+    {v:'drilling', l:'Drilling'},
+    {v:'tapping', l:'Tapping'},
+    {v:'deflashing', l:'Deflashing'},
+    {v:'shot_blast', l:'Shot Blast'},
+    {v:'plating', l:'Plating'},
+    {v:'painting', l:'Painting'},
+    {v:'heat_treat', l:'Heat Treatment'},
+    {v:'inspection', l:'Final Inspection'},
+    {v:'packing', l:'Packing'},
+    {v:'dispatch', l:'Dispatch'},
+    {v:'outsource', l:'Outsource'},
+    {v:'other', l:'Other'},
+  ];
+
+  // If filling pendingEntry, prefill from it; else default
+  const isReconcile = !!pendingEntry?.id;
+  const [form, setForm] = useState(isReconcile ? {
+    log_date: pendingEntry.log_date,
+    shift_id: pendingEntry.shift_id,
+    unit_id: pendingEntry.unit_id || (units[0]?.id || ''),
+    part_id: pendingEntry.part_id,
+    stage: pendingEntry.stage,
+    qty_good: pendingEntry.qty_good || '',
+    qty_rejected: pendingEntry.qty_rejected || '',
+    reject_reason: pendingEntry.reject_reason || '',
+    machine_id: pendingEntry.machine_id || '',
+    die_id: pendingEntry.die_id || '',
+    operator_user_id: pendingEntry.operator_user_id || me.id,
+    notes: pendingEntry.notes || '',
+  } : {
+    log_date: defaultDate || new Date().toISOString().slice(0,10),
+    shift_id: shifts[0]?.id || '',
+    unit_id: units[0]?.id || '',
+    part_id: parts[0]?.id || '',
+    stage: 'pdc',
+    qty_good: '',
+    qty_rejected: '',
+    reject_reason: '',
+    machine_id: '',
+    die_id: '',
+    operator_user_id: me.id,
+    notes: '',
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const { data, error } = await sb.rpc('log_stage_entry', {
+        p_log_date: form.log_date,
+        p_shift_id: form.shift_id,
+        p_unit_id: form.unit_id || null,
+        p_part_id: form.part_id,
+        p_stage: form.stage,
+        p_qty_good: parseFloat(form.qty_good) || 0,
+        p_qty_rejected: parseFloat(form.qty_rejected) || 0,
+        p_reject_reason: form.reject_reason || null,
+        p_machine_id: form.machine_id || null,
+        p_die_id: form.die_id || null,
+        p_operator_user_id: form.operator_user_id || null,
+        p_notes: form.notes || null,
+      });
+      if (error) throw error;
+      if (!data?.success) throw new Error(data?.error || 'Failed');
+      showToast(isReconcile ? 'Entry reconciled' : 'Entry logged');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  // Auto-detect stage from part route on part change (for new entries)
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${isReconcile ? '⏰ Log pending entry' : 'Log production'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${isReconcile && html`
+          <div class="alert info" style="margin-bottom:14px">
+            Downstream stage <strong>${pendingEntry.triggered_by_stage}</strong> already logged. Enter your <strong>${pendingEntry.stage.toUpperCase()}</strong> count for ${pendingEntry.log_date}.
+          </div>
+        `}
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Date *</label><input type="date" required value=${form.log_date} disabled=${isReconcile} onChange=${e => setForm({...form, log_date: e.target.value})} /></div>
+            <div class="field"><label>Shift *</label>
+              <select required value=${form.shift_id} disabled=${isReconcile} onChange=${e => setForm({...form, shift_id: e.target.value})}>
+                ${shifts.map(s => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Part *</label>
+            <select required value=${form.part_id} disabled=${isReconcile} onChange=${e => setForm({...form, part_id: e.target.value})}>
+              ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number} · ${p.name}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Stage *</label>
+            <select required value=${form.stage} disabled=${isReconcile} onChange=${e => setForm({...form, stage: e.target.value})}>
+              ${STAGE_OPTIONS.map(s => html`<option key=${s.v} value=${s.v}>${s.l}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Unit</label>
+            <select value=${form.unit_id} onChange=${e => setForm({...form, unit_id: e.target.value})}>
+              <option value="">— None —</option>
+              ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
+            </select>
+          </div>
+          ${form.stage === 'pdc' && html`
+            <div class="field-row">
+              <div class="field"><label>Machine</label>
+                <select value=${form.machine_id} onChange=${e => setForm({...form, machine_id: e.target.value})}>
+                  <option value="">— None —</option>
+                  ${machines.map(m => html`<option key=${m.id} value=${m.id}>${m.code}</option>`)}
+                </select>
+              </div>
+              <div class="field"><label>Die</label>
+                <select value=${form.die_id} onChange=${e => setForm({...form, die_id: e.target.value})}>
+                  <option value="">— None —</option>
+                  ${dies.map(d => html`<option key=${d.id} value=${d.id}>${d.code}</option>`)}
+                </select>
+              </div>
+            </div>
+          `}
+          <div class="field"><label>Operator</label>
+            <select value=${form.operator_user_id} onChange=${e => setForm({...form, operator_user_id: e.target.value})}>
+              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+            </select>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Good * (qty)</label><input type="number" required min=${0} step="0.01" value=${form.qty_good} onChange=${e => setForm({...form, qty_good: e.target.value})} /></div>
+            <div class="field"><label>Rejected</label><input type="number" min=${0} step="0.01" value=${form.qty_rejected} onChange=${e => setForm({...form, qty_rejected: e.target.value})} /></div>
+          </div>
+          ${parseFloat(form.qty_rejected) > 0 && html`
+            <div class="field"><label>Reject reason</label>
+              <select value=${form.reject_reason} onChange=${e => setForm({...form, reject_reason: e.target.value})}>
+                <option value="">— Select —</option>
+                <option>Dimension</option><option>Surface</option><option>Crack</option><option>Cold-shut</option><option>Porosity</option><option>Flash</option><option>Other</option>
+              </select>
+            </div>
+          `}
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (isReconcile ? 'Reconcile entry' : 'Log entry')}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= STAGE OVERRIDE (plant head only) =============
+function StageOverrideModal({ plant, me, entry, onClose, onSaved }) {
+  const [reason, setReason] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const { data, error } = await sb.rpc('override_unlock_stage', {
+        p_log_id: entry.id,
+        p_reason: reason,
+      });
+      if (error) throw error;
+      if (!data?.success) throw new Error(data?.error || 'Failed');
+      showToast('Unlocked · broadcast posted to chat');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">🔓 Override lock</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${me.role !== 'plant_head' && me.role !== 'admin' ? html`
+          <div class="alert error">Only plant head/admin can override locks.</div>
+          <button class="btn ghost" onClick=${onClose}>Close</button>
+        ` : html`
+          <div class="card" style="background:var(--slate-50);margin-bottom:14px">
+            <div class="card-row"><span class="label">Stage</span><span class="value">${entry.stage}</span></div>
+            <div class="card-row"><span class="label">Date</span><span class="value">${entry.log_date}</span></div>
+            <div class="card-row"><span class="label">Locked at</span><span class="value">${fmtDate(entry.locked_at)}</span></div>
+          </div>
+          <div class="alert info">Unlocking will be posted to the Logistics chat group with your reason. The entry can then be edited.</div>
+          ${error && html`<div class="alert error">${error}</div>`}
+          <form onSubmit=${submit}>
+            <div class="field"><label>Reason for override *</label><textarea required rows=${3} value=${reason} onChange=${e => setReason(e.target.value)} placeholder="e.g. Operator forgot to log; vendor claim mismatch; audit correction"></textarea></div>
+            <button class="btn danger" disabled=${loading}>${loading ? 'Unlocking…' : 'Unlock + broadcast'}</button>
+          </form>
+        `}
       </div>
     </div>
   `;
