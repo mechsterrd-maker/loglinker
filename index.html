@@ -3479,69 +3479,303 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
 function ActionHub({ plant, me }) {
   const [actions, setActions] = useState([]);
   const [users, setUsers] = useState([]);
-  const [filter, setFilter] = useState('open');
+  const [departments, setDepartments] = useState([]);
+  const [view, setView] = useState('all'); // all | mine | by_dept | by_person
+  const [statusFilter, setStatusFilter] = useState('open'); // open | done | all
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
+  const [activeTask, setActiveTask] = useState(null);
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    let q = sb.from('actions').select('*, owner_user:owner_id(full_name), assigner:assigned_by(full_name)').order('created_at', { ascending:false });
-    if (filter === 'open') q = q.in('status', ['open','in_progress']);
-    else if (filter === 'mine') q = q.eq('owner_id', me.id);
-    else if (filter === 'completed') q = q.eq('status', 'completed');
-    const [a, u] = await Promise.all([q.limit(100), sb.from('users').select('*')]);
+    let q = sb.from('actions').select('*, owner_user:owner_id(full_name, role), assigner:assigned_by(full_name)').order('created_at', { ascending:false });
+    if (statusFilter === 'open') q = q.in('status', ['open','in_progress']);
+    else if (statusFilter === 'done') q = q.eq('status', 'completed');
+    const [a, u, d] = await Promise.all([
+      q.limit(200),
+      sb.from('users').select('*').order('full_name'),
+      sb.from('departments').select('*').order('name')
+    ]);
     setActions(a.data || []);
     setUsers(u.data || []);
+    setDepartments(d.data || []);
     setLoading(false);
-  }, [filter, me.id]);
+  }, [statusFilter]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
+  // Live updates — subscribe to actions table
+  useEffect(() => {
+    if (!plant?.id) return;
+    const channel = sb.channel('actions-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'actions', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [plant?.id, refresh]);
+
+  // If a task is active, show detail screen
+  if (activeTask) {
+    return html`<${TaskDetail} plant=${plant} me=${me} task=${activeTask} users=${users} onClose=${() => { setActiveTask(null); refresh(); }} />`;
+  }
+
+  let filteredActions = actions;
+  if (view === 'mine') filteredActions = actions.filter(a => a.owner_id === me.id);
+
   const myOpen = actions.filter(a => a.owner_id === me.id && (a.status === 'open' || a.status === 'in_progress')).length;
+  const teamOpen = actions.filter(a => a.owner_id !== me.id && (a.status === 'open' || a.status === 'in_progress')).length;
+  const overdue = actions.filter(a => (a.status === 'open' || a.status === 'in_progress') && a.due_at && new Date(a.due_at) < new Date()).length;
+
+  // Group counters
+  const byDept = {};
+  const byPerson = {};
+  for (const a of filteredActions) {
+    const d = a.department || 'Unassigned';
+    if (!byDept[d]) byDept[d] = [];
+    byDept[d].push(a);
+    const p = a.owner_user?.full_name || 'Unassigned';
+    if (!byPerson[p]) byPerson[p] = [];
+    byPerson[p].push(a);
+  }
 
   return html`
-    <div class="page-header"><div><h1>Action Hub</h1><div class="sub">All open commitments</div></div></div>
+    <div class="page-header"><div><h1>Action Hub</h1><div class="sub">Live tasks across the plant</div></div></div>
 
     <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
-      <div class="stat ${myOpen > 0 ? 'amber' : 'teal'}"><div class="stat-num">${myOpen}</div><div class="stat-label">Mine Open</div></div>
-      <div class="stat teal"><div class="stat-num">${actions.filter(a => a.status === 'open' || a.status === 'in_progress').length}</div><div class="stat-label">All Open</div></div>
-      <div class="stat teal"><div class="stat-num">${actions.filter(a => a.status === 'completed').length}</div><div class="stat-label">Completed</div></div>
+      <div class="stat ${myOpen > 0 ? 'amber' : 'teal'}"><div class="stat-num">${myOpen}</div><div class="stat-label">Mine</div></div>
+      <div class="stat teal"><div class="stat-num">${teamOpen}</div><div class="stat-label">Team</div></div>
+      <div class="stat ${overdue > 0 ? 'rose' : 'teal'}"><div class="stat-num">${overdue}</div><div class="stat-label">Overdue</div></div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:10px;overflow-x:auto;flex-wrap:nowrap">
+      <button class=${'auth-tab' + (view === 'all' ? ' active' : '')} onClick=${() => setView('all')}>All</button>
+      <button class=${'auth-tab' + (view === 'mine' ? ' active' : '')} onClick=${() => setView('mine')}>Mine</button>
+      <button class=${'auth-tab' + (view === 'by_dept' ? ' active' : '')} onClick=${() => setView('by_dept')}>By Dept</button>
+      <button class=${'auth-tab' + (view === 'by_person' ? ' active' : '')} onClick=${() => setView('by_person')}>By Person</button>
     </div>
 
     <div class="auth-tabs" style="margin-bottom:14px">
-      <button class=${'auth-tab' + (filter === 'open' ? ' active' : '')} onClick=${() => setFilter('open')}>All Open</button>
-      <button class=${'auth-tab' + (filter === 'mine' ? ' active' : '')} onClick=${() => setFilter('mine')}>Mine</button>
-      <button class=${'auth-tab' + (filter === 'completed' ? ' active' : '')} onClick=${() => setFilter('completed')}>Done</button>
-      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
+      <button class=${'auth-tab' + (statusFilter === 'open' ? ' active' : '')} onClick=${() => setStatusFilter('open')}>Open</button>
+      <button class=${'auth-tab' + (statusFilter === 'done' ? ' active' : '')} onClick=${() => setStatusFilter('done')}>Done</button>
+      <button class=${'auth-tab' + (statusFilter === 'all' ? ' active' : '')} onClick=${() => setStatusFilter('all')}>All</button>
     </div>
 
-    <div class="section-h">Actions · ${actions.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('action'); }}>+ Add</button></div>
+    <div class="section-h">Tasks · ${filteredActions.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('action'); }}>+ Add</button></div>
+
     ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
-      actions.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✓</div>No actions in this filter</div></div>` :
-      actions.map(a => html`
-        <div class="list-item" key=${a.id} onClick=${() => { setEditTarget(a); setModal('action'); }}>
-          <div class="list-item-row">
-            <div class="list-item-main">
-              <div class="list-item-title">${a.title}</div>
-              <div class="list-item-sub">${a.source_type} · ${a.owner_user?.full_name || 'unassigned'} ${a.due_at ? '· due ' + fmtDate(a.due_at) : ''}</div>
+      filteredActions.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✓</div>No tasks in this filter</div></div>` :
+      (view === 'by_dept' || view === 'by_person') ? html`
+        ${Object.entries(view === 'by_dept' ? byDept : byPerson).sort((a,b) => b[1].length - a[1].length).map(([groupKey, groupItems]) => html`
+          <details key=${groupKey} open style="margin-bottom:8px">
+            <summary style="cursor:pointer;padding:10px 12px;background:var(--slate-100);border-radius:10px;font-weight:600;font-size:14px;display:flex;justify-content:space-between;align-items:center">
+              <span>${view === 'by_dept' ? '🏢 ' : '👤 '}${groupKey}</span>
+              <span style="background:var(--teal-600);color:white;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px">${groupItems.length}</span>
+            </summary>
+            <div style="margin-top:6px;padding-left:8px">
+              ${groupItems.map(a => html`<${TaskRow} key=${a.id} action=${a} onTap=${() => setActiveTask(a)} />`)}
             </div>
-            <span class=${'badge ' + (a.status === 'completed' ? 'emerald' : a.status === 'cancelled' ? '' : 'amber')}>${a.status}</span>
-          </div>
-        </div>
-      `)
+          </details>
+        `)}
+      ` : html`
+        ${filteredActions.map(a => html`<${TaskRow} key=${a.id} action=${a} onTap=${() => setActiveTask(a)} />`)}
+      `
     }
 
-    ${modal === 'action' && html`<${ActionModal} plant=${plant} me=${me} users=${users} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'action' && html`<${ActionModal} plant=${plant} me=${me} users=${users} departments=${departments} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
   `;
 }
 
-function ActionModal({ plant, me, users, editTarget, onClose, onSaved }) {
+// ============= TASK ROW =============
+function TaskRow({ action, onTap }) {
+  const overdue = action.due_at && new Date(action.due_at) < new Date() && action.status !== 'completed' && action.status !== 'cancelled';
+  return html`
+    <div class="list-item" onClick=${onTap}>
+      <div class="list-item-row">
+        <div class="list-item-main">
+          <div class="list-item-title" style=${action.status === 'completed' ? 'text-decoration:line-through;color:var(--slate-500)' : ''}>${action.title}</div>
+          <div class="list-item-sub">
+            ${action.owner_user?.full_name || '— unassigned'}
+            ${action.department ? ' · ' + action.department : ''}
+            ${action.due_at ? ' · ' + (overdue ? '⚠️ ' : '') + 'due ' + fmtDate(action.due_at) : ''}
+            · ${action.source_type}
+          </div>
+        </div>
+        <span class=${'badge ' + (action.status === 'completed' ? 'emerald' : action.status === 'cancelled' ? '' : overdue ? 'rose' : 'amber')}>${action.status}</span>
+      </div>
+    </div>
+  `;
+}
+
+// ============= TASK DETAIL =============
+function TaskDetail({ plant, me, task: initialTask, users, onClose }) {
+  const [task, setTask] = useState(initialTask);
+  const [updates, setUpdates] = useState([]);
+  const [comment, setComment] = useState('');
+  const [posting, setPosting] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [showOriginalMsg, setShowOriginalMsg] = useState(null);
+
+  const refresh = useCallback(async () => {
+    const [t, u] = await Promise.all([
+      sb.from('actions').select('*, owner_user:owner_id(full_name), assigner:assigned_by(full_name), creator:assigned_by(full_name)').eq('id', task.id).maybeSingle(),
+      sb.from('action_updates').select('*, author:author_id(full_name)').eq('action_id', task.id).order('created_at')
+    ]);
+    if (t.data) setTask(t.data);
+    setUpdates(u.data || []);
+  }, [task.id]);
+
+  useEffect(() => {
+    refresh();
+    // Get original chat message if linked
+    if (task.chat_message_id) {
+      sb.from('chat_messages').select('body, attachments, users(full_name)').eq('id', task.chat_message_id).maybeSingle().then(({data}) => setShowOriginalMsg(data));
+    }
+    // Subscribe to live updates
+    const channel = sb.channel('task-' + task.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'action_updates', filter:'action_id=eq.' + task.id }, () => refresh())
+      .on('postgres_changes', { event:'*', schema:'public', table:'actions', filter:'id=eq.' + task.id }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [task.id, refresh]);
+
+  const postComment = async () => {
+    if (!comment.trim() || posting) return;
+    setPosting(true);
+    const body = comment.trim();
+    setComment('');
+    const { error } = await sb.from('action_updates').insert({
+      plant_id: plant.id, action_id: task.id,
+      author_id: me.id, update_type: 'comment', body
+    });
+    if (error) alert(error.message);
+    setPosting(false);
+  };
+
+  const changeStatus = async (newStatus) => {
+    const updates = { status: newStatus };
+    if (newStatus === 'completed') updates.completed_at = new Date().toISOString();
+    const { error } = await sb.from('actions').update(updates).eq('id', task.id);
+    if (error) { alert(error.message); return; }
+    showToast(newStatus === 'completed' ? 'Task closed · chat notified' : 'Status updated');
+  };
+
+  const reassign = async (newOwnerId) => {
+    const { error } = await sb.from('actions').update({ owner_id: newOwnerId || null }).eq('id', task.id);
+    if (error) { alert(error.message); return; }
+    await sb.from('action_updates').insert({
+      plant_id: plant.id, action_id: task.id,
+      author_id: me.id, update_type: 'comment',
+      body: '👤 Reassigned to ' + (users.find(u => u.id === newOwnerId)?.full_name || 'unassigned')
+    });
+  };
+
+  const isOwner = task.owner_id === me.id;
+  const isClosed = task.status === 'completed' || task.status === 'cancelled';
+  const overdue = task.due_at && new Date(task.due_at) < new Date() && !isClosed;
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:0">
+        <h1 style="font-size:18px">Task</h1>
+        <div class="sub">${task.source_type}${task.department ? ' · ' + task.department : ''}</div>
+      </div>
+      ${(isOwner || me.role === 'plant_head' || me.role === 'admin') && html`
+        <button class="btn small ghost" onClick=${() => setEditing(true)}>Edit</button>
+      `}
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:18px;margin:0 0 8px;${isClosed ? 'text-decoration:line-through;color:var(--slate-500)' : ''}">${task.title}</h2>
+      ${task.description && html`<p style="font-size:14px;color:var(--slate-600);line-height:1.5;margin:0 0 12px">${task.description}</p>`}
+      <div class="card-row"><span class="label">Status</span><span class="value"><span class=${'badge ' + (task.status === 'completed' ? 'emerald' : overdue ? 'rose' : 'amber')}>${task.status}</span></span></div>
+      <div class="card-row"><span class="label">Owner</span><span class="value">${task.owner_user?.full_name || '— unassigned'}</span></div>
+      <div class="card-row"><span class="label">Assigned by</span><span class="value">${task.assigner?.full_name || '?'}</span></div>
+      ${task.due_at && html`<div class="card-row"><span class="label">Due</span><span class="value" style=${overdue ? 'color:var(--rose-500)' : ''}>${overdue ? '⚠️ ' : ''}${fmtDate(task.due_at)}</span></div>`}
+      ${task.completed_at && html`<div class="card-row"><span class="label">Closed</span><span class="value">${fmtDate(task.completed_at)}</span></div>`}
+    </div>
+
+    ${showOriginalMsg && html`
+      <div class="card" style="background:var(--teal-50);border-color:var(--teal-100);margin-top:14px">
+        <div style="font-size:11px;color:var(--teal-700);font-weight:600;margin-bottom:6px">FROM CHAT</div>
+        <div style="font-size:13px;color:var(--slate-700)"><strong>${showOriginalMsg.users?.full_name || '?'}:</strong> ${showOriginalMsg.body || '(attachment)'}</div>
+      </div>
+    `}
+
+    ${!isClosed && html`
+      <div class="card" style="margin-top:14px">
+        <div class="card-title">Actions</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          ${task.status === 'open' && html`<button class="btn small" onClick=${() => changeStatus('in_progress')}>Start working</button>`}
+          ${task.status === 'in_progress' && html`<button class="btn small ghost" onClick=${() => changeStatus('open')}>Pause</button>`}
+          <button class="btn small" style="background:var(--emerald-600)" onClick=${() => { if (confirm('Close this task?')) changeStatus('completed'); }}>✓ Close task</button>
+          ${(me.role === 'plant_head' || me.role === 'admin' || task.assigned_by === me.id) && html`
+            <button class="btn small danger" onClick=${() => { if (confirm('Cancel this task?')) changeStatus('cancelled'); }}>Cancel</button>
+          `}
+        </div>
+        ${(me.role === 'plant_head' || me.role === 'admin' || task.assigned_by === me.id) && html`
+          <div class="field" style="margin-top:14px">
+            <label>Reassign to</label>
+            <select value=${task.owner_id || ''} onChange=${e => reassign(e.target.value)}>
+              <option value="">— Unassigned —</option>
+              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.id === me.id ? ' (me)' : ''}</option>`)}
+            </select>
+          </div>
+        `}
+      </div>
+    `}
+
+    <div class="section-h">Activity · ${updates.length}</div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      ${updates.length === 0 ? html`<div class="empty"><div style="font-size:13px">No activity yet. Be the first to add an update.</div></div>` :
+        updates.map(u => {
+          const isComment = u.update_type === 'comment';
+          const isOwn = u.author_id === me.id;
+          if (!isComment) {
+            return html`
+              <div key=${u.id} style="text-align:center;padding:6px 0">
+                <span style="background:var(--slate-100);color:var(--slate-600);padding:4px 10px;border-radius:999px;font-size:11px">
+                  ${u.body || (u.update_type + ': ' + u.status_from + ' → ' + u.status_to)} · ${u.author?.full_name || '?'} · ${fmtDate(u.created_at)}
+                </span>
+              </div>
+            `;
+          }
+          return html`
+            <div key=${u.id} style="background:${isOwn ? 'var(--teal-50)' : 'white'};border:1px solid var(--slate-200);border-radius:12px;padding:10px 12px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+                <strong style="font-size:13px;color:var(--slate-700)">${u.author?.full_name || '?'}</strong>
+                <span style="font-size:11px;color:var(--slate-400)">${fmtDate(u.created_at)}</span>
+              </div>
+              <div style="font-size:14px;line-height:1.5">${u.body}</div>
+            </div>
+          `;
+        })
+      }
+    </div>
+
+    ${!isClosed && html`
+      <div style="position:sticky;bottom:0;background:white;padding:10px 0;margin-top:14px;display:flex;gap:8px">
+        <input type="text" value=${comment} onChange=${e => setComment(e.target.value)} onKeyPress=${e => { if (e.key === 'Enter' && !e.shiftKey) postComment(); }} placeholder="Add an update or comment…" style="flex:1;padding:10px 14px;border:1px solid var(--slate-200);border-radius:999px;font-size:14px;outline:none" disabled=${posting} />
+        <button class="btn" style="border-radius:999px;width:auto;padding:10px 18px;flex-shrink:0" onClick=${postComment} disabled=${posting || !comment.trim()}>${posting ? '…' : 'Post'}</button>
+      </div>
+    `}
+
+    ${editing && html`<${ActionModal} plant=${plant} me=${me} users=${users} editTarget=${task} onClose=${() => setEditing(false)} onSaved=${() => { setEditing(false); refresh(); }} />`}
+  `;
+}
+
+function ActionModal({ plant, me, users, departments, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget ? {...editTarget, due_at: editTarget.due_at ? editTarget.due_at.slice(0,16) : ''} : {
-    title:'', description:'', owner_id:'', due_at:'', source_type:'manual'
+    title:'', description:'', owner_id:'', department:'', due_at:'', source_type:'manual'
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // Auto-fill department from owner's department if available
+  const onPickOwner = (id) => {
+    const u = users.find(x => x.id === id);
+    setForm({...form, owner_id: id, department: form.department || (u?.role === 'qa' ? 'Quality' : u?.role === 'maintenance' ? 'Maintenance' : u?.role === 'production' ? 'Production' : form.department)});
+  };
 
   const submit = async (e) => {
     e.preventDefault();
@@ -3553,6 +3787,7 @@ function ActionModal({ plant, me, users, editTarget, onClose, onSaved }) {
         title: form.title,
         description: form.description || null,
         owner_id: form.owner_id || null,
+        department: form.department || null,
         assigned_by: me.id,
         due_at: form.due_at ? new Date(form.due_at).toISOString() : null,
         status: form.status || 'open',
@@ -3564,27 +3799,37 @@ function ActionModal({ plant, me, users, editTarget, onClose, onSaved }) {
         ? await sb.from('actions').update(payload).eq('id', editTarget.id)
         : await sb.from('actions').insert(payload);
       if (error) throw error;
-      showToast(editTarget ? 'Action updated' : 'Action added');
+      showToast(editTarget ? 'Task updated' : 'Task added');
       onSaved();
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
+
+  const deptOptions = ['Production', 'Quality', 'Maintenance', 'Stores', 'Tool Room', 'Logistics', 'Admin', 'Finance'];
 
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal">
         <div class="modal-header">
-          <div class="modal-title">${editTarget ? 'Edit Action' : 'Add Action'}</div>
+          <div class="modal-title">${editTarget ? 'Edit Task' : 'New Task'}</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
         <form onSubmit=${submit}>
           <div class="field"><label>Title *</label><input type="text" required value=${form.title} onChange=${e => setForm({...form, title: e.target.value})} placeholder="Order new corepins" /></div>
           <div class="field"><label>Description</label><textarea rows=${2} value=${form.description || ''} onChange=${e => setForm({...form, description: e.target.value})}></textarea></div>
-          <div class="field"><label>Owner</label>
-            <select value=${form.owner_id || ''} onChange=${e => setForm({...form, owner_id: e.target.value})}>
-              <option value="">— Unassigned —</option>
-              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
-            </select>
+          <div class="field-row">
+            <div class="field"><label>Owner</label>
+              <select value=${form.owner_id || ''} onChange=${e => onPickOwner(e.target.value)}>
+                <option value="">— Unassigned —</option>
+                ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+              </select>
+            </div>
+            <div class="field"><label>Department</label>
+              <select value=${form.department || ''} onChange=${e => setForm({...form, department: e.target.value})}>
+                <option value="">— None —</option>
+                ${deptOptions.map(d => html`<option key=${d} value=${d}>${d}</option>`)}
+              </select>
+            </div>
           </div>
           <div class="field"><label>Due Date</label><input type="datetime-local" value=${form.due_at} onChange=${e => setForm({...form, due_at: e.target.value})} /></div>
           ${editTarget && html`
@@ -3595,7 +3840,7 @@ function ActionModal({ plant, me, users, editTarget, onClose, onSaved }) {
               </select>
             </div>
           `}
-          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Create task')}</button>
         </form>
       </div>
     </div>
@@ -3610,6 +3855,7 @@ function AssignTaskFromMsgModal({ plant, me, message, group, onClose, onSaved })
     title: messagePreview.slice(0, 80),
     description: messagePreview,
     owner_id: message.sender_id !== me.id ? message.sender_id : '',
+    department: '',
     due_at: '',
   });
   const [loading, setLoading] = useState(false);
@@ -3629,6 +3875,7 @@ function AssignTaskFromMsgModal({ plant, me, message, group, onClose, onSaved })
         title: form.title,
         description: form.description || null,
         owner_id: form.owner_id || null,
+        department: form.department || null,
         assigned_by: me.id,
         due_at: form.due_at ? new Date(form.due_at).toISOString() : null,
         status: 'open',
@@ -3649,6 +3896,8 @@ function AssignTaskFromMsgModal({ plant, me, message, group, onClose, onSaved })
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
 
+  const deptOptions = ['Production', 'Quality', 'Maintenance', 'Stores', 'Tool Room', 'Logistics', 'Admin', 'Finance'];
+
   return html`
     <div class="modal-backdrop active" style="z-index:200" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal">
@@ -3664,11 +3913,19 @@ function AssignTaskFromMsgModal({ plant, me, message, group, onClose, onSaved })
         <form onSubmit=${submit}>
           <div class="field"><label>Task Title *</label><input type="text" required value=${form.title} onChange=${e => setForm({...form, title: e.target.value})} /></div>
           <div class="field"><label>Description</label><textarea rows=${2} value=${form.description} onChange=${e => setForm({...form, description: e.target.value})}></textarea></div>
-          <div class="field"><label>Assign To *</label>
-            <select required value=${form.owner_id} onChange=${e => setForm({...form, owner_id: e.target.value})}>
-              <option value="">— Select person —</option>
-              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.id === me.id ? ' (me)' : ''}</option>`)}
-            </select>
+          <div class="field-row">
+            <div class="field"><label>Assign To *</label>
+              <select required value=${form.owner_id} onChange=${e => setForm({...form, owner_id: e.target.value})}>
+                <option value="">— Select —</option>
+                ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.id === me.id ? ' (me)' : ''}</option>`)}
+              </select>
+            </div>
+            <div class="field"><label>Department</label>
+              <select value=${form.department} onChange=${e => setForm({...form, department: e.target.value})}>
+                <option value="">— None —</option>
+                ${deptOptions.map(d => html`<option key=${d} value=${d}>${d}</option>`)}
+              </select>
+            </div>
           </div>
           <div class="field"><label>Due Date</label><input type="datetime-local" value=${form.due_at} onChange=${e => setForm({...form, due_at: e.target.value})} /></div>
           <button class="btn" disabled=${loading}>${loading ? 'Assigning…' : 'Assign task'}</button>
