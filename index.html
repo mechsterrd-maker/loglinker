@@ -317,13 +317,13 @@ const requestNotificationPermission = async () => {
 const showNotification = (title, body, icon) => {
   try {
     if (!('Notification' in window) || Notification.permission !== 'granted') return;
-    if (document.visibilityState === 'visible') return; // Don't notify if app is open and active
     const n = new Notification(title, {
       body: body || '',
       icon: icon || '/favicon.ico',
       badge: '/favicon.ico',
       tag: 'loglinkr-' + Date.now(),
-      silent: false
+      silent: true, // we play our own sound
+      requireInteraction: false
     });
     n.onclick = () => { window.focus(); n.close(); };
     setTimeout(() => n.close(), 6000);
@@ -757,6 +757,38 @@ function App() {
 // ============= APP SHELL =============
 function Shell({ user, plant, me, tab, setTab, logout, reload }) {
   const initials = (me.full_name || user.email).split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  const recalcUnread = useCallback(async () => {
+    if (!plant?.id) return;
+    const { data: groups } = await sb.from('chat_groups').select('id, members').contains('members', [user.id]);
+    if (!groups) return;
+    let total = 0;
+    for (const g of groups) {
+      const lastRead = parseInt(localStorage.getItem('loglinkr_lastread_' + user.id + '_' + g.id) || '0');
+      const lastReadIso = new Date(lastRead || 0).toISOString();
+      const { count } = await sb.from('chat_messages')
+        .select('id', { count:'exact', head:true })
+        .eq('group_id', g.id)
+        .gt('created_at', lastReadIso)
+        .neq('sender_id', user.id);
+      total += count || 0;
+    }
+    setUnreadCount(total);
+  }, [plant?.id, user.id]);
+
+  useEffect(() => {
+    recalcUnread();
+    if (!plant?.id) return;
+    const channel = sb.channel('shell-msgs-' + plant.id)
+      .on('postgres_changes', { event:'INSERT', schema:'public', table:'chat_messages', filter:'plant_id=eq.' + plant.id }, () => {
+        recalcUnread();
+      })
+      .subscribe();
+    // Recalc when localStorage changes (mark-read in chat)
+    const interval = setInterval(recalcUnread, 5000);
+    return () => { sb.removeChannel(channel); clearInterval(interval); };
+  }, [plant?.id, recalcUnread]);
 
   return html`
     <div class="app">
@@ -779,7 +811,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload }) {
       <${Page} active=${tab === 'maintenance'}><${Maintenance} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'stocks'}><${Stocks} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'actions'}><${ActionHub} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} /></${Page}>
+      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab}/></${Page}>
 
@@ -787,7 +819,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload }) {
         <${TabBtn} icon="home" label="Home" active=${tab === 'home'} onClick=${() => setTab('home')} />
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
-        <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} />
+        <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
         <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
     </div>
@@ -798,7 +830,7 @@ function Page({ active, children }) {
   return html`<div class=${'page' + (active ? ' active' : '')}>${children}</div>`;
 }
 
-function TabBtn({ icon, label, active, onClick }) {
+function TabBtn({ icon, label, active, onClick, badge }) {
   const icons = {
     home: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>`,
     production: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>`,
@@ -807,7 +839,7 @@ function TabBtn({ icon, label, active, onClick }) {
     people: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
     more: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>`,
   };
-  return html`<button class=${'tab' + (active ? ' active' : '')} onClick=${onClick}>${icons[icon]}<span class="tab-label">${label}</span></button>`;
+  return html`<button class=${'tab' + (active ? ' active' : '')} onClick=${onClick} style="position:relative">${icons[icon]}<span class="tab-label">${label}</span>${badge > 0 ? html`<span style="position:absolute;top:4px;right:calc(50% - 18px);background:var(--rose-500);color:white;font-size:9px;font-weight:700;padding:1px 5px;border-radius:999px;min-width:16px;text-align:center;line-height:1.4">${badge > 99 ? '99+' : badge}</span>` : ''}</button>`;
 }
 
 // ============= HOME =============
@@ -1361,7 +1393,11 @@ function Chat({ plant, me, user }) {
       }, async (payload) => {
         const newMsg = payload.new;
         if (newMsg.sender_id === user.id) return;
-        // If we're in the active group already, the per-group handler covers it
+
+        // Refresh group list so badges + previews update
+        loadGroups();
+
+        // If we're in the active group already, per-group handler shows the message
         if (activeGroup && newMsg.group_id === activeGroup.id) return;
 
         // Check the user is a member of the message's group
@@ -1407,26 +1443,69 @@ function Chat({ plant, me, user }) {
           if (wrap) wrap.scrollTop = wrap.scrollHeight;
         }, 50);
 
-        // Sound + notification
+        // Mark this group as read since user is actively viewing it
+        markRead(activeGroup.id);
+
+        // Sound + notification (notification only if tab not visible)
         playNotificationSound();
-        const senderName = sender?.full_name || 'Someone';
-        const preview = newMsg.body || (Array.isArray(newMsg.attachments) && newMsg.attachments.length ? '📎 ' + (newMsg.attachments[0].name || 'attachment') : '');
-        showNotification(senderName + ' · ' + activeGroup.name, preview);
+        if (document.visibilityState !== 'visible') {
+          const senderName = sender?.full_name || 'Someone';
+          const preview = newMsg.body || (Array.isArray(newMsg.attachments) && newMsg.attachments.length ? '📎 ' + (newMsg.attachments[0].name || 'attachment') : '');
+          showNotification(senderName + ' · ' + activeGroup.name, preview);
+        }
       })
       .subscribe();
     return () => { sb.removeChannel(channel); };
   }, [activeGroup]);
 
+  const lastReadKey = (groupId) => 'loglinkr_lastread_' + user.id + '_' + groupId;
+  const getLastRead = (groupId) => parseInt(localStorage.getItem(lastReadKey(groupId)) || '0');
+  const markRead = (groupId) => localStorage.setItem(lastReadKey(groupId), Date.now().toString());
+
   const loadGroups = async () => {
     setLoading(true);
-    const { data } = await sb.from('chat_groups').select('*').contains('members', [user.id]);
-    setGroups(data || []);
+    const { data: groupsData } = await sb.from('chat_groups').select('*').contains('members', [user.id]);
+    const groupsList = groupsData || [];
+
+    // Get unread count + last message preview for each group
+    const enriched = await Promise.all(groupsList.map(async (g) => {
+      const lastRead = getLastRead(g.id);
+      const lastReadIso = new Date(lastRead || 0).toISOString();
+
+      // Count unread (messages newer than lastRead, not from self)
+      const { count } = await sb.from('chat_messages')
+        .select('id', { count: 'exact', head: true })
+        .eq('group_id', g.id)
+        .gt('created_at', lastReadIso)
+        .neq('sender_id', user.id);
+
+      // Last message
+      const { data: lastMsg } = await sb.from('chat_messages')
+        .select('body, attachments, created_at, users(full_name)')
+        .eq('group_id', g.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      return { ...g, unread: count || 0, lastMsg };
+    }));
+
+    // Sort: groups with unread first, then by last message time
+    enriched.sort((a, b) => {
+      if ((b.unread > 0) !== (a.unread > 0)) return (b.unread > 0) - (a.unread > 0);
+      const at = a.lastMsg?.created_at || a.created_at;
+      const bt = b.lastMsg?.created_at || b.created_at;
+      return new Date(bt) - new Date(at);
+    });
+
+    setGroups(enriched);
     setLoading(false);
   };
 
   const loadMessages = async (groupId) => {
     const { data } = await sb.from('chat_messages').select('*, users(full_name)').eq('group_id', groupId).order('created_at').limit(100);
     setMessages(data || []);
+    markRead(groupId);
     setTimeout(() => {
       const wrap = document.getElementById('threadMessages');
       if (wrap) wrap.scrollTop = wrap.scrollHeight;
@@ -1596,15 +1675,27 @@ function Chat({ plant, me, user }) {
     ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
       groups.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">💬</div>No chat groups yet</div></div>` :
       html`<div class="chat-list">
-        ${groups.map(g => html`
-          <div class="chat-item" key=${g.id} onClick=${() => setActiveGroup(g)}>
-            <div class="chat-avatar">${g.name[0] === '#' ? '#' : g.name[0]}</div>
-            <div class="chat-info">
-              <div class="chat-name">${g.name}</div>
-              <div class="chat-preview">${g.members.length} member${g.members.length > 1 ? 's' : ''}</div>
+        ${groups.map(g => {
+          const last = g.lastMsg;
+          const lastWho = last?.users?.full_name?.split(' ')[0];
+          const lastBody = last?.body || (Array.isArray(last?.attachments) && last.attachments.length ? '📎 ' + (last.attachments[0].name || 'attachment') : '');
+          const preview = last ? (lastWho ? lastWho + ': ' + lastBody : lastBody) : g.members.length + ' member' + (g.members.length > 1 ? 's' : '');
+          return html`
+            <div class="chat-item" key=${g.id} onClick=${() => setActiveGroup(g)}>
+              <div class="chat-avatar">${g.name[0] === '#' ? '#' : g.name[0]}</div>
+              <div class="chat-info">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+                  <div class="chat-name" style=${g.unread > 0 ? 'font-weight:700' : ''}>${g.name}</div>
+                  ${last && html`<div style="font-size:11px;color:var(--slate-400);flex-shrink:0">${fmtDate(last.created_at)}</div>`}
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:2px">
+                  <div class="chat-preview" style=${g.unread > 0 ? 'color:var(--slate-700);font-weight:500' : ''}>${preview}</div>
+                  ${g.unread > 0 && html`<span style="background:var(--teal-600);color:white;font-size:11px;font-weight:700;padding:2px 7px;border-radius:999px;min-width:20px;text-align:center;flex-shrink:0">${g.unread}</span>`}
+                </div>
+              </div>
             </div>
-          </div>
-        `)}
+          `;
+        })}
       </div>`
     }
   `;
