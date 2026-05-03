@@ -325,6 +325,42 @@ const requestNotificationPermission = async () => {
   return result === 'granted';
 };
 
+// Resize image to max dimension to cut API costs (and upload speed)
+const resizeImageFile = async (file, maxDim = 1600, quality = 0.82) => {
+  if (!file.type.startsWith('image/')) return file;
+  // Skip if already small
+  if (file.size < 200 * 1024) return file;
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = reject;
+      i.src = URL.createObjectURL(file);
+    });
+    const ratio = Math.min(1, maxDim / Math.max(img.width, img.height));
+    if (ratio === 1) return file;
+    const w = Math.round(img.width * ratio);
+    const h = Math.round(img.height * ratio);
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, w, h);
+    URL.revokeObjectURL(img.src);
+    return await new Promise((resolve) => {
+      canvas.toBlob(blob => {
+        if (!blob) return resolve(file);
+        // Keep .jpg extension for resized
+        const newName = file.name.replace(/\.\w+$/, '') + '.jpg';
+        resolve(new File([blob], newName, { type: 'image/jpeg' }));
+      }, 'image/jpeg', quality);
+    });
+  } catch (e) {
+    console.warn('Resize failed, using original:', e);
+    return file;
+  }
+};
+
 const showNotification = (title, body, icon) => {
   try {
     if (!('Notification' in window) || Notification.permission !== 'granted') return;
@@ -2284,21 +2320,52 @@ function Chat({ plant, me, user }) {
     }, 50);
   };
 
-  const onPickFile = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (file.size > 10 * 1024 * 1024) {
-      alert('File too large. Max 10 MB.');
+  const onPickFile = async (e) => {
+    const original = e.target.files?.[0];
+    if (!original) return;
+    if (original.size > 20 * 1024 * 1024) {
+      alert('File too large. Max 20 MB.');
       return;
     }
-    const isImage = file.type.startsWith('image/');
+    e.target.value = '';
+    const isImage = original.type.startsWith('image/');
+    // Resize images to cut API + upload cost
+    const file = isImage ? await resizeImageFile(original, 1600, 0.82) : original;
     setAttachment({
       file,
       previewUrl: isImage ? URL.createObjectURL(file) : null,
       type: file.type,
       name: file.name
     });
-    e.target.value = '';
+  };
+
+  const triggerExtraction = async (msg, imageUrl) => {
+    try {
+      const { data: queueId, error } = await sb.rpc('enqueue_chat_image_for_extraction', {
+        p_message_id: msg.id,
+        p_group_id: activeGroup.id,
+        p_image_url: imageUrl,
+      });
+      if (error) { alert(error.message); return; }
+      if (!queueId) { alert('Already queued'); return; }
+      const { data: { session } } = await sb.auth.getSession();
+      if (session) {
+        showToast('Extracting…');
+        fetch(SUPABASE_URL + '/functions/v1/extract-document', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + session.access_token,
+            'apikey': SUPABASE_ANON_KEY,
+          },
+          body: JSON.stringify({
+            queue_id: queueId,
+            image_url: imageUrl,
+            plant_name: plant.name,
+          }),
+        }).catch(e => console.warn('Extract failed:', e));
+      }
+    } catch (e) { alert(e.message); }
   };
 
   const send = async () => {
@@ -2376,8 +2443,10 @@ function Chat({ plant, me, user }) {
     // Replace optimistic with real (so realtime won't double-add)
     setMessages(prev => prev.map(m => m.id === localId ? {...inserted, users: { full_name: me.full_name }} : m));
 
-    // Auto-extract documents from images posted in any chat group
-    if (inserted && attachments.length > 0 && attachments[0].isImage) {
+    // Auto-extract documents — ONLY in groups marked for logistics (saves API cost on casual chat)
+    const groupName = (activeGroup?.name || '').toLowerCase();
+    const isLogisticsGroup = groupName.includes('logistic') || groupName.includes('bill') || groupName.includes('invoice') || groupName.includes('document');
+    if (inserted && attachments.length > 0 && attachments[0].isImage && isLogisticsGroup) {
       try {
         const { data: queueId, error: enqErr } = await sb.rpc('enqueue_chat_image_for_extraction', {
           p_message_id: inserted.id,
@@ -2427,6 +2496,7 @@ function Chat({ plant, me, user }) {
               const atts = Array.isArray(m.attachments) ? m.attachments : [];
               const ex = m._extraction;
               const doc = m._doc;
+              const hasImage = atts.length > 0 && atts[0].isImage;
               return html`
                 <div class=${'msg ' + (isOut ? 'out' : 'in')} key=${m.id}>
                   ${!isOut && html`<div class="who">${m.users?.full_name || '?'}</div>`}
@@ -2445,6 +2515,9 @@ function Chat({ plant, me, user }) {
                         ex.status === 'skipped' ? html`<span>📷 ${ex.classification || 'skipped'}</span>` :
                         ex.status === 'failed' ? html`<span>✗ Extract failed</span>` : ''}
                     </div>
+                  `}
+                  ${hasImage && !ex && html`
+                    <button class="msg-action-btn" style="margin-top:6px" onClick=${() => triggerExtraction(m, atts[0].url)} title="Extract document">📄 Extract as document</button>
                   `}
                   <div class="ts">
                     ${fmtDate(m.created_at)}
