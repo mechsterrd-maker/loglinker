@@ -207,6 +207,12 @@ body{
 .msg img.attached-img{max-width:200px;max-height:200px;border-radius:8px;display:block;margin-top:4px;cursor:pointer}
 .msg .file-attached{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;background:rgba(255,255,255,0.15);border-radius:8px;margin-top:4px;font-size:12px;text-decoration:none;color:inherit}
 .msg.in .file-attached{background:var(--slate-50);border:1px solid var(--slate-200)}
+.extract-badge{display:inline-block;margin-top:6px;padding:5px 10px;border-radius:8px;font-size:11px;font-weight:600;line-height:1.4}
+.extract-badge.completed{background:var(--emerald-50);color:var(--emerald-700);border:1px solid var(--emerald-200)}
+.extract-badge.duplicate{background:var(--amber-50);color:var(--amber-700);border:1px solid var(--amber-200)}
+.extract-badge.processing,.extract-badge.pending{background:var(--teal-50);color:var(--teal-700);border:1px solid var(--teal-200)}
+.extract-badge.skipped{background:var(--slate-100);color:var(--slate-500);border:1px solid var(--slate-200)}
+.extract-badge.failed{background:var(--rose-50);color:var(--rose-600);border:1px solid var(--rose-200)}
 
 /* ================= WIZARD ================= */
 .wizard{max-width:480px;margin:0 auto;padding:32px 24px}
@@ -816,6 +822,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload }) {
       <${Page} active=${tab === 'maintenance'}><${Maintenance} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'stocks'}><${Stocks} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'actions'}><${ActionHub} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'documents'}><${Documents} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab}/></${Page}>
@@ -825,7 +832,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload }) {
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
     </div>
   `;
@@ -2181,6 +2188,17 @@ function Chat({ plant, me, user }) {
     return () => { sb.removeChannel(channel); };
   }, [activeGroup]);
 
+  // Live extraction status updates (refetch messages for the active group when extraction completes)
+  useEffect(() => {
+    if (!plant?.id || !activeGroup) return;
+    const channel = sb.channel('extract-' + activeGroup.id)
+      .on('postgres_changes', { event:'UPDATE', schema:'public', table:'mcp_logistics_extraction_queue', filter:'group_id=eq.' + activeGroup.id }, () => {
+        loadMessages(activeGroup.id);
+      })
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [plant?.id, activeGroup?.id]);
+
   const lastReadKey = (groupId) => 'loglinkr_lastread_' + user.id + '_' + groupId;
   const getLastRead = (groupId) => parseInt(localStorage.getItem(lastReadKey(groupId)) || '0');
   const markRead = (groupId) => localStorage.setItem(lastReadKey(groupId), Date.now().toString());
@@ -2226,8 +2244,39 @@ function Chat({ plant, me, user }) {
   };
 
   const loadMessages = async (groupId) => {
-    const { data } = await sb.from('chat_messages').select('*, users(full_name)').eq('group_id', groupId).order('created_at').limit(100);
-    setMessages(data || []);
+    const { data: msgs } = await sb.from('chat_messages').select('*, users(full_name)').eq('group_id', groupId).order('created_at').limit(100);
+    const messages = msgs || [];
+
+    // Fetch extraction status for these messages (if any have images)
+    if (messages.length > 0) {
+      const msgIds = messages.map(m => m.id);
+      const { data: queue } = await sb.from('mcp_logistics_extraction_queue')
+        .select('message_id, status, classification, result_doc_id')
+        .in('message_id', msgIds);
+      const statusMap = (queue || []).reduce((acc, q) => { acc[q.message_id] = q; return acc; }, {});
+
+      // Fetch resulting docs
+      const docIds = (queue || []).filter(q => q.result_doc_id).map(q => q.result_doc_id);
+      const docMap = {};
+      if (docIds.length > 0) {
+        const { data: docs } = await sb.from('mcp_logistics_documents')
+          .select('id, doc_type, doc_number, vendor_name_raw, total_value, status')
+          .in('id', docIds);
+        (docs || []).forEach(d => { docMap[d.id] = d; });
+      }
+
+      // Attach to messages
+      for (const m of messages) {
+        if (statusMap[m.id]) {
+          m._extraction = statusMap[m.id];
+          if (statusMap[m.id].result_doc_id && docMap[statusMap[m.id].result_doc_id]) {
+            m._doc = docMap[statusMap[m.id].result_doc_id];
+          }
+        }
+      }
+    }
+
+    setMessages(messages);
     markRead(groupId);
     setTimeout(() => {
       const wrap = document.getElementById('threadMessages');
@@ -2326,6 +2375,38 @@ function Chat({ plant, me, user }) {
 
     // Replace optimistic with real (so realtime won't double-add)
     setMessages(prev => prev.map(m => m.id === localId ? {...inserted, users: { full_name: me.full_name }} : m));
+
+    // Auto-extract documents from images posted in any chat group
+    if (inserted && attachments.length > 0 && attachments[0].isImage) {
+      try {
+        const { data: queueId, error: enqErr } = await sb.rpc('enqueue_chat_image_for_extraction', {
+          p_message_id: inserted.id,
+          p_group_id: activeGroup.id,
+          p_image_url: attachments[0].url,
+        });
+        if (queueId && !enqErr) {
+          // Fire-and-forget call to Edge Function
+          const { data: { session } } = await sb.auth.getSession();
+          if (session) {
+            fetch(SUPABASE_URL + '/functions/v1/extract-document', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + session.access_token,
+                'apikey': SUPABASE_ANON_KEY,
+              },
+              body: JSON.stringify({
+                queue_id: queueId,
+                image_url: attachments[0].url,
+                plant_name: plant.name,
+              }),
+            }).catch(e => console.warn('Extract call failed (will retry on next image):', e));
+          }
+        }
+      } catch (e) {
+        console.warn('Enqueue failed:', e);
+      }
+    }
   };
 
   if (activeGroup) {
@@ -2344,6 +2425,8 @@ function Chat({ plant, me, user }) {
             messages.map(m => {
               const isOut = m.sender_id === user.id;
               const atts = Array.isArray(m.attachments) ? m.attachments : [];
+              const ex = m._extraction;
+              const doc = m._doc;
               return html`
                 <div class=${'msg ' + (isOut ? 'out' : 'in')} key=${m.id}>
                   ${!isOut && html`<div class="who">${m.users?.full_name || '?'}</div>`}
@@ -2352,6 +2435,17 @@ function Chat({ plant, me, user }) {
                     ? html`<a href=${a.url} target="_blank" rel="noopener" key=${i}><img class="attached-img" src=${a.url} alt=${a.name || 'image'} /></a>`
                     : html`<a href=${a.url} target="_blank" rel="noopener" class="file-attached" key=${i}>📎 ${a.name || 'file'}</a>`
                   )}
+                  ${ex && html`
+                    <div class="extract-badge ${ex.status}">
+                      ${ex.status === 'pending' || ex.status === 'processing' ? html`<span>🔍 Reading…</span>` :
+                        ex.status === 'completed' && doc ? html`
+                          <span>📄 ${doc.doc_type.replace('_',' ')} · ${doc.vendor_name_raw || '?'} ${doc.total_value ? '· ₹' + fmtNum(doc.total_value) : ''}</span>
+                        ` :
+                        ex.status === 'duplicate' ? html`<span>⚠️ Already captured</span>` :
+                        ex.status === 'skipped' ? html`<span>📷 ${ex.classification || 'skipped'}</span>` :
+                        ex.status === 'failed' ? html`<span>✗ Extract failed</span>` : ''}
+                    </div>
+                  `}
                   <div class="ts">
                     ${fmtDate(m.created_at)}
                     <button class="msg-action-btn" onClick=${() => setTaskFromMsg(m)} title="Assign as task">✓</button>
@@ -2854,6 +2948,7 @@ function More({ plant, me, user, logout, setTab }) {
     { key:'maintenance', icon:'🔧', label:'Maintenance', sub:'Breakdowns, machine status' },
     { key:'stocks', icon:'📦', label:'Stocks', sub:'Inventory, items, transactions' },
     { key:'actions', icon:'✓', label:'Action Hub', sub:'All open commitments' },
+    { key:'documents', icon:'📄', label:'Documents · Bills', sub:'Invoices, DCs, payments, vendors' },
   ];
 
   return html`
@@ -4078,6 +4173,649 @@ function GroupCreateModal({ plant, me, user, onClose, onSaved }) {
             })}
           </div>
           <button class="btn" style="margin-top:14px" disabled=${loading}>${loading ? 'Creating…' : 'Create group'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= DOCUMENTS / BILLS / VENDORS =============
+function Documents({ plant, me }) {
+  const [docs, setDocs] = useState([]);
+  const [vendors, setVendors] = useState([]);
+  const [jobworkStock, setJobworkStock] = useState([]);
+  const [view, setView] = useState('dashboard'); // dashboard | vendors | jobwork
+  const [typeFilter, setTypeFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState('open');
+  const [search, setSearch] = useState('');
+  const [activeDoc, setActiveDoc] = useState(null);
+  const [activeVendor, setActiveVendor] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [d, v, jw] = await Promise.all([
+      sb.from('mcp_logistics_documents')
+        .select('*, mcp_logistics_vendors(name, gstin, payment_terms_days)')
+        .order('doc_date', { ascending: false, nullsFirst: false })
+        .limit(500),
+      sb.from('mcp_logistics_vendors').select('*').order('name'),
+      sb.from('v_vendor_jobwork_stock').select('*').order('vendor_name'),
+    ]);
+    setDocs(d.data || []);
+    setVendors(v.data || []);
+    setJobworkStock(jw.data || []);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  // Live updates
+  useEffect(() => {
+    if (!plant?.id) return;
+    const channel = sb.channel('docs-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_logistics_documents', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_logistics_payments', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [plant?.id, refresh]);
+
+  if (activeDoc) {
+    return html`<${DocumentDetail} plant=${plant} me=${me} doc=${activeDoc} vendors=${vendors} onClose=${() => { setActiveDoc(null); refresh(); }} />`;
+  }
+  if (activeVendor) {
+    return html`<${VendorDetail} plant=${plant} me=${me} vendor=${activeVendor} jobworkStock=${jobworkStock.filter(s => s.vendor_id === activeVendor.id)} docs=${docs.filter(d => d.vendor_id === activeVendor.id)} onClose=${() => { setActiveVendor(null); refresh(); }} />`;
+  }
+
+  // Filter docs
+  let filteredDocs = docs;
+  if (typeFilter !== 'all') filteredDocs = filteredDocs.filter(d => d.doc_type === typeFilter);
+  if (statusFilter === 'open') filteredDocs = filteredDocs.filter(d => ['pending','approved','partial'].includes(d.status));
+  else if (statusFilter === 'overdue') filteredDocs = filteredDocs.filter(d => ['pending','approved','partial'].includes(d.status) && d.due_date && new Date(d.due_date) < new Date());
+  else if (statusFilter === 'paid') filteredDocs = filteredDocs.filter(d => d.status === 'paid');
+  if (search.trim()) {
+    const q = search.toLowerCase();
+    filteredDocs = filteredDocs.filter(d =>
+      (d.vendor_name_raw || '').toLowerCase().includes(q) ||
+      (d.doc_number || '').toLowerCase().includes(q) ||
+      (d.mcp_logistics_vendors?.name || '').toLowerCase().includes(q)
+    );
+  }
+
+  // Stats
+  const today = new Date();
+  const totalPayable = docs.filter(d => ['invoice_in','bill'].includes(d.doc_type) && ['pending','approved','partial'].includes(d.status))
+    .reduce((sum, d) => sum + (parseFloat(d.total_value || 0) - parseFloat(d.paid_amount || 0)), 0);
+  const overdueCount = docs.filter(d => ['pending','approved','partial'].includes(d.status) && d.due_date && new Date(d.due_date) < today && ['invoice_in','bill'].includes(d.doc_type)).length;
+  const dueIn7Days = docs.filter(d => ['pending','approved','partial'].includes(d.status) && d.due_date && new Date(d.due_date) >= today && new Date(d.due_date) <= new Date(today.getTime() + 7*86400000)).length;
+
+  const docTypeLabels = {
+    invoice_in:'Invoice (in)', invoice_out:'Invoice (out)',
+    dc_in:'DC (in)', dc_out:'DC (out)',
+    job_work_dc_out:'JW Out', job_work_dc_in:'JW Return',
+    bill:'Bill', quote:'Quote', po:'PO', other:'Other'
+  };
+
+  return html`
+    <div class="page-header"><div><h1>Documents</h1><div class="sub">Bills, DCs, payments · auto-extracted from chat</div></div></div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (view === 'dashboard' ? ' active' : '')} onClick=${() => setView('dashboard')}>Documents</button>
+      <button class=${'auth-tab' + (view === 'vendors' ? ' active' : '')} onClick=${() => setView('vendors')}>Vendors · ${vendors.length}</button>
+      <button class=${'auth-tab' + (view === 'jobwork' ? ' active' : '')} onClick=${() => setView('jobwork')}>Job-work</button>
+    </div>
+
+    ${view === 'dashboard' && html`
+      <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+        <div class="stat ${totalPayable > 0 ? 'amber' : 'teal'}"><div class="stat-num" style="font-size:18px">₹${(totalPayable/100000).toFixed(1)}L</div><div class="stat-label">Payable</div></div>
+        <div class="stat ${overdueCount > 0 ? 'rose' : 'teal'}"><div class="stat-num">${overdueCount}</div><div class="stat-label">Overdue</div></div>
+        <div class="stat ${dueIn7Days > 0 ? 'amber' : 'teal'}"><div class="stat-num">${dueIn7Days}</div><div class="stat-label">Due 7d</div></div>
+      </div>
+
+      <div style="margin-bottom:10px">
+        <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search vendor, invoice number…" style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+      </div>
+
+      <div class="auth-tabs" style="margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
+        <button class=${'auth-tab' + (typeFilter === 'all' ? ' active' : '')} onClick=${() => setTypeFilter('all')}>All</button>
+        ${Object.entries(docTypeLabels).map(([k,l]) => html`
+          <button key=${k} class=${'auth-tab' + (typeFilter === k ? ' active' : '')} onClick=${() => setTypeFilter(k)}>${l}</button>
+        `)}
+      </div>
+
+      <div class="auth-tabs" style="margin-bottom:14px">
+        <button class=${'auth-tab' + (statusFilter === 'open' ? ' active' : '')} onClick=${() => setStatusFilter('open')}>Open</button>
+        <button class=${'auth-tab' + (statusFilter === 'overdue' ? ' active' : '')} onClick=${() => setStatusFilter('overdue')}>Overdue</button>
+        <button class=${'auth-tab' + (statusFilter === 'paid' ? ' active' : '')} onClick=${() => setStatusFilter('paid')}>Paid</button>
+        <button class=${'auth-tab' + (statusFilter === 'all' ? ' active' : '')} onClick=${() => setStatusFilter('all')}>All</button>
+      </div>
+
+      <div class="section-h">${filteredDocs.length} document${filteredDocs.length !== 1 ? 's' : ''}<button class="btn small ghost" onClick=${() => setActiveDoc({ _new: true })}>+ Add manually</button></div>
+
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        filteredDocs.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📄</div>No documents in this filter. Post invoice/DC photos in any chat group — Loglinkr extracts automatically.</div></div>` :
+        filteredDocs.map(d => {
+          const overdue = d.due_date && new Date(d.due_date) < today && ['pending','approved','partial'].includes(d.status);
+          const balance = (parseFloat(d.total_value || 0)) - (parseFloat(d.paid_amount || 0));
+          return html`
+            <div class="list-item" key=${d.id} onClick=${() => setActiveDoc(d)}>
+              <div class="list-item-row">
+                <div class="list-item-main">
+                  <div class="list-item-title">${d.mcp_logistics_vendors?.name || d.vendor_name_raw || '?'}</div>
+                  <div class="list-item-sub">
+                    <span class="badge teal">${docTypeLabels[d.doc_type] || d.doc_type}</span>
+                    ${d.doc_number ? ' · ' + d.doc_number : ''}
+                    ${d.doc_date ? ' · ' + d.doc_date : ''}
+                    ${d.due_date && ['pending','approved','partial'].includes(d.status) ? ' · ' + (overdue ? '⚠️ ' : '') + 'due ' + d.due_date : ''}
+                  </div>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                  ${d.total_value && html`<span style="font-size:13px;font-weight:600">₹${fmtNum(d.total_value)}</span>`}
+                  <span class=${'badge ' + (d.status === 'paid' ? 'emerald' : d.status === 'partial' ? 'amber' : overdue ? 'rose' : '')}>${d.status}</span>
+                  ${d.status === 'partial' && balance > 0 && html`<span style="font-size:10px;color:var(--rose-500)">₹${fmtNum(balance)} bal</span>`}
+                </div>
+              </div>
+            </div>
+          `;
+        })
+      }
+    `}
+
+    ${view === 'vendors' && html`
+      <div class="section-h">Vendors · ${vendors.length}<button class="btn small ghost" onClick=${() => setActiveVendor({_new:true})}>+ Add</button></div>
+      ${vendors.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🏢</div>No vendors yet. They auto-create when documents are extracted.</div></div>` :
+        vendors.map(v => {
+          const vDocs = docs.filter(d => d.vendor_id === v.id);
+          const payable = vDocs.filter(d => ['invoice_in','bill'].includes(d.doc_type) && ['pending','approved','partial'].includes(d.status))
+            .reduce((sum, d) => sum + (parseFloat(d.total_value || 0) - parseFloat(d.paid_amount || 0)), 0);
+          const atVendor = jobworkStock.filter(s => s.vendor_id === v.id);
+          return html`
+            <div class="list-item" key=${v.id} onClick=${() => setActiveVendor(v)}>
+              <div class="list-item-row">
+                <div class="list-item-main">
+                  <div class="list-item-title">${v.name}</div>
+                  <div class="list-item-sub">
+                    ${v.gstin ? v.gstin + ' · ' : ''}${v.city || ''}
+                    ${v.is_jobwork_vendor ? ' · 🔧 Job-work' : ''}
+                    · ${vDocs.length} doc${vDocs.length !== 1 ? 's' : ''}
+                  </div>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                  ${payable > 0 && html`<span class="badge amber">₹${fmtNum(payable)} due</span>`}
+                  ${atVendor.length > 0 && html`<span style="font-size:10px;color:var(--slate-500)">${atVendor.length} JW pending</span>`}
+                </div>
+              </div>
+            </div>
+          `;
+        })
+      }
+    `}
+
+    ${view === 'jobwork' && html`
+      <div class="section-h">Job-work pending at vendors · ${jobworkStock.length}</div>
+      ${jobworkStock.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🔧</div>No pending job-work. As you send DC out and receive DC in, this view shows what's still at each vendor.</div></div>` :
+        Object.entries(jobworkStock.reduce((acc, s) => {
+          if (!acc[s.vendor_name]) acc[s.vendor_name] = [];
+          acc[s.vendor_name].push(s);
+          return acc;
+        }, {})).map(([vname, list]) => html`
+          <details key=${vname} open style="margin-bottom:8px">
+            <summary style="cursor:pointer;padding:10px 12px;background:var(--slate-100);border-radius:10px;font-weight:600;font-size:14px;display:flex;justify-content:space-between;align-items:center">
+              <span>🏢 ${vname}</span>
+              <span style="background:var(--amber-500);color:white;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px">${list.length}</span>
+            </summary>
+            <div style="margin-top:6px">
+              ${list.map(s => html`
+                <div class="list-item" key=${s.vendor_id + s.item_name}>
+                  <div class="list-item-row">
+                    <div class="list-item-main">
+                      <div class="list-item-title">${s.item_name}</div>
+                      <div class="list-item-sub">
+                        ${s.process ? s.process + ' · ' : ''}
+                        Sent ${fmtNum(s.total_sent)} ${s.uom || ''} · Received back ${fmtNum(s.total_received)}
+                      </div>
+                    </div>
+                    <span class="badge amber">${fmtNum(s.pending_at_vendor)} ${s.uom || ''}</span>
+                  </div>
+                </div>
+              `)}
+            </div>
+          </details>
+        `)
+      }
+    `}
+  `;
+}
+
+// ============= DOCUMENT DETAIL =============
+function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
+  const isNew = initialDoc?._new;
+  const [doc, setDoc] = useState(isNew ? null : initialDoc);
+  const [payments, setPayments] = useState([]);
+  const [paymentModal, setPaymentModal] = useState(false);
+  const [editing, setEditing] = useState(isNew);
+
+  const refresh = useCallback(async () => {
+    if (isNew || !doc?.id) return;
+    const [d, p] = await Promise.all([
+      sb.from('mcp_logistics_documents').select('*, mcp_logistics_vendors(name, gstin)').eq('id', doc.id).maybeSingle(),
+      sb.from('mcp_logistics_payments').select('*, users:recorded_by(full_name)').eq('doc_id', doc.id).order('payment_date', { ascending: false }),
+    ]);
+    if (d.data) setDoc(d.data);
+    setPayments(p.data || []);
+  }, [doc?.id, isNew]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  if (isNew && editing) {
+    return html`<${DocumentEditModal} plant=${plant} me=${me} doc=${null} vendors=${vendors} onClose=${onClose} onSaved=${(d) => { setDoc(d); setEditing(false); }} />`;
+  }
+  if (!doc) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  if (editing) {
+    return html`<${DocumentEditModal} plant=${plant} me=${me} doc=${doc} vendors=${vendors} onClose=${() => setEditing(false)} onSaved=${(d) => { setDoc(d); setEditing(false); refresh(); }} />`;
+  }
+
+  const balance = (parseFloat(doc.total_value || 0)) - (parseFloat(doc.paid_amount || 0));
+  const overdue = doc.due_date && new Date(doc.due_date) < new Date() && ['pending','approved','partial'].includes(doc.status);
+  const items = Array.isArray(doc.items) ? doc.items : [];
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1"><h1 style="font-size:18px">${doc.mcp_logistics_vendors?.name || doc.vendor_name_raw || 'Document'}</h1>
+        <div class="sub">${doc.doc_type?.replace('_',' ')} · ${doc.doc_number || ''}</div>
+      </div>
+      <button class="btn small ghost" onClick=${() => setEditing(true)}>Edit</button>
+    </div>
+
+    ${doc.source_image_url && html`
+      <div class="card" style="padding:0;overflow:hidden;margin-bottom:14px">
+        <a href=${doc.source_image_url} target="_blank" rel="noopener" style="display:block">
+          <img src=${doc.source_image_url} style="width:100%;display:block;max-height:400px;object-fit:contain;background:var(--slate-100)" />
+        </a>
+        <div style="padding:8px 12px;background:var(--slate-50);font-size:11px;color:var(--slate-500)">📎 Original document image · tap to enlarge</div>
+      </div>
+    `}
+
+    <div class="card">
+      <div class="card-row"><span class="label">Type</span><span class="value"><span class="badge teal">${doc.doc_type?.replace('_',' ')}</span></span></div>
+      <div class="card-row"><span class="label">Status</span><span class="value"><span class=${'badge ' + (doc.status === 'paid' ? 'emerald' : doc.status === 'partial' ? 'amber' : overdue ? 'rose' : '')}>${doc.status}</span></span></div>
+      <div class="card-row"><span class="label">Vendor</span><span class="value">${doc.mcp_logistics_vendors?.name || doc.vendor_name_raw || '?'}</span></div>
+      ${doc.vendor_gstin_raw && html`<div class="card-row"><span class="label">GSTIN</span><span class="value mono">${doc.vendor_gstin_raw}</span></div>`}
+      <div class="card-row"><span class="label">Doc #</span><span class="value mono">${doc.doc_number || '—'}</span></div>
+      <div class="card-row"><span class="label">Date</span><span class="value">${doc.doc_date || '—'}</span></div>
+      ${doc.due_date && html`<div class="card-row"><span class="label">Due</span><span class="value" style=${overdue ? 'color:var(--rose-500)' : ''}>${overdue ? '⚠️ ' : ''}${doc.due_date}</span></div>`}
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-title">Amounts</div>
+      ${doc.taxable_value && html`<div class="card-row"><span class="label">Taxable</span><span class="value">₹${fmtNum(doc.taxable_value)}</span></div>`}
+      ${doc.tax_amount && html`<div class="card-row"><span class="label">Tax</span><span class="value">₹${fmtNum(doc.tax_amount)}</span></div>`}
+      <div class="card-row"><span class="label" style="font-weight:700">Total</span><span class="value" style="font-weight:700;font-size:16px">₹${fmtNum(doc.total_value || 0)}</span></div>
+      ${doc.paid_amount > 0 && html`
+        <div class="card-row"><span class="label">Paid</span><span class="value" style="color:var(--emerald-600)">₹${fmtNum(doc.paid_amount)}</span></div>
+        <div class="card-row"><span class="label">Balance</span><span class="value" style="color:${balance > 0 ? 'var(--rose-500)' : 'var(--emerald-600)'};font-weight:700">₹${fmtNum(balance)}</span></div>
+      `}
+    </div>
+
+    ${doc.validation_note && html`
+      <div class="alert info" style="margin-top:14px"><strong>AI Note:</strong> ${doc.validation_note}</div>
+    `}
+
+    ${items.length > 0 && html`
+      <div class="section-h">Items · ${items.length}</div>
+      ${items.map((it, i) => html`
+        <div class="list-item" key=${i}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${it.name || it.item_name || '?'}</div>
+              <div class="list-item-sub">${it.qty || 0} ${it.uom || 'nos'} × ₹${fmtNum(it.rate || 0)} ${it.hsn ? '· HSN ' + it.hsn : ''} ${it.process ? '· ' + it.process : ''}</div>
+            </div>
+            ${it.amount && html`<span style="font-size:13px;font-weight:600">₹${fmtNum(it.amount)}</span>`}
+          </div>
+        </div>
+      `)}
+    `}
+
+    ${['invoice_in','bill','invoice_out'].includes(doc.doc_type) && html`
+      <div class="section-h">Payments · ${payments.length}<button class="btn small ghost" onClick=${() => setPaymentModal(true)} disabled=${doc.status === 'paid'}>+ Record</button></div>
+      ${payments.length === 0 ? html`<div class="empty"><div style="font-size:13px">No payments yet</div></div>` :
+        payments.map(p => html`
+          <div class="list-item" key=${p.id}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">₹${fmtNum(p.amount)} · ${p.payment_mode}</div>
+                <div class="list-item-sub">${p.payment_date} ${p.reference ? '· ' + p.reference : ''} ${p.bank_name ? '· ' + p.bank_name : ''} ${p.users?.full_name ? '· ' + p.users.full_name : ''}</div>
+              </div>
+              ${(me.role === 'plant_head' || me.role === 'admin' || p.recorded_by === me.id) && html`
+                <button class="btn small danger" onClick=${async () => { if (confirm('Delete this payment?')) { await sb.from('mcp_logistics_payments').delete().eq('id', p.id); refresh(); } }}>×</button>
+              `}
+            </div>
+          </div>
+        `)
+      }
+    `}
+
+    ${paymentModal && html`<${PaymentModal} plant=${plant} me=${me} doc=${doc} balance=${balance} onClose=${() => setPaymentModal(false)} onSaved=${() => { setPaymentModal(false); refresh(); }} />`}
+  `;
+}
+
+// ============= PAYMENT MODAL =============
+function PaymentModal({ plant, me, doc, balance, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    amount: balance > 0 ? balance : doc.total_value,
+    payment_mode: 'upi',
+    payment_date: new Date().toISOString().slice(0,10),
+    reference: '', bank_name: '', notes: ''
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const { error } = await sb.from('mcp_logistics_payments').insert({
+        plant_id: plant.id,
+        doc_id: doc.id,
+        amount: parseFloat(form.amount),
+        payment_mode: form.payment_mode,
+        payment_date: form.payment_date,
+        reference: form.reference || null,
+        bank_name: form.bank_name || null,
+        notes: form.notes || null,
+        recorded_by: me.id,
+      });
+      if (error) throw error;
+      showToast('Payment recorded · status auto-updated');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Record Payment</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card" style="background:var(--slate-50);margin-bottom:14px">
+          <div class="card-row"><span class="label">Total</span><span class="value">₹${fmtNum(doc.total_value || 0)}</span></div>
+          <div class="card-row"><span class="label">Already paid</span><span class="value">₹${fmtNum(doc.paid_amount || 0)}</span></div>
+          <div class="card-row"><span class="label" style="font-weight:700">Balance</span><span class="value" style="font-weight:700">₹${fmtNum(balance)}</span></div>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Amount * (₹)</label><input type="number" step="0.01" required value=${form.amount} onChange=${e => setForm({...form, amount: e.target.value})} /></div>
+          <div class="field-row">
+            <div class="field"><label>Mode *</label>
+              <select required value=${form.payment_mode} onChange=${e => setForm({...form, payment_mode: e.target.value})}>
+                <option value="upi">UPI</option>
+                <option value="neft">NEFT</option>
+                <option value="rtgs">RTGS</option>
+                <option value="imps">IMPS</option>
+                <option value="cheque">Cheque</option>
+                <option value="cash">Cash</option>
+                <option value="card">Card</option>
+                <option value="adjustment">Adjustment</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+            <div class="field"><label>Date *</label><input type="date" required value=${form.payment_date} onChange=${e => setForm({...form, payment_date: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Reference / Txn ID</label><input type="text" value=${form.reference} onChange=${e => setForm({...form, reference: e.target.value})} placeholder="UTR / Cheque# / UPI ref" /></div>
+          ${['neft','rtgs','imps','cheque'].includes(form.payment_mode) && html`
+            <div class="field"><label>Bank</label><input type="text" value=${form.bank_name} onChange=${e => setForm({...form, bank_name: e.target.value})} placeholder="HDFC / ICICI / etc" /></div>
+          `}
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : 'Record payment'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= DOCUMENT EDIT MODAL =============
+function DocumentEditModal({ plant, me, doc, vendors, onClose, onSaved }) {
+  const [form, setForm] = useState(doc ? {
+    ...doc,
+    doc_date: doc.doc_date || '',
+    due_date: doc.due_date || '',
+  } : {
+    doc_type: 'invoice_in',
+    doc_number: '', doc_date: new Date().toISOString().slice(0,10), due_date: '',
+    vendor_id: '', vendor_name_raw: '', vendor_gstin_raw: '',
+    taxable_value: '', tax_amount: '', total_value: '',
+    status: 'pending', notes: '',
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        doc_type: form.doc_type,
+        doc_number: form.doc_number || null,
+        doc_date: form.doc_date || null,
+        due_date: form.due_date || null,
+        vendor_id: form.vendor_id || null,
+        vendor_name_raw: form.vendor_name_raw || null,
+        vendor_gstin_raw: form.vendor_gstin_raw || null,
+        taxable_value: form.taxable_value ? parseFloat(form.taxable_value) : null,
+        tax_amount: form.tax_amount ? parseFloat(form.tax_amount) : null,
+        total_value: form.total_value ? parseFloat(form.total_value) : null,
+        status: form.status,
+        notes: form.notes || null,
+      };
+      let result;
+      if (doc?.id) {
+        result = await sb.from('mcp_logistics_documents').update(payload).eq('id', doc.id).select().single();
+      } else {
+        payload.created_by = me.id;
+        result = await sb.from('mcp_logistics_documents').insert(payload).select().single();
+      }
+      if (result.error) throw result.error;
+      showToast(doc?.id ? 'Updated' : 'Document created');
+      onSaved(result.data);
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${doc?.id ? 'Edit' : 'New'} Document</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Type *</label>
+            <select required value=${form.doc_type} onChange=${e => setForm({...form, doc_type: e.target.value})}>
+              <option value="invoice_in">Invoice (received)</option>
+              <option value="invoice_out">Invoice (issued)</option>
+              <option value="dc_in">DC (received)</option>
+              <option value="dc_out">DC (issued)</option>
+              <option value="job_work_dc_out">JW DC out</option>
+              <option value="job_work_dc_in">JW DC in</option>
+              <option value="bill">Bill</option>
+              <option value="po">PO</option>
+              <option value="quote">Quote</option>
+            </select>
+          </div>
+          <div class="field"><label>Vendor</label>
+            <select value=${form.vendor_id || ''} onChange=${e => { const v = vendors.find(x => x.id === e.target.value); setForm({...form, vendor_id: e.target.value, vendor_name_raw: v?.name || form.vendor_name_raw}); }}>
+              <option value="">— Select existing or type new below —</option>
+              ${vendors.map(v => html`<option key=${v.id} value=${v.id}>${v.name}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Vendor Name (free text)</label><input type="text" value=${form.vendor_name_raw || ''} onChange=${e => setForm({...form, vendor_name_raw: e.target.value})} /></div>
+          <div class="field-row">
+            <div class="field"><label>Doc Number</label><input type="text" value=${form.doc_number || ''} onChange=${e => setForm({...form, doc_number: e.target.value})} /></div>
+            <div class="field"><label>Doc Date</label><input type="date" value=${form.doc_date || ''} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Due Date</label><input type="date" value=${form.due_date || ''} onChange=${e => setForm({...form, due_date: e.target.value})} /></div>
+          <div class="field-row">
+            <div class="field"><label>Taxable</label><input type="number" step="0.01" value=${form.taxable_value || ''} onChange=${e => setForm({...form, taxable_value: e.target.value})} /></div>
+            <div class="field"><label>Tax</label><input type="number" step="0.01" value=${form.tax_amount || ''} onChange=${e => setForm({...form, tax_amount: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Total *</label><input type="number" step="0.01" required value=${form.total_value || ''} onChange=${e => setForm({...form, total_value: e.target.value})} /></div>
+          <div class="field"><label>Status</label>
+            <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
+              <option value="pending">Pending</option>
+              <option value="approved">Approved</option>
+              <option value="rejected">Rejected</option>
+              <option value="closed">Closed</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+          </div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes || ''} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (doc?.id ? 'Update' : 'Create')}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= VENDOR DETAIL =============
+function VendorDetail({ plant, me, vendor: initialVendor, jobworkStock, docs, onClose }) {
+  const isNew = initialVendor?._new;
+  const [editing, setEditing] = useState(isNew);
+  const [vendor, setVendor] = useState(isNew ? null : initialVendor);
+
+  if (isNew && editing) {
+    return html`<${VendorEditModal} plant=${plant} me=${me} vendor=${null} onClose=${onClose} onSaved=${(v) => { setVendor(v); setEditing(false); }} />`;
+  }
+  if (!vendor) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  if (editing) {
+    return html`<${VendorEditModal} plant=${plant} me=${me} vendor=${vendor} onClose=${() => setEditing(false)} onSaved=${(v) => { setVendor(v); setEditing(false); }} />`;
+  }
+
+  const totalPayable = docs.filter(d => ['invoice_in','bill'].includes(d.doc_type) && ['pending','approved','partial'].includes(d.status))
+    .reduce((sum, d) => sum + (parseFloat(d.total_value || 0) - parseFloat(d.paid_amount || 0)), 0);
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1"><h1 style="font-size:18px">${vendor.name}</h1>
+        <div class="sub">${vendor.is_jobwork_vendor ? '🔧 Job-work vendor' : 'Vendor'}</div>
+      </div>
+      <button class="btn small ghost" onClick=${() => setEditing(true)}>Edit</button>
+    </div>
+
+    <div class="card">
+      ${vendor.gstin && html`<div class="card-row"><span class="label">GSTIN</span><span class="value mono">${vendor.gstin}</span></div>`}
+      ${vendor.phone && html`<div class="card-row"><span class="label">Phone</span><span class="value mono">${vendor.phone}</span></div>`}
+      ${vendor.city && html`<div class="card-row"><span class="label">Location</span><span class="value">${vendor.city}${vendor.state ? ', ' + vendor.state : ''}</span></div>`}
+      <div class="card-row"><span class="label">Payment terms</span><span class="value">${vendor.payment_terms_days || 30} days</span></div>
+      <div class="card-row"><span class="label">Outstanding</span><span class="value" style="color:${totalPayable > 0 ? 'var(--rose-500)' : 'var(--emerald-600)'};font-weight:700">₹${fmtNum(totalPayable)}</span></div>
+    </div>
+
+    ${jobworkStock.length > 0 && html`
+      <div class="section-h">Stock at this vendor (job-work)</div>
+      ${jobworkStock.map(s => html`
+        <div class="list-item" key=${s.item_name}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${s.item_name}</div>
+              <div class="list-item-sub">${s.process || ''} · Sent ${fmtNum(s.total_sent)} · Got back ${fmtNum(s.total_received)}</div>
+            </div>
+            <span class="badge amber">${fmtNum(s.pending_at_vendor)} ${s.uom || ''}</span>
+          </div>
+        </div>
+      `)}
+    `}
+
+    <div class="section-h">Documents · ${docs.length}</div>
+    ${docs.length === 0 ? html`<div class="empty"><div style="font-size:13px">No documents yet for this vendor</div></div>` :
+      docs.slice(0, 50).map(d => html`
+        <div class="list-item" key=${d.id}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${d.doc_number || '?'} · ${d.doc_type?.replace('_',' ')}</div>
+              <div class="list-item-sub">${d.doc_date || '?'} · ₹${fmtNum(d.total_value || 0)}</div>
+            </div>
+            <span class=${'badge ' + (d.status === 'paid' ? 'emerald' : d.status === 'partial' ? 'amber' : '')}>${d.status}</span>
+          </div>
+        </div>
+      `)
+    }
+  `;
+}
+
+// ============= VENDOR EDIT MODAL =============
+function VendorEditModal({ plant, me, vendor, onClose, onSaved }) {
+  const [form, setForm] = useState(vendor || {
+    name: '', legal_name: '', gstin: '', pan: '', phone: '', email: '',
+    address: '', city: '', state: 'Tamil Nadu', pincode: '',
+    is_vendor: true, is_customer: false, is_jobwork_vendor: false,
+    payment_terms_days: 30, notes: ''
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        name: form.name, legal_name: form.legal_name || null,
+        gstin: form.gstin || null, pan: form.pan || null,
+        phone: form.phone || null, email: form.email || null,
+        address: form.address || null, city: form.city || null,
+        state: form.state || null, pincode: form.pincode || null,
+        is_vendor: !!form.is_vendor, is_customer: !!form.is_customer,
+        is_jobwork_vendor: !!form.is_jobwork_vendor,
+        payment_terms_days: parseInt(form.payment_terms_days) || 30,
+        notes: form.notes || null,
+      };
+      let result;
+      if (vendor?.id) {
+        result = await sb.from('mcp_logistics_vendors').update(payload).eq('id', vendor.id).select().single();
+      } else {
+        result = await sb.from('mcp_logistics_vendors').insert(payload).select().single();
+      }
+      if (result.error) throw result.error;
+      showToast(vendor?.id ? 'Updated' : 'Vendor added');
+      onSaved(result.data);
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${vendor?.id ? 'Edit' : 'New'} Vendor</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} /></div>
+          <div class="field"><label>Legal Name</label><input type="text" value=${form.legal_name || ''} onChange=${e => setForm({...form, legal_name: e.target.value})} /></div>
+          <div class="field-row">
+            <div class="field"><label>GSTIN</label><input type="text" maxLength=${15} value=${form.gstin || ''} onChange=${e => setForm({...form, gstin: e.target.value.toUpperCase()})} /></div>
+            <div class="field"><label>PAN</label><input type="text" maxLength=${10} value=${form.pan || ''} onChange=${e => setForm({...form, pan: e.target.value.toUpperCase()})} /></div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Phone</label><input type="tel" value=${form.phone || ''} onChange=${e => setForm({...form, phone: e.target.value})} /></div>
+            <div class="field"><label>Email</label><input type="email" value=${form.email || ''} onChange=${e => setForm({...form, email: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Address</label><input type="text" value=${form.address || ''} onChange=${e => setForm({...form, address: e.target.value})} /></div>
+          <div class="field-row">
+            <div class="field"><label>City</label><input type="text" value=${form.city || ''} onChange=${e => setForm({...form, city: e.target.value})} /></div>
+            <div class="field"><label>State</label><input type="text" value=${form.state || ''} onChange=${e => setForm({...form, state: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Payment Terms (days)</label><input type="number" value=${form.payment_terms_days || 30} onChange=${e => setForm({...form, payment_terms_days: e.target.value})} /></div>
+          <div class="toggle-row"><div class="toggle-label">Vendor (we buy from)</div><div class=${'toggle' + (form.is_vendor ? ' active' : '')} onClick=${() => setForm({...form, is_vendor: !form.is_vendor})}></div></div>
+          <div class="toggle-row"><div class="toggle-label">Customer (we sell to)</div><div class=${'toggle' + (form.is_customer ? ' active' : '')} onClick=${() => setForm({...form, is_customer: !form.is_customer})}></div></div>
+          <div class="toggle-row"><div class="toggle-label">Job-work vendor</div><div class=${'toggle' + (form.is_jobwork_vendor ? ' active' : '')} onClick=${() => setForm({...form, is_jobwork_vendor: !form.is_jobwork_vendor})}></div></div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes || ''} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (vendor?.id ? 'Update' : 'Create')}</button>
         </form>
       </div>
     </div>
