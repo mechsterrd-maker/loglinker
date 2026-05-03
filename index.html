@@ -190,7 +190,12 @@ body{
 .msg.out{background:var(--teal-600);color:white;align-self:flex-end}
 .msg .who{font-size:11px;color:var(--slate-500);margin-bottom:2px;font-weight:500}
 .msg.out .who{color:var(--teal-100)}
-.msg .ts{font-size:10px;color:var(--slate-400);margin-top:3px}
+.msg .ts{font-size:10px;color:var(--slate-400);margin-top:3px;display:flex;align-items:center;gap:6px;justify-content:flex-end}
+.msg.in .ts{justify-content:flex-start}
+.msg-action-btn{background:rgba(255,255,255,0.2);border:none;color:inherit;font-size:11px;padding:2px 8px;border-radius:6px;cursor:pointer;line-height:1.3;font-weight:600}
+.msg.in .msg-action-btn{background:var(--teal-50);color:var(--teal-700)}
+.msg.out .msg-action-btn{background:rgba(255,255,255,0.25);color:white}
+.msg-action-btn:active{transform:scale(0.95)}
 .msg.out .ts{color:var(--teal-100)}
 .thread-input{background:white;border-top:1px solid var(--slate-200);padding:10px 12px;display:flex;gap:8px;flex-shrink:0;align-items:center}
 .thread-input input{flex:1;padding:10px 14px;border:1px solid var(--slate-200);border-radius:999px;font-family:inherit;font-size:14px;outline:none;min-width:0}
@@ -918,6 +923,8 @@ function Home({ plant, me, setTab, reload }) {
       </div>
     `}
 
+    <${DailyDigest} me=${me} setTab=${setTab} />
+
     ${alerts > 0 && html`
       <div class="section-h">Needs attention</div>
       ${stats.openNcrs > 0 && html`
@@ -1149,7 +1156,7 @@ function Production({ plant, me }) {
 
     ${modal === 'part' && html`<${PartModal} plant=${plant} me=${me} dies=${dies} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'machine' && html`<${MachineModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
-    ${modal === 'die' && html`<${DieModal} plant=${plant} parts=${parts} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'die' && html`<${DieModal} plant=${plant} me=${me} parts=${parts} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'shot' && html`<${ShotModal} plant=${plant} me=${me} units=${units} shifts=${shifts} machines=${machines} dies=${dies} parts=${parts} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
   `;
 }
@@ -1679,15 +1686,27 @@ function MachineModal({ plant, units, editTarget, onClose, onSaved }) {
 }
 
 // ============= DIE MODAL =============
-function DieModal({ plant, parts, editTarget, onClose, onSaved }) {
+function DieModal({ plant, me, parts, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget || { code:'', part_number:'', customer_name:'', max_strokes:300000, corepin_count:0, ejector_pin_count:0, status:'active', default_part_id:'' });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [history, setHistory] = useState([]);
+  const [spares, setSpares] = useState([]);
+  const [stockItems, setStockItems] = useState([]);
+  const [spareModal, setSpareModal] = useState(false);
+  const [replaceModal, setReplaceModal] = useState(null); // spare row to replace
+
+  const refreshSpares = async () => {
+    if (!editTarget) return;
+    const { data } = await sb.from('mcp_pdc_die_spares').select('*, mcp_stocks_items(code, name, uom, current_qty, reorder_level)').eq('die_id', editTarget.id);
+    setSpares(data || []);
+  };
 
   useEffect(() => {
     if (editTarget) {
       sb.from('mcp_pdc_die_history').select('*, users:performed_by_user_id(full_name)').eq('die_id', editTarget.id).order('event_date', { ascending:false }).then(({ data }) => setHistory(data || []));
+      refreshSpares();
+      sb.from('mcp_stocks_items').select('*').order('name').then(({ data }) => setStockItems(data || []));
     }
   }, [editTarget]);
 
@@ -1719,6 +1738,12 @@ function DieModal({ plant, parts, editTarget, onClose, onSaved }) {
     }
   };
 
+  const removeSpare = async (id) => {
+    if (!confirm('Unlink this spare from the die?')) return;
+    await sb.from('mcp_pdc_die_spares').delete().eq('id', id);
+    refreshSpares();
+  };
+
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal">
@@ -1748,7 +1773,7 @@ function DieModal({ plant, parts, editTarget, onClose, onSaved }) {
             </select>
           </div>
           ${parts && parts.length > 0 && html`
-            <div class="field"><label>Default Part (links die to part master)</label>
+            <div class="field"><label>Default Part (auto-fills part on shot logging)</label>
               <select value=${form.default_part_id || ''} onChange=${e => setForm({...form, default_part_id: e.target.value})}>
                 <option value="">— None —</option>
                 ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number} · Rev ${p.revision} · ${p.name}</option>`)}
@@ -1760,9 +1785,32 @@ function DieModal({ plant, parts, editTarget, onClose, onSaved }) {
 
         ${editTarget && html`
           <div style="margin-top:24px">
+            <div class="section-h">Die Spares · ${spares.length}<button type="button" class="btn small ghost" onClick=${() => setSpareModal(true)}>+ Link spare</button></div>
+            ${spares.length === 0 ? html`<div class="empty"><div style="font-size:13px">No spares linked yet. Link corepins, ejector pins, etc. — replacements will auto-deduct from stock.</div></div>` :
+              spares.map(s => {
+                const isLow = s.mcp_stocks_items?.reorder_level && s.mcp_stocks_items.current_qty <= s.mcp_stocks_items.reorder_level;
+                return html`
+                  <div class="list-item" key=${s.id}>
+                    <div class="list-item-row">
+                      <div class="list-item-main">
+                        <div class="list-item-title">${s.spare_type} · ${s.mcp_stocks_items?.code || '?'} · ${s.mcp_stocks_items?.name || ''}</div>
+                        <div class="list-item-sub">${s.qty_in_die} in die · stock: ${fmtNum(s.mcp_stocks_items?.current_qty || 0)} ${s.mcp_stocks_items?.uom || ''} ${isLow ? '· ⚠️ low' : ''}</div>
+                      </div>
+                      <div style="display:flex;gap:6px">
+                        <button class="btn small" type="button" onClick=${() => setReplaceModal(s)}>Replace</button>
+                        <button class="btn small danger" type="button" onClick=${() => removeSpare(s.id)}>×</button>
+                      </div>
+                    </div>
+                  </div>
+                `;
+              })
+            }
+          </div>
+
+          <div style="margin-top:24px">
             <div class="section-h">Die History · ${history.length}</div>
             ${history.length === 0 ? html`<div class="empty"><div style="font-size:13px">No events yet</div></div>` :
-              history.map(ev => html`
+              history.slice(0, 10).map(ev => html`
                 <div class="list-item" key=${ev.id}>
                   <div class="list-item-row">
                     <div class="list-item-main">
@@ -1776,6 +1824,139 @@ function DieModal({ plant, parts, editTarget, onClose, onSaved }) {
             }
           </div>
         `}
+
+        ${spareModal && html`<${DieSpareLinkModal} plant=${plant} die=${editTarget} stockItems=${stockItems} existing=${spares} onClose=${() => setSpareModal(false)} onSaved=${() => { setSpareModal(false); refreshSpares(); }} />`}
+        ${replaceModal && html`<${DieSpareReplaceModal} plant=${plant} me=${me} die=${editTarget} spare=${replaceModal} onClose=${() => setReplaceModal(null)} onSaved=${() => { setReplaceModal(null); refreshSpares(); }} />`}
+      </div>
+    </div>
+  `;
+}
+
+// ============= DIE SPARE LINK MODAL =============
+function DieSpareLinkModal({ plant, die, stockItems, existing, onClose, onSaved }) {
+  const linkedItemIds = existing.map(s => s.item_id);
+  const available = stockItems.filter(s => !linkedItemIds.includes(s.id));
+  const [form, setForm] = useState({
+    item_id: available[0]?.id || '',
+    spare_type: 'Corepin',
+    qty_in_die: 1,
+    expected_life_strokes: '',
+    notes: ''
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const { error } = await sb.from('mcp_pdc_die_spares').insert({
+        plant_id: plant.id,
+        die_id: die.id,
+        item_id: form.item_id,
+        spare_type: form.spare_type,
+        qty_in_die: parseInt(form.qty_in_die) || 1,
+        expected_life_strokes: form.expected_life_strokes ? parseInt(form.expected_life_strokes) : null,
+        notes: form.notes || null,
+      });
+      if (error) throw error;
+      showToast('Spare linked');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" style="z-index:200" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Link Spare to ${die.code}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        ${available.length === 0 ? html`
+          <div class="alert info">All stock items are already linked, or you have no stock items yet. Add items in Stocks tab first.</div>
+          <button class="btn ghost" onClick=${onClose}>Close</button>
+        ` : html`
+        <form onSubmit=${submit}>
+          <div class="field"><label>Stock Item *</label>
+            <select required value=${form.item_id} onChange=${e => setForm({...form, item_id: e.target.value})}>
+              ${available.map(s => html`<option key=${s.id} value=${s.id}>${s.code} · ${s.name} (${s.uom})</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Spare Type *</label>
+            <select required value=${form.spare_type} onChange=${e => setForm({...form, spare_type: e.target.value})}>
+              <option>Corepin</option><option>Ejector Pin</option><option>Insert</option><option>Bushing</option><option>Slide</option><option>Other</option>
+            </select>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Qty in Die</label><input type="number" min=${1} value=${form.qty_in_die} onChange=${e => setForm({...form, qty_in_die: e.target.value})} /></div>
+            <div class="field"><label>Expected Life (strokes)</label><input type="number" value=${form.expected_life_strokes || ''} onChange=${e => setForm({...form, expected_life_strokes: e.target.value})} placeholder="50000" /></div>
+          </div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : 'Link spare'}</button>
+        </form>
+        `}
+      </div>
+    </div>
+  `;
+}
+
+// ============= DIE SPARE REPLACE MODAL =============
+function DieSpareReplaceModal({ plant, me, die, spare, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    qty_replaced: 1,
+    reason: 'Broken',
+    notes: ''
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const stock = spare.mcp_stocks_items?.current_qty || 0;
+  const insufficient = parseInt(form.qty_replaced) > stock;
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      if (insufficient) throw new Error('Not enough stock. Available: ' + stock);
+      const { error } = await sb.from('mcp_pdc_die_spare_replacements').insert({
+        plant_id: plant.id,
+        die_id: die.id,
+        spare_id: spare.id,
+        item_id: spare.item_id,
+        qty_replaced: parseInt(form.qty_replaced),
+        reason: form.reason || null,
+        replaced_by: me.id,
+        notes: form.notes || null,
+      });
+      if (error) throw error;
+      showToast('Replaced · stock auto-deducted · die history updated');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" style="z-index:200" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Replace ${spare.spare_type}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card" style="background:var(--slate-50);margin-bottom:14px">
+          <div class="card-row"><span class="label">Item</span><span class="value">${spare.mcp_stocks_items?.code} · ${spare.mcp_stocks_items?.name}</span></div>
+          <div class="card-row"><span class="label">In stock</span><span class="value">${fmtNum(stock)} ${spare.mcp_stocks_items?.uom}</span></div>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Qty to Replace *</label><input type="number" required min=${1} value=${form.qty_replaced} onChange=${e => setForm({...form, qty_replaced: e.target.value})} />${insufficient && html`<div style="color:var(--rose-500);font-size:11px;margin-top:4px">⚠️ Only ${stock} available</div>`}</div>
+          <div class="field"><label>Reason *</label>
+            <select required value=${form.reason} onChange=${e => setForm({...form, reason: e.target.value})}>
+              <option>Broken</option><option>Worn out</option><option>Bent</option><option>Cracked</option><option>End of life</option><option>Preventive</option><option>Other</option>
+            </select>
+          </div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})} placeholder="What happened?"></textarea></div>
+          <button class="btn" disabled=${loading || insufficient}>${loading ? 'Replacing…' : 'Replace · Deduct stock'}</button>
+        </form>
       </div>
     </div>
   `;
@@ -1783,11 +1964,15 @@ function DieModal({ plant, parts, editTarget, onClose, onSaved }) {
 
 // ============= SHOT MODAL =============
 function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onClose, onSaved }) {
+  const defaultDie = dies[0];
+  const defaultPartFromDie = defaultDie?.default_part_id || '';
+
   const [form, setForm] = useState({
     unit_id: units[0]?.id || '',
     shift_id: shifts[0]?.id || '',
     machine_id: machines[0]?.id || '',
-    die_id: dies[0]?.id || '',
+    die_id: defaultDie?.id || '',
+    part_id: defaultPartFromDie,
     operator_user_id: me.id,
     shots_good: 0,
     shots_rejected: 0,
@@ -1799,6 +1984,12 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  // Auto-update part when die is changed
+  const onDieChange = (newDieId) => {
+    const die = dies.find(d => d.id === newDieId);
+    setForm({...form, die_id: newDieId, part_id: die?.default_part_id || form.part_id});
+  };
+
   const submit = async (e) => {
     e.preventDefault();
     setError(''); setLoading(true);
@@ -1809,6 +2000,7 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
         shift_id: form.shift_id,
         machine_id: form.machine_id,
         die_id: form.die_id,
+        part_id: form.part_id || null,
         operator_user_id: form.operator_user_id || null,
         shots_good: parseInt(form.shots_good) || 0,
         shots_rejected: parseInt(form.shots_rejected) || 0,
@@ -1821,7 +2013,8 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
       };
       const { error } = await sb.from('mcp_pdc_shots').insert(payload);
       if (error) throw error;
-      showToast('Shot logged · die strokes auto-updated');
+      const msg = form.part_id ? 'Shot logged · die strokes + BOM stock updated' : 'Shot logged · die strokes updated (no part linked, no BOM consumed)';
+      showToast(msg);
       onSaved();
     } catch (err) {
       setError(err.message);
@@ -1857,8 +2050,14 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
             </select>
           </div>
           <div class="field"><label>Die *</label>
-            <select required value=${form.die_id} onChange=${e => setForm({...form, die_id: e.target.value})}>
+            <select required value=${form.die_id} onChange=${e => onDieChange(e.target.value)}>
               ${dies.map(d => html`<option key=${d.id} value=${d.id}>${d.code} · ${d.part_number}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Part Made ${form.part_id ? '— BOM will auto-consume stock' : '— optional'}</label>
+            <select value=${form.part_id || ''} onChange=${e => setForm({...form, part_id: e.target.value})}>
+              <option value="">— None / unknown —</option>
+              ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number} · Rev ${p.revision} · ${p.name}</option>`)}
             </select>
           </div>
           <div class="field"><label>Operator</label>
@@ -1900,6 +2099,8 @@ function Chat({ plant, me, user }) {
   const [attachment, setAttachment] = useState(null); // { file, previewUrl, type }
   const [uploading, setUploading] = useState(false);
   const [notifPerm, setNotifPerm] = useState(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
+  const [taskFromMsg, setTaskFromMsg] = useState(null);
+  const [groupModal, setGroupModal] = useState(false);
 
   useEffect(() => { loadGroups(); }, []);
   // Global plant-wide subscription — notifications work even when not on chat tab
@@ -2151,7 +2352,10 @@ function Chat({ plant, me, user }) {
                     ? html`<a href=${a.url} target="_blank" rel="noopener" key=${i}><img class="attached-img" src=${a.url} alt=${a.name || 'image'} /></a>`
                     : html`<a href=${a.url} target="_blank" rel="noopener" class="file-attached" key=${i}>📎 ${a.name || 'file'}</a>`
                   )}
-                  <div class="ts">${fmtDate(m.created_at)}</div>
+                  <div class="ts">
+                    ${fmtDate(m.created_at)}
+                    <button class="msg-action-btn" onClick=${() => setTaskFromMsg(m)} title="Assign as task">✓</button>
+                  </div>
                 </div>
               `;
             })
@@ -2172,12 +2376,13 @@ function Chat({ plant, me, user }) {
           <input type="text" value=${input} onChange=${e => setInput(e.target.value)} onKeyPress=${e => { if (e.key === 'Enter' && !e.shiftKey) send(); }} placeholder=${uploading ? 'Uploading…' : 'Message…'} disabled=${uploading} />
           <button onClick=${send} disabled=${uploading || (!input.trim() && !attachment)}>${uploading ? '…' : '→'}</button>
         </div>
+        ${taskFromMsg && html`<${AssignTaskFromMsgModal} plant=${plant} me=${me} message=${taskFromMsg} group=${activeGroup} onClose=${() => setTaskFromMsg(null)} onSaved=${() => setTaskFromMsg(null)} />`}
       </div>
     `;
   }
 
   return html`
-    <div class="page-header"><div><h1>Chat</h1><div class="sub">Plant communication</div></div></div>
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start"><div><h1>Chat</h1><div class="sub">Plant communication</div></div><button class="btn small" onClick=${() => setGroupModal(true)} style="margin-top:6px">+ New Group</button></div>
     ${notifPerm === 'default' && html`
       <div class="setup-banner" style="margin-bottom:14px">
         <div class="setup-banner-title">🔔 Enable notifications</div>
@@ -2220,6 +2425,9 @@ function Chat({ plant, me, user }) {
         })}
       </div>`
     }
+
+    ${taskFromMsg && html`<${AssignTaskFromMsgModal} plant=${plant} me=${me} message=${taskFromMsg} group=${activeGroup} onClose=${() => setTaskFromMsg(null)} onSaved=${() => setTaskFromMsg(null)} />`}
+    ${groupModal && html`<${GroupCreateModal} plant=${plant} me=${me} user=${user} onClose=${() => setGroupModal(false)} onSaved=${() => { setGroupModal(false); loadGroups(); }} />`}
   `;
 }
 
@@ -2558,6 +2766,83 @@ function InviteViewModal({ invite, onClose, onCancel }) {
         <button class="btn secondary" style="margin-top:8px" onClick=${() => { navigator.clipboard.writeText(inviteUrl); showToast('Link copied'); }}>Copy link</button>
         <button class="btn danger" style="margin-top:8px" onClick=${onCancel}>Cancel invite</button>
       </div>
+    </div>
+  `;
+}
+
+// ============= DAILY DIGEST (Tasks reminder) =============
+function DailyDigest({ me, setTab }) {
+  const [digest, setDigest] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [collapsed, setCollapsed] = useState(false);
+
+  useEffect(() => { load(); }, []);
+
+  const load = async () => {
+    setLoading(true);
+    const { data } = await sb.from('v_user_daily_digest')
+      .select('*')
+      .or('owner_id.eq.' + me.id + ',owner_id.is.null')
+      .order('digest_state', { ascending: true })
+      .order('due_at', { ascending: true });
+    setDigest(data || []);
+    setLoading(false);
+  };
+
+  const markComplete = async (id) => {
+    await sb.from('actions').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('id', id);
+    load();
+  };
+
+  const pending = digest.filter(d => d.digest_state === 'pending' && d.owner_id === me.id);
+  const completedToday = digest.filter(d => d.digest_state === 'completed_today' && d.owner_id === me.id);
+  const teamPending = digest.filter(d => d.digest_state === 'pending' && d.owner_id !== me.id && (me.role === 'plant_head' || me.role === 'admin'));
+
+  if (loading) return null;
+  if (pending.length === 0 && completedToday.length === 0 && teamPending.length === 0) return null;
+
+  return html`
+    <div class="card" style="background:var(--teal-50);border-color:var(--teal-100);margin-bottom:14px">
+      <div onClick=${() => setCollapsed(!collapsed)} style="cursor:pointer;display:flex;justify-content:space-between;align-items:center">
+        <div style="font-weight:700;color:var(--teal-700)">📋 Today's Tasks · ${pending.length} pending${completedToday.length > 0 ? ' · ' + completedToday.length + ' done' : ''}</div>
+        <span style="color:var(--teal-600);font-size:18px">${collapsed ? '›' : '▼'}</span>
+      </div>
+      ${!collapsed && html`
+        <div style="margin-top:12px">
+          ${pending.length > 0 && html`
+            <div style="font-size:11px;color:var(--slate-600);font-weight:600;margin:8px 0 4px">PENDING (you)</div>
+            ${pending.map(t => {
+              const overdue = t.due_at && new Date(t.due_at) < new Date();
+              return html`
+                <div key=${t.id} style="background:white;padding:10px 12px;border-radius:8px;margin-bottom:6px;display:flex;align-items:center;gap:10px">
+                  <button onClick=${() => markComplete(t.id)} style="width:22px;height:22px;border:2px solid var(--teal-600);border-radius:50%;background:white;cursor:pointer;flex-shrink:0;padding:0" title="Mark done"></button>
+                  <div style="flex:1;min-width:0;cursor:pointer" onClick=${() => setTab('actions')}>
+                    <div style="font-size:13px;font-weight:500">${t.title}</div>
+                    <div style="font-size:11px;color:${overdue ? 'var(--rose-500)' : 'var(--slate-500)'}">${t.due_at ? (overdue ? '⚠️ Overdue · ' : 'Due ') + fmtDate(t.due_at) : 'No due date'} · ${t.source_type}</div>
+                  </div>
+                </div>
+              `;
+            })}
+          `}
+          ${completedToday.length > 0 && html`
+            <div style="font-size:11px;color:var(--slate-600);font-weight:600;margin:8px 0 4px">DONE TODAY</div>
+            ${completedToday.map(t => html`
+              <div key=${t.id} style="background:white;padding:8px 12px;border-radius:8px;margin-bottom:6px;opacity:0.65">
+                <div style="font-size:13px;text-decoration:line-through;color:var(--slate-500)">${t.title}</div>
+                <div style="font-size:11px;color:var(--emerald-600)">✓ Completed ${fmtDate(t.completed_at)}</div>
+              </div>
+            `)}
+          `}
+          ${teamPending.length > 0 && html`
+            <div style="font-size:11px;color:var(--slate-600);font-weight:600;margin:8px 0 4px">TEAM PENDING (${teamPending.length})</div>
+            <div style="background:white;padding:10px 12px;border-radius:8px;cursor:pointer" onClick=${() => setTab('actions')}>
+              <div style="font-size:13px">${teamPending.length} task${teamPending.length > 1 ? 's' : ''} assigned to your team</div>
+              <div style="font-size:11px;color:var(--slate-500)">Tap to review in Action Hub</div>
+            </div>
+          `}
+          <button class="btn small ghost" style="width:100%;margin-top:10px" onClick=${() => setTab('actions')}>Open Action Hub →</button>
+        </div>
+      `}
     </div>
   `;
 }
@@ -3311,6 +3596,149 @@ function ActionModal({ plant, me, users, editTarget, onClose, onSaved }) {
             </div>
           `}
           <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= ASSIGN TASK FROM CHAT MESSAGE =============
+function AssignTaskFromMsgModal({ plant, me, message, group, onClose, onSaved }) {
+  const messagePreview = message.body || (Array.isArray(message.attachments) && message.attachments.length ? '📎 ' + (message.attachments[0].name || 'attachment') : '(empty)');
+  const [users, setUsers] = useState([]);
+  const [form, setForm] = useState({
+    title: messagePreview.slice(0, 80),
+    description: messagePreview,
+    owner_id: message.sender_id !== me.id ? message.sender_id : '',
+    due_at: '',
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    sb.from('users').select('*').order('full_name').then(({ data }) => setUsers(data || []));
+  }, []);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const { error } = await sb.from('actions').insert({
+        plant_id: plant.id,
+        source_type: 'chat',
+        title: form.title,
+        description: form.description || null,
+        owner_id: form.owner_id || null,
+        assigned_by: me.id,
+        due_at: form.due_at ? new Date(form.due_at).toISOString() : null,
+        status: 'open',
+        chat_message_id: message.id,
+        chat_group_id: group?.id,
+      });
+      if (error) throw error;
+      // Send a confirmation message in chat
+      const ownerName = users.find(u => u.id === form.owner_id)?.full_name;
+      await sb.from('chat_messages').insert({
+        plant_id: plant.id,
+        group_id: group.id,
+        sender_id: me.id,
+        body: '✅ Task assigned' + (ownerName ? ' to ' + ownerName : '') + ': ' + form.title + (form.due_at ? ' · due ' + new Date(form.due_at).toLocaleString() : ''),
+      });
+      showToast('Task assigned');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" style="z-index:200" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Assign as Task</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card" style="background:var(--teal-50);border-color:var(--teal-100);margin-bottom:14px">
+          <div style="font-size:11px;color:var(--teal-700);font-weight:600;margin-bottom:4px">FROM MESSAGE</div>
+          <div style="font-size:13px;color:var(--slate-700)">${messagePreview}</div>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Task Title *</label><input type="text" required value=${form.title} onChange=${e => setForm({...form, title: e.target.value})} /></div>
+          <div class="field"><label>Description</label><textarea rows=${2} value=${form.description} onChange=${e => setForm({...form, description: e.target.value})}></textarea></div>
+          <div class="field"><label>Assign To *</label>
+            <select required value=${form.owner_id} onChange=${e => setForm({...form, owner_id: e.target.value})}>
+              <option value="">— Select person —</option>
+              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.id === me.id ? ' (me)' : ''}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Due Date</label><input type="datetime-local" value=${form.due_at} onChange=${e => setForm({...form, due_at: e.target.value})} /></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Assigning…' : 'Assign task'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= GROUP CREATE MODAL =============
+function GroupCreateModal({ plant, me, user, onClose, onSaved }) {
+  const [users, setUsers] = useState([]);
+  const [form, setForm] = useState({ name: '', selected: [user.id] });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    sb.from('users').select('*').order('full_name').then(({ data }) => setUsers(data || []));
+  }, []);
+
+  const toggle = (id) => {
+    if (id === user.id) return; // can't remove self
+    setForm(f => ({...f, selected: f.selected.includes(id) ? f.selected.filter(x => x !== id) : [...f.selected, id]}));
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      if (form.selected.length < 2) throw new Error('Pick at least one other person');
+      const { error } = await sb.from('chat_groups').insert({
+        plant_id: plant.id,
+        name: form.name.startsWith('#') ? form.name : '# ' + form.name,
+        type: 'custom',
+        members: form.selected,
+        created_by: me.id,
+      });
+      if (error) throw error;
+      showToast('Group created');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">New Chat Group</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Group Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} placeholder="Quality Team / Shift A / Vendor Call" /></div>
+          <div class="field"><label>Members · ${form.selected.length}</label></div>
+          <div style="max-height:300px;overflow-y:auto;border:1px solid var(--slate-200);border-radius:10px;padding:6px">
+            ${users.map(u => {
+              const isSelf = u.id === user.id;
+              const selected = form.selected.includes(u.id);
+              return html`
+                <div key=${u.id} onClick=${() => toggle(u.id)} style="padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:${isSelf ? 'default' : 'pointer'};border-radius:8px;${selected ? 'background:var(--teal-50)' : ''}">
+                  <div style="width:20px;height:20px;border:2px solid ${selected ? 'var(--teal-600)' : 'var(--slate-300)'};border-radius:6px;display:flex;align-items:center;justify-content:center;background:${selected ? 'var(--teal-600)' : 'transparent'};color:white;font-size:12px;flex-shrink:0">${selected ? '✓' : ''}</div>
+                  <div style="flex:1">
+                    <div style="font-size:14px;font-weight:500">${u.full_name} ${isSelf ? '(you)' : ''}</div>
+                    <div style="font-size:11px;color:var(--slate-500)">${u.role}</div>
+                  </div>
+                </div>
+              `;
+            })}
+          </div>
+          <button class="btn" style="margin-top:14px" disabled=${loading}>${loading ? 'Creating…' : 'Create group'}</button>
         </form>
       </div>
     </div>
