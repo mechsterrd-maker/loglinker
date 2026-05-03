@@ -286,13 +286,24 @@ const showToast = (msg) => {
 };
 
 // ============= AUTH SCREEN =============
-function AuthScreen({ onAuth }) {
-  const [mode, setMode] = useState('login');
+function AuthScreen({ onAuth, pendingInviteCode }) {
+  const hasInvite = !!pendingInviteCode;
+  const [mode, setMode] = useState(hasInvite ? 'signup' : 'login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [loading, setLoading] = useState(false);
+  const [invitedPlant, setInvitedPlant] = useState(null);
+
+  // If URL has invite code, look up the plant name
+  useEffect(() => {
+    if (!hasInvite) return;
+    (async () => {
+      const { data } = await sb.from('user_invites').select('plants(name), full_name, role').eq('invite_code', pendingInviteCode).eq('status', 'pending').maybeSingle();
+      if (data) setInvitedPlant({ name: data.plants?.name, full_name: data.full_name, role: data.role });
+    })();
+  }, [hasInvite, pendingInviteCode]);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -304,7 +315,7 @@ function AuthScreen({ onAuth }) {
       } else {
         result = await sb.auth.signUp({
           email, password,
-          options: { emailRedirectTo: window.location.origin + window.location.pathname }
+          options: { emailRedirectTo: window.location.href }
         });
       }
       if (result.error) {
@@ -327,8 +338,22 @@ function AuthScreen({ onAuth }) {
         <div class="logo-mark">L</div>
         <div class="display" style="font-size:24px;font-weight:700">Loglinkr</div>
       </div>
-      <h1>${mode === 'login' ? 'Welcome back' : 'Create your account'}</h1>
-      <p class="sub">${mode === 'login' ? 'Run your plant. From your phone.' : 'Set up your plant in 5 minutes.'}</p>
+
+      ${hasInvite && invitedPlant && html`
+        <div class="alert info" style="margin-bottom:20px">
+          🎉 You've been invited to <strong>${invitedPlant.name}</strong> as ${invitedPlant.role}.
+          ${invitedPlant.full_name && html` Welcome, ${invitedPlant.full_name}.`}
+          <br/><br/>Sign up below — you'll be added to ${invitedPlant.name} automatically.
+        </div>
+      `}
+      ${hasInvite && !invitedPlant && html`
+        <div class="alert error" style="margin-bottom:20px">
+          Invite code <span class="mono">${pendingInviteCode}</span> is invalid or already used.
+        </div>
+      `}
+
+      <h1>${mode === 'login' ? 'Welcome back' : (hasInvite ? 'Join your plant' : 'Create your account')}</h1>
+      <p class="sub">${mode === 'login' ? 'Run your plant. From your phone.' : (hasInvite ? 'Sign up with your details below.' : 'Set up your plant in 5 minutes.')}</p>
 
       <div class="auth-tabs">
         <button class=${'auth-tab' + (mode === 'login' ? ' active' : '')} onClick=${() => setMode('login')}>Login</button>
@@ -354,8 +379,9 @@ function AuthScreen({ onAuth }) {
 }
 
 // ============= WIZARD =============
-function Wizard({ user, onDone }) {
-  const [path, setPath] = useState('choose'); // choose | new | join
+function Wizard({ user, pendingInvite, onDone }) {
+  // If invite detected, jump straight to join path with code prefilled
+  const [path, setPath] = useState(pendingInvite ? 'join' : 'choose');
   const [form, setForm] = useState({
     name: '', legal_name: '', gstin: '',
     address: '', city: 'Chennai', state: 'Tamil Nadu', pincode: '',
@@ -363,7 +389,11 @@ function Wizard({ user, onDone }) {
     your_name: user.email ? user.email.split('@')[0] : '',
     your_phone: ''
   });
-  const [joinForm, setJoinForm] = useState({ code: '', full_name: user.email ? user.email.split('@')[0] : '', phone: '' });
+  const [joinForm, setJoinForm] = useState({
+    code: pendingInvite?.invite_code || '',
+    full_name: pendingInvite?.full_name || (user.email ? user.email.split('@')[0] : ''),
+    phone: ''
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -480,12 +510,17 @@ function Wizard({ user, onDone }) {
         </div>
         <div class="wizard-step">
           <h2>Join your plant</h2>
-          <p class="sub">Enter the invite code your plant head shared with you.</p>
+          ${pendingInvite ? html`
+            <div class="alert info" style="margin-bottom:16px">
+              You're being added to <strong>${pendingInvite.plants?.name || 'plant'}</strong> as <strong>${pendingInvite.role}</strong>.
+              ${pendingInvite.full_name ? html` Welcome, ${pendingInvite.full_name}.` : ''}
+            </div>
+          ` : html`<p class="sub">Enter the invite code your plant head shared with you.</p>`}
           ${error && html`<div class="alert error">${error}</div>`}
           <form onSubmit=${submitJoin}>
             <div class="field">
               <label>Invite Code *</label>
-              <input type="text" required maxLength=${6} style="font-family:'Geist Mono',monospace;letter-spacing:0.15em;text-transform:uppercase;font-size:18px;text-align:center" value=${joinForm.code} onChange=${e => setJoinForm({...joinForm, code: e.target.value.toUpperCase()})} placeholder="ABC123" />
+              <input type="text" required maxLength=${6} style="font-family:'Geist Mono',monospace;letter-spacing:0.15em;text-transform:uppercase;font-size:18px;text-align:center" value=${joinForm.code} onChange=${e => setJoinForm({...joinForm, code: e.target.value.toUpperCase()})} placeholder="ABC123" readOnly=${!!pendingInvite} />
             </div>
             <div class="field">
               <label>Your Full Name *</label>
@@ -496,7 +531,8 @@ function Wizard({ user, onDone }) {
               <input type="tel" required maxLength=${10} value=${joinForm.phone} onChange=${e => setJoinForm({...joinForm, phone: e.target.value.replace(/\D/g,'')})} placeholder="9876543210" />
             </div>
             <button class="btn" disabled=${loading}>${loading ? 'Joining…' : 'Join plant'}</button>
-            <button type="button" class="btn ghost" style="margin-top:8px;width:100%" onClick=${() => setPath('choose')}>← Back</button>
+            ${!pendingInvite && html`<button type="button" class="btn ghost" style="margin-top:8px;width:100%" onClick=${() => setPath('choose')}>← Back</button>`}
+            ${pendingInvite && html`<button type="button" class="btn ghost" style="margin-top:8px;width:100%" onClick=${async () => { await sb.auth.signOut(); location.reload(); }}>Sign out</button>`}
           </form>
         </div>
       </div>
@@ -573,12 +609,20 @@ function App() {
   const [me, setMe] = useState(null);
   const [tab, setTab] = useState('home');
   const [loading, setLoading] = useState(true);
+  const [pendingInvite, setPendingInvite] = useState(null);
+
+  // Read invite code from URL on first load
+  const urlCode = useMemo(() => {
+    const u = new URL(window.location.href);
+    return (u.searchParams.get('code') || u.searchParams.get('invite') || '').toUpperCase().trim();
+  }, []);
 
   useEffect(() => {
     (async () => {
       const { data: { session } } = await sb.auth.getSession();
       if (session) {
         setUser(session.user);
+        await detectInvite(session.user);
         await loadProfile(session.user);
       }
       setLoading(false);
@@ -586,44 +630,59 @@ function App() {
 
     const { data: { subscription } } = sb.auth.onAuthStateChange(async (event, session) => {
       if (event === 'SIGNED_OUT') {
-        setUser(null); setPlant(null); setMe(null);
+        setUser(null); setPlant(null); setMe(null); setPendingInvite(null);
       }
     });
     return () => subscription.unsubscribe();
   }, []);
 
+  // Look for any pending invite that matches: URL code OR user's email
+  const detectInvite = async (u) => {
+    let invite = null;
+
+    // 1. URL code wins
+    if (urlCode) {
+      const { data } = await sb.from('user_invites').select('*, plants(name)').eq('invite_code', urlCode).eq('status', 'pending').maybeSingle();
+      if (data) invite = data;
+    }
+
+    // 2. Fall back to email match
+    if (!invite && u.email) {
+      const { data } = await sb.from('user_invites').select('*, plants(name)').eq('email', u.email).eq('status', 'pending').maybeSingle();
+      if (data) invite = data;
+    }
+
+    if (invite) {
+      console.log('[Loglinkr] Pending invite found:', invite.invite_code, 'for plant', invite.plants?.name);
+      setPendingInvite(invite);
+    } else {
+      setPendingInvite(null);
+    }
+  };
+
   const loadProfile = async (u) => {
     console.log('[Loglinkr] loadProfile for user:', u.id);
-    
-    // Fetch user row
-    const { data: userRow, error: userErr } = await sb.from('users').select('*').eq('id', u.id).maybeSingle();
-    console.log('[Loglinkr] user row:', userRow, 'error:', userErr);
-    
+    const { data: userRow } = await sb.from('users').select('*').eq('id', u.id).maybeSingle();
     if (!userRow || !userRow.plant_id) {
-      console.log('[Loglinkr] No user row or no plant_id, showing wizard');
-      setPlant(null);
-      setMe(null);
+      setPlant(null); setMe(null);
       return;
     }
-    
-    // Fetch plant separately
-    const { data: plantRow, error: plantErr } = await sb.from('plants').select('*').eq('id', userRow.plant_id).maybeSingle();
-    console.log('[Loglinkr] plant row:', plantRow, 'error:', plantErr);
-    
+    const { data: plantRow } = await sb.from('plants').select('*').eq('id', userRow.plant_id).maybeSingle();
     if (!plantRow) {
-      console.log('[Loglinkr] Plant not found, showing wizard');
-      setPlant(null);
-      setMe(null);
+      setPlant(null); setMe(null);
       return;
     }
-    
-    console.log('[Loglinkr] Loaded successfully, going to dashboard');
     setPlant(plantRow);
     setMe(userRow);
+    // Clear URL params on successful load
+    if (window.location.search) {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
   };
 
   const handleAuth = async (u) => {
     setUser(u);
+    await detectInvite(u);
     await loadProfile(u);
   };
 
@@ -634,8 +693,8 @@ function App() {
   };
 
   if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
-  if (!user) return html`<${AuthScreen} onAuth=${handleAuth} />`;
-  if (!plant) return html`<${Wizard} user=${user} onDone=${(p) => loadProfile(user)} />`;
+  if (!user) return html`<${AuthScreen} onAuth=${handleAuth} pendingInviteCode=${urlCode} />`;
+  if (!plant) return html`<${Wizard} user=${user} pendingInvite=${pendingInvite} onDone=${(p) => loadProfile(user)} />`;
 
   return html`<${Shell} user=${user} plant=${plant} me=${me} tab=${tab} setTab=${setTab} logout=${logout} reload=${() => loadProfile(user)} />`;
 }
@@ -1550,6 +1609,13 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
   };
 
   if (createdInvite) {
+    const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
+    const inviteUrl = baseUrl + '?code=' + createdInvite.invite_code;
+    const waMessage = encodeURIComponent(
+      `Hi ${createdInvite.full_name}, you've been invited to join ${plant.name} on Loglinkr as ${createdInvite.role}.\n\nSign up here: ${inviteUrl}\n\nOr enter code: ${createdInvite.invite_code}`
+    );
+    const waUrl = createdInvite.phone ? 'https://wa.me/' + createdInvite.phone.replace(/\D/g,'') + '?text=' + waMessage : 'https://wa.me/?text=' + waMessage;
+
     return html`
       <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
         <div class="modal">
@@ -1557,11 +1623,24 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
             <div class="modal-title">Invite created</div>
             <button class="close-btn" onClick=${onSaved}>×</button>
           </div>
-          <p style="font-size:14px;color:var(--slate-600);margin-bottom:8px">Share this code with <strong>${createdInvite.full_name}</strong>:</p>
+          <p style="font-size:14px;color:var(--slate-600);margin-bottom:8px">Share this with <strong>${createdInvite.full_name}</strong>:</p>
           <div class="invite-code">${createdInvite.invite_code}</div>
-          <p style="font-size:12px;color:var(--slate-500);margin-bottom:16px">They sign up with their email + password, then enter this code to join your plant.</p>
-          <button class="btn" onClick=${() => { navigator.clipboard.writeText(createdInvite.invite_code); showToast('Copied'); }}>Copy code</button>
-          <button class="btn secondary" style="margin-top:8px" onClick=${onSaved}>Done</button>
+
+          <div class="field" style="margin-top:14px">
+            <label>Or share this link</label>
+            <input type="text" readOnly value=${inviteUrl} style="font-size:12px" onClick=${e => e.target.select()} />
+          </div>
+
+          <p style="font-size:12px;color:var(--slate-500);margin-bottom:14px;line-height:1.5">
+            They open the link → sign up with email + password → automatically added to your plant. No code typing needed.
+          </p>
+
+          <a href=${waUrl} target="_blank" rel="noopener" class="btn" style="text-decoration:none;display:flex;align-items:center;justify-content:center;gap:8px;background:#25D366">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="white"><path d="M17.5 14.4c-.3-.1-1.7-.8-2-.9-.3-.1-.5-.1-.7.1-.2.3-.7.9-.9 1.1-.2.2-.3.2-.6.1-.3-.1-1.2-.5-2.4-1.5-.9-.8-1.5-1.8-1.7-2.1-.2-.3 0-.5.1-.6.1-.1.3-.3.4-.5.1-.2.2-.3.3-.5.1-.2 0-.4 0-.5 0-.1-.7-1.6-.9-2.2-.2-.6-.5-.5-.7-.5h-.6c-.2 0-.5.1-.8.4-.3.3-1 1-1 2.4 0 1.4 1 2.7 1.2 2.9.1.2 2 3.1 4.9 4.3.7.3 1.2.5 1.6.6.7.2 1.3.2 1.8.1.5-.1 1.7-.7 1.9-1.3.2-.7.2-1.2.2-1.3-.1-.2-.3-.3-.6-.4zM12 2C6.5 2 2 6.5 2 12c0 1.8.5 3.5 1.3 5L2 22l5.2-1.4c1.4.8 3.1 1.2 4.8 1.2 5.5 0 10-4.5 10-10S17.5 2 12 2zm0 18c-1.5 0-3-.4-4.3-1.2l-.3-.2-3.1.8.8-3-.2-.3C4 15.1 3.5 13.6 3.5 12 3.5 7.3 7.3 3.5 12 3.5S20.5 7.3 20.5 12 16.7 20.5 12 20.5z"/></svg>
+            Send via WhatsApp
+          </a>
+          <button class="btn secondary" style="margin-top:8px" onClick=${() => { navigator.clipboard.writeText(inviteUrl); showToast('Link copied'); }}>Copy link</button>
+          <button class="btn ghost" style="margin-top:8px;width:100%" onClick=${onSaved}>Done</button>
         </div>
       </div>
     `;
@@ -1604,6 +1683,13 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
 }
 
 function InviteViewModal({ invite, onClose, onCancel }) {
+  const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
+  const inviteUrl = baseUrl + '?code=' + invite.invite_code;
+  const waMessage = encodeURIComponent(
+    `Hi ${invite.full_name}, your Loglinkr invite as ${invite.role}:\n\n${inviteUrl}\n\nOr enter code: ${invite.invite_code}`
+  );
+  const waUrl = invite.phone ? 'https://wa.me/' + invite.phone.replace(/\D/g,'') + '?text=' + waMessage : 'https://wa.me/?text=' + waMessage;
+
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal">
@@ -1614,7 +1700,15 @@ function InviteViewModal({ invite, onClose, onCancel }) {
         <div class="card-row"><span class="label">Role</span><span class="value">${invite.role}</span></div>
         <div class="card-row"><span class="label">Phone</span><span class="value mono">${invite.phone}</span></div>
         <div class="invite-code">${invite.invite_code}</div>
-        <button class="btn" onClick=${() => { navigator.clipboard.writeText(invite.invite_code); showToast('Copied'); }}>Copy code</button>
+        <div class="field" style="margin-top:14px">
+          <label>Invite link</label>
+          <input type="text" readOnly value=${inviteUrl} style="font-size:12px" onClick=${e => e.target.select()} />
+        </div>
+        <a href=${waUrl} target="_blank" rel="noopener" class="btn" style="text-decoration:none;display:flex;align-items:center;justify-content:center;gap:8px;background:#25D366">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="white"><path d="M17.5 14.4c-.3-.1-1.7-.8-2-.9-.3-.1-.5-.1-.7.1-.2.3-.7.9-.9 1.1-.2.2-.3.2-.6.1-.3-.1-1.2-.5-2.4-1.5-.9-.8-1.5-1.8-1.7-2.1-.2-.3 0-.5.1-.6.1-.1.3-.3.4-.5.1-.2.2-.3.3-.5.1-.2 0-.4 0-.5 0-.1-.7-1.6-.9-2.2-.2-.6-.5-.5-.7-.5h-.6c-.2 0-.5.1-.8.4-.3.3-1 1-1 2.4 0 1.4 1 2.7 1.2 2.9.1.2 2 3.1 4.9 4.3.7.3 1.2.5 1.6.6.7.2 1.3.2 1.8.1.5-.1 1.7-.7 1.9-1.3.2-.7.2-1.2.2-1.3-.1-.2-.3-.3-.6-.4zM12 2C6.5 2 2 6.5 2 12c0 1.8.5 3.5 1.3 5L2 22l5.2-1.4c1.4.8 3.1 1.2 4.8 1.2 5.5 0 10-4.5 10-10S17.5 2 12 2zm0 18c-1.5 0-3-.4-4.3-1.2l-.3-.2-3.1.8.8-3-.2-.3C4 15.1 3.5 13.6 3.5 12 3.5 7.3 7.3 3.5 12 3.5S20.5 7.3 20.5 12 16.7 20.5 12 20.5z"/></svg>
+          Send via WhatsApp
+        </a>
+        <button class="btn secondary" style="margin-top:8px" onClick=${() => { navigator.clipboard.writeText(inviteUrl); showToast('Link copied'); }}>Copy link</button>
         <button class="btn danger" style="margin-top:8px" onClick=${onCancel}>Cancel invite</button>
       </div>
     </div>
