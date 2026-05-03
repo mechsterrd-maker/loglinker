@@ -181,7 +181,7 @@ body{
 .chat-name{font-weight:600;font-size:14px;margin-bottom:2px}
 .chat-preview{color:var(--slate-500);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-.chat-thread{display:flex;flex-direction:column;height:calc(100vh - 56px - 76px - var(--safe-bottom));position:fixed;top:56px;left:0;right:0;background:#fafaf9;z-index:30}
+.chat-thread{display:flex;flex-direction:column;position:fixed;top:60px;left:0;right:0;bottom:calc(76px + var(--safe-bottom));background:#fafaf9;z-index:30}
 .thread-header{background:white;border-bottom:1px solid var(--slate-200);padding:10px 14px;display:flex;align-items:center;gap:10px;flex-shrink:0}
 .thread-back{background:none;border:none;color:var(--slate-700);cursor:pointer;font-size:18px;padding:6px}
 .thread-messages{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:6px}
@@ -192,9 +192,16 @@ body{
 .msg.out .who{color:var(--teal-100)}
 .msg .ts{font-size:10px;color:var(--slate-400);margin-top:3px}
 .msg.out .ts{color:var(--teal-100)}
-.thread-input{background:white;border-top:1px solid var(--slate-200);padding:10px 12px calc(10px + var(--safe-bottom));display:flex;gap:8px;flex-shrink:0}
-.thread-input input{flex:1;padding:10px 14px;border:1px solid var(--slate-200);border-radius:999px;font-family:inherit;font-size:14px;outline:none}
-.thread-input button{background:var(--teal-600);color:white;border:none;border-radius:50%;width:40px;height:40px;cursor:pointer;font-size:18px;flex-shrink:0}
+.thread-input{background:white;border-top:1px solid var(--slate-200);padding:10px 12px;display:flex;gap:8px;flex-shrink:0;align-items:center}
+.thread-input input{flex:1;padding:10px 14px;border:1px solid var(--slate-200);border-radius:999px;font-family:inherit;font-size:14px;outline:none;min-width:0}
+.thread-input button{background:var(--teal-600);color:white;border:none;border-radius:50%;width:40px;height:40px;cursor:pointer;font-size:18px;flex-shrink:0;display:flex;align-items:center;justify-content:center}
+.thread-input button.attach{background:var(--slate-100);color:var(--slate-600)}
+.thread-attach-preview{padding:8px 12px;background:var(--teal-50);border-top:1px solid var(--teal-100);display:flex;align-items:center;gap:10px;font-size:13px;color:var(--teal-700)}
+.thread-attach-preview img{width:40px;height:40px;object-fit:cover;border-radius:6px}
+.thread-attach-preview button{background:none;border:none;color:var(--rose-500);cursor:pointer;font-size:18px;margin-left:auto;padding:4px}
+.msg img.attached-img{max-width:200px;max-height:200px;border-radius:8px;display:block;margin-top:4px;cursor:pointer}
+.msg .file-attached{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;background:rgba(255,255,255,0.15);border-radius:8px;margin-top:4px;font-size:12px;text-decoration:none;color:inherit}
+.msg.in .file-attached{background:var(--slate-50);border:1px solid var(--slate-200)}
 
 /* ================= WIZARD ================= */
 .wizard{max-width:480px;margin:0 auto;padding:32px 24px}
@@ -1288,6 +1295,8 @@ function Chat({ plant, me, user }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
+  const [attachment, setAttachment] = useState(null); // { file, previewUrl, type }
+  const [uploading, setUploading] = useState(false);
 
   useEffect(() => { loadGroups(); }, []);
   useEffect(() => {
@@ -1315,12 +1324,67 @@ function Chat({ plant, me, user }) {
     }, 50);
   };
 
+  const onPickFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 10 * 1024 * 1024) {
+      alert('File too large. Max 10 MB.');
+      return;
+    }
+    const isImage = file.type.startsWith('image/');
+    setAttachment({
+      file,
+      previewUrl: isImage ? URL.createObjectURL(file) : null,
+      type: file.type,
+      name: file.name
+    });
+    e.target.value = '';
+  };
+
   const send = async () => {
-    if (!input.trim() || !activeGroup) return;
+    if ((!input.trim() && !attachment) || !activeGroup || uploading) return;
     const body = input.trim();
+    let attachments = [];
+
+    if (attachment) {
+      setUploading(true);
+      try {
+        const ext = attachment.name.split('.').pop().toLowerCase();
+        const path = plant.id + '/' + activeGroup.id + '/' + user.id + '-' + Date.now() + '.' + ext;
+        const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, attachment.file, {
+          cacheControl: '3600',
+          upsert: false
+        });
+        if (upErr) {
+          alert('Upload failed: ' + upErr.message);
+          setUploading(false);
+          return;
+        }
+        const { data: { publicUrl } } = sb.storage.from('chat-attachments').getPublicUrl(path);
+        attachments = [{
+          url: publicUrl,
+          path: path,
+          type: attachment.type,
+          name: attachment.name,
+          isImage: attachment.type.startsWith('image/')
+        }];
+      } catch (err) {
+        alert('Upload failed: ' + err.message);
+        setUploading(false);
+        return;
+      }
+      setUploading(false);
+    }
+
     setInput('');
+    setAttachment(null);
+
     await sb.from('chat_messages').insert({
-      plant_id: plant.id, group_id: activeGroup.id, sender_id: user.id, body
+      plant_id: plant.id,
+      group_id: activeGroup.id,
+      sender_id: user.id,
+      body: body || null,
+      attachments: attachments
     });
   };
 
@@ -1339,19 +1403,35 @@ function Chat({ plant, me, user }) {
           ${messages.length === 0 ? html`<div class="empty"><div class="icon">💬</div><div style="font-size:13px">No messages yet. Say hi.</div></div>` :
             messages.map(m => {
               const isOut = m.sender_id === user.id;
+              const atts = Array.isArray(m.attachments) ? m.attachments : [];
               return html`
                 <div class=${'msg ' + (isOut ? 'out' : 'in')} key=${m.id}>
                   ${!isOut && html`<div class="who">${m.users?.full_name || '?'}</div>`}
-                  <div>${m.body}</div>
+                  ${m.body && html`<div>${m.body}</div>`}
+                  ${atts.map((a, i) => a.isImage
+                    ? html`<a href=${a.url} target="_blank" rel="noopener" key=${i}><img class="attached-img" src=${a.url} alt=${a.name || 'image'} /></a>`
+                    : html`<a href=${a.url} target="_blank" rel="noopener" class="file-attached" key=${i}>📎 ${a.name || 'file'}</a>`
+                  )}
                   <div class="ts">${fmtDate(m.created_at)}</div>
                 </div>
               `;
             })
           }
         </div>
+        ${attachment && html`
+          <div class="thread-attach-preview">
+            ${attachment.previewUrl ? html`<img src=${attachment.previewUrl} />` : html`<span>📎</span>`}
+            <span>${attachment.name}</span>
+            <button onClick=${() => setAttachment(null)}>×</button>
+          </div>
+        `}
         <div class="thread-input">
-          <input type="text" value=${input} onChange=${e => setInput(e.target.value)} onKeyPress=${e => { if (e.key === 'Enter') send(); }} placeholder="Message…" />
-          <button onClick=${send}>→</button>
+          <input type="file" id="chatFileInput" accept="image/*,application/pdf,.doc,.docx,.xls,.xlsx" style="display:none" onChange=${onPickFile} />
+          <button class="attach" onClick=${() => document.getElementById('chatFileInput').click()} disabled=${uploading} title="Attach">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
+          <input type="text" value=${input} onChange=${e => setInput(e.target.value)} onKeyPress=${e => { if (e.key === 'Enter' && !e.shiftKey) send(); }} placeholder=${uploading ? 'Uploading…' : 'Message…'} disabled=${uploading} />
+          <button onClick=${send} disabled=${uploading || (!input.trim() && !attachment)}>${uploading ? '…' : '→'}</button>
         </div>
       </div>
     `;
