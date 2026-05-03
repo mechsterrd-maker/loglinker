@@ -3269,7 +3269,10 @@ function BreakdownModal({ plant, me, machines, users, editTarget, onClose, onSav
 function Stocks({ plant, me }) {
   const [items, setItems] = useState([]);
   const [transactions, setTransactions] = useState([]);
-  const [view, setView] = useState('items');
+  const [view, setView] = useState('items'); // items | transactions
+  const [layout, setLayout] = useState('list'); // list | by_category
+  const [categoryFilter, setCategoryFilter] = useState('all');
+  const [search, setSearch] = useState('');
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -3278,7 +3281,7 @@ function Stocks({ plant, me }) {
     setLoading(true);
     const [i, t] = await Promise.all([
       sb.from('mcp_stocks_items').select('*').order('name'),
-      sb.from('mcp_stocks_transactions').select('*, mcp_stocks_items(code,name,uom), users:performed_by(full_name)').order('created_at', { ascending:false }).limit(50),
+      sb.from('mcp_stocks_transactions').select('*, mcp_stocks_items(code,name,uom,category), users:performed_by(full_name)').order('created_at', { ascending:false }).limit(100),
     ]);
     setItems(i.data || []);
     setTransactions(t.data || []);
@@ -3287,43 +3290,120 @@ function Stocks({ plant, me }) {
 
   useEffect(() => { refresh(); }, [refresh]);
 
+  // Live updates on stock changes
+  useEffect(() => {
+    if (!plant?.id) return;
+    const channel = sb.channel('stocks-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_stocks_items', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_stocks_transactions', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [plant?.id, refresh]);
+
   const lowStockCount = items.filter(i => i.reorder_level && i.current_qty <= i.reorder_level).length;
+  const totalValue = items.reduce((sum, i) => sum + (parseFloat(i.current_qty || 0) * parseFloat(i.unit_cost || 0)), 0);
+
+  // Filter by category + search
+  let filteredItems = items;
+  if (categoryFilter !== 'all') filteredItems = filteredItems.filter(i => (i.category || 'general') === categoryFilter);
+  if (search.trim()) {
+    const q = search.toLowerCase();
+    filteredItems = filteredItems.filter(i => (i.code + ' ' + i.name).toLowerCase().includes(q));
+  }
+
+  // Group by category for category view
+  const byCategory = {};
+  for (const i of filteredItems) {
+    const c = i.category || 'general';
+    if (!byCategory[c]) byCategory[c] = [];
+    byCategory[c].push(i);
+  }
+
+  // Get unique category list with counts
+  const categoryCounts = items.reduce((acc, i) => {
+    const c = i.category || 'general';
+    acc[c] = (acc[c] || 0) + 1;
+    return acc;
+  }, {});
+
+  const categoryLabels = {
+    raw_material: 'Raw Material',
+    die_spares: 'Die Spares',
+    consumables: 'Consumables',
+    tools: 'Tools',
+    packing: 'Packing',
+    bought_out: 'Bought-out',
+    general: 'General',
+  };
+  const lbl = (c) => categoryLabels[c] || c;
+
+  const ItemRow = ({ i }) => {
+    const isLow = i.reorder_level && i.current_qty <= i.reorder_level;
+    return html`
+      <div class="list-item" key=${i.id} onClick=${() => { setEditTarget(i); setModal('item'); }}>
+        <div class="list-item-row">
+          <div class="list-item-main">
+            <div class="list-item-title">${i.code} · ${i.name}</div>
+            <div class="list-item-sub">${lbl(i.category || 'general')}${i.reorder_level ? ' · reorder at ' + i.reorder_level + ' ' + i.uom : ''}${i.unit_cost ? ' · ₹' + i.unit_cost + '/' + i.uom : ''}</div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+            <span class=${'badge ' + (isLow ? 'rose' : 'emerald')}>${fmtNum(i.current_qty)} ${i.uom}</span>
+            <button class="btn small ghost" onClick=${(e) => { e.stopPropagation(); setEditTarget(i); setModal('txn'); }}>Txn</button>
+          </div>
+        </div>
+      </div>
+    `;
+  };
 
   return html`
-    <div class="page-header"><div><h1>Stocks</h1><div class="sub">Items, GRN, issues</div></div></div>
+    <div class="page-header"><div><h1>Stocks</h1><div class="sub">Items, GRN, issues, valuation</div></div></div>
 
     <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
       <div class="stat teal"><div class="stat-num">${items.length}</div><div class="stat-label">Items</div></div>
-      <div class="stat ${lowStockCount > 0 ? 'amber' : 'teal'}"><div class="stat-num">${lowStockCount}</div><div class="stat-label">Low</div></div>
-      <div class="stat teal"><div class="stat-num">${transactions.length}</div><div class="stat-label">Recent Txns</div></div>
+      <div class="stat ${lowStockCount > 0 ? 'amber' : 'teal'}"><div class="stat-num">${lowStockCount}</div><div class="stat-label">Low Stock</div></div>
+      <div class="stat teal"><div class="stat-num" style="font-size:18px">₹${(totalValue/100000).toFixed(1)}L</div><div class="stat-label">Value</div></div>
     </div>
 
-    <div class="auth-tabs" style="margin-bottom:14px">
+    <div class="auth-tabs" style="margin-bottom:10px">
       <button class=${'auth-tab' + (view === 'items' ? ' active' : '')} onClick=${() => setView('items')}>Items</button>
       <button class=${'auth-tab' + (view === 'transactions' ? ' active' : '')} onClick=${() => setView('transactions')}>Transactions</button>
     </div>
 
     ${view === 'items' && html`
-      <div class="section-h">Items · ${items.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('item'); }}>+ Add</button></div>
+      <div style="display:flex;gap:6px;margin-bottom:10px">
+        <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search items…" style="flex:1;padding:8px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+        <button class="btn small ${layout === 'list' ? '' : 'ghost'}" onClick=${() => setLayout('list')}>List</button>
+        <button class="btn small ${layout === 'by_category' ? '' : 'ghost'}" onClick=${() => setLayout('by_category')}>By Category</button>
+      </div>
+
+      ${layout === 'list' && html`
+        <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
+          <button class=${'auth-tab' + (categoryFilter === 'all' ? ' active' : '')} onClick=${() => setCategoryFilter('all')}>All · ${items.length}</button>
+          ${Object.keys(categoryLabels).map(c => categoryCounts[c] > 0 && html`
+            <button key=${c} class=${'auth-tab' + (categoryFilter === c ? ' active' : '')} onClick=${() => setCategoryFilter(c)}>${lbl(c)} · ${categoryCounts[c]}</button>
+          `)}
+        </div>
+      `}
+
+      <div class="section-h">Items · ${filteredItems.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('item'); }}>+ Add</button></div>
+
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
-        items.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📦</div>No items yet</div></div>` :
-        items.map(i => {
-          const isLow = i.reorder_level && i.current_qty <= i.reorder_level;
-          return html`
-            <div class="list-item" key=${i.id} onClick=${() => { setEditTarget(i); setModal('item'); }}>
-              <div class="list-item-row">
-                <div class="list-item-main">
-                  <div class="list-item-title">${i.code} · ${i.name}</div>
-                  <div class="list-item-sub">${i.category || 'general'} ${i.reorder_level ? '· reorder at ' + i.reorder_level + ' ' + i.uom : ''}</div>
-                </div>
-                <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
-                  <span class=${'badge ' + (isLow ? 'rose' : 'emerald')}>${fmtNum(i.current_qty)} ${i.uom}</span>
-                  <button class="btn small ghost" onClick=${(e) => { e.stopPropagation(); setEditTarget(i); setModal('txn'); }}>Txn</button>
-                </div>
+        filteredItems.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📦</div>${items.length === 0 ? 'No items yet' : 'No items match this filter'}</div></div>` :
+        layout === 'by_category' ? html`
+          ${Object.entries(byCategory).sort((a,b) => b[1].length - a[1].length).map(([cat, list]) => html`
+            <details key=${cat} open style="margin-bottom:8px">
+              <summary style="cursor:pointer;padding:10px 12px;background:var(--slate-100);border-radius:10px;font-weight:600;font-size:14px;display:flex;justify-content:space-between;align-items:center">
+                <span>📦 ${lbl(cat)}</span>
+                <span style="background:var(--teal-600);color:white;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px">${list.length}</span>
+              </summary>
+              <div style="margin-top:6px">
+                ${list.map(i => html`<${ItemRow} i=${i} />`)}
               </div>
-            </div>
-          `;
-        })
+            </details>
+          `)}
+        ` : html`
+          ${filteredItems.map(i => html`<${ItemRow} i=${i} />`)}
+        `
       }
     `}
 
@@ -3404,6 +3484,8 @@ function ItemModal({ plant, editTarget, onClose, onSaved }) {
               <option value="die_spares">Die Spares</option>
               <option value="consumables">Consumables</option>
               <option value="tools">Tools</option>
+              <option value="packing">Packing</option>
+              <option value="bought_out">Bought-out</option>
               <option value="general">General</option>
             </select>
           </div>
