@@ -1302,8 +1302,28 @@ function Chat({ plant, me, user }) {
   useEffect(() => {
     if (!activeGroup) return;
     loadMessages(activeGroup.id);
+
     const channel = sb.channel('messages-' + activeGroup.id)
-      .on('postgres_changes', { event:'INSERT', schema:'public', table:'chat_messages', filter:'group_id=eq.' + activeGroup.id }, () => loadMessages(activeGroup.id))
+      .on('postgres_changes', {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'chat_messages',
+        filter: 'group_id=eq.' + activeGroup.id
+      }, async (payload) => {
+        // Append the new message instantly instead of refetching all
+        const newMsg = payload.new;
+        // Get sender name
+        const { data: sender } = await sb.from('users').select('full_name').eq('id', newMsg.sender_id).maybeSingle();
+        setMessages(prev => {
+          // Skip if already in list (own message we already added optimistically)
+          if (prev.some(m => m.id === newMsg.id)) return prev;
+          return [...prev, { ...newMsg, users: sender }];
+        });
+        setTimeout(() => {
+          const wrap = document.getElementById('threadMessages');
+          if (wrap) wrap.scrollTop = wrap.scrollHeight;
+        }, 50);
+      })
       .subscribe();
     return () => { sb.removeChannel(channel); };
   }, [activeGroup]);
@@ -1376,16 +1396,45 @@ function Chat({ plant, me, user }) {
       setUploading(false);
     }
 
+    const localId = 'local-' + Date.now();
+    const optimisticMsg = {
+      id: localId,
+      plant_id: plant.id,
+      group_id: activeGroup.id,
+      sender_id: user.id,
+      body: body || null,
+      attachments,
+      users: { full_name: me.full_name },
+      created_at: new Date().toISOString(),
+      _pending: true
+    };
+
+    // Show immediately
+    setMessages(prev => [...prev, optimisticMsg]);
     setInput('');
     setAttachment(null);
+    setTimeout(() => {
+      const wrap = document.getElementById('threadMessages');
+      if (wrap) wrap.scrollTop = wrap.scrollHeight;
+    }, 30);
 
-    await sb.from('chat_messages').insert({
+    // Send to server
+    const { data: inserted, error } = await sb.from('chat_messages').insert({
       plant_id: plant.id,
       group_id: activeGroup.id,
       sender_id: user.id,
       body: body || null,
       attachments: attachments
-    });
+    }).select().single();
+
+    if (error) {
+      // Mark as failed
+      setMessages(prev => prev.map(m => m.id === localId ? {...m, _failed: true, _pending: false} : m));
+      return;
+    }
+
+    // Replace optimistic with real (so realtime won't double-add)
+    setMessages(prev => prev.map(m => m.id === localId ? {...inserted, users: { full_name: me.full_name }} : m));
   };
 
   if (activeGroup) {
