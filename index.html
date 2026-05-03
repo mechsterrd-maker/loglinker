@@ -355,6 +355,7 @@ function AuthScreen({ onAuth }) {
 
 // ============= WIZARD =============
 function Wizard({ user, onDone }) {
+  const [path, setPath] = useState('choose'); // choose | new | join
   const [form, setForm] = useState({
     name: '', legal_name: '', gstin: '',
     address: '', city: 'Chennai', state: 'Tamil Nadu', pincode: '',
@@ -362,6 +363,7 @@ function Wizard({ user, onDone }) {
     your_name: user.email ? user.email.split('@')[0] : '',
     your_phone: ''
   });
+  const [joinForm, setJoinForm] = useState({ code: '', full_name: user.email ? user.email.split('@')[0] : '', phone: '' });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -430,6 +432,77 @@ function Wizard({ user, onDone }) {
     }
   };
 
+  const submitJoin = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const { data, error: err } = await sb.rpc('redeem_invite_code', {
+        p_code: joinForm.code.trim().toUpperCase(),
+        p_full_name: joinForm.full_name,
+        p_phone: '+91' + joinForm.phone
+      });
+      if (err) throw err;
+      if (!data || !data.success) throw new Error(data?.error || 'Could not redeem code');
+      const { data: plant } = await sb.from('plants').select('*').eq('id', data.plant_id).single();
+      showToast('Welcome to ' + plant.name);
+      onDone(plant);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (path === 'choose') {
+    return html`
+      <div class="wizard">
+        <div class="auth-logo" style="margin-bottom:24px">
+          <div class="logo-mark">L</div>
+          <div class="display" style="font-size:22px;font-weight:700">Loglinkr</div>
+        </div>
+        <div class="wizard-step">
+          <h2>Welcome</h2>
+          <p class="sub">Are you setting up a new plant or joining an existing one?</p>
+          <button class="btn" style="margin-bottom:10px" onClick=${() => setPath('new')}>Set up a new plant</button>
+          <button class="btn secondary" onClick=${() => setPath('join')}>I have an invite code</button>
+          <button class="btn ghost" style="margin-top:20px;width:100%" onClick=${async () => { await sb.auth.signOut(); location.reload(); }}>Sign out</button>
+        </div>
+      </div>
+    `;
+  }
+
+  if (path === 'join') {
+    return html`
+      <div class="wizard">
+        <div class="auth-logo" style="margin-bottom:24px">
+          <div class="logo-mark">L</div>
+          <div class="display" style="font-size:22px;font-weight:700">Loglinkr</div>
+        </div>
+        <div class="wizard-step">
+          <h2>Join your plant</h2>
+          <p class="sub">Enter the invite code your plant head shared with you.</p>
+          ${error && html`<div class="alert error">${error}</div>`}
+          <form onSubmit=${submitJoin}>
+            <div class="field">
+              <label>Invite Code *</label>
+              <input type="text" required maxLength=${6} style="font-family:'Geist Mono',monospace;letter-spacing:0.15em;text-transform:uppercase;font-size:18px;text-align:center" value=${joinForm.code} onChange=${e => setJoinForm({...joinForm, code: e.target.value.toUpperCase()})} placeholder="ABC123" />
+            </div>
+            <div class="field">
+              <label>Your Full Name *</label>
+              <input type="text" required value=${joinForm.full_name} onChange=${e => setJoinForm({...joinForm, full_name: e.target.value})} placeholder="Selvam K" />
+            </div>
+            <div class="field">
+              <label>Your Phone *</label>
+              <input type="tel" required maxLength=${10} value=${joinForm.phone} onChange=${e => setJoinForm({...joinForm, phone: e.target.value.replace(/\D/g,'')})} placeholder="9876543210" />
+            </div>
+            <button class="btn" disabled=${loading}>${loading ? 'Joining…' : 'Join plant'}</button>
+            <button type="button" class="btn ghost" style="margin-top:8px;width:100%" onClick=${() => setPath('choose')}>← Back</button>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
   return html`
     <div class="wizard">
       <div class="auth-logo" style="margin-bottom:24px">
@@ -486,6 +559,7 @@ function Wizard({ user, onDone }) {
             <div class=${'toggle' + (form.iatf ? ' active' : '')} onClick=${() => update('iatf', !form.iatf)}></div>
           </div>
           <button class="btn" disabled=${loading}>${loading ? 'Creating…' : 'Create plant'}</button>
+          <button type="button" class="btn ghost" style="margin-top:8px;width:100%" onClick=${() => setPath('choose')}>← Back</button>
         </form>
       </div>
     </div>
@@ -587,18 +661,20 @@ function Shell({ user, plant, me, tab, setTab, logout, reload }) {
 
       <${Page} active=${tab === 'home'}><${Home} plant=${plant} me=${me} setTab=${setTab} reload=${reload} /></${Page}>
       <${Page} active=${tab === 'production'}><${Production} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'quality'}><${SimpleTab} title="Quality" sub="NCRs, inspections, IATF records" comingSoon=${true} block="Block 2"/></${Page}>
+      <${Page} active=${tab === 'quality'}><${Quality} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'maintenance'}><${Maintenance} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'stocks'}><${Stocks} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'actions'}><${ActionHub} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout}/></${Page}>
+      <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab}/></${Page}>
 
       <div class="tabbar">
         <${TabBtn} icon="home" label="Home" active=${tab === 'home'} onClick=${() => setTab('home')} />
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} />
-        <${TabBtn} icon="people" label="People" active=${tab === 'people'} onClick=${() => setTab('people')} />
-        <${TabBtn} icon="more" label="More" active=${tab === 'more'} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
     </div>
   `;
@@ -622,7 +698,7 @@ function TabBtn({ icon, label, active, onClick }) {
 
 // ============= HOME =============
 function Home({ plant, me, setTab, reload }) {
-  const [stats, setStats] = useState({ units: 0, users: 1, machines: 0, dies: 0, shotsToday: 0, openActions: 0 });
+  const [stats, setStats] = useState({ units: 0, users: 1, machines: 0, dies: 0, shotsToday: 0, openActions: 0, openNcrs: 0, openBreakdowns: 0, lowStock: 0 });
   const [loading, setLoading] = useState(true);
 
   useEffect(() => { loadStats(); }, []);
@@ -630,13 +706,16 @@ function Home({ plant, me, setTab, reload }) {
   const loadStats = async () => {
     setLoading(true);
     const today = new Date(); today.setHours(0,0,0,0);
-    const [u, us, m, d, s, a] = await Promise.all([
+    const [u, us, m, d, s, a, n, b, st] = await Promise.all([
       sb.from('units').select('id', { count:'exact', head:true }),
       sb.from('users').select('id', { count:'exact', head:true }),
       sb.from('mcp_pdc_machines').select('id', { count:'exact', head:true }),
       sb.from('mcp_pdc_dies').select('id', { count:'exact', head:true }),
       sb.from('mcp_pdc_shots').select('id', { count:'exact', head:true }).gte('recorded_at', today.toISOString()),
       sb.from('actions').select('id', { count:'exact', head:true }).eq('status', 'open'),
+      sb.from('mcp_quality_ncrs').select('id', { count:'exact', head:true }).neq('status', 'closed').neq('status', 'cancelled'),
+      sb.from('mcp_maintenance_breakdowns').select('id', { count:'exact', head:true }).neq('status', 'resolved').neq('status', 'cancelled'),
+      sb.from('mcp_stocks_items').select('id', { count:'exact', head:true }).filter('current_qty', 'lte', 'reorder_level'),
     ]);
     setStats({
       units: u.count || 0,
@@ -645,6 +724,9 @@ function Home({ plant, me, setTab, reload }) {
       dies: d.count || 0,
       shotsToday: s.count || 0,
       openActions: a.count || 0,
+      openNcrs: n.count || 0,
+      openBreakdowns: b.count || 0,
+      lowStock: st.count || 0,
     });
     setLoading(false);
   };
@@ -658,6 +740,7 @@ function Home({ plant, me, setTab, reload }) {
   ];
   const setupComplete = setupSteps.every(s => s.done);
   const greeting = me.full_name.split(' ')[0];
+  const alerts = stats.openNcrs + stats.openBreakdowns + stats.lowStock;
 
   return html`
     <div class="page-header">
@@ -673,7 +756,7 @@ function Home({ plant, me, setTab, reload }) {
       <div class="pulse-grid">
         <div class="pulse-stat"><div class="pulse-stat-num">${stats.shotsToday}</div><div class="pulse-stat-label">Shots Today</div></div>
         <div class="pulse-stat"><div class="pulse-stat-num">${stats.machines}</div><div class="pulse-stat-label">Machines</div></div>
-        <div class="pulse-stat"><div class="pulse-stat-num">${stats.openActions}</div><div class="pulse-stat-label">Open Actions</div></div>
+        <div class="pulse-stat"><div class="pulse-stat-num">${alerts}</div><div class="pulse-stat-label">Alerts</div></div>
       </div>
     </div>
 
@@ -687,6 +770,43 @@ function Home({ plant, me, setTab, reload }) {
           </div>
         `)}
       </div>
+    `}
+
+    ${alerts > 0 && html`
+      <div class="section-h">Needs attention</div>
+      ${stats.openNcrs > 0 && html`
+        <div class="list-item" onClick=${() => setTab('quality')}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${stats.openNcrs} open NCR${stats.openNcrs > 1 ? 's' : ''}</div>
+              <div class="list-item-sub">Tap to investigate</div>
+            </div>
+            <span class="badge rose">Quality</span>
+          </div>
+        </div>
+      `}
+      ${stats.openBreakdowns > 0 && html`
+        <div class="list-item" onClick=${() => setTab('maintenance')}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${stats.openBreakdowns} active breakdown${stats.openBreakdowns > 1 ? 's' : ''}</div>
+              <div class="list-item-sub">Tap to resolve</div>
+            </div>
+            <span class="badge amber">Maintenance</span>
+          </div>
+        </div>
+      `}
+      ${stats.lowStock > 0 && html`
+        <div class="list-item" onClick=${() => setTab('stocks')}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${stats.lowStock} item${stats.lowStock > 1 ? 's' : ''} low on stock</div>
+              <div class="list-item-sub">Tap to reorder</div>
+            </div>
+            <span class="badge amber">Stocks</span>
+          </div>
+        </div>
+      `}
     `}
 
     <div class="section-h">Quick Stats</div>
@@ -1501,36 +1621,758 @@ function InviteViewModal({ invite, onClose, onCancel }) {
   `;
 }
 
-// ============= MORE =============
-function More({ plant, me, user, logout }) {
+// ============= MORE (navigator) =============
+function More({ plant, me, user, logout, setTab }) {
+  const navItems = [
+    { key:'people', icon:'👥', label:'People · Units, Team, Shifts', sub:'Manage team, units, shifts' },
+    { key:'maintenance', icon:'🔧', label:'Maintenance', sub:'Breakdowns, machine status' },
+    { key:'stocks', icon:'📦', label:'Stocks', sub:'Inventory, items, transactions' },
+    { key:'actions', icon:'✓', label:'Action Hub', sub:'All open commitments' },
+  ];
+
   return html`
-    <div class="page-header"><div><h1>More</h1><div class="sub">Account, settings</div></div></div>
+    <div class="page-header"><div><h1>More</h1><div class="sub">Modules, account, settings</div></div></div>
+
+    <div class="section-h">Modules</div>
+    ${navItems.map(it => html`
+      <div class="list-item" key=${it.key} onClick=${() => setTab(it.key)}>
+        <div class="list-item-row">
+          <div class="list-item-main">
+            <div class="list-item-title">${it.icon}  ${it.label}</div>
+            <div class="list-item-sub">${it.sub}</div>
+          </div>
+          <span style="color:var(--slate-400);font-size:18px">›</span>
+        </div>
+      </div>
+    `)}
+
+    <div class="section-h">Account</div>
     <div class="card">
-      <div class="card-title">Account</div>
       <div class="card-row"><span class="label">Name</span><span class="value">${me.full_name}</span></div>
       <div class="card-row"><span class="label">Email</span><span class="value">${user.email}</span></div>
       <div class="card-row"><span class="label">Phone</span><span class="value mono">${me.phone}</span></div>
       <div class="card-row"><span class="label">Role</span><span class="value"><span class="badge teal">${me.role}</span></span></div>
     </div>
 
+    <div class="section-h">Plant</div>
     <div class="card">
-      <div class="card-title">Plant</div>
       <div class="card-row"><span class="label">Name</span><span class="value">${plant.name}</span></div>
       <div class="card-row"><span class="label">City</span><span class="value">${plant.city}</span></div>
       <div class="card-row"><span class="label">GSTIN</span><span class="value mono">${plant.gstin || '—'}</span></div>
       <div class="card-row"><span class="label">IATF</span><span class="value">${plant.iatf_certified ? html`<span class="badge emerald">Yes</span>` : 'No'}</span></div>
       <div class="card-row"><span class="label">Tier</span><span class="value"><span class="badge teal">${plant.subscription_tier.toUpperCase()}</span></span></div>
-      <div class="card-row"><span class="label">MCPs Installed</span><span class="value">${(plant.installed_mcps || []).length}</span></div>
     </div>
 
-    <div class="card" style="background:var(--slate-50)">
-      <div class="card-title">About this build</div>
-      <p style="font-size:13px;color:var(--slate-600);line-height:1.6">
-        <strong>Loglinkr Block 1</strong> — base structure + Production-PDC MCP. Quality, Maintenance, Stocks, Logistics modules come in subsequent blocks. AI chat parsing, OCR, and Pulse layer wire-up come in Block 1.5.
-      </p>
+    ${me.role === 'plant_head' || me.role === 'admin' ? html`
+      <div class="section-h">Compliance</div>
+      <${AuditLogViewer} plant=${plant} />
+    ` : ''}
+
+    <button class="btn danger" style="margin-top:14px" onClick=${logout}>Log out</button>
+  `;
+}
+
+// ============= AUDIT LOG VIEWER =============
+function AuditLogViewer({ plant }) {
+  const [logs, setLogs] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [open, setOpen] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    const { data } = await sb.from('audit_log').select('*, users:user_id(full_name)').order('created_at', { ascending:false }).limit(100);
+    setLogs(data || []);
+    setLoading(false);
+  };
+
+  useEffect(() => { if (open) load(); }, [open]);
+
+  return html`
+    <div class="card">
+      <div class="card-title" onClick=${() => setOpen(!open)} style="cursor:pointer">
+        Audit Log <span style="color:var(--slate-400);font-size:14px">${open ? '▼' : '›'}</span>
+      </div>
+      ${open && html`
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+          logs.length === 0 ? html`<div class="empty"><div style="font-size:13px">No audit entries yet</div></div>` :
+          html`<div style="max-height:380px;overflow-y:auto;margin-top:8px">
+            ${logs.map(l => html`
+              <div style="padding:8px 0;border-top:1px solid var(--slate-100);font-size:12px" key=${l.id}>
+                <div style="display:flex;justify-content:space-between;gap:8px">
+                  <div>
+                    <span class="badge ${l.action === 'insert' ? 'emerald' : l.action === 'delete' ? 'rose' : 'amber'}">${l.action}</span>
+                    <span style="margin-left:6px;color:var(--slate-700)">${l.table_name}</span>
+                  </div>
+                  <span style="color:var(--slate-400)">${fmtDate(l.created_at)}</span>
+                </div>
+                <div style="color:var(--slate-500);margin-top:2px">${l.users?.full_name || 'system'}</div>
+              </div>
+            `)}
+          </div>`
+        }
+      `}
+    </div>
+  `;
+}
+
+// ============= QUALITY (NCRs) =============
+function Quality({ plant, me }) {
+  const [ncrs, setNcrs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [modal, setModal] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+  const [filter, setFilter] = useState('open');
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    let q = sb.from('mcp_quality_ncrs').select('*, raised_by_user:raised_by(full_name), assigned_to_user:assigned_to(full_name)').order('created_at', { ascending:false });
+    if (filter === 'open') q = q.neq('status', 'closed').neq('status', 'cancelled');
+    else if (filter === 'closed') q = q.eq('status', 'closed');
+    const { data } = await q.limit(100);
+    setNcrs(data || []);
+    setLoading(false);
+  }, [filter]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const openCount = ncrs.filter(n => n.status !== 'closed' && n.status !== 'cancelled').length;
+  const criticalCount = ncrs.filter(n => n.severity === 'critical' && n.status !== 'closed').length;
+
+  return html`
+    <div class="page-header"><div><h1>Quality</h1><div class="sub">NCRs and IATF records</div></div></div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stat ${openCount > 0 ? 'amber' : 'teal'}"><div class="stat-num">${openCount}</div><div class="stat-label">Open</div></div>
+      <div class="stat rose"><div class="stat-num">${criticalCount}</div><div class="stat-label">Critical</div></div>
+      <div class="stat teal"><div class="stat-num">${ncrs.filter(n => n.status === 'closed').length}</div><div class="stat-label">Closed</div></div>
     </div>
 
-    <button class="btn danger" onClick=${logout}>Log out</button>
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (filter === 'open' ? ' active' : '')} onClick=${() => setFilter('open')}>Open</button>
+      <button class=${'auth-tab' + (filter === 'closed' ? ' active' : '')} onClick=${() => setFilter('closed')}>Closed</button>
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
+    </div>
+
+    <div class="section-h">NCRs · ${ncrs.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('ncr'); }}>+ Raise NCR</button></div>
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      ncrs.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✓</div>No NCRs in this filter</div></div>` :
+      ncrs.map(n => html`
+        <div class="list-item" key=${n.id} onClick=${() => { setEditTarget(n); setModal('ncr'); }}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${n.ncr_number} · ${n.title}</div>
+              <div class="list-item-sub">${n.part_number || ''} ${n.qty_affected ? '· ' + n.qty_affected + ' pcs' : ''} · ${n.raised_by_user?.full_name || '?'}</div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+              <span class=${'badge ' + (n.severity === 'critical' ? 'rose' : n.severity === 'major' ? 'amber' : '')}>${n.severity}</span>
+              <span class=${'badge ' + (n.status === 'closed' ? 'emerald' : n.status === 'open' ? 'amber' : '')}>${n.status}</span>
+            </div>
+          </div>
+        </div>
+      `)
+    }
+
+    ${modal === 'ncr' && html`<${NcrModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+  `;
+}
+
+function NcrModal({ plant, me, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget ? {...editTarget} : {
+    title:'', description:'', severity:'minor', source:'manual',
+    part_number:'', qty_affected:'', root_cause:'', corrective_action:''
+  });
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    sb.from('users').select('*').then(({ data }) => setUsers(data || []));
+  }, []);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      if (editTarget) {
+        const updates = {
+          title: form.title, description: form.description,
+          severity: form.severity, status: form.status,
+          part_number: form.part_number || null,
+          qty_affected: form.qty_affected ? parseInt(form.qty_affected) : null,
+          root_cause: form.root_cause || null,
+          corrective_action: form.corrective_action || null,
+          assigned_to: form.assigned_to || null,
+        };
+        if (form.status === 'closed' && !editTarget.closed_at) {
+          updates.closed_at = new Date().toISOString();
+          updates.closed_by = me.id;
+        }
+        const { error } = await sb.from('mcp_quality_ncrs').update(updates).eq('id', editTarget.id);
+        if (error) throw error;
+      } else {
+        const { data: existing } = await sb.from('mcp_quality_ncrs').select('id', { count:'exact', head:true });
+        const num = 'NCR-' + new Date().toISOString().slice(2,7).replace('-','') + '-' + String((existing?.count || 0) + 1).padStart(4,'0');
+        const { error } = await sb.from('mcp_quality_ncrs').insert({
+          plant_id: plant.id,
+          ncr_number: num,
+          source: form.source || 'manual',
+          title: form.title,
+          description: form.description || null,
+          severity: form.severity,
+          raised_by: me.id,
+          assigned_to: form.assigned_to || null,
+          part_number: form.part_number || null,
+          qty_affected: form.qty_affected ? parseInt(form.qty_affected) : null,
+        });
+        if (error) throw error;
+      }
+      showToast(editTarget ? 'NCR updated' : 'NCR raised');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? editTarget.ncr_number : 'Raise NCR'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Title *</label><input type="text" required value=${form.title} onChange=${e => setForm({...form, title: e.target.value})} placeholder="Surface defect on filterhead" /></div>
+          <div class="field"><label>Description</label><textarea rows=${3} value=${form.description || ''} onChange=${e => setForm({...form, description: e.target.value})}></textarea></div>
+          <div class="field-row">
+            <div class="field"><label>Part Number</label><input type="text" value=${form.part_number || ''} onChange=${e => setForm({...form, part_number: e.target.value})} /></div>
+            <div class="field"><label>Qty Affected</label><input type="number" value=${form.qty_affected || ''} onChange=${e => setForm({...form, qty_affected: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Severity</label>
+            <select value=${form.severity} onChange=${e => setForm({...form, severity: e.target.value})}>
+              <option value="minor">Minor</option><option value="major">Major</option><option value="critical">Critical</option>
+            </select>
+          </div>
+          <div class="field"><label>Assigned To</label>
+            <select value=${form.assigned_to || ''} onChange=${e => setForm({...form, assigned_to: e.target.value})}>
+              <option value="">— Unassigned —</option>
+              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+            </select>
+          </div>
+          ${editTarget && html`
+            <div class="field"><label>Status</label>
+              <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
+                <option value="open">Open</option><option value="investigation">Investigation</option>
+                <option value="containment">Containment</option><option value="corrective_action">Corrective Action</option>
+                <option value="verification">Verification</option><option value="closed">Closed</option>
+                <option value="cancelled">Cancelled</option>
+              </select>
+            </div>
+            <div class="field"><label>Root Cause</label><textarea rows=${2} value=${form.root_cause || ''} onChange=${e => setForm({...form, root_cause: e.target.value})}></textarea></div>
+            <div class="field"><label>Corrective Action</label><textarea rows=${2} value=${form.corrective_action || ''} onChange=${e => setForm({...form, corrective_action: e.target.value})}></textarea></div>
+          `}
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update NCR' : 'Raise NCR')}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= MAINTENANCE =============
+function Maintenance({ plant, me }) {
+  const [breakdowns, setBreakdowns] = useState([]);
+  const [machines, setMachines] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [modal, setModal] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState('open');
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    let q = sb.from('mcp_maintenance_breakdowns').select('*, mcp_pdc_machines(code), reported_by_user:reported_by(full_name), attended_by_user:attended_by(full_name)').order('reported_at', { ascending:false });
+    if (filter === 'open') q = q.neq('status', 'resolved').neq('status', 'cancelled');
+    else if (filter === 'resolved') q = q.eq('status', 'resolved');
+    const [b, m, u] = await Promise.all([
+      q.limit(100),
+      sb.from('mcp_pdc_machines').select('*').order('code'),
+      sb.from('users').select('*').order('full_name')
+    ]);
+    setBreakdowns(b.data || []);
+    setMachines(m.data || []);
+    setUsers(u.data || []);
+    setLoading(false);
+  }, [filter]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const openCount = breakdowns.filter(b => b.status !== 'resolved' && b.status !== 'cancelled').length;
+  const machinesDown = machines.filter(m => m.status === 'breakdown').length;
+
+  return html`
+    <div class="page-header"><div><h1>Maintenance</h1><div class="sub">Breakdowns, machine status</div></div></div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stat ${openCount > 0 ? 'rose' : 'teal'}"><div class="stat-num">${openCount}</div><div class="stat-label">Active</div></div>
+      <div class="stat ${machinesDown > 0 ? 'rose' : 'teal'}"><div class="stat-num">${machinesDown}</div><div class="stat-label">Machines Down</div></div>
+      <div class="stat teal"><div class="stat-num">${breakdowns.filter(b => b.status === 'resolved').length}</div><div class="stat-label">Resolved</div></div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (filter === 'open' ? ' active' : '')} onClick=${() => setFilter('open')}>Active</button>
+      <button class=${'auth-tab' + (filter === 'resolved' ? ' active' : '')} onClick=${() => setFilter('resolved')}>Resolved</button>
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
+    </div>
+
+    <div class="section-h">Breakdowns · ${breakdowns.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('breakdown'); }} disabled=${machines.length === 0}>+ Report</button></div>
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      breakdowns.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✓</div>No breakdowns ${machines.length === 0 ? '— add machines first' : ''}</div></div>` :
+      breakdowns.map(b => html`
+        <div class="list-item" key=${b.id} onClick=${() => { setEditTarget(b); setModal('breakdown'); }}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${b.mcp_pdc_machines?.code || 'unknown'} · ${b.description.slice(0,50)}</div>
+              <div class="list-item-sub">By ${b.reported_by_user?.full_name || '?'}${b.attended_by_user ? ' · attended by ' + b.attended_by_user.full_name : ''} · ${fmtDate(b.reported_at)}</div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+              <span class=${'badge ' + (b.status === 'resolved' ? 'emerald' : b.status === 'attended' ? 'amber' : 'rose')}>${b.status}</span>
+              ${b.downtime_minutes && html`<span style="font-size:10px;color:var(--slate-500)">${b.downtime_minutes}m down</span>`}
+            </div>
+          </div>
+        </div>
+      `)
+    }
+
+    <div class="section-h">Machine Status</div>
+    ${machines.map(m => html`
+      <div class="list-item" key=${m.id}>
+        <div class="list-item-row">
+          <div class="list-item-main">
+            <div class="list-item-title">${m.code} · ${m.make || ''} ${m.tonnage ? '· ' + m.tonnage + 'T' : ''}</div>
+          </div>
+          <span class=${'badge ' + (m.status === 'running' ? 'emerald' : m.status === 'breakdown' ? 'rose' : m.status === 'maintenance' ? 'amber' : '')}>${m.status}</span>
+        </div>
+      </div>
+    `)}
+
+    ${modal === 'breakdown' && html`<${BreakdownModal} plant=${plant} me=${me} machines=${machines} users=${users} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+  `;
+}
+
+function BreakdownModal({ plant, me, machines, users, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget ? {...editTarget} : {
+    machine_id: machines[0]?.id || '',
+    description: '',
+    status: 'open',
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      if (editTarget) {
+        const updates = {
+          description: form.description,
+          status: form.status,
+          attended_by: form.attended_by || null,
+          resolution_notes: form.resolution_notes || null,
+        };
+        if (form.status === 'attended' && !editTarget.attended_at) {
+          updates.attended_at = new Date().toISOString();
+          if (!form.attended_by) updates.attended_by = me.id;
+        }
+        if (form.status === 'resolved' && !editTarget.resolved_at) {
+          updates.resolved_at = new Date().toISOString();
+          if (!editTarget.attended_at) updates.attended_at = new Date().toISOString();
+        }
+        const { error } = await sb.from('mcp_maintenance_breakdowns').update(updates).eq('id', editTarget.id);
+        if (error) throw error;
+      } else {
+        const { error } = await sb.from('mcp_maintenance_breakdowns').insert({
+          plant_id: plant.id,
+          machine_id: form.machine_id,
+          description: form.description,
+          reported_by: me.id,
+          status: 'open',
+        });
+        if (error) throw error;
+      }
+      showToast(editTarget ? 'Updated' : 'Breakdown reported');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Update Breakdown' : 'Report Breakdown'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Machine *</label>
+            <select required value=${form.machine_id} onChange=${e => setForm({...form, machine_id: e.target.value})}>
+              ${machines.map(m => html`<option key=${m.id} value=${m.id}>${m.code}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Description *</label><textarea required rows=${3} value=${form.description} onChange=${e => setForm({...form, description: e.target.value})} placeholder="Hydraulic leak, machine stopped" /></div>
+          ${editTarget && html`
+            <div class="field"><label>Status</label>
+              <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
+                <option value="open">Open</option><option value="attended">Attended</option>
+                <option value="resolved">Resolved</option><option value="cancelled">Cancelled</option>
+              </select>
+            </div>
+            <div class="field"><label>Attended By</label>
+              <select value=${form.attended_by || ''} onChange=${e => setForm({...form, attended_by: e.target.value})}>
+                <option value="">— None —</option>
+                ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+              </select>
+            </div>
+            <div class="field"><label>Resolution Notes</label><textarea rows=${2} value=${form.resolution_notes || ''} onChange=${e => setForm({...form, resolution_notes: e.target.value})}></textarea></div>
+          `}
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Report')}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= STOCKS =============
+function Stocks({ plant, me }) {
+  const [items, setItems] = useState([]);
+  const [transactions, setTransactions] = useState([]);
+  const [view, setView] = useState('items');
+  const [modal, setModal] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [i, t] = await Promise.all([
+      sb.from('mcp_stocks_items').select('*').order('name'),
+      sb.from('mcp_stocks_transactions').select('*, mcp_stocks_items(code,name,uom), users:performed_by(full_name)').order('created_at', { ascending:false }).limit(50),
+    ]);
+    setItems(i.data || []);
+    setTransactions(t.data || []);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const lowStockCount = items.filter(i => i.reorder_level && i.current_qty <= i.reorder_level).length;
+
+  return html`
+    <div class="page-header"><div><h1>Stocks</h1><div class="sub">Items, GRN, issues</div></div></div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stat teal"><div class="stat-num">${items.length}</div><div class="stat-label">Items</div></div>
+      <div class="stat ${lowStockCount > 0 ? 'amber' : 'teal'}"><div class="stat-num">${lowStockCount}</div><div class="stat-label">Low</div></div>
+      <div class="stat teal"><div class="stat-num">${transactions.length}</div><div class="stat-label">Recent Txns</div></div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (view === 'items' ? ' active' : '')} onClick=${() => setView('items')}>Items</button>
+      <button class=${'auth-tab' + (view === 'transactions' ? ' active' : '')} onClick=${() => setView('transactions')}>Transactions</button>
+    </div>
+
+    ${view === 'items' && html`
+      <div class="section-h">Items · ${items.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('item'); }}>+ Add</button></div>
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        items.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📦</div>No items yet</div></div>` :
+        items.map(i => {
+          const isLow = i.reorder_level && i.current_qty <= i.reorder_level;
+          return html`
+            <div class="list-item" key=${i.id} onClick=${() => { setEditTarget(i); setModal('item'); }}>
+              <div class="list-item-row">
+                <div class="list-item-main">
+                  <div class="list-item-title">${i.code} · ${i.name}</div>
+                  <div class="list-item-sub">${i.category || 'general'} ${i.reorder_level ? '· reorder at ' + i.reorder_level + ' ' + i.uom : ''}</div>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                  <span class=${'badge ' + (isLow ? 'rose' : 'emerald')}>${fmtNum(i.current_qty)} ${i.uom}</span>
+                  <button class="btn small ghost" onClick=${(e) => { e.stopPropagation(); setEditTarget(i); setModal('txn'); }}>Txn</button>
+                </div>
+              </div>
+            </div>
+          `;
+        })
+      }
+    `}
+
+    ${view === 'transactions' && html`
+      <div class="section-h">Recent Transactions · ${transactions.length}</div>
+      ${transactions.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📋</div>No transactions yet</div></div>` :
+        transactions.map(t => html`
+          <div class="list-item" key=${t.id}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${t.mcp_stocks_items?.code || '?'} · ${t.mcp_stocks_items?.name || ''}</div>
+                <div class="list-item-sub">${t.users?.full_name || '?'} · ${t.reference || ''} · ${fmtDate(t.created_at)}</div>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                <span class=${'badge ' + (['grn','return','adjustment'].includes(t.txn_type) ? 'emerald' : 'rose')}>${t.txn_type} ${['grn','return','adjustment'].includes(t.txn_type) ? '+' : '-'}${fmtNum(t.qty)}</span>
+                <span style="font-size:10px;color:var(--slate-500)">→ ${fmtNum(t.qty_after || 0)}</span>
+              </div>
+            </div>
+          </div>
+        `)
+      }
+    `}
+
+    ${modal === 'item' && html`<${ItemModal} plant=${plant} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'txn' && html`<${TxnModal} plant=${plant} me=${me} item=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+  `;
+}
+
+function ItemModal({ plant, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget || { code:'', name:'', category:'general', uom:'nos', current_qty:0, reorder_level:'', unit_cost:'' });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        code: form.code, name: form.name,
+        category: form.category || 'general',
+        uom: form.uom,
+        current_qty: parseFloat(form.current_qty) || 0,
+        reorder_level: form.reorder_level ? parseFloat(form.reorder_level) : null,
+        unit_cost: form.unit_cost ? parseFloat(form.unit_cost) : null,
+      };
+      const { error } = editTarget
+        ? await sb.from('mcp_stocks_items').update(payload).eq('id', editTarget.id)
+        : await sb.from('mcp_stocks_items').insert(payload);
+      if (error) throw error;
+      showToast(editTarget ? 'Item updated' : 'Item added');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Edit' : 'Add'} Item</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Code *</label><input type="text" required value=${form.code} onChange=${e => setForm({...form, code: e.target.value})} placeholder="ALU-ADC12" /></div>
+            <div class="field"><label>UOM</label>
+              <select value=${form.uom} onChange=${e => setForm({...form, uom: e.target.value})}>
+                <option value="nos">Nos</option><option value="kg">Kg</option><option value="ltr">Ltr</option>
+                <option value="mtr">Mtr</option><option value="set">Set</option><option value="box">Box</option>
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} placeholder="Aluminum ADC-12 ingots" /></div>
+          <div class="field"><label>Category</label>
+            <select value=${form.category} onChange=${e => setForm({...form, category: e.target.value})}>
+              <option value="raw_material">Raw Material</option>
+              <option value="die_spares">Die Spares</option>
+              <option value="consumables">Consumables</option>
+              <option value="tools">Tools</option>
+              <option value="general">General</option>
+            </select>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Current Qty</label><input type="number" step="0.001" value=${form.current_qty} onChange=${e => setForm({...form, current_qty: e.target.value})} /></div>
+            <div class="field"><label>Reorder Level</label><input type="number" step="0.001" value=${form.reorder_level || ''} onChange=${e => setForm({...form, reorder_level: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Unit Cost (₹)</label><input type="number" step="0.01" value=${form.unit_cost || ''} onChange=${e => setForm({...form, unit_cost: e.target.value})} /></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function TxnModal({ plant, me, item, onClose, onSaved }) {
+  const [form, setForm] = useState({ txn_type:'grn', qty:'', reference:'', notes:'' });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const { error } = await sb.from('mcp_stocks_transactions').insert({
+        plant_id: plant.id,
+        item_id: item.id,
+        txn_type: form.txn_type,
+        qty: parseFloat(form.qty),
+        reference: form.reference || null,
+        notes: form.notes || null,
+        performed_by: me.id,
+      });
+      if (error) throw error;
+      showToast('Transaction recorded');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${item.code} · Transaction</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card" style="background:var(--slate-50);margin-bottom:14px">
+          <div class="card-row"><span class="label">Item</span><span class="value">${item.name}</span></div>
+          <div class="card-row"><span class="label">Current</span><span class="value">${fmtNum(item.current_qty)} ${item.uom}</span></div>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Type *</label>
+            <select required value=${form.txn_type} onChange=${e => setForm({...form, txn_type: e.target.value})}>
+              <option value="grn">GRN (receive)</option>
+              <option value="issue">Issue (out)</option>
+              <option value="return">Return (in)</option>
+              <option value="consumption">Consumption</option>
+              <option value="adjustment">Adjustment</option>
+            </select>
+          </div>
+          <div class="field"><label>Quantity * (${item.uom})</label><input type="number" step="0.001" required value=${form.qty} onChange=${e => setForm({...form, qty: e.target.value})} /></div>
+          <div class="field"><label>Reference</label><input type="text" value=${form.reference} onChange=${e => setForm({...form, reference: e.target.value})} placeholder="GRN# / DC# / etc" /></div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : 'Record'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= ACTION HUB =============
+function ActionHub({ plant, me }) {
+  const [actions, setActions] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [filter, setFilter] = useState('open');
+  const [modal, setModal] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    let q = sb.from('actions').select('*, owner_user:owner_id(full_name), assigner:assigned_by(full_name)').order('created_at', { ascending:false });
+    if (filter === 'open') q = q.in('status', ['open','in_progress']);
+    else if (filter === 'mine') q = q.eq('owner_id', me.id);
+    else if (filter === 'completed') q = q.eq('status', 'completed');
+    const [a, u] = await Promise.all([q.limit(100), sb.from('users').select('*')]);
+    setActions(a.data || []);
+    setUsers(u.data || []);
+    setLoading(false);
+  }, [filter, me.id]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const myOpen = actions.filter(a => a.owner_id === me.id && (a.status === 'open' || a.status === 'in_progress')).length;
+
+  return html`
+    <div class="page-header"><div><h1>Action Hub</h1><div class="sub">All open commitments</div></div></div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stat ${myOpen > 0 ? 'amber' : 'teal'}"><div class="stat-num">${myOpen}</div><div class="stat-label">Mine Open</div></div>
+      <div class="stat teal"><div class="stat-num">${actions.filter(a => a.status === 'open' || a.status === 'in_progress').length}</div><div class="stat-label">All Open</div></div>
+      <div class="stat teal"><div class="stat-num">${actions.filter(a => a.status === 'completed').length}</div><div class="stat-label">Completed</div></div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (filter === 'open' ? ' active' : '')} onClick=${() => setFilter('open')}>All Open</button>
+      <button class=${'auth-tab' + (filter === 'mine' ? ' active' : '')} onClick=${() => setFilter('mine')}>Mine</button>
+      <button class=${'auth-tab' + (filter === 'completed' ? ' active' : '')} onClick=${() => setFilter('completed')}>Done</button>
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
+    </div>
+
+    <div class="section-h">Actions · ${actions.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('action'); }}>+ Add</button></div>
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      actions.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✓</div>No actions in this filter</div></div>` :
+      actions.map(a => html`
+        <div class="list-item" key=${a.id} onClick=${() => { setEditTarget(a); setModal('action'); }}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${a.title}</div>
+              <div class="list-item-sub">${a.source_type} · ${a.owner_user?.full_name || 'unassigned'} ${a.due_at ? '· due ' + fmtDate(a.due_at) : ''}</div>
+            </div>
+            <span class=${'badge ' + (a.status === 'completed' ? 'emerald' : a.status === 'cancelled' ? '' : 'amber')}>${a.status}</span>
+          </div>
+        </div>
+      `)
+    }
+
+    ${modal === 'action' && html`<${ActionModal} plant=${plant} me=${me} users=${users} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+  `;
+}
+
+function ActionModal({ plant, me, users, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget ? {...editTarget, due_at: editTarget.due_at ? editTarget.due_at.slice(0,16) : ''} : {
+    title:'', description:'', owner_id:'', due_at:'', source_type:'manual'
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        source_type: form.source_type,
+        title: form.title,
+        description: form.description || null,
+        owner_id: form.owner_id || null,
+        assigned_by: me.id,
+        due_at: form.due_at ? new Date(form.due_at).toISOString() : null,
+        status: form.status || 'open',
+      };
+      if (form.status === 'completed' && !editTarget?.completed_at) {
+        payload.completed_at = new Date().toISOString();
+      }
+      const { error } = editTarget
+        ? await sb.from('actions').update(payload).eq('id', editTarget.id)
+        : await sb.from('actions').insert(payload);
+      if (error) throw error;
+      showToast(editTarget ? 'Action updated' : 'Action added');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Edit Action' : 'Add Action'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Title *</label><input type="text" required value=${form.title} onChange=${e => setForm({...form, title: e.target.value})} placeholder="Order new corepins" /></div>
+          <div class="field"><label>Description</label><textarea rows=${2} value=${form.description || ''} onChange=${e => setForm({...form, description: e.target.value})}></textarea></div>
+          <div class="field"><label>Owner</label>
+            <select value=${form.owner_id || ''} onChange=${e => setForm({...form, owner_id: e.target.value})}>
+              <option value="">— Unassigned —</option>
+              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Due Date</label><input type="datetime-local" value=${form.due_at} onChange=${e => setForm({...form, due_at: e.target.value})} /></div>
+          ${editTarget && html`
+            <div class="field"><label>Status</label>
+              <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
+                <option value="open">Open</option><option value="in_progress">In Progress</option>
+                <option value="completed">Completed</option><option value="cancelled">Cancelled</option>
+              </select>
+            </div>
+          `}
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
+        </form>
+      </div>
+    </div>
   `;
 }
 
