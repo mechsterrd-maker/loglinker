@@ -4604,16 +4604,20 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
   const [doc, setDoc] = useState(isNew ? null : initialDoc);
   const [payments, setPayments] = useState([]);
   const [paymentModal, setPaymentModal] = useState(false);
+  const [grnModal, setGrnModal] = useState(false);
+  const [grnReception, setGrnReception] = useState(null);
   const [editing, setEditing] = useState(isNew);
 
   const refresh = useCallback(async () => {
     if (isNew || !doc?.id) return;
-    const [d, p] = await Promise.all([
+    const [d, p, g] = await Promise.all([
       sb.from('mcp_logistics_documents').select('*, mcp_logistics_vendors(name, gstin)').eq('id', doc.id).maybeSingle(),
       sb.from('mcp_logistics_payments').select('*, users:recorded_by(full_name)').eq('doc_id', doc.id).order('payment_date', { ascending: false }),
+      sb.from('mcp_logistics_grn_receptions').select('*, users:received_by(full_name), mcp_quality_ncrs(ncr_number), actions(title, status)').eq('doc_id', doc.id).maybeSingle(),
     ]);
     if (d.data) setDoc(d.data);
     setPayments(p.data || []);
+    setGrnReception(g.data);
   }, [doc?.id, isNew]);
 
   useEffect(() => { refresh(); }, [refresh]);
@@ -4674,6 +4678,30 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       <div class="alert info" style="margin-top:14px"><strong>AI Note:</strong> ${doc.validation_note}</div>
     `}
 
+    ${['invoice_in','dc_in','job_work_dc_in','bill'].includes(doc.doc_type) && html`
+      <div class="section-h">Inward / Stock</div>
+      ${grnReception ? html`
+        <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200)">
+          <div style="font-weight:700;color:var(--emerald-700);margin-bottom:8px">✅ Stock received</div>
+          <div class="card-row" style="border:none;padding:4px 0"><span class="label">Received by</span><span class="value">${grnReception.users?.full_name || '?'}</span></div>
+          <div class="card-row" style="border:none;padding:4px 0"><span class="label">When</span><span class="value">${fmtDate(grnReception.received_at)}</span></div>
+          ${grnReception.shortage_detected && html`
+            <div class="card-row" style="border:none;padding:4px 0"><span class="label">Shortage</span><span class="value" style="color:var(--rose-500);font-weight:700">⚠️ ${grnReception.shortage_pct?.toFixed(1)}%</span></div>
+            ${grnReception.mcp_quality_ncrs && html`<div class="card-row" style="border:none;padding:4px 0"><span class="label">NCR</span><span class="value mono">${grnReception.mcp_quality_ncrs.ncr_number}</span></div>`}
+            ${grnReception.actions && html`<div class="card-row" style="border:none;padding:4px 0"><span class="label">Follow-up</span><span class="value">${grnReception.actions.status} · ${grnReception.actions.title}</span></div>`}
+          `}
+        </div>
+      ` : items.length > 0 ? html`
+        <div class="card" style="background:var(--teal-50);border-color:var(--teal-200)">
+          <div style="font-weight:700;color:var(--teal-700);margin-bottom:6px">📦 Ready to receive into stock</div>
+          <div style="font-size:13px;color:var(--slate-700);margin-bottom:10px">${items.length} item line${items.length > 1 ? 's' : ''} extracted. Confirm physical receipt and add to stock.</div>
+          <button class="btn" onClick=${() => setGrnModal(true)}>📥 Receive into stock</button>
+        </div>
+      ` : html`
+        <div class="empty"><div style="font-size:13px">No items extracted from invoice yet. Edit document to add items manually before receiving.</div></div>
+      `}
+    `}
+
     ${items.length > 0 && html`
       <div class="section-h">Items · ${items.length}</div>
       ${items.map((it, i) => html`
@@ -4709,6 +4737,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     `}
 
     ${paymentModal && html`<${PaymentModal} plant=${plant} me=${me} doc=${doc} balance=${balance} onClose=${() => setPaymentModal(false)} onSaved=${() => { setPaymentModal(false); refresh(); }} />`}
+    ${grnModal && html`<${GrnReceptionModal} plant=${plant} me=${me} doc=${doc} onClose=${() => setGrnModal(false)} onSaved=${() => { setGrnModal(false); refresh(); }} />`}
   `;
 }
 
@@ -5374,6 +5403,290 @@ function StageOverrideModal({ plant, me, entry, onClose, onSaved }) {
             <button class="btn danger" disabled=${loading}>${loading ? 'Unlocking…' : 'Unlock + broadcast'}</button>
           </form>
         `}
+      </div>
+    </div>
+  `;
+}
+
+// ============= GRN RECEPTION MODAL — verify mappings, edit qty, accept into stock =============
+function GrnReceptionModal({ plant, me, doc, onClose, onSaved }) {
+  const [lines, setLines] = useState([]);
+  const [stockItems, setStockItems] = useState([]);
+  const [notes, setNotes] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+  const [createItemModal, setCreateItemModal] = useState(null); // line index when creating new item
+
+  // Load suggested mappings + all stock items
+  useEffect(() => { load(); }, []);
+
+  const load = async () => {
+    setLoading(true);
+    const [s, m] = await Promise.all([
+      sb.rpc('suggest_grn_mappings', { p_doc_id: doc.id }),
+      sb.from('mcp_stocks_items').select('*').order('name'),
+    ]);
+    if (s.error) { setError(s.error.message); setLoading(false); return; }
+    const suggestions = s.data?.lines || [];
+    setStockItems(m.data || []);
+    setLines(suggestions.map(line => ({
+      ...line,
+      // mutable fields
+      received_qty: line.invoice_qty,
+      rejected_qty: 0,
+      reject_reason: '',
+      stock_item_id: line.matched_stock_id,
+      notes: '',
+    })));
+    setLoading(false);
+  };
+
+  const updateLine = (idx, patch) => {
+    setLines(prev => prev.map((l, i) => i === idx ? {...l, ...patch} : l));
+  };
+
+  const onCreateNewItem = (idx, newItem) => {
+    setStockItems(prev => [...prev, newItem]);
+    updateLine(idx, {
+      stock_item_id: newItem.id,
+      matched_stock_code: newItem.code,
+      matched_stock_name: newItem.name,
+      matched_stock_uom: newItem.uom,
+      match_source: 'created',
+      match_confidence: 'high',
+    });
+    setCreateItemModal(null);
+  };
+
+  const allMapped = lines.every(l => !!l.stock_item_id);
+  const totalInvoice = lines.reduce((s, l) => s + parseFloat(l.invoice_qty || 0), 0);
+  const totalReceived = lines.reduce((s, l) => s + parseFloat(l.received_qty || 0), 0);
+  const shortagePct = totalInvoice > 0 ? ((totalInvoice - totalReceived) / totalInvoice) * 100 : 0;
+  const willRaiseNcr = shortagePct > 5;
+
+  const submit = async () => {
+    setError(''); setSubmitting(true);
+    try {
+      // Validate
+      for (let i = 0; i < lines.length; i++) {
+        const l = lines[i];
+        if (!l.stock_item_id) {
+          throw new Error('Line ' + (i+1) + ' has no stock item mapped');
+        }
+        if (parseFloat(l.received_qty || 0) < 0) {
+          throw new Error('Line ' + (i+1) + ': received qty cannot be negative');
+        }
+      }
+
+      const payload = lines.map(l => ({
+        stock_item_id: l.stock_item_id,
+        vendor_item_name: l.invoice_name,
+        invoice_qty: parseFloat(l.invoice_qty || 0),
+        received_qty: parseFloat(l.received_qty || 0),
+        rejected_qty: parseFloat(l.rejected_qty || 0),
+        rate: parseFloat(l.invoice_rate || 0),
+        uom: l.invoice_uom || l.matched_stock_uom || 'nos',
+        reject_reason: l.reject_reason || null,
+        notes: l.notes || null,
+      }));
+
+      const { data, error } = await sb.rpc('accept_grn_reception', {
+        p_doc_id: doc.id,
+        p_lines: payload,
+        p_notes: notes || null,
+      });
+      if (error) throw error;
+      if (!data?.success) throw new Error(data?.error || 'Failed');
+
+      const msg = data.shortage_detected
+        ? '✅ Stock added · ⚠️ Shortage NCR ' + data.ncr_number + ' raised + follow-up task created'
+        : '✅ ' + data.lines_processed + ' line(s) added to stock';
+      showToast(msg);
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setSubmitting(false); }
+  };
+
+  if (loading) return html`
+    <div class="modal-backdrop active"><div class="modal"><div class="loader"><div class="spinner"></div></div></div></div>
+  `;
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:720px">
+        <div class="modal-header">
+          <div class="modal-title">📥 Receive into Stock</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+
+        <div class="card" style="background:var(--slate-50);margin-bottom:14px">
+          <div class="card-row"><span class="label">Vendor</span><span class="value">${doc.vendor_name_raw || '?'}</span></div>
+          <div class="card-row"><span class="label">Invoice #</span><span class="value mono">${doc.doc_number || '—'}</span></div>
+          <div class="card-row"><span class="label">Date</span><span class="value">${doc.doc_date || '—'}</span></div>
+          <div class="card-row"><span class="label">Amount</span><span class="value">₹${fmtNum(doc.total_value || 0)}</span></div>
+        </div>
+
+        ${error && html`<div class="alert error">${error}</div>`}
+
+        ${shortagePct > 5 && html`
+          <div class="alert info" style="background:var(--amber-50);border-color:var(--amber-200);color:var(--amber-700)">
+            ⚠️ Shortage detected: ${shortagePct.toFixed(1)}%. NCR + vendor follow-up task will be auto-raised on accept.
+          </div>
+        `}
+
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:var(--slate-700)">Items to receive (${lines.length})</div>
+
+        ${lines.map((line, idx) => html`
+          <div key=${idx} class="card" style="margin-bottom:10px;padding:12px">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px">
+              <div style="flex:1;min-width:0">
+                <div style="font-size:13px;font-weight:600;line-height:1.3">${line.invoice_name || '(no name)'}</div>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:2px">Invoice: ${fmtNum(line.invoice_qty)} ${line.invoice_uom} × ₹${fmtNum(line.invoice_rate)}${line.invoice_hsn ? ' · HSN ' + line.invoice_hsn : ''}</div>
+              </div>
+              ${line.match_confidence === 'high' && html`<span class="badge emerald" style="flex-shrink:0;font-size:10px">${line.match_source === 'memory' ? '🧠 Remembered' : line.match_source === 'created' ? '🆕 Created' : '✓ Match'}</span>`}
+              ${line.match_confidence === 'low' && html`<span class="badge amber" style="flex-shrink:0;font-size:10px">~ Fuzzy</span>`}
+              ${line.match_confidence === 'none' && html`<span class="badge rose" style="flex-shrink:0;font-size:10px">No match</span>`}
+            </div>
+
+            <div class="field" style="margin-bottom:8px">
+              <label style="font-size:11px">Map to stock item *</label>
+              <div style="display:flex;gap:6px">
+                <select required value=${line.stock_item_id || ''} onChange=${e => {
+                  const it = stockItems.find(s => s.id === e.target.value);
+                  updateLine(idx, {
+                    stock_item_id: e.target.value || null,
+                    matched_stock_code: it?.code,
+                    matched_stock_name: it?.name,
+                    matched_stock_uom: it?.uom,
+                    match_source: 'manual',
+                    match_confidence: e.target.value ? 'high' : 'none',
+                  });
+                }} style="flex:1">
+                  <option value="">— Pick stock item —</option>
+                  ${stockItems.map(s => html`<option key=${s.id} value=${s.id}>${s.code} · ${s.name} (${s.uom})</option>`)}
+                </select>
+                <button type="button" class="btn small ghost" onClick=${() => setCreateItemModal(idx)} style="flex-shrink:0">+ New</button>
+              </div>
+              ${line.stock_item_id && html`<div style="font-size:11px;color:var(--slate-500);margin-top:4px">Current stock: ${fmtNum(line.matched_current_qty || stockItems.find(s => s.id === line.stock_item_id)?.current_qty || 0)} ${stockItems.find(s => s.id === line.stock_item_id)?.uom}</div>`}
+            </div>
+
+            <div class="field-row" style="margin-bottom:8px">
+              <div class="field">
+                <label style="font-size:11px">Received qty *</label>
+                <input type="number" step="0.001" min=${0} required value=${line.received_qty} onChange=${e => updateLine(idx, { received_qty: e.target.value })} style=${parseFloat(line.received_qty) < parseFloat(line.invoice_qty) ? 'border-color:var(--amber-400)' : ''} />
+                ${parseFloat(line.received_qty) < parseFloat(line.invoice_qty) && html`<div style="font-size:10px;color:var(--amber-600);margin-top:2px">⚠️ Short by ${fmtNum(line.invoice_qty - line.received_qty)}</div>`}
+              </div>
+              <div class="field">
+                <label style="font-size:11px">Rejected (damage)</label>
+                <input type="number" step="0.001" min=${0} value=${line.rejected_qty} onChange=${e => updateLine(idx, { rejected_qty: e.target.value })} />
+              </div>
+            </div>
+
+            ${parseFloat(line.rejected_qty) > 0 && html`
+              <div class="field" style="margin-bottom:8px">
+                <label style="font-size:11px">Reject reason</label>
+                <input type="text" value=${line.reject_reason} onChange=${e => updateLine(idx, { reject_reason: e.target.value })} placeholder="Damaged in transit / wrong size / etc" />
+              </div>
+            `}
+
+            <div class="field" style="margin-bottom:0">
+              <label style="font-size:11px">Notes</label>
+              <input type="text" value=${line.notes} onChange=${e => updateLine(idx, { notes: e.target.value })} placeholder="Optional" />
+            </div>
+          </div>
+        `)}
+
+        <div class="field" style="margin-top:14px">
+          <label>Overall notes</label>
+          <textarea rows=${2} value=${notes} onChange=${e => setNotes(e.target.value)} placeholder="Receipt remarks, signing person, etc"></textarea>
+        </div>
+
+        <div class="card" style="background:var(--slate-50);margin:14px 0">
+          <div class="card-row" style="border:none;padding:4px 0"><span class="label">Total invoice qty</span><span class="value">${fmtNum(totalInvoice)}</span></div>
+          <div class="card-row" style="border:none;padding:4px 0"><span class="label">Total received</span><span class="value" style=${shortagePct > 0 ? 'color:var(--amber-600)' : 'color:var(--emerald-600)'}>${fmtNum(totalReceived)}</span></div>
+          ${shortagePct > 0 && html`<div class="card-row" style="border:none;padding:4px 0"><span class="label">Shortage</span><span class="value" style="color:${shortagePct > 5 ? 'var(--rose-500)' : 'var(--amber-600)'};font-weight:700">${shortagePct.toFixed(1)}%</span></div>`}
+        </div>
+
+        <button class="btn" onClick=${submit} disabled=${submitting || !allMapped} style="font-size:15px;padding:14px">
+          ${submitting ? 'Adding to stock…' : !allMapped ? 'Map all items first' : '✅ Accept & add to stock'}
+        </button>
+        <button class="btn ghost" style="margin-top:8px;width:100%" onClick=${onClose}>Cancel</button>
+
+        ${createItemModal !== null && html`<${QuickItemCreateModal} plant=${plant} prefillName=${lines[createItemModal].invoice_name} prefillUom=${lines[createItemModal].invoice_uom} onClose=${() => setCreateItemModal(null)} onSaved=${(item) => onCreateNewItem(createItemModal, item)} />`}
+      </div>
+    </div>
+  `;
+}
+
+// ============= QUICK ITEM CREATE (for inline new item from GRN) =============
+function QuickItemCreateModal({ plant, prefillName, prefillUom, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    code: '',
+    name: prefillName || '',
+    category: 'raw_material',
+    uom: prefillUom || 'nos',
+    reorder_level: '',
+    unit_cost: '',
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const { data, error } = await sb.from('mcp_stocks_items').insert({
+        plant_id: plant.id,
+        code: form.code,
+        name: form.name,
+        category: form.category,
+        uom: form.uom,
+        current_qty: 0,
+        reorder_level: form.reorder_level ? parseFloat(form.reorder_level) : null,
+        unit_cost: form.unit_cost ? parseFloat(form.unit_cost) : null,
+      }).select().single();
+      if (error) throw error;
+      showToast('Stock item created');
+      onSaved(data);
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" style="z-index:200" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">🆕 Create Stock Item</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <p style="font-size:12px;color:var(--slate-500);margin-bottom:14px">This new item will be saved to your Stocks master and used for this and future GRNs from the same vendor.</p>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Code *</label><input type="text" required value=${form.code} onChange=${e => setForm({...form, code: e.target.value.toUpperCase()})} placeholder="ALU-ADC12" /></div>
+            <div class="field"><label>UOM</label>
+              <select value=${form.uom} onChange=${e => setForm({...form, uom: e.target.value})}>
+                <option value="nos">Nos</option><option value="kg">Kg</option><option value="g">g</option><option value="ml">ml</option><option value="l">L</option><option value="mtr">m</option><option value="set">Set</option>
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} /></div>
+          <div class="field"><label>Category</label>
+            <select value=${form.category} onChange=${e => setForm({...form, category: e.target.value})}>
+              <option value="raw_material">Raw Material</option>
+              <option value="die_spares">Die Spares</option>
+              <option value="consumables">Consumables</option>
+              <option value="tools">Tools</option>
+              <option value="packing">Packing</option>
+              <option value="bought_out">Bought-out</option>
+              <option value="general">General</option>
+            </select>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Reorder Level</label><input type="number" step="0.001" value=${form.reorder_level} onChange=${e => setForm({...form, reorder_level: e.target.value})} /></div>
+            <div class="field"><label>Unit Cost (₹)</label><input type="number" step="0.01" value=${form.unit_cost} onChange=${e => setForm({...form, unit_cost: e.target.value})} /></div>
+          </div>
+          <button class="btn" disabled=${loading}>${loading ? 'Creating…' : 'Create item'}</button>
+        </form>
       </div>
     </div>
   `;
