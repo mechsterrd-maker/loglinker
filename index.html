@@ -1,193 +1,3355 @@
--- =============================================================================
--- LOGLINKR — Parts, Routing, BOM (Block 1 extension)
--- Run after schema-block1-final.sql is already applied.
--- =============================================================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Loglinkr</title>
+<meta name="theme-color" content="#0d9488">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 
--- ============================================================
--- ENUMS
--- ============================================================
-DO $$ BEGIN
-  CREATE TYPE part_type AS ENUM ('finished','sub_assembly','component','raw_part');
-EXCEPTION WHEN duplicate_object THEN null; END $$;
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;600;700;800&family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
 
-DO $$ BEGIN
-  CREATE TYPE part_status AS ENUM ('active','prototype','obsolete','hold');
-EXCEPTION WHEN duplicate_object THEN null; END $$;
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
-DO $$ BEGIN
-  CREATE TYPE op_type AS ENUM ('pdc','trimming','deflashing','shot_blast','machining','drilling','tapping','plating','painting','assembly','inspection','packing','outsource','other');
-EXCEPTION WHEN duplicate_object THEN null; END $$;
+<style>
+:root {
+  --teal-50:#f0fdfa; --teal-100:#ccfbf1; --teal-300:#5eead4;
+  --teal-500:#14b8a6; --teal-600:#0d9488; --teal-700:#0f766e; --teal-900:#134e4a;
+  --slate-50:#f8fafc; --slate-100:#f1f5f9; --slate-200:#e2e8f0;
+  --slate-300:#cbd5e1; --slate-400:#94a3b8; --slate-500:#64748b;
+  --slate-600:#475569; --slate-700:#334155; --slate-900:#0f172a;
+  --rose-500:#f43f5e; --rose-50:#fff1f2;
+  --amber-500:#f59e0b; --amber-50:#fffbeb;
+  --emerald-500:#10b981; --emerald-50:#ecfdf5;
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{scroll-behavior:smooth}
+body{
+  font-family:'Geist',system-ui,sans-serif;
+  background:#fafaf9;
+  color:var(--slate-900);
+  line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+  overscroll-behavior:none;
+}
+.display{font-family:'Bricolage Grotesque',sans-serif;letter-spacing:-0.02em}
+.mono{font-family:'Geist Mono',monospace}
 
-DO $$ BEGIN
-  CREATE TYPE bom_child_type AS ENUM ('part','stock_item');
-EXCEPTION WHEN duplicate_object THEN null; END $$;
+/* ================= AUTH ================= */
+.auth-screen{min-height:100vh;display:flex;flex-direction:column;justify-content:center;padding:32px 24px;max-width:420px;margin:0 auto}
+.auth-logo{display:flex;align-items:center;gap:10px;justify-content:center;margin-bottom:32px}
+.logo-mark{width:48px;height:48px;border-radius:12px;background:linear-gradient(135deg,var(--teal-500),var(--teal-700));display:flex;align-items:center;justify-content:center;color:white;font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:24px;box-shadow:0 8px 20px rgba(13,148,136,0.25)}
+.auth-screen h1{font-family:'Bricolage Grotesque',sans-serif;font-size:32px;font-weight:700;margin-bottom:8px;text-align:center}
+.auth-screen .sub{text-align:center;color:var(--slate-500);font-size:14px;margin-bottom:32px}
+.auth-tabs{display:flex;gap:4px;background:var(--slate-100);border-radius:10px;padding:4px;margin-bottom:24px}
+.auth-tab{flex:1;padding:8px;border-radius:7px;font-size:13px;font-weight:500;text-align:center;cursor:pointer;border:none;background:transparent;color:var(--slate-600);font-family:inherit}
+.auth-tab.active{background:white;color:var(--slate-900);box-shadow:0 1px 2px rgba(0,0,0,0.05)}
 
--- ============================================================
--- PARTS MASTER
--- ============================================================
-CREATE TABLE IF NOT EXISTS mcp_pdc_parts (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  plant_id UUID NOT NULL REFERENCES plants(id) ON DELETE CASCADE,
-  part_number TEXT NOT NULL,
-  revision TEXT NOT NULL DEFAULT 'A',
-  name TEXT NOT NULL,
-  description TEXT,
-  part_type part_type NOT NULL DEFAULT 'finished',
-  status part_status NOT NULL DEFAULT 'active',
-  customer TEXT,
-  drawing_url TEXT,
-  weight_kg NUMERIC(10,3),
-  uom TEXT NOT NULL DEFAULT 'nos',
-  default_die_id UUID REFERENCES mcp_pdc_dies(id),
-  notes TEXT,
-  created_by UUID REFERENCES users(id),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+/* ================= FORM ================= */
+.field{margin-bottom:14px}
+.field label{display:block;font-size:12px;font-weight:500;color:var(--slate-600);margin-bottom:6px}
+.field input,.field select,.field textarea{
+  width:100%;padding:12px 14px;border:1px solid var(--slate-200);
+  border-radius:10px;font-family:inherit;font-size:15px;background:white;
+  color:var(--slate-900);outline:none;transition:border-color 0.15s,box-shadow 0.15s
+}
+.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--teal-500);box-shadow:0 0 0 3px rgba(20,184,166,0.15)}
+.field textarea{resize:vertical;min-height:80px;font-family:inherit}
+.field-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.field-row-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_parts_pn_rev ON mcp_pdc_parts(plant_id, part_number, revision);
-CREATE INDEX IF NOT EXISTS idx_parts_status ON mcp_pdc_parts(plant_id, status);
+.btn{
+  width:100%;padding:13px;background:var(--teal-600);color:white;
+  border:none;border-radius:10px;font-family:inherit;font-size:15px;font-weight:600;
+  cursor:pointer;transition:background 0.15s,transform 0.1s;
+  display:flex;align-items:center;justify-content:center;gap:8px
+}
+.btn:hover{background:var(--teal-700)}
+.btn:active{transform:scale(0.98)}
+.btn:disabled{opacity:0.5;cursor:not-allowed}
+.btn.secondary{background:white;color:var(--slate-700);border:1px solid var(--slate-200)}
+.btn.secondary:hover{background:var(--slate-50)}
+.btn.danger{background:var(--rose-500)}
+.btn.small{padding:7px 14px;font-size:13px;width:auto;border-radius:8px}
+.btn.ghost{background:transparent;color:var(--teal-600);border:none}
 
--- ============================================================
--- ROUTING (header + steps)
--- ============================================================
-CREATE TABLE IF NOT EXISTS mcp_pdc_routes (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  plant_id UUID NOT NULL REFERENCES plants(id) ON DELETE CASCADE,
-  part_id UUID NOT NULL REFERENCES mcp_pdc_parts(id) ON DELETE CASCADE,
-  version INTEGER NOT NULL DEFAULT 1,
-  is_active BOOLEAN NOT NULL DEFAULT true,
-  notes TEXT,
-  created_by UUID REFERENCES users(id),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+.alert{padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:14px;line-height:1.5}
+.alert.error{background:var(--rose-50);border:1px solid #fecdd3;color:#be123c}
+.alert.success{background:var(--emerald-50);border:1px solid #a7f3d0;color:#047857}
+.alert.info{background:var(--teal-50);border:1px solid var(--teal-100);color:var(--teal-700)}
 
-CREATE INDEX IF NOT EXISTS idx_routes_part ON mcp_pdc_routes(part_id, is_active);
+/* ================= APP SHELL ================= */
+.app{min-height:100vh;padding-bottom:calc(76px + var(--safe-bottom))}
+.topbar{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 18px;background:white;border-bottom:1px solid var(--slate-200);
+  position:sticky;top:0;z-index:50
+}
+.topbar-left{display:flex;align-items:center;gap:10px}
+.topbar-logo{width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,var(--teal-500),var(--teal-700));display:flex;align-items:center;justify-content:center;color:white;font-weight:700;font-size:14px}
+.topbar-title{font-family:'Bricolage Grotesque',sans-serif;font-weight:700;font-size:18px}
+.topbar-right{display:flex;gap:8px;align-items:center}
+.topbar-btn{background:var(--slate-100);border:none;border-radius:50%;width:36px;height:36px;display:flex;align-items:center;justify-content:center;cursor:pointer}
+.topbar-user{width:36px;height:36px;border-radius:50%;background:var(--teal-100);color:var(--teal-700);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600;cursor:pointer}
 
-CREATE TABLE IF NOT EXISTS mcp_pdc_route_steps (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  plant_id UUID NOT NULL REFERENCES plants(id) ON DELETE CASCADE,
-  route_id UUID NOT NULL REFERENCES mcp_pdc_routes(id) ON DELETE CASCADE,
-  seq INTEGER NOT NULL,
-  op_type op_type NOT NULL,
-  op_name TEXT NOT NULL,
-  machine_id UUID REFERENCES mcp_pdc_machines(id),
-  fixture TEXT,
-  cycle_time_sec INTEGER,
-  setup_time_min INTEGER,
-  outsource_vendor TEXT,
-  inspection_required BOOLEAN NOT NULL DEFAULT false,
-  instructions TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+/* ================= TABBAR ================= */
+.tabbar{
+  position:fixed;bottom:0;left:0;right:0;background:white;
+  border-top:1px solid var(--slate-200);display:flex;z-index:50;
+  padding-bottom:var(--safe-bottom);
+  box-shadow:0 -2px 12px rgba(15,23,42,0.04)
+}
+.tab{flex:1;padding:9px 2px;background:none;border:none;font-family:inherit;color:var(--slate-500);font-size:10px;font-weight:500;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:2px;min-width:0}
+.tab.active{color:var(--teal-600)}
+.tab svg{width:22px;height:22px}
+.tab-label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;width:100%;text-align:center}
 
-CREATE INDEX IF NOT EXISTS idx_route_steps_route ON mcp_pdc_route_steps(route_id, seq);
+/* ================= PAGES ================= */
+.page{display:none;padding:18px;max-width:720px;margin:0 auto}
+.page.active{display:block}
+.page-header{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:20px;gap:12px}
+.page-header h1{font-family:'Bricolage Grotesque',sans-serif;font-size:24px;font-weight:700;line-height:1.1;margin-bottom:2px}
+.page-header .sub{color:var(--slate-500);font-size:13px}
 
--- ============================================================
--- BOM (multi-level — child can be another part OR a stock item)
--- ============================================================
-CREATE TABLE IF NOT EXISTS mcp_pdc_bom (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  plant_id UUID NOT NULL REFERENCES plants(id) ON DELETE CASCADE,
-  parent_part_id UUID NOT NULL REFERENCES mcp_pdc_parts(id) ON DELETE CASCADE,
-  child_type bom_child_type NOT NULL,
-  child_part_id UUID REFERENCES mcp_pdc_parts(id) ON DELETE CASCADE,
-  child_item_id UUID REFERENCES mcp_stocks_items(id) ON DELETE CASCADE,
-  qty_per_assy NUMERIC(14,4) NOT NULL,
-  uom TEXT NOT NULL DEFAULT 'nos',
-  scrap_pct NUMERIC(5,2) DEFAULT 0,
-  notes TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT bom_child_xor CHECK (
-    (child_type = 'part' AND child_part_id IS NOT NULL AND child_item_id IS NULL) OR
-    (child_type = 'stock_item' AND child_item_id IS NOT NULL AND child_part_id IS NULL)
-  ),
-  CONSTRAINT bom_no_self CHECK (parent_part_id != child_part_id)
-);
+/* ================= CARDS ================= */
+.card{background:white;border:1px solid var(--slate-200);border-radius:14px;padding:16px;margin-bottom:10px}
+.card-title{font-weight:600;margin-bottom:8px;font-size:14px;display:flex;justify-content:space-between;align-items:center}
+.card-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;font-size:14px;border-top:1px solid var(--slate-100);gap:12px}
+.card-row:first-of-type{border-top:none}
+.card-row .label{color:var(--slate-500);font-size:13px}
+.card-row .value{color:var(--slate-900);font-weight:500;text-align:right}
 
-CREATE INDEX IF NOT EXISTS idx_bom_parent ON mcp_pdc_bom(parent_part_id);
-CREATE INDEX IF NOT EXISTS idx_bom_child_part ON mcp_pdc_bom(child_part_id) WHERE child_part_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_bom_child_item ON mcp_pdc_bom(child_item_id) WHERE child_item_id IS NOT NULL;
+.list-item{background:white;border:1px solid var(--slate-200);border-radius:12px;padding:12px 14px;margin-bottom:8px;cursor:pointer;transition:border-color 0.15s,transform 0.1s}
+.list-item:active{transform:scale(0.99)}
+.list-item:hover{border-color:var(--slate-300)}
+.list-item-row{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.list-item-main{flex:1;min-width:0}
+.list-item-title{font-weight:600;font-size:14px;margin-bottom:2px;color:var(--slate-900);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.list-item-sub{font-size:12px;color:var(--slate-500)}
+.list-item-meta{font-size:12px;color:var(--slate-500);text-align:right;flex-shrink:0}
 
--- ============================================================
--- WHERE-USED VIEW (recursive)
--- ============================================================
-CREATE OR REPLACE VIEW v_bom_where_used AS
-WITH RECURSIVE up AS (
-  -- Direct usage
-  SELECT
-    b.child_part_id AS part_id,
-    b.parent_part_id AS used_in_part_id,
-    1 AS depth,
-    ARRAY[b.parent_part_id] AS path
-  FROM mcp_pdc_bom b
-  WHERE b.child_type = 'part'
-  UNION
-  SELECT
-    up.part_id,
-    b.parent_part_id,
-    up.depth + 1,
-    up.path || b.parent_part_id
-  FROM up
-  JOIN mcp_pdc_bom b ON b.child_part_id = up.used_in_part_id AND b.child_type = 'part'
-  WHERE NOT (b.parent_part_id = ANY(up.path))
-    AND up.depth < 10
-)
-SELECT DISTINCT
-  up.part_id,
-  up.used_in_part_id,
-  up.depth,
-  p.part_number AS used_in_part_number,
-  p.revision AS used_in_revision,
-  p.name AS used_in_name,
-  p.plant_id
-FROM up
-JOIN mcp_pdc_parts p ON p.id = up.used_in_part_id;
+.empty{text-align:center;padding:40px 20px;color:var(--slate-500)}
+.empty .icon{font-size:36px;margin-bottom:12px;opacity:0.5}
 
-GRANT SELECT ON v_bom_where_used TO authenticated;
+/* ================= PULSE CARD ================= */
+.pulse-card{background:linear-gradient(135deg,var(--teal-600),var(--teal-700));color:white;padding:20px;border-radius:16px;margin-bottom:18px;box-shadow:0 8px 20px rgba(13,148,136,0.25);position:relative;overflow:hidden}
+.pulse-card::after{content:'';position:absolute;right:-30px;top:-30px;width:140px;height:140px;border-radius:50%;background:radial-gradient(circle,rgba(255,255,255,0.12),transparent 70%)}
+.pulse-label{font-size:11px;font-weight:500;color:var(--teal-100);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:6px;position:relative}
+.pulse-num{font-family:'Bricolage Grotesque',sans-serif;font-size:36px;font-weight:700;line-height:1;position:relative}
+.pulse-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px;position:relative}
+.pulse-stat{padding:10px;background:rgba(255,255,255,0.1);border-radius:10px;backdrop-filter:blur(10px)}
+.pulse-stat-num{font-family:'Bricolage Grotesque',sans-serif;font-size:18px;font-weight:700;line-height:1}
+.pulse-stat-label{font-size:10px;color:var(--teal-100);margin-top:2px;text-transform:uppercase;letter-spacing:0.05em}
 
--- ============================================================
--- LINK SHOTS TO PARTS (optional column, populated when known)
--- ============================================================
-ALTER TABLE mcp_pdc_shots ADD COLUMN IF NOT EXISTS part_id UUID REFERENCES mcp_pdc_parts(id);
-CREATE INDEX IF NOT EXISTS idx_shots_part ON mcp_pdc_shots(part_id) WHERE part_id IS NOT NULL;
+/* ================= MODAL ================= */
+.modal-backdrop{display:none;position:fixed;inset:0;background:rgba(15,23,42,0.5);backdrop-filter:blur(4px);z-index:100;align-items:flex-end;justify-content:center}
+.modal-backdrop.active{display:flex}
+.modal{background:white;width:100%;max-width:480px;border-radius:20px 20px 0 0;padding:20px 18px calc(24px + var(--safe-bottom));max-height:92vh;overflow-y:auto;animation:slideUp 0.25s ease}
+@keyframes slideUp{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+.modal-title{font-family:'Bricolage Grotesque',sans-serif;font-size:20px;font-weight:700}
+.close-btn{background:var(--slate-100);border:none;border-radius:50%;width:32px;height:32px;cursor:pointer;color:var(--slate-600);font-size:18px;line-height:1}
 
--- ============================================================
--- LINK DIES TO DEFAULT PART (a die typically makes one part family)
--- ============================================================
-ALTER TABLE mcp_pdc_dies ADD COLUMN IF NOT EXISTS default_part_id UUID REFERENCES mcp_pdc_parts(id);
+/* ================= FAB ================= */
+.fab{
+  position:fixed;bottom:calc(86px + var(--safe-bottom));right:18px;
+  width:54px;height:54px;border-radius:50%;
+  background:var(--teal-600);color:white;border:none;font-size:26px;cursor:pointer;
+  box-shadow:0 8px 24px rgba(13,148,136,0.4);
+  display:flex;align-items:center;justify-content:center;z-index:40;
+  transition:transform 0.15s
+}
+.fab:active{transform:scale(0.92)}
 
--- ============================================================
--- RLS — same pattern as everything else
--- ============================================================
-DO $$
-DECLARE t TEXT; pol RECORD;
-DECLARE table_list TEXT[] := ARRAY['mcp_pdc_parts','mcp_pdc_routes','mcp_pdc_route_steps','mcp_pdc_bom'];
-BEGIN
-  FOREACH t IN ARRAY table_list LOOP
-    FOR pol IN SELECT policyname FROM pg_policies WHERE tablename = t LOOP
-      EXECUTE format('DROP POLICY %I ON %I', pol.policyname, t);
-    END LOOP;
-    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
-  END LOOP;
-END $$;
+/* ================= BADGES ================= */
+.badge{display:inline-flex;align-items:center;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:600;background:var(--slate-100);color:var(--slate-700);white-space:nowrap}
+.badge.teal{background:var(--teal-50);color:var(--teal-700)}
+.badge.amber{background:var(--amber-50);color:#92400e}
+.badge.emerald{background:var(--emerald-50);color:#047857}
+.badge.rose{background:var(--rose-50);color:#be123c}
+.badge.slate-dark{background:var(--slate-900);color:white}
 
-CREATE POLICY parts_all ON mcp_pdc_parts FOR ALL TO authenticated USING (plant_id = my_plant_id()) WITH CHECK (plant_id = my_plant_id());
-CREATE POLICY routes_all ON mcp_pdc_routes FOR ALL TO authenticated USING (plant_id = my_plant_id()) WITH CHECK (plant_id = my_plant_id());
-CREATE POLICY route_steps_all ON mcp_pdc_route_steps FOR ALL TO authenticated USING (plant_id = my_plant_id()) WITH CHECK (plant_id = my_plant_id());
-CREATE POLICY bom_all ON mcp_pdc_bom FOR ALL TO authenticated USING (plant_id = my_plant_id()) WITH CHECK (plant_id = my_plant_id());
+/* ================= CHAT ================= */
+.chat-list{display:flex;flex-direction:column;gap:6px}
+.chat-item{background:white;padding:12px 14px;border-radius:12px;border:1px solid var(--slate-200);cursor:pointer;display:flex;align-items:center;gap:12px}
+.chat-avatar{width:40px;height:40px;border-radius:50%;background:var(--teal-100);color:var(--teal-700);display:flex;align-items:center;justify-content:center;font-weight:600;font-size:14px;flex-shrink:0}
+.chat-info{flex:1;min-width:0}
+.chat-name{font-weight:600;font-size:14px;margin-bottom:2px}
+.chat-preview{color:var(--slate-500);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
--- ============================================================
--- AUDIT triggers
--- ============================================================
-DO $$
-DECLARE t TEXT;
-DECLARE audit_tables TEXT[] := ARRAY['mcp_pdc_parts','mcp_pdc_routes','mcp_pdc_route_steps','mcp_pdc_bom'];
-BEGIN
-  FOREACH t IN ARRAY audit_tables LOOP
-    EXECUTE format('DROP TRIGGER IF EXISTS audit_trg ON %I', t);
-    EXECUTE format('CREATE TRIGGER audit_trg AFTER INSERT OR UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION audit_log_trigger()', t);
-  END LOOP;
-END $$;
+.chat-thread{display:flex;flex-direction:column;position:fixed;top:60px;left:0;right:0;bottom:calc(76px + var(--safe-bottom));background:#fafaf9;z-index:30}
+.thread-header{background:white;border-bottom:1px solid var(--slate-200);padding:10px 14px;display:flex;align-items:center;gap:10px;flex-shrink:0}
+.thread-back{background:none;border:none;color:var(--slate-700);cursor:pointer;font-size:18px;padding:6px}
+.thread-messages{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:6px}
+.msg{padding:9px 13px;border-radius:14px;max-width:80%;font-size:14px;word-wrap:break-word;line-height:1.4}
+.msg.in{background:white;border:1px solid var(--slate-200);align-self:flex-start}
+.msg.out{background:var(--teal-600);color:white;align-self:flex-end}
+.msg .who{font-size:11px;color:var(--slate-500);margin-bottom:2px;font-weight:500}
+.msg.out .who{color:var(--teal-100)}
+.msg .ts{font-size:10px;color:var(--slate-400);margin-top:3px}
+.msg.out .ts{color:var(--teal-100)}
+.thread-input{background:white;border-top:1px solid var(--slate-200);padding:10px 12px;display:flex;gap:8px;flex-shrink:0;align-items:center}
+.thread-input input{flex:1;padding:10px 14px;border:1px solid var(--slate-200);border-radius:999px;font-family:inherit;font-size:14px;outline:none;min-width:0}
+.thread-input button{background:var(--teal-600);color:white;border:none;border-radius:50%;width:40px;height:40px;cursor:pointer;font-size:18px;flex-shrink:0;display:flex;align-items:center;justify-content:center}
+.thread-input button.attach{background:var(--slate-100);color:var(--slate-600)}
+.thread-attach-preview{padding:8px 12px;background:var(--teal-50);border-top:1px solid var(--teal-100);display:flex;align-items:center;gap:10px;font-size:13px;color:var(--teal-700)}
+.thread-attach-preview img{width:40px;height:40px;object-fit:cover;border-radius:6px}
+.thread-attach-preview button{background:none;border:none;color:var(--rose-500);cursor:pointer;font-size:18px;margin-left:auto;padding:4px}
+.msg img.attached-img{max-width:200px;max-height:200px;border-radius:8px;display:block;margin-top:4px;cursor:pointer}
+.msg .file-attached{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;background:rgba(255,255,255,0.15);border-radius:8px;margin-top:4px;font-size:12px;text-decoration:none;color:inherit}
+.msg.in .file-attached{background:var(--slate-50);border:1px solid var(--slate-200)}
 
-SELECT 'Parts + Routing + BOM tables created' AS status;
+/* ================= WIZARD ================= */
+.wizard{max-width:480px;margin:0 auto;padding:32px 24px}
+.wizard-step{background:white;border-radius:16px;border:1px solid var(--slate-200);padding:22px 20px}
+.wizard h2{font-family:'Bricolage Grotesque',sans-serif;font-size:22px;margin-bottom:6px;font-weight:700}
+.wizard .sub{color:var(--slate-500);font-size:13px;margin-bottom:22px}
+
+.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:11px 0;border-bottom:1px solid var(--slate-100)}
+.toggle-row:last-child{border-bottom:none}
+.toggle-label{font-size:14px;color:var(--slate-700)}
+.toggle{width:42px;height:24px;background:var(--slate-300);border-radius:999px;position:relative;cursor:pointer;transition:background 0.2s;flex-shrink:0}
+.toggle.active{background:var(--teal-500)}
+.toggle::after{content:'';position:absolute;top:2px;left:2px;width:20px;height:20px;background:white;border-radius:50%;transition:transform 0.2s;box-shadow:0 1px 3px rgba(0,0,0,0.2)}
+.toggle.active::after{transform:translateX(18px)}
+
+/* ================= TOAST ================= */
+.toast{position:fixed;bottom:calc(110px + var(--safe-bottom));left:50%;transform:translateX(-50%);background:var(--slate-900);color:white;padding:10px 18px;border-radius:999px;font-size:13px;font-weight:500;z-index:200;opacity:0;pointer-events:none;transition:opacity 0.3s,transform 0.3s;white-space:nowrap;max-width:90vw;text-align:center}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(-4px)}
+
+/* ================= SETUP STEPS ================= */
+.setup-banner{background:var(--teal-50);border:1px solid var(--teal-100);border-radius:14px;padding:14px;margin-bottom:14px}
+.setup-banner-title{color:var(--teal-700);font-weight:600;margin-bottom:6px;font-size:14px;display:flex;align-items:center;gap:6px}
+.setup-step{display:flex;align-items:center;gap:10px;padding:7px 0;font-size:13px}
+.setup-step .num{width:22px;height:22px;border-radius:50%;background:var(--teal-100);color:var(--teal-700);display:flex;align-items:center;justify-content:center;font-weight:600;font-size:11px;flex-shrink:0}
+.setup-step.done .num{background:var(--teal-600);color:white}
+.setup-step.done span{text-decoration:line-through;color:var(--slate-500)}
+
+/* ================= LOADING ================= */
+.loader{display:flex;align-items:center;justify-content:center;padding:40px;color:var(--slate-400)}
+.spinner{width:24px;height:24px;border:3px solid var(--slate-200);border-top-color:var(--teal-500);border-radius:50%;animation:spin 0.8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ================= INVITE CODE ================= */
+.invite-code{background:var(--slate-900);color:var(--teal-300);font-family:'Geist Mono',monospace;padding:14px;border-radius:10px;text-align:center;font-size:18px;font-weight:600;letter-spacing:0.1em;margin:12px 0}
+
+/* ================= STAT GRID ================= */
+.stat-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:14px}
+.stat{background:white;border:1px solid var(--slate-200);border-radius:12px;padding:14px}
+.stat-num{font-family:'Bricolage Grotesque',sans-serif;font-size:24px;font-weight:700;line-height:1}
+.stat-label{font-size:11px;color:var(--slate-500);margin-top:4px;text-transform:uppercase;letter-spacing:0.05em}
+.stat.teal .stat-num{color:var(--teal-600)}
+.stat.amber .stat-num{color:#d97706}
+.stat.rose .stat-num{color:var(--rose-500)}
+
+/* ================= DIE LIFE BAR ================= */
+.life-bar{height:6px;background:var(--slate-100);border-radius:999px;overflow:hidden;margin-top:6px}
+.life-bar-fill{height:100%;background:linear-gradient(90deg,var(--teal-500),var(--teal-600));border-radius:999px;transition:width 0.3s}
+.life-bar-fill.warn{background:linear-gradient(90deg,var(--amber-500),#d97706)}
+.life-bar-fill.danger{background:linear-gradient(90deg,var(--rose-500),#dc2626)}
+
+/* ================= SECTION HEADER ================= */
+.section-h{font-size:11px;font-weight:600;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.08em;margin:18px 0 10px;display:flex;align-items:center;justify-content:space-between}
+.section-h:first-of-type{margin-top:0}
+</style>
+</head>
+<body>
+
+<div id="root"></div>
+
+<script type="module">
+import { h, render } from 'https://esm.sh/preact@10.19.3';
+import { useState, useEffect, useCallback, useMemo } from 'https://esm.sh/preact@10.19.3/hooks';
+import htm from 'https://esm.sh/htm@3.1.1';
+
+const html = htm.bind(h);
+// React compatibility shim
+const React = { createElement: h };
+const createRoot = (container) => ({ render: (el) => render(el, container) });
+
+// ============= SUPABASE =============
+const SUPABASE_URL = 'https://wzxowvrvuecybdxymjvi.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind6eG93dnJ2dWVjeWJkeHltanZpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3MjMzMTQsImV4cCI6MjA5MzI5OTMxNH0.GyvHnBtlJTWs8HqMvu0VyRhjme5jbTUWzz9vOAxXhO8';
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// ============= UTILITIES =============
+const escapeHtml = s => (s || '').toString();
+const fmtDate = d => new Date(d).toLocaleString('en-IN', { day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' });
+const fmtNum = n => Number(n || 0).toLocaleString('en-IN');
+const generateInviteCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
+
+// =============== NOTIFICATIONS + SOUND ===============
+let _notifAudioCtx = null;
+const playNotificationSound = () => {
+  try {
+    if (!_notifAudioCtx) _notifAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = _notifAudioCtx;
+    const now = ctx.currentTime;
+    // Two-tone "ding"
+    [880, 1320].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0, now + i * 0.1);
+      gain.gain.linearRampToValueAtTime(0.15, now + i * 0.1 + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.1 + 0.25);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now + i * 0.1);
+      osc.stop(now + i * 0.1 + 0.3);
+    });
+  } catch (e) { console.log('Sound failed:', e); }
+};
+
+const requestNotificationPermission = async () => {
+  if (!('Notification' in window)) return false;
+  if (Notification.permission === 'granted') return true;
+  if (Notification.permission === 'denied') return false;
+  const result = await Notification.requestPermission();
+  return result === 'granted';
+};
+
+const showNotification = (title, body, icon) => {
+  try {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    const n = new Notification(title, {
+      body: body || '',
+      icon: icon || '/favicon.ico',
+      badge: '/favicon.ico',
+      tag: 'loglinkr-' + Date.now(),
+      silent: true, // we play our own sound
+      requireInteraction: false
+    });
+    n.onclick = () => { window.focus(); n.close(); };
+    setTimeout(() => n.close(), 6000);
+  } catch (e) { console.log('Notification failed:', e); }
+};
+
+const showToast = (msg) => {
+  const existing = document.querySelector('.toast');
+  if (existing) existing.remove();
+  const t = document.createElement('div');
+  t.className = 'toast show';
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, 2200);
+};
+
+// ============= AUTH SCREEN =============
+function AuthScreen({ onAuth, pendingInviteCode }) {
+  const hasInvite = !!pendingInviteCode;
+  const [mode, setMode] = useState(hasInvite ? 'signup' : 'login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [invitedPlant, setInvitedPlant] = useState(null);
+
+  // If URL has invite code, look up the plant name
+  useEffect(() => {
+    if (!hasInvite) return;
+    (async () => {
+      const { data } = await sb.from('user_invites').select('plants(name), full_name, role').eq('invite_code', pendingInviteCode).eq('status', 'pending').maybeSingle();
+      if (data) setInvitedPlant({ name: data.plants?.name, full_name: data.full_name, role: data.role });
+    })();
+  }, [hasInvite, pendingInviteCode]);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setSuccess(''); setLoading(true);
+    try {
+      let result;
+      if (mode === 'login') {
+        result = await sb.auth.signInWithPassword({ email, password });
+      } else {
+        result = await sb.auth.signUp({
+          email, password,
+          options: { emailRedirectTo: window.location.href }
+        });
+      }
+      if (result.error) {
+        setError(result.error.message);
+      } else if (mode === 'signup' && !result.data.session) {
+        setSuccess('Check your email for the confirmation link, then come back and log in.');
+      } else {
+        onAuth(result.data.user);
+      }
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return html`
+    <div class="auth-screen">
+      <div class="auth-logo">
+        <div class="logo-mark">L</div>
+        <div class="display" style="font-size:24px;font-weight:700">Loglinkr</div>
+      </div>
+
+      ${hasInvite && invitedPlant && html`
+        <div class="alert info" style="margin-bottom:20px">
+          🎉 You've been invited to <strong>${invitedPlant.name}</strong> as ${invitedPlant.role}.
+          ${invitedPlant.full_name && html` Welcome, ${invitedPlant.full_name}.`}
+          <br/><br/>Sign up below — you'll be added to ${invitedPlant.name} automatically.
+        </div>
+      `}
+      ${hasInvite && !invitedPlant && html`
+        <div class="alert error" style="margin-bottom:20px">
+          Invite code <span class="mono">${pendingInviteCode}</span> is invalid or already used.
+        </div>
+      `}
+
+      <h1>${mode === 'login' ? 'Welcome back' : (hasInvite ? 'Join your plant' : 'Create your account')}</h1>
+      <p class="sub">${mode === 'login' ? 'Run your plant. From your phone.' : (hasInvite ? 'Sign up with your details below.' : 'Set up your plant in 5 minutes.')}</p>
+
+      <div class="auth-tabs">
+        <button class=${'auth-tab' + (mode === 'login' ? ' active' : '')} onClick=${() => setMode('login')}>Login</button>
+        <button class=${'auth-tab' + (mode === 'signup' ? ' active' : '')} onClick=${() => setMode('signup')}>Sign up</button>
+      </div>
+
+      ${error && html`<div class="alert error">${error}</div>`}
+      ${success && html`<div class="alert success">${success}</div>`}
+
+      <form onSubmit=${submit}>
+        <div class="field">
+          <label>Email</label>
+          <input type="email" required value=${email} onChange=${e => setEmail(e.target.value)} placeholder="you@plant.com" autoComplete="email" />
+        </div>
+        <div class="field">
+          <label>Password</label>
+          <input type="password" required minLength=${6} value=${password} onChange=${e => setPassword(e.target.value)} placeholder="At least 6 characters" autoComplete=${mode === 'login' ? 'current-password' : 'new-password'} />
+        </div>
+        <button class="btn" type="submit" disabled=${loading}>${loading ? 'Working…' : (mode === 'login' ? 'Log in' : 'Create account')}</button>
+      </form>
+    </div>
+  `;
+}
+
+// ============= WIZARD =============
+function Wizard({ user, pendingInvite, onDone }) {
+  // If invite detected, jump straight to join path with code prefilled
+  const [path, setPath] = useState(pendingInvite ? 'join' : 'choose');
+  const [form, setForm] = useState({
+    name: '', legal_name: '', gstin: '',
+    address: '', city: 'Chennai', state: 'Tamil Nadu', pincode: '',
+    iatf: false,
+    your_name: user.email ? user.email.split('@')[0] : '',
+    your_phone: ''
+  });
+  const [joinForm, setJoinForm] = useState({
+    code: pendingInvite?.invite_code || '',
+    full_name: pendingInvite?.full_name || (user.email ? user.email.split('@')[0] : ''),
+    phone: ''
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const update = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      // Direct inserts (RLS is disabled for now, will re-enable in Block 1.5)
+
+      // 1. Create plant
+      const { data: plant, error: plantErr } = await sb.from('plants').insert({
+        name: form.name,
+        legal_name: form.legal_name || null,
+        gstin: form.gstin || null,
+        iatf_certified: form.iatf,
+        address: form.address,
+        city: form.city,
+        state: form.state,
+        pincode: form.pincode,
+        subscription_tier: 'lite',
+        installed_mcps: ['production_pdc_v1']
+      }).select().single();
+      if (plantErr) throw plantErr;
+
+      // 2. Delete any existing user row first (in case of retry)
+      await sb.from('users').delete().eq('id', user.id);
+
+      // 3. Create user row linked to plant
+      const { error: userErr } = await sb.from('users').insert({
+        id: user.id,
+        plant_id: plant.id,
+        full_name: form.your_name,
+        phone: '+91' + form.your_phone,
+        email: user.email,
+        role: 'plant_head',
+        status: 'active',
+        can_install_mcps: true
+      });
+      if (userErr) throw userErr;
+
+      // 4. Set primary contact
+      await sb.from('plants').update({ primary_contact_user_id: user.id }).eq('id', plant.id);
+
+      // 5. Default chat groups
+      await sb.from('chat_groups').insert([
+        { plant_id: plant.id, name: '# All Hands', type: 'all_hands', members: [user.id] },
+        { plant_id: plant.id, name: '# Quality', type: 'department', members: [user.id] },
+        { plant_id: plant.id, name: '# Maintenance', type: 'department', members: [user.id] },
+      ]);
+
+      // 6. Default shifts
+      await sb.from('shifts').insert([
+        { plant_id: plant.id, name: 'Day Shift', start_time: '06:00', end_time: '14:00' },
+        { plant_id: plant.id, name: 'Evening Shift', start_time: '14:00', end_time: '22:00' },
+        { plant_id: plant.id, name: 'Night Shift', start_time: '22:00', end_time: '06:00' },
+      ]);
+
+      showToast('Plant created!');
+      onDone(plant);
+    } catch (err) {
+      setError(err.message || 'Something went wrong');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const submitJoin = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const { data, error: err } = await sb.rpc('redeem_invite_code', {
+        p_code: joinForm.code.trim().toUpperCase(),
+        p_full_name: joinForm.full_name,
+        p_phone: '+91' + joinForm.phone
+      });
+      if (err) throw err;
+      if (!data || !data.success) throw new Error(data?.error || 'Could not redeem code');
+      const { data: plant } = await sb.from('plants').select('*').eq('id', data.plant_id).single();
+      showToast('Welcome to ' + plant.name);
+      onDone(plant);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (path === 'choose') {
+    return html`
+      <div class="wizard">
+        <div class="auth-logo" style="margin-bottom:24px">
+          <div class="logo-mark">L</div>
+          <div class="display" style="font-size:22px;font-weight:700">Loglinkr</div>
+        </div>
+        <div class="wizard-step">
+          <h2>Welcome</h2>
+          <p class="sub">Are you setting up a new plant or joining an existing one?</p>
+          <button class="btn" style="margin-bottom:10px" onClick=${() => setPath('new')}>Set up a new plant</button>
+          <button class="btn secondary" onClick=${() => setPath('join')}>I have an invite code</button>
+          <button class="btn ghost" style="margin-top:20px;width:100%" onClick=${async () => { await sb.auth.signOut(); location.reload(); }}>Sign out</button>
+        </div>
+      </div>
+    `;
+  }
+
+  if (path === 'join') {
+    return html`
+      <div class="wizard">
+        <div class="auth-logo" style="margin-bottom:24px">
+          <div class="logo-mark">L</div>
+          <div class="display" style="font-size:22px;font-weight:700">Loglinkr</div>
+        </div>
+        <div class="wizard-step">
+          <h2>Join your plant</h2>
+          ${pendingInvite ? html`
+            <div class="alert info" style="margin-bottom:16px">
+              You're being added to <strong>${pendingInvite.plants?.name || 'plant'}</strong> as <strong>${pendingInvite.role}</strong>.
+              ${pendingInvite.full_name ? html` Welcome, ${pendingInvite.full_name}.` : ''}
+            </div>
+          ` : html`<p class="sub">Enter the invite code your plant head shared with you.</p>`}
+          ${error && html`<div class="alert error">${error}</div>`}
+          <form onSubmit=${submitJoin}>
+            <div class="field">
+              <label>Invite Code *</label>
+              <input type="text" required maxLength=${6} style="font-family:'Geist Mono',monospace;letter-spacing:0.15em;text-transform:uppercase;font-size:18px;text-align:center" value=${joinForm.code} onChange=${e => setJoinForm({...joinForm, code: e.target.value.toUpperCase()})} placeholder="ABC123" />
+            </div>
+            <div class="field">
+              <label>Your Full Name *</label>
+              <input type="text" required value=${joinForm.full_name} onChange=${e => setJoinForm({...joinForm, full_name: e.target.value})} placeholder="Selvam K" />
+            </div>
+            <div class="field">
+              <label>Your Phone *</label>
+              <input type="tel" required maxLength=${10} value=${joinForm.phone} onChange=${e => setJoinForm({...joinForm, phone: e.target.value.replace(/\D/g,'')})} placeholder="9876543210" />
+            </div>
+            <button class="btn" disabled=${loading}>${loading ? 'Joining…' : 'Join plant'}</button>
+            ${!pendingInvite && html`<button type="button" class="btn ghost" style="margin-top:8px;width:100%" onClick=${() => setPath('choose')}>← Back</button>`}
+            ${pendingInvite && html`<button type="button" class="btn ghost" style="margin-top:8px;width:100%" onClick=${async () => { await sb.auth.signOut(); location.reload(); }}>Sign out</button>`}
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
+  return html`
+    <div class="wizard">
+      <div class="auth-logo" style="margin-bottom:24px">
+        <div class="logo-mark">L</div>
+        <div class="display" style="font-size:22px;font-weight:700">Loglinkr</div>
+      </div>
+      <div class="wizard-step">
+        <h2>Set up your plant</h2>
+        <p class="sub">One-time setup. We'll have you logging production in minutes.</p>
+
+        ${error && html`<div class="alert error">${error}</div>`}
+
+        <form onSubmit=${submit}>
+          <div class="field">
+            <label>Plant Name *</label>
+            <input type="text" required value=${form.name} onChange=${e => update('name', e.target.value)} placeholder="Krishnas Fittings" />
+          </div>
+          <div class="field">
+            <label>Legal Name</label>
+            <input type="text" value=${form.legal_name} onChange=${e => update('legal_name', e.target.value)} placeholder="Krishnas Fittings Pvt Ltd" />
+          </div>
+          <div class="field">
+            <label>GSTIN</label>
+            <input type="text" maxLength=${15} value=${form.gstin} onChange=${e => update('gstin', e.target.value.toUpperCase())} placeholder="33AABCK1234A1Z5" />
+          </div>
+          <div class="field">
+            <label>Address *</label>
+            <input type="text" required value=${form.address} onChange=${e => update('address', e.target.value)} placeholder="Street, Area" />
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label>City *</label>
+              <input type="text" required value=${form.city} onChange=${e => update('city', e.target.value)} />
+            </div>
+            <div class="field">
+              <label>Pincode *</label>
+              <input type="text" required maxLength=${6} value=${form.pincode} onChange=${e => update('pincode', e.target.value)} placeholder="600001" />
+            </div>
+          </div>
+          <div class="field">
+            <label>State *</label>
+            <input type="text" required value=${form.state} onChange=${e => update('state', e.target.value)} />
+          </div>
+          <div class="field">
+            <label>Your Full Name *</label>
+            <input type="text" required value=${form.your_name} onChange=${e => update('your_name', e.target.value)} placeholder="Rajadurai R" />
+          </div>
+          <div class="field">
+            <label>Your Phone *</label>
+            <input type="tel" required maxLength=${10} value=${form.your_phone} onChange=${e => update('your_phone', e.target.value.replace(/\D/g, ''))} placeholder="9876543210" />
+          </div>
+          <div class="toggle-row" style="margin:6px 0 20px">
+            <div class="toggle-label">IATF 16949 Certified</div>
+            <div class=${'toggle' + (form.iatf ? ' active' : '')} onClick=${() => update('iatf', !form.iatf)}></div>
+          </div>
+          <button class="btn" disabled=${loading}>${loading ? 'Creating…' : 'Create plant'}</button>
+          <button type="button" class="btn ghost" style="margin-top:8px;width:100%" onClick=${() => setPath('choose')}>← Back</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= MAIN APP =============
+function App() {
+  const [user, setUser] = useState(null);
+  const [plant, setPlant] = useState(null);
+  const [me, setMe] = useState(null);
+  const [tab, setTab] = useState('home');
+  const [loading, setLoading] = useState(true);
+  const [pendingInvite, setPendingInvite] = useState(null);
+
+  // Read invite code from URL on first load
+  const urlCode = useMemo(() => {
+    const u = new URL(window.location.href);
+    return (u.searchParams.get('code') || u.searchParams.get('invite') || '').toUpperCase().trim();
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      const { data: { session } } = await sb.auth.getSession();
+      if (session) {
+        setUser(session.user);
+        await detectInvite(session.user);
+        await loadProfile(session.user);
+      }
+      setLoading(false);
+    })();
+
+    const { data: { subscription } } = sb.auth.onAuthStateChange(async (event, session) => {
+      if (event === 'SIGNED_OUT') {
+        setUser(null); setPlant(null); setMe(null); setPendingInvite(null);
+      }
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // Look for any pending invite that matches: URL code OR user's email
+  const detectInvite = async (u) => {
+    let invite = null;
+
+    // 1. URL code wins
+    if (urlCode) {
+      const { data } = await sb.from('user_invites').select('*, plants(name)').eq('invite_code', urlCode).eq('status', 'pending').maybeSingle();
+      if (data) invite = data;
+    }
+
+    // 2. Fall back to email match
+    if (!invite && u.email) {
+      const { data } = await sb.from('user_invites').select('*, plants(name)').eq('email', u.email).eq('status', 'pending').maybeSingle();
+      if (data) invite = data;
+    }
+
+    if (invite) {
+      console.log('[Loglinkr] Pending invite found:', invite.invite_code, 'for plant', invite.plants?.name);
+      setPendingInvite(invite);
+    } else {
+      setPendingInvite(null);
+    }
+  };
+
+  const loadProfile = async (u) => {
+    console.log('[Loglinkr] loadProfile for user:', u.id);
+    const { data: userRow } = await sb.from('users').select('*').eq('id', u.id).maybeSingle();
+    if (!userRow || !userRow.plant_id) {
+      setPlant(null); setMe(null);
+      return;
+    }
+    const { data: plantRow } = await sb.from('plants').select('*').eq('id', userRow.plant_id).maybeSingle();
+    if (!plantRow) {
+      setPlant(null); setMe(null);
+      return;
+    }
+    setPlant(plantRow);
+    setMe(userRow);
+    // Clear URL params on successful load
+    if (window.location.search) {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  };
+
+  const handleAuth = async (u) => {
+    setUser(u);
+    await detectInvite(u);
+    await loadProfile(u);
+  };
+
+  const logout = async () => {
+    if (!confirm('Log out?')) return;
+    await sb.auth.signOut();
+    location.reload();
+  };
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+  if (!user) return html`<${AuthScreen} onAuth=${handleAuth} pendingInviteCode=${urlCode} />`;
+  if (!plant) return html`<${Wizard} user=${user} pendingInvite=${pendingInvite} onDone=${(p) => loadProfile(user)} />`;
+
+  return html`<${Shell} user=${user} plant=${plant} me=${me} tab=${tab} setTab=${setTab} logout=${logout} reload=${() => loadProfile(user)} />`;
+}
+
+// ============= APP SHELL =============
+function Shell({ user, plant, me, tab, setTab, logout, reload }) {
+  const initials = (me.full_name || user.email).split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  const recalcUnread = useCallback(async () => {
+    if (!plant?.id) return;
+    const { data: groups } = await sb.from('chat_groups').select('id, members').contains('members', [user.id]);
+    if (!groups) return;
+    let total = 0;
+    for (const g of groups) {
+      const lastRead = parseInt(localStorage.getItem('loglinkr_lastread_' + user.id + '_' + g.id) || '0');
+      const lastReadIso = new Date(lastRead || 0).toISOString();
+      const { count } = await sb.from('chat_messages')
+        .select('id', { count:'exact', head:true })
+        .eq('group_id', g.id)
+        .gt('created_at', lastReadIso)
+        .neq('sender_id', user.id);
+      total += count || 0;
+    }
+    setUnreadCount(total);
+  }, [plant?.id, user.id]);
+
+  useEffect(() => {
+    recalcUnread();
+    if (!plant?.id) return;
+    const channel = sb.channel('shell-msgs-' + plant.id)
+      .on('postgres_changes', { event:'INSERT', schema:'public', table:'chat_messages', filter:'plant_id=eq.' + plant.id }, () => {
+        recalcUnread();
+      })
+      .subscribe();
+    // Recalc when localStorage changes (mark-read in chat)
+    const interval = setInterval(recalcUnread, 5000);
+    return () => { sb.removeChannel(channel); clearInterval(interval); };
+  }, [plant?.id, recalcUnread]);
+
+  return html`
+    <div class="app">
+      <div class="topbar">
+        <div class="topbar-left">
+          <div class="topbar-logo">L</div>
+          <div>
+            <div class="topbar-title">Loglinkr</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:-2px">${plant.name}</div>
+          </div>
+        </div>
+        <div class="topbar-right">
+          <div class="topbar-user" onClick=${logout} title="Log out">${initials}</div>
+        </div>
+      </div>
+
+      <${Page} active=${tab === 'home'}><${Home} plant=${plant} me=${me} setTab=${setTab} reload=${reload} /></${Page}>
+      <${Page} active=${tab === 'production'}><${Production} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'quality'}><${Quality} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'maintenance'}><${Maintenance} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'stocks'}><${Stocks} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'actions'}><${ActionHub} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} /></${Page}>
+      <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab}/></${Page}>
+
+      <div class="tabbar">
+        <${TabBtn} icon="home" label="Home" active=${tab === 'home'} onClick=${() => setTab('home')} />
+        <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
+        <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
+        <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people'].includes(tab)} onClick=${() => setTab('more')} />
+      </div>
+    </div>
+  `;
+}
+
+function Page({ active, children }) {
+  return html`<div class=${'page' + (active ? ' active' : '')}>${children}</div>`;
+}
+
+function TabBtn({ icon, label, active, onClick, badge }) {
+  const icons = {
+    home: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>`,
+    production: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>`,
+    quality: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>`,
+    chat: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>`,
+    people: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
+    more: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>`,
+  };
+  return html`<button class=${'tab' + (active ? ' active' : '')} onClick=${onClick} style="position:relative">${icons[icon]}<span class="tab-label">${label}</span>${badge > 0 ? html`<span style="position:absolute;top:4px;right:calc(50% - 18px);background:var(--rose-500);color:white;font-size:9px;font-weight:700;padding:1px 5px;border-radius:999px;min-width:16px;text-align:center;line-height:1.4">${badge > 99 ? '99+' : badge}</span>` : ''}</button>`;
+}
+
+// ============= HOME =============
+function Home({ plant, me, setTab, reload }) {
+  const [stats, setStats] = useState({ units: 0, users: 1, machines: 0, dies: 0, shotsToday: 0, openActions: 0, openNcrs: 0, openBreakdowns: 0, lowStock: 0 });
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => { loadStats(); }, []);
+
+  const loadStats = async () => {
+    setLoading(true);
+    const today = new Date(); today.setHours(0,0,0,0);
+    const [u, us, m, d, s, a, n, b, st] = await Promise.all([
+      sb.from('units').select('id', { count:'exact', head:true }),
+      sb.from('users').select('id', { count:'exact', head:true }),
+      sb.from('mcp_pdc_machines').select('id', { count:'exact', head:true }),
+      sb.from('mcp_pdc_dies').select('id', { count:'exact', head:true }),
+      sb.from('mcp_pdc_shots').select('id', { count:'exact', head:true }).gte('recorded_at', today.toISOString()),
+      sb.from('actions').select('id', { count:'exact', head:true }).eq('status', 'open'),
+      sb.from('mcp_quality_ncrs').select('id', { count:'exact', head:true }).neq('status', 'closed').neq('status', 'cancelled'),
+      sb.from('mcp_maintenance_breakdowns').select('id', { count:'exact', head:true }).neq('status', 'resolved').neq('status', 'cancelled'),
+      sb.from('mcp_stocks_items').select('id', { count:'exact', head:true }).filter('current_qty', 'lte', 'reorder_level'),
+    ]);
+    setStats({
+      units: u.count || 0,
+      users: us.count || 0,
+      machines: m.count || 0,
+      dies: d.count || 0,
+      shotsToday: s.count || 0,
+      openActions: a.count || 0,
+      openNcrs: n.count || 0,
+      openBreakdowns: b.count || 0,
+      lowStock: st.count || 0,
+    });
+    setLoading(false);
+  };
+
+  const setupSteps = [
+    { done: stats.units > 0, label: 'Add units (Unit 1, 2, 3)' },
+    { done: stats.users > 1, label: 'Invite users (supervisors, QA)' },
+    { done: stats.machines > 0, label: 'Add PDC machines' },
+    { done: stats.dies > 0, label: 'Add dies' },
+    { done: stats.shotsToday > 0, label: 'Log first production shot' },
+  ];
+  const setupComplete = setupSteps.every(s => s.done);
+  const greeting = me.full_name.split(' ')[0];
+  const alerts = stats.openNcrs + stats.openBreakdowns + stats.lowStock;
+
+  return html`
+    <div class="page-header">
+      <div>
+        <h1>Hi, ${greeting}</h1>
+        <div class="sub">${plant.name} · ${plant.city}</div>
+      </div>
+    </div>
+
+    <div class="pulse-card">
+      <div class="pulse-label">Plant Pulse · Today</div>
+      <div class="pulse-num">${stats.shotsToday > 0 ? '🟢 Active' : (stats.units > 0 ? '⏸ Idle' : '⚙️ Setup')}</div>
+      <div class="pulse-grid">
+        <div class="pulse-stat"><div class="pulse-stat-num">${stats.shotsToday}</div><div class="pulse-stat-label">Shots Today</div></div>
+        <div class="pulse-stat"><div class="pulse-stat-num">${stats.machines}</div><div class="pulse-stat-label">Machines</div></div>
+        <div class="pulse-stat"><div class="pulse-stat-num">${alerts}</div><div class="pulse-stat-label">Alerts</div></div>
+      </div>
+    </div>
+
+    ${!setupComplete && html`
+      <div class="setup-banner">
+        <div class="setup-banner-title">⚡ Quick setup</div>
+        ${setupSteps.map(s => html`
+          <div class=${'setup-step' + (s.done ? ' done' : '')}>
+            <div class="num">${s.done ? '✓' : ''}</div>
+            <span>${s.label}</span>
+          </div>
+        `)}
+      </div>
+    `}
+
+    ${alerts > 0 && html`
+      <div class="section-h">Needs attention</div>
+      ${stats.openNcrs > 0 && html`
+        <div class="list-item" onClick=${() => setTab('quality')}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${stats.openNcrs} open NCR${stats.openNcrs > 1 ? 's' : ''}</div>
+              <div class="list-item-sub">Tap to investigate</div>
+            </div>
+            <span class="badge rose">Quality</span>
+          </div>
+        </div>
+      `}
+      ${stats.openBreakdowns > 0 && html`
+        <div class="list-item" onClick=${() => setTab('maintenance')}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${stats.openBreakdowns} active breakdown${stats.openBreakdowns > 1 ? 's' : ''}</div>
+              <div class="list-item-sub">Tap to resolve</div>
+            </div>
+            <span class="badge amber">Maintenance</span>
+          </div>
+        </div>
+      `}
+      ${stats.lowStock > 0 && html`
+        <div class="list-item" onClick=${() => setTab('stocks')}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${stats.lowStock} item${stats.lowStock > 1 ? 's' : ''} low on stock</div>
+              <div class="list-item-sub">Tap to reorder</div>
+            </div>
+            <span class="badge amber">Stocks</span>
+          </div>
+        </div>
+      `}
+    `}
+
+    <div class="section-h">Quick Stats</div>
+    <div class="stat-grid">
+      <div class="stat teal"><div class="stat-num">${stats.units}</div><div class="stat-label">Units</div></div>
+      <div class="stat teal"><div class="stat-num">${stats.users}</div><div class="stat-label">Team</div></div>
+      <div class="stat amber"><div class="stat-num">${stats.machines}</div><div class="stat-label">Machines</div></div>
+      <div class="stat amber"><div class="stat-num">${stats.dies}</div><div class="stat-label">Dies</div></div>
+    </div>
+
+    <div class="card" style="background:var(--slate-900);color:white;border:none">
+      <div class="card-title" style="color:white">Plant Info</div>
+      <div class="card-row" style="border-color:rgba(255,255,255,0.1)"><span class="label" style="color:var(--slate-400)">Plant</span><span class="value" style="color:white">${plant.name}</span></div>
+      <div class="card-row" style="border-color:rgba(255,255,255,0.1)"><span class="label" style="color:var(--slate-400)">GSTIN</span><span class="value" style="color:white">${plant.gstin || '—'}</span></div>
+      <div class="card-row" style="border-color:rgba(255,255,255,0.1)"><span class="label" style="color:var(--slate-400)">IATF</span><span class="value">${plant.iatf_certified ? html`<span class="badge emerald">Certified</span>` : html`<span class="badge">Not certified</span>`}</span></div>
+      <div class="card-row" style="border-color:rgba(255,255,255,0.1)"><span class="label" style="color:var(--slate-400)">Tier</span><span class="value"><span class="badge teal">${plant.subscription_tier.toUpperCase()}</span></span></div>
+    </div>
+  `;
+}
+
+// ============= PRODUCTION =============
+function Production({ plant, me }) {
+  const [view, setView] = useState('overview');
+  const [machines, setMachines] = useState([]);
+  const [dies, setDies] = useState([]);
+  const [shots, setShots] = useState([]);
+  const [parts, setParts] = useState([]);
+  const [units, setUnits] = useState([]);
+  const [shifts, setShifts] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [modal, setModal] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+  const [activePart, setActivePart] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [m, d, s, p, u, sh, us] = await Promise.all([
+      sb.from('mcp_pdc_machines').select('*, units(name)').order('code'),
+      sb.from('mcp_pdc_dies').select('*').order('code'),
+      sb.from('mcp_pdc_shots').select('*, units(name), shifts(name), mcp_pdc_dies(code,part_number), mcp_pdc_machines(code), users:operator_user_id(full_name)').order('recorded_at', { ascending:false }).limit(50),
+      sb.from('mcp_pdc_parts').select('*').order('part_number'),
+      sb.from('units').select('*').order('name'),
+      sb.from('shifts').select('*').order('start_time'),
+      sb.from('users').select('*').order('full_name'),
+    ]);
+    setMachines(m.data || []);
+    setDies(d.data || []);
+    setShots(s.data || []);
+    setParts(p.data || []);
+    setUnits(u.data || []);
+    setShifts(sh.data || []);
+    setUsers(us.data || []);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  if (units.length === 0) {
+    return html`
+      <div class="page-header"><div><h1>Production</h1><div class="sub">Parts, dies, machines, shots</div></div></div>
+      <div class="card">
+        <div class="alert info">First, add at least one unit in <strong>People → Units</strong>.</div>
+      </div>
+    `;
+  }
+
+  // If a part is selected, show its detail (route + BOM)
+  if (activePart) {
+    return html`<${PartDetail} plant=${plant} me=${me} part=${activePart} machines=${machines} dies=${dies} parts=${parts.filter(x => x.id !== activePart.id)} onClose=${() => { setActivePart(null); refresh(); }} />`;
+  }
+
+  const todayShots = shots.filter(s => new Date(s.recorded_at).toDateString() === new Date().toDateString());
+  const todayGood = todayShots.reduce((a,s) => a + (s.shots_good || 0), 0);
+  const todayReject = todayShots.reduce((a,s) => a + (s.shots_rejected || 0), 0);
+  const rejectRate = todayGood + todayReject > 0 ? ((todayReject / (todayGood + todayReject)) * 100).toFixed(1) : 0;
+
+  return html`
+    <div class="page-header">
+      <div><h1>Production</h1><div class="sub">Parts, dies, machines, shots</div></div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
+      <button class=${'auth-tab' + (view === 'overview' ? ' active' : '')} onClick=${() => setView('overview')}>Overview</button>
+      <button class=${'auth-tab' + (view === 'parts' ? ' active' : '')} onClick=${() => setView('parts')}>Parts</button>
+      <button class=${'auth-tab' + (view === 'machines' ? ' active' : '')} onClick=${() => setView('machines')}>Machines</button>
+      <button class=${'auth-tab' + (view === 'dies' ? ' active' : '')} onClick=${() => setView('dies')}>Dies</button>
+      <button class=${'auth-tab' + (view === 'shots' ? ' active' : '')} onClick=${() => setView('shots')}>Shots</button>
+    </div>
+
+    ${view === 'overview' && html`
+      <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+        <div class="stat teal"><div class="stat-num">${fmtNum(todayGood)}</div><div class="stat-label">Good Today</div></div>
+        <div class="stat amber"><div class="stat-num">${fmtNum(todayReject)}</div><div class="stat-label">Reject</div></div>
+        <div class="stat ${rejectRate > 3 ? 'rose' : 'teal'}"><div class="stat-num">${rejectRate}%</div><div class="stat-label">Reject Rate</div></div>
+      </div>
+      <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-top:10px">
+        <div class="stat teal"><div class="stat-num">${parts.length}</div><div class="stat-label">Parts</div></div>
+        <div class="stat teal"><div class="stat-num">${dies.length}</div><div class="stat-label">Dies</div></div>
+        <div class="stat teal"><div class="stat-num">${machines.length}</div><div class="stat-label">Machines</div></div>
+        <div class="stat teal"><div class="stat-num">${todayShots.length}</div><div class="stat-label">Logs Today</div></div>
+      </div>
+      <div class="section-h">Recent Shots</div>
+      ${shots.slice(0, 5).map(s => html`
+        <div class="list-item" key=${s.id}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${s.mcp_pdc_dies?.code || '?'} on ${s.mcp_pdc_machines?.code || '?'} · ${fmtNum(s.shots_good)} good${s.shots_rejected > 0 ? ' / ' + s.shots_rejected + ' rej' : ''}</div>
+              <div class="list-item-sub">${s.units?.name} · ${s.shifts?.name} · ${s.users?.full_name || '?'}</div>
+            </div>
+            <div class="list-item-meta">${fmtDate(s.recorded_at)}</div>
+          </div>
+        </div>
+      `)}
+    `}
+
+    ${view === 'parts' && html`
+      <div class="section-h">Parts · ${parts.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('part'); }}>+ Add Part</button></div>
+      ${parts.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🔩</div>No parts yet. Add your first part — then add its route and BOM.</div></div>` :
+        parts.map(p => html`
+          <div class="list-item" key=${p.id} onClick=${() => setActivePart(p)}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${p.part_number} · Rev ${p.revision} · ${p.name}</div>
+                <div class="list-item-sub">${p.part_type} ${p.customer ? '· ' + p.customer : ''} ${p.weight_kg ? '· ' + p.weight_kg + ' kg' : ''}</div>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                <span class=${'badge ' + (p.status === 'active' ? 'emerald' : p.status === 'prototype' ? 'amber' : '')}>${p.status}</span>
+                <span style="color:var(--slate-400);font-size:18px">›</span>
+              </div>
+            </div>
+          </div>
+        `)
+      }
+    `}
+
+    ${view === 'machines' && html`
+      <div class="section-h">Machines · ${machines.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('machine'); }}>+ Add</button></div>
+      ${machines.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">⚙️</div>No machines yet</div></div>` :
+        machines.map(m => html`
+          <div class="list-item" key=${m.id} onClick=${() => { setEditTarget(m); setModal('machine'); }}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${m.code} · ${m.make || ''} ${m.model || ''}</div>
+                <div class="list-item-sub">${m.units?.name || ''} · ${m.tonnage ? m.tonnage + 'T' : '—'}</div>
+              </div>
+              <span class=${'badge ' + (m.status === 'running' ? 'emerald' : m.status === 'breakdown' ? 'rose' : m.status === 'maintenance' ? 'amber' : '')}>${m.status}</span>
+            </div>
+          </div>
+        `)
+      }
+    `}
+
+    ${view === 'dies' && html`
+      <div class="section-h">Dies · ${dies.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('die'); }}>+ Add</button></div>
+      ${dies.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🔩</div>No dies yet</div></div>` :
+        dies.map(d => {
+          const lifePct = d.max_strokes > 0 ? Math.min(100, (d.current_stroke_count / d.max_strokes) * 100) : 0;
+          const lifeClass = lifePct >= 90 ? 'danger' : lifePct >= 75 ? 'warn' : '';
+          return html`
+            <div class="list-item" key=${d.id} onClick=${() => { setEditTarget(d); setModal('die'); }}>
+              <div class="list-item-row">
+                <div class="list-item-main">
+                  <div class="list-item-title">${d.code} · ${d.part_number}</div>
+                  <div class="list-item-sub">${d.customer_name || 'No customer'} · ${fmtNum(d.current_stroke_count)} / ${fmtNum(d.max_strokes)} strokes</div>
+                  <div class="life-bar"><div class=${'life-bar-fill ' + lifeClass} style=${'width:' + lifePct + '%'}></div></div>
+                </div>
+                <span class=${'badge ' + (d.status === 'active' ? 'emerald' : d.status === 'repair' ? 'amber' : 'rose')}>${d.status}</span>
+              </div>
+            </div>
+          `;
+        })
+      }
+    `}
+
+    ${view === 'shots' && html`
+      <div class="section-h">Shots · ${shots.length}<button class="btn small ghost" onClick=${() => setModal('shot')} disabled=${machines.length === 0 || dies.length === 0}>+ Log</button></div>
+      ${shots.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📊</div>No shots logged yet</div></div>` :
+        shots.map(s => html`
+          <div class="list-item" key=${s.id}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${s.mcp_pdc_dies?.code || '?'} on ${s.mcp_pdc_machines?.code || '?'} · ${fmtNum(s.shots_good)} good${s.shots_rejected > 0 ? ' / ' + s.shots_rejected + ' rej' : ''}</div>
+                <div class="list-item-sub">${s.units?.name} · ${s.shifts?.name} · ${s.users?.full_name || '?'}</div>
+              </div>
+              <div class="list-item-meta">${fmtDate(s.recorded_at)}</div>
+            </div>
+          </div>
+        `)
+      }
+    `}
+
+    ${modal === 'part' && html`<${PartModal} plant=${plant} me=${me} dies=${dies} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'machine' && html`<${MachineModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'die' && html`<${DieModal} plant=${plant} parts=${parts} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'shot' && html`<${ShotModal} plant=${plant} me=${me} units=${units} shifts=${shifts} machines=${machines} dies=${dies} parts=${parts} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
+  `;
+}
+
+// ============= MACHINE MODAL =============
+// ============= PART MODAL =============
+function PartModal({ plant, me, dies, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget || {
+    part_number: '', revision: 'A', name: '', description: '',
+    part_type: 'finished', status: 'active',
+    customer: '', drawing_url: '', weight_kg: '', uom: 'nos',
+    default_die_id: '', notes: ''
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        part_number: form.part_number.trim().toUpperCase(),
+        revision: form.revision.trim().toUpperCase() || 'A',
+        name: form.name,
+        description: form.description || null,
+        part_type: form.part_type,
+        status: form.status,
+        customer: form.customer || null,
+        drawing_url: form.drawing_url || null,
+        weight_kg: form.weight_kg ? parseFloat(form.weight_kg) : null,
+        uom: form.uom,
+        default_die_id: form.default_die_id || null,
+        notes: form.notes || null,
+      };
+      if (!editTarget) payload.created_by = me.id;
+      const { error } = editTarget
+        ? await sb.from('mcp_pdc_parts').update(payload).eq('id', editTarget.id)
+        : await sb.from('mcp_pdc_parts').insert(payload);
+      if (error) throw error;
+      showToast(editTarget ? 'Part updated' : 'Part added');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Edit Part' : 'New Part'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Part Number *</label><input type="text" required value=${form.part_number} onChange=${e => setForm({...form, part_number: e.target.value})} placeholder="FH-2024-001" /></div>
+            <div class="field"><label>Rev</label><input type="text" maxLength=${3} value=${form.revision} onChange=${e => setForm({...form, revision: e.target.value})} placeholder="A" /></div>
+          </div>
+          <div class="field"><label>Part Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} placeholder="Filterhead Body" /></div>
+          <div class="field"><label>Description</label><textarea rows=${2} value=${form.description || ''} onChange=${e => setForm({...form, description: e.target.value})}></textarea></div>
+          <div class="field-row">
+            <div class="field"><label>Type *</label>
+              <select value=${form.part_type} onChange=${e => setForm({...form, part_type: e.target.value})}>
+                <option value="finished">Finished (sold)</option>
+                <option value="sub_assembly">Sub-Assembly</option>
+                <option value="component">Component</option>
+                <option value="raw_part">Raw Part</option>
+              </select>
+            </div>
+            <div class="field"><label>Status</label>
+              <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
+                <option value="active">Active</option>
+                <option value="prototype">Prototype</option>
+                <option value="hold">On Hold</option>
+                <option value="obsolete">Obsolete</option>
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Customer</label><input type="text" value=${form.customer || ''} onChange=${e => setForm({...form, customer: e.target.value})} placeholder="Bosch / TVS / etc" /></div>
+          <div class="field-row">
+            <div class="field"><label>Weight (kg)</label><input type="number" step="0.001" value=${form.weight_kg || ''} onChange=${e => setForm({...form, weight_kg: e.target.value})} /></div>
+            <div class="field"><label>UOM</label>
+              <select value=${form.uom} onChange=${e => setForm({...form, uom: e.target.value})}>
+                <option value="nos">Nos</option><option value="kg">Kg</option><option value="set">Set</option><option value="pair">Pair</option>
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Default Die</label>
+            <select value=${form.default_die_id || ''} onChange=${e => setForm({...form, default_die_id: e.target.value})}>
+              <option value="">— None —</option>
+              ${dies.map(d => html`<option key=${d.id} value=${d.id}>${d.code} · ${d.part_number}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Drawing URL</label><input type="url" value=${form.drawing_url || ''} onChange=${e => setForm({...form, drawing_url: e.target.value})} placeholder="https://..." /></div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes || ''} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Create part')}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= PART DETAIL (Route + BOM) =============
+function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
+  const [tab, setTab] = useState('route');
+  const [route, setRoute] = useState(null);
+  const [steps, setSteps] = useState([]);
+  const [bom, setBom] = useState([]);
+  const [whereUsed, setWhereUsed] = useState([]);
+  const [stockItems, setStockItems] = useState([]);
+  const [modal, setModal] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [r, b, w, s] = await Promise.all([
+      sb.from('mcp_pdc_routes').select('*').eq('part_id', part.id).eq('is_active', true).maybeSingle(),
+      sb.from('mcp_pdc_bom').select('*, child_part:child_part_id(part_number,name,revision), child_item:child_item_id(code,name,uom)').eq('parent_part_id', part.id),
+      sb.from('v_bom_where_used').select('*').eq('part_id', part.id),
+      sb.from('mcp_stocks_items').select('*').order('name'),
+    ]);
+    setRoute(r.data);
+    if (r.data) {
+      const { data: stps } = await sb.from('mcp_pdc_route_steps').select('*, mcp_pdc_machines(code)').eq('route_id', r.data.id).order('seq');
+      setSteps(stps || []);
+    } else {
+      setSteps([]);
+    }
+    setBom(b.data || []);
+    setWhereUsed(w.data || []);
+    setStockItems(s.data || []);
+    setLoading(false);
+  }, [part.id]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const createRoute = async () => {
+    const { data, error } = await sb.from('mcp_pdc_routes').insert({
+      plant_id: plant.id, part_id: part.id, version: 1, is_active: true, created_by: me.id
+    }).select().single();
+    if (error) { alert(error.message); return; }
+    setRoute(data);
+    refresh();
+  };
+
+  const deleteStep = async (id) => {
+    if (!confirm('Delete this step?')) return;
+    await sb.from('mcp_pdc_route_steps').delete().eq('id', id);
+    refresh();
+  };
+
+  const deleteBom = async (id) => {
+    if (!confirm('Delete this BOM line?')) return;
+    await sb.from('mcp_pdc_bom').delete().eq('id', id);
+    refresh();
+  };
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:0">
+        <h1 style="font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${part.part_number} · Rev ${part.revision}</h1>
+        <div class="sub">${part.name}</div>
+      </div>
+      <button class="btn small ghost" onClick=${() => { setEditTarget(part); setModal('part'); }}>Edit</button>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-row"><span class="label">Type</span><span class="value"><span class="badge teal">${part.part_type}</span></span></div>
+      <div class="card-row"><span class="label">Status</span><span class="value"><span class=${'badge ' + (part.status === 'active' ? 'emerald' : 'amber')}>${part.status}</span></span></div>
+      ${part.customer && html`<div class="card-row"><span class="label">Customer</span><span class="value">${part.customer}</span></div>`}
+      ${part.weight_kg && html`<div class="card-row"><span class="label">Weight</span><span class="value">${part.weight_kg} kg</span></div>`}
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (tab === 'route' ? ' active' : '')} onClick=${() => setTab('route')}>Route</button>
+      <button class=${'auth-tab' + (tab === 'bom' ? ' active' : '')} onClick=${() => setTab('bom')}>BOM</button>
+      <button class=${'auth-tab' + (tab === 'whereused' ? ' active' : '')} onClick=${() => setTab('whereused')}>Where Used</button>
+    </div>
+
+    ${tab === 'route' && html`
+      ${!route ? html`
+        <div class="card">
+          <div class="empty">
+            <div class="icon">🛣️</div>
+            <div style="margin-bottom:14px">No route defined for this part yet</div>
+            <button class="btn" onClick=${createRoute}>Create route</button>
+          </div>
+        </div>
+      ` : html`
+        <div class="section-h">Route v${route.version} · ${steps.length} step${steps.length !== 1 ? 's' : ''}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('step'); }}>+ Add Step</button></div>
+        ${steps.length === 0 ? html`<div class="card"><div class="empty">No steps yet. Add the first operation in the route.</div></div>` :
+          steps.map((s, idx) => html`
+            <div class="list-item" key=${s.id} onClick=${() => { setEditTarget(s); setModal('step'); }}>
+              <div class="list-item-row">
+                <div class="list-item-main">
+                  <div class="list-item-title">
+                    <span style="display:inline-block;width:24px;height:24px;background:var(--teal-600);color:white;border-radius:50%;text-align:center;line-height:24px;font-size:11px;font-weight:700;margin-right:8px">${s.seq}</span>
+                    ${s.op_name}
+                  </div>
+                  <div class="list-item-sub">
+                    <span class="badge teal">${s.op_type}</span>
+                    ${s.mcp_pdc_machines?.code ? ' · ' + s.mcp_pdc_machines.code : ''}
+                    ${s.cycle_time_sec ? ' · ' + s.cycle_time_sec + 's cycle' : ''}
+                    ${s.outsource_vendor ? ' · ' + s.outsource_vendor : ''}
+                    ${s.inspection_required ? ' · 🔍 inspection' : ''}
+                  </div>
+                </div>
+                <button class="btn small danger" onClick=${(e) => { e.stopPropagation(); deleteStep(s.id); }}>×</button>
+              </div>
+            </div>
+          `)
+        }
+      `}
+    `}
+
+    ${tab === 'bom' && html`
+      <div class="section-h">BOM · ${bom.length} item${bom.length !== 1 ? 's' : ''}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('bom'); }}>+ Add Item</button></div>
+      ${bom.length === 0 ? html`<div class="card"><div class="empty">No BOM defined. Add raw materials, sub-assemblies, or bought-out parts.</div></div>` :
+        bom.map(b => {
+          const isPart = b.child_type === 'part';
+          const childName = isPart ? (b.child_part?.part_number + ' · Rev ' + b.child_part?.revision + ' · ' + b.child_part?.name) : (b.child_item?.code + ' · ' + b.child_item?.name);
+          const uom = isPart ? b.uom : (b.child_item?.uom || b.uom);
+          return html`
+            <div class="list-item" key=${b.id}>
+              <div class="list-item-row">
+                <div class="list-item-main">
+                  <div class="list-item-title">${childName}</div>
+                  <div class="list-item-sub">
+                    <span class=${'badge ' + (isPart ? 'teal' : '')}>${isPart ? 'Sub-part' : 'Stock'}</span>
+                    · ${b.qty_per_assy} ${uom} per assy
+                    ${b.scrap_pct > 0 ? ' · +' + b.scrap_pct + '% scrap' : ''}
+                  </div>
+                </div>
+                <button class="btn small danger" onClick=${() => deleteBom(b.id)}>×</button>
+              </div>
+            </div>
+          `;
+        })
+      }
+    `}
+
+    ${tab === 'whereused' && html`
+      <div class="section-h">Used in · ${whereUsed.length} parent part${whereUsed.length !== 1 ? 's' : ''}</div>
+      ${whereUsed.length === 0 ? html`<div class="card"><div class="empty">This part is not used in any other assembly.</div></div>` :
+        whereUsed.map(w => html`
+          <div class="list-item" key=${w.used_in_part_id}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${w.used_in_part_number} · Rev ${w.used_in_revision}</div>
+                <div class="list-item-sub">${w.used_in_name} · depth ${w.depth}</div>
+              </div>
+            </div>
+          </div>
+        `)
+      }
+    `}
+
+    ${modal === 'step' && html`<${RouteStepModal} plant=${plant} route=${route} machines=${machines} editTarget=${editTarget} nextSeq=${steps.length > 0 ? Math.max(...steps.map(s => s.seq)) + 10 : 10} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'bom' && html`<${BomModal} plant=${plant} parentPart=${part} parts=${parts} stockItems=${stockItems} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
+    ${modal === 'part' && html`<${PartModal} plant=${plant} me=${me} dies=${dies} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); onClose(); }} />`}
+  `;
+}
+
+// ============= ROUTE STEP MODAL =============
+function RouteStepModal({ plant, route, machines, editTarget, nextSeq, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget || {
+    seq: nextSeq, op_type: 'pdc', op_name: '',
+    machine_id: '', fixture: '',
+    cycle_time_sec: '', setup_time_min: '',
+    outsource_vendor: '', inspection_required: false, instructions: ''
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        route_id: route.id,
+        seq: parseInt(form.seq),
+        op_type: form.op_type,
+        op_name: form.op_name,
+        machine_id: form.machine_id || null,
+        fixture: form.fixture || null,
+        cycle_time_sec: form.cycle_time_sec ? parseInt(form.cycle_time_sec) : null,
+        setup_time_min: form.setup_time_min ? parseInt(form.setup_time_min) : null,
+        outsource_vendor: form.outsource_vendor || null,
+        inspection_required: !!form.inspection_required,
+        instructions: form.instructions || null,
+      };
+      const { error } = editTarget
+        ? await sb.from('mcp_pdc_route_steps').update(payload).eq('id', editTarget.id)
+        : await sb.from('mcp_pdc_route_steps').insert(payload);
+      if (error) throw error;
+      showToast(editTarget ? 'Step updated' : 'Step added');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Edit Step' : 'Add Route Step'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Seq *</label><input type="number" required value=${form.seq} onChange=${e => setForm({...form, seq: e.target.value})} /></div>
+            <div class="field"><label>Op Type *</label>
+              <select required value=${form.op_type} onChange=${e => setForm({...form, op_type: e.target.value})}>
+                <option value="pdc">PDC (Casting)</option>
+                <option value="trimming">Trimming</option>
+                <option value="deflashing">Deflashing</option>
+                <option value="shot_blast">Shot Blast</option>
+                <option value="machining">Machining</option>
+                <option value="drilling">Drilling</option>
+                <option value="tapping">Tapping</option>
+                <option value="plating">Plating</option>
+                <option value="painting">Painting</option>
+                <option value="assembly">Assembly</option>
+                <option value="inspection">Inspection</option>
+                <option value="packing">Packing</option>
+                <option value="outsource">Outsource</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Operation Name *</label><input type="text" required value=${form.op_name} onChange=${e => setForm({...form, op_name: e.target.value})} placeholder="Bore facing on VMC" /></div>
+          <div class="field"><label>Machine</label>
+            <select value=${form.machine_id || ''} onChange=${e => setForm({...form, machine_id: e.target.value})}>
+              <option value="">— Any / NA —</option>
+              ${machines.map(m => html`<option key=${m.id} value=${m.id}>${m.code} · ${m.make || ''}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Fixture / Tool</label><input type="text" value=${form.fixture || ''} onChange=${e => setForm({...form, fixture: e.target.value})} /></div>
+          <div class="field-row">
+            <div class="field"><label>Cycle Time (sec)</label><input type="number" value=${form.cycle_time_sec || ''} onChange=${e => setForm({...form, cycle_time_sec: e.target.value})} /></div>
+            <div class="field"><label>Setup Time (min)</label><input type="number" value=${form.setup_time_min || ''} onChange=${e => setForm({...form, setup_time_min: e.target.value})} /></div>
+          </div>
+          ${form.op_type === 'outsource' && html`
+            <div class="field"><label>Outsource Vendor</label><input type="text" value=${form.outsource_vendor || ''} onChange=${e => setForm({...form, outsource_vendor: e.target.value})} placeholder="Sri Krishna Plating" /></div>
+          `}
+          <div class="toggle-row">
+            <div class="toggle-label">Inspection Required</div>
+            <div class=${'toggle' + (form.inspection_required ? ' active' : '')} onClick=${() => setForm({...form, inspection_required: !form.inspection_required})}></div>
+          </div>
+          <div class="field"><label>Instructions</label><textarea rows=${2} value=${form.instructions || ''} onChange=${e => setForm({...form, instructions: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add step')}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= BOM MODAL =============
+function BomModal({ plant, parentPart, parts, stockItems, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    child_type: 'stock_item',
+    child_part_id: '', child_item_id: '',
+    qty_per_assy: '1', uom: 'nos', scrap_pct: '0', notes: ''
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      if (form.child_type === 'part' && !form.child_part_id) throw new Error('Pick a sub-part');
+      if (form.child_type === 'stock_item' && !form.child_item_id) throw new Error('Pick a stock item');
+      if (form.child_type === 'part' && form.child_part_id === parentPart.id) throw new Error("Can't add part to its own BOM");
+      const payload = {
+        plant_id: plant.id,
+        parent_part_id: parentPart.id,
+        child_type: form.child_type,
+        child_part_id: form.child_type === 'part' ? form.child_part_id : null,
+        child_item_id: form.child_type === 'stock_item' ? form.child_item_id : null,
+        qty_per_assy: parseFloat(form.qty_per_assy),
+        uom: form.uom,
+        scrap_pct: parseFloat(form.scrap_pct) || 0,
+        notes: form.notes || null,
+      };
+      const { error } = await sb.from('mcp_pdc_bom').insert(payload);
+      if (error) throw error;
+      showToast('BOM line added');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  // Auto-set UOM when picking stock item
+  const onPickStockItem = (id) => {
+    const item = stockItems.find(s => s.id === id);
+    setForm({...form, child_item_id: id, uom: item?.uom || form.uom});
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Add BOM Item</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <p style="font-size:13px;color:var(--slate-600);margin-bottom:12px">Adding to: <strong>${parentPart.part_number} · ${parentPart.name}</strong></p>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Item Type</label>
+            <div class="auth-tabs">
+              <button type="button" class=${'auth-tab' + (form.child_type === 'stock_item' ? ' active' : '')} onClick=${() => setForm({...form, child_type: 'stock_item', child_part_id: ''})}>Stock Item</button>
+              <button type="button" class=${'auth-tab' + (form.child_type === 'part' ? ' active' : '')} onClick=${() => setForm({...form, child_type: 'part', child_item_id: ''})}>Sub-Part</button>
+            </div>
+          </div>
+          ${form.child_type === 'stock_item' ? html`
+            <div class="field"><label>Stock Item *</label>
+              <select required value=${form.child_item_id} onChange=${e => onPickStockItem(e.target.value)}>
+                <option value="">— Select —</option>
+                ${stockItems.map(s => html`<option key=${s.id} value=${s.id}>${s.code} · ${s.name} (${s.uom})</option>`)}
+              </select>
+              ${stockItems.length === 0 && html`<div style="font-size:11px;color:var(--slate-500);margin-top:4px">No stock items yet. Add some in Stocks tab first.</div>`}
+            </div>
+          ` : html`
+            <div class="field"><label>Sub-Part *</label>
+              <select required value=${form.child_part_id} onChange=${e => setForm({...form, child_part_id: e.target.value})}>
+                <option value="">— Select —</option>
+                ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number} · Rev ${p.revision} · ${p.name}</option>`)}
+              </select>
+              ${parts.length === 0 && html`<div style="font-size:11px;color:var(--slate-500);margin-top:4px">No other parts yet.</div>`}
+            </div>
+          `}
+          <div class="field-row">
+            <div class="field"><label>Qty per Assy *</label><input type="number" step="0.0001" required value=${form.qty_per_assy} onChange=${e => setForm({...form, qty_per_assy: e.target.value})} /></div>
+            <div class="field"><label>UOM</label>
+              <select value=${form.uom} onChange=${e => setForm({...form, uom: e.target.value})}>
+                <option value="nos">Nos</option><option value="kg">Kg</option><option value="g">g</option><option value="ml">ml</option><option value="l">L</option><option value="mtr">m</option><option value="set">Set</option>
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Scrap %</label><input type="number" step="0.1" value=${form.scrap_pct} onChange=${e => setForm({...form, scrap_pct: e.target.value})} placeholder="0" /></div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : 'Add to BOM'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= MACHINE MODAL =============
+function MachineModal({ plant, units, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget || { code:'', make:'', model:'', tonnage:'', unit_id: units[0]?.id || '', status:'idle' });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        code: form.code,
+        make: form.make || null,
+        model: form.model || null,
+        tonnage: form.tonnage ? parseInt(form.tonnage) : null,
+        unit_id: form.unit_id,
+        status: form.status,
+      };
+      const { error } = editTarget
+        ? await sb.from('mcp_pdc_machines').update(payload).eq('id', editTarget.id)
+        : await sb.from('mcp_pdc_machines').insert(payload);
+      if (error) throw error;
+      showToast(editTarget ? 'Machine updated' : 'Machine added');
+      onSaved();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const remove = async () => {
+    if (!confirm('Delete this machine? Past shots referencing it will keep working.')) return;
+    const { error } = await sb.from('mcp_pdc_machines').delete().eq('id', editTarget.id);
+    if (error) { setError(error.message); return; }
+    showToast('Machine deleted');
+    onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Edit' : 'Add'} Machine</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Machine Code *</label><input type="text" required value=${form.code} onChange=${e => setForm({...form, code: e.target.value})} placeholder="PDC-01" /></div>
+          <div class="field-row">
+            <div class="field"><label>Make</label><input type="text" value=${form.make || ''} onChange=${e => setForm({...form, make: e.target.value})} placeholder="Toshiba" /></div>
+            <div class="field"><label>Tonnage</label><input type="number" value=${form.tonnage || ''} onChange=${e => setForm({...form, tonnage: e.target.value})} placeholder="250" /></div>
+          </div>
+          <div class="field"><label>Model</label><input type="text" value=${form.model || ''} onChange=${e => setForm({...form, model: e.target.value})} placeholder="DC-250J" /></div>
+          <div class="field-row">
+            <div class="field"><label>Unit *</label>
+              <select required value=${form.unit_id} onChange=${e => setForm({...form, unit_id: e.target.value})}>
+                ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
+              </select>
+            </div>
+            <div class="field"><label>Status</label>
+              <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
+                <option value="running">Running</option><option value="idle">Idle</option><option value="breakdown">Breakdown</option><option value="maintenance">Maintenance</option>
+              </select>
+            </div>
+          </div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
+          ${editTarget && html`<button class="btn danger" type="button" style="margin-top:8px" onClick=${remove}>Delete</button>`}
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= DIE MODAL =============
+function DieModal({ plant, parts, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget || { code:'', part_number:'', customer_name:'', max_strokes:300000, corepin_count:0, ejector_pin_count:0, status:'active', default_part_id:'' });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [history, setHistory] = useState([]);
+
+  useEffect(() => {
+    if (editTarget) {
+      sb.from('mcp_pdc_die_history').select('*, users:performed_by_user_id(full_name)').eq('die_id', editTarget.id).order('event_date', { ascending:false }).then(({ data }) => setHistory(data || []));
+    }
+  }, [editTarget]);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        code: form.code,
+        part_number: form.part_number,
+        customer_name: form.customer_name || null,
+        max_strokes: parseInt(form.max_strokes) || 300000,
+        corepin_count: parseInt(form.corepin_count) || 0,
+        ejector_pin_count: parseInt(form.ejector_pin_count) || 0,
+        status: form.status,
+        default_part_id: form.default_part_id || null,
+      };
+      const { error } = editTarget
+        ? await sb.from('mcp_pdc_dies').update(payload).eq('id', editTarget.id)
+        : await sb.from('mcp_pdc_dies').insert(payload);
+      if (error) throw error;
+      showToast(editTarget ? 'Die updated' : 'Die added');
+      onSaved();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Edit' : 'Add'} Die</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        ${editTarget && html`
+          <div class="card" style="background:var(--slate-50)">
+            <div class="card-row"><span class="label">Strokes</span><span class="value">${fmtNum(editTarget.current_stroke_count)} / ${fmtNum(editTarget.max_strokes)}</span></div>
+            <div class="life-bar" style="margin-top:0"><div class="life-bar-fill" style=${'width:' + Math.min(100,(editTarget.current_stroke_count/editTarget.max_strokes)*100) + '%'}></div></div>
+          </div>
+        `}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Die Code *</label><input type="text" required value=${form.code} onChange=${e => setForm({...form, code: e.target.value})} placeholder="FH-21" /></div>
+          <div class="field"><label>Part Number *</label><input type="text" required value=${form.part_number} onChange=${e => setForm({...form, part_number: e.target.value})} placeholder="Filterhead" /></div>
+          <div class="field"><label>Customer</label><input type="text" value=${form.customer_name || ''} onChange=${e => setForm({...form, customer_name: e.target.value})} placeholder="Bosch" /></div>
+          <div class="field"><label>Max Strokes</label><input type="number" value=${form.max_strokes} onChange=${e => setForm({...form, max_strokes: e.target.value})} placeholder="300000" /></div>
+          <div class="field-row">
+            <div class="field"><label>Corepins</label><input type="number" value=${form.corepin_count} onChange=${e => setForm({...form, corepin_count: e.target.value})} /></div>
+            <div class="field"><label>Ejector Pins</label><input type="number" value=${form.ejector_pin_count} onChange=${e => setForm({...form, ejector_pin_count: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Status</label>
+            <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
+              <option value="active">Active</option><option value="repair">Repair</option><option value="retired">Retired</option>
+            </select>
+          </div>
+          ${parts && parts.length > 0 && html`
+            <div class="field"><label>Default Part (links die to part master)</label>
+              <select value=${form.default_part_id || ''} onChange=${e => setForm({...form, default_part_id: e.target.value})}>
+                <option value="">— None —</option>
+                ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number} · Rev ${p.revision} · ${p.name}</option>`)}
+              </select>
+            </div>
+          `}
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
+        </form>
+
+        ${editTarget && html`
+          <div style="margin-top:24px">
+            <div class="section-h">Die History · ${history.length}</div>
+            ${history.length === 0 ? html`<div class="empty"><div style="font-size:13px">No events yet</div></div>` :
+              history.map(ev => html`
+                <div class="list-item" key=${ev.id}>
+                  <div class="list-item-row">
+                    <div class="list-item-main">
+                      <div class="list-item-title">${ev.event_type.replace(/_/g, ' ')}</div>
+                      <div class="list-item-sub">${ev.users?.full_name || 'Unknown'} · ${ev.notes || ''}</div>
+                    </div>
+                    <div class="list-item-meta">${fmtDate(ev.event_date)}<br/>${fmtNum(ev.stroke_count_at_event)} str</div>
+                  </div>
+                </div>
+              `)
+            }
+          </div>
+        `}
+      </div>
+    </div>
+  `;
+}
+
+// ============= SHOT MODAL =============
+function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    unit_id: units[0]?.id || '',
+    shift_id: shifts[0]?.id || '',
+    machine_id: machines[0]?.id || '',
+    die_id: dies[0]?.id || '',
+    operator_user_id: me.id,
+    shots_good: 0,
+    shots_rejected: 0,
+    reject_reason: '',
+    metal_alloy: 'ADC-12',
+    metal_consumed_kg: '',
+    notes: '',
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        unit_id: form.unit_id,
+        shift_id: form.shift_id,
+        machine_id: form.machine_id,
+        die_id: form.die_id,
+        operator_user_id: form.operator_user_id || null,
+        shots_good: parseInt(form.shots_good) || 0,
+        shots_rejected: parseInt(form.shots_rejected) || 0,
+        reject_reason: form.reject_reason || null,
+        metal_alloy: form.metal_alloy || null,
+        metal_consumed_kg: form.metal_consumed_kg ? parseFloat(form.metal_consumed_kg) : null,
+        notes: form.notes || null,
+        recorded_by_user_id: me.id,
+        recorded_at: new Date().toISOString(),
+      };
+      const { error } = await sb.from('mcp_pdc_shots').insert(payload);
+      if (error) throw error;
+      showToast('Shot logged · die strokes auto-updated');
+      onSaved();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Log PDC Shot</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Unit *</label>
+              <select required value=${form.unit_id} onChange=${e => setForm({...form, unit_id: e.target.value})}>
+                ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
+              </select>
+            </div>
+            <div class="field"><label>Shift *</label>
+              <select required value=${form.shift_id} onChange=${e => setForm({...form, shift_id: e.target.value})}>
+                ${shifts.map(s => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Machine *</label>
+            <select required value=${form.machine_id} onChange=${e => setForm({...form, machine_id: e.target.value})}>
+              ${machines.map(m => html`<option key=${m.id} value=${m.id}>${m.code} · ${m.make || ''}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Die *</label>
+            <select required value=${form.die_id} onChange=${e => setForm({...form, die_id: e.target.value})}>
+              ${dies.map(d => html`<option key=${d.id} value=${d.id}>${d.code} · ${d.part_number}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Operator</label>
+            <select value=${form.operator_user_id} onChange=${e => setForm({...form, operator_user_id: e.target.value})}>
+              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+            </select>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Good *</label><input type="number" required min=${0} value=${form.shots_good} onChange=${e => setForm({...form, shots_good: e.target.value})} /></div>
+            <div class="field"><label>Rejected</label><input type="number" min=${0} value=${form.shots_rejected} onChange=${e => setForm({...form, shots_rejected: e.target.value})} /></div>
+          </div>
+          ${form.shots_rejected > 0 && html`
+            <div class="field"><label>Reject Reason</label>
+              <select value=${form.reject_reason} onChange=${e => setForm({...form, reject_reason: e.target.value})}>
+                <option value="">— Select —</option>
+                <option>Dimension</option><option>Surface</option><option>Crack</option><option>Cold-shut</option><option>Porosity</option><option>Flash</option><option>Other</option>
+              </select>
+            </div>
+          `}
+          <div class="field-row">
+            <div class="field"><label>Alloy</label><input type="text" value=${form.metal_alloy} onChange=${e => setForm({...form, metal_alloy: e.target.value})} /></div>
+            <div class="field"><label>Metal (kg)</label><input type="number" step="0.01" value=${form.metal_consumed_kg} onChange=${e => setForm({...form, metal_consumed_kg: e.target.value})} placeholder="850" /></div>
+          </div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Logging…' : 'Submit'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= CHAT =============
+function Chat({ plant, me, user }) {
+  const [groups, setGroups] = useState([]);
+  const [activeGroup, setActiveGroup] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [attachment, setAttachment] = useState(null); // { file, previewUrl, type }
+  const [uploading, setUploading] = useState(false);
+  const [notifPerm, setNotifPerm] = useState(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
+
+  useEffect(() => { loadGroups(); }, []);
+  // Global plant-wide subscription — notifications work even when not on chat tab
+  useEffect(() => {
+    if (!plant?.id) return;
+
+    const channel = sb.channel('plant-msgs-' + plant.id)
+      .on('postgres_changes', {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'chat_messages',
+        filter: 'plant_id=eq.' + plant.id
+      }, async (payload) => {
+        const newMsg = payload.new;
+        if (newMsg.sender_id === user.id) return;
+
+        // Refresh group list so badges + previews update
+        loadGroups();
+
+        // If we're in the active group already, per-group handler shows the message
+        if (activeGroup && newMsg.group_id === activeGroup.id) return;
+
+        // Check the user is a member of the message's group
+        const { data: group } = await sb.from('chat_groups').select('name, members').eq('id', newMsg.group_id).maybeSingle();
+        if (!group || !group.members?.includes(user.id)) return;
+
+        const { data: sender } = await sb.from('users').select('full_name').eq('id', newMsg.sender_id).maybeSingle();
+
+        playNotificationSound();
+        const preview = newMsg.body || (Array.isArray(newMsg.attachments) && newMsg.attachments.length ? '📎 ' + (newMsg.attachments[0].name || 'attachment') : '');
+        showNotification((sender?.full_name || 'Someone') + ' · ' + group.name, preview);
+      })
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [plant?.id, user.id, activeGroup?.id]);
+
+  useEffect(() => {
+    if (!activeGroup) return;
+    loadMessages(activeGroup.id);
+
+    // Ask for notification permission on first chat open
+    requestNotificationPermission();
+
+    const channel = sb.channel('messages-' + activeGroup.id)
+      .on('postgres_changes', {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'chat_messages',
+        filter: 'group_id=eq.' + activeGroup.id
+      }, async (payload) => {
+        const newMsg = payload.new;
+        // Don't notify for own messages
+        if (newMsg.sender_id === user.id) return;
+
+        // Get sender name
+        const { data: sender } = await sb.from('users').select('full_name').eq('id', newMsg.sender_id).maybeSingle();
+        setMessages(prev => {
+          if (prev.some(m => m.id === newMsg.id)) return prev;
+          return [...prev, { ...newMsg, users: sender }];
+        });
+        setTimeout(() => {
+          const wrap = document.getElementById('threadMessages');
+          if (wrap) wrap.scrollTop = wrap.scrollHeight;
+        }, 50);
+
+        // Mark this group as read since user is actively viewing it
+        markRead(activeGroup.id);
+
+        // Sound + notification (notification only if tab not visible)
+        playNotificationSound();
+        if (document.visibilityState !== 'visible') {
+          const senderName = sender?.full_name || 'Someone';
+          const preview = newMsg.body || (Array.isArray(newMsg.attachments) && newMsg.attachments.length ? '📎 ' + (newMsg.attachments[0].name || 'attachment') : '');
+          showNotification(senderName + ' · ' + activeGroup.name, preview);
+        }
+      })
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [activeGroup]);
+
+  const lastReadKey = (groupId) => 'loglinkr_lastread_' + user.id + '_' + groupId;
+  const getLastRead = (groupId) => parseInt(localStorage.getItem(lastReadKey(groupId)) || '0');
+  const markRead = (groupId) => localStorage.setItem(lastReadKey(groupId), Date.now().toString());
+
+  const loadGroups = async () => {
+    setLoading(true);
+    const { data: groupsData } = await sb.from('chat_groups').select('*').contains('members', [user.id]);
+    const groupsList = groupsData || [];
+
+    // Get unread count + last message preview for each group
+    const enriched = await Promise.all(groupsList.map(async (g) => {
+      const lastRead = getLastRead(g.id);
+      const lastReadIso = new Date(lastRead || 0).toISOString();
+
+      // Count unread (messages newer than lastRead, not from self)
+      const { count } = await sb.from('chat_messages')
+        .select('id', { count: 'exact', head: true })
+        .eq('group_id', g.id)
+        .gt('created_at', lastReadIso)
+        .neq('sender_id', user.id);
+
+      // Last message
+      const { data: lastMsg } = await sb.from('chat_messages')
+        .select('body, attachments, created_at, users(full_name)')
+        .eq('group_id', g.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      return { ...g, unread: count || 0, lastMsg };
+    }));
+
+    // Sort: groups with unread first, then by last message time
+    enriched.sort((a, b) => {
+      if ((b.unread > 0) !== (a.unread > 0)) return (b.unread > 0) - (a.unread > 0);
+      const at = a.lastMsg?.created_at || a.created_at;
+      const bt = b.lastMsg?.created_at || b.created_at;
+      return new Date(bt) - new Date(at);
+    });
+
+    setGroups(enriched);
+    setLoading(false);
+  };
+
+  const loadMessages = async (groupId) => {
+    const { data } = await sb.from('chat_messages').select('*, users(full_name)').eq('group_id', groupId).order('created_at').limit(100);
+    setMessages(data || []);
+    markRead(groupId);
+    setTimeout(() => {
+      const wrap = document.getElementById('threadMessages');
+      if (wrap) wrap.scrollTop = wrap.scrollHeight;
+    }, 50);
+  };
+
+  const onPickFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 10 * 1024 * 1024) {
+      alert('File too large. Max 10 MB.');
+      return;
+    }
+    const isImage = file.type.startsWith('image/');
+    setAttachment({
+      file,
+      previewUrl: isImage ? URL.createObjectURL(file) : null,
+      type: file.type,
+      name: file.name
+    });
+    e.target.value = '';
+  };
+
+  const send = async () => {
+    if ((!input.trim() && !attachment) || !activeGroup || uploading) return;
+    const body = input.trim();
+    let attachments = [];
+
+    if (attachment) {
+      setUploading(true);
+      try {
+        const ext = attachment.name.split('.').pop().toLowerCase();
+        const path = plant.id + '/' + activeGroup.id + '/' + user.id + '-' + Date.now() + '.' + ext;
+        const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, attachment.file, {
+          cacheControl: '3600',
+          upsert: false
+        });
+        if (upErr) {
+          alert('Upload failed: ' + upErr.message);
+          setUploading(false);
+          return;
+        }
+        const { data: { publicUrl } } = sb.storage.from('chat-attachments').getPublicUrl(path);
+        attachments = [{
+          url: publicUrl,
+          path: path,
+          type: attachment.type,
+          name: attachment.name,
+          isImage: attachment.type.startsWith('image/')
+        }];
+      } catch (err) {
+        alert('Upload failed: ' + err.message);
+        setUploading(false);
+        return;
+      }
+      setUploading(false);
+    }
+
+    const localId = 'local-' + Date.now();
+    const optimisticMsg = {
+      id: localId,
+      plant_id: plant.id,
+      group_id: activeGroup.id,
+      sender_id: user.id,
+      body: body || null,
+      attachments,
+      users: { full_name: me.full_name },
+      created_at: new Date().toISOString(),
+      _pending: true
+    };
+
+    // Show immediately
+    setMessages(prev => [...prev, optimisticMsg]);
+    setInput('');
+    setAttachment(null);
+    setTimeout(() => {
+      const wrap = document.getElementById('threadMessages');
+      if (wrap) wrap.scrollTop = wrap.scrollHeight;
+    }, 30);
+
+    // Send to server
+    const { data: inserted, error } = await sb.from('chat_messages').insert({
+      plant_id: plant.id,
+      group_id: activeGroup.id,
+      sender_id: user.id,
+      body: body || null,
+      attachments: attachments
+    }).select().single();
+
+    if (error) {
+      // Mark as failed
+      setMessages(prev => prev.map(m => m.id === localId ? {...m, _failed: true, _pending: false} : m));
+      return;
+    }
+
+    // Replace optimistic with real (so realtime won't double-add)
+    setMessages(prev => prev.map(m => m.id === localId ? {...inserted, users: { full_name: me.full_name }} : m));
+  };
+
+  if (activeGroup) {
+    return html`
+      <div class="chat-thread">
+        <div class="thread-header">
+          <button class="thread-back" onClick=${() => setActiveGroup(null)}>←</button>
+          <div class="chat-avatar">${activeGroup.name[0] === '#' ? '#' : activeGroup.name[0]}</div>
+          <div>
+            <div style="font-weight:600;font-size:14px">${activeGroup.name}</div>
+            <div style="font-size:11px;color:var(--slate-500)">${activeGroup.members.length} member${activeGroup.members.length > 1 ? 's' : ''}</div>
+          </div>
+        </div>
+        <div class="thread-messages" id="threadMessages">
+          ${messages.length === 0 ? html`<div class="empty"><div class="icon">💬</div><div style="font-size:13px">No messages yet. Say hi.</div></div>` :
+            messages.map(m => {
+              const isOut = m.sender_id === user.id;
+              const atts = Array.isArray(m.attachments) ? m.attachments : [];
+              return html`
+                <div class=${'msg ' + (isOut ? 'out' : 'in')} key=${m.id}>
+                  ${!isOut && html`<div class="who">${m.users?.full_name || '?'}</div>`}
+                  ${m.body && html`<div>${m.body}</div>`}
+                  ${atts.map((a, i) => a.isImage
+                    ? html`<a href=${a.url} target="_blank" rel="noopener" key=${i}><img class="attached-img" src=${a.url} alt=${a.name || 'image'} /></a>`
+                    : html`<a href=${a.url} target="_blank" rel="noopener" class="file-attached" key=${i}>📎 ${a.name || 'file'}</a>`
+                  )}
+                  <div class="ts">${fmtDate(m.created_at)}</div>
+                </div>
+              `;
+            })
+          }
+        </div>
+        ${attachment && html`
+          <div class="thread-attach-preview">
+            ${attachment.previewUrl ? html`<img src=${attachment.previewUrl} />` : html`<span>📎</span>`}
+            <span>${attachment.name}</span>
+            <button onClick=${() => setAttachment(null)}>×</button>
+          </div>
+        `}
+        <div class="thread-input">
+          <input type="file" id="chatFileInput" accept="image/*,video/*,audio/*,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip,.rar,.dwg,.dxf,.step,.stp,.iges,.igs,.stl" style="display:none" onChange=${onPickFile} />
+          <button class="attach" onClick=${() => document.getElementById('chatFileInput').click()} disabled=${uploading} title="Attach">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
+          <input type="text" value=${input} onChange=${e => setInput(e.target.value)} onKeyPress=${e => { if (e.key === 'Enter' && !e.shiftKey) send(); }} placeholder=${uploading ? 'Uploading…' : 'Message…'} disabled=${uploading} />
+          <button onClick=${send} disabled=${uploading || (!input.trim() && !attachment)}>${uploading ? '…' : '→'}</button>
+        </div>
+      </div>
+    `;
+  }
+
+  return html`
+    <div class="page-header"><div><h1>Chat</h1><div class="sub">Plant communication</div></div></div>
+    ${notifPerm === 'default' && html`
+      <div class="setup-banner" style="margin-bottom:14px">
+        <div class="setup-banner-title">🔔 Enable notifications</div>
+        <p style="font-size:13px;color:var(--slate-700);margin-bottom:10px">Get instant alerts when teammates message you, even when Loglinkr isn't open.</p>
+        <button class="btn small" onClick=${async () => {
+          const ok = await requestNotificationPermission();
+          setNotifPerm(Notification.permission);
+          if (ok) showToast('Notifications enabled');
+        }}>Enable notifications</button>
+      </div>
+    `}
+    ${notifPerm === 'denied' && html`
+      <div class="alert info" style="margin-bottom:14px">
+        🔕 Notifications blocked. Enable them in your browser settings to get alerts.
+      </div>
+    `}
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      groups.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">💬</div>No chat groups yet</div></div>` :
+      html`<div class="chat-list">
+        ${groups.map(g => {
+          const last = g.lastMsg;
+          const lastWho = last?.users?.full_name?.split(' ')[0];
+          const lastBody = last?.body || (Array.isArray(last?.attachments) && last.attachments.length ? '📎 ' + (last.attachments[0].name || 'attachment') : '');
+          const preview = last ? (lastWho ? lastWho + ': ' + lastBody : lastBody) : g.members.length + ' member' + (g.members.length > 1 ? 's' : '');
+          return html`
+            <div class="chat-item" key=${g.id} onClick=${() => setActiveGroup(g)}>
+              <div class="chat-avatar">${g.name[0] === '#' ? '#' : g.name[0]}</div>
+              <div class="chat-info">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+                  <div class="chat-name" style=${g.unread > 0 ? 'font-weight:700' : ''}>${g.name}</div>
+                  ${last && html`<div style="font-size:11px;color:var(--slate-400);flex-shrink:0">${fmtDate(last.created_at)}</div>`}
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:2px">
+                  <div class="chat-preview" style=${g.unread > 0 ? 'color:var(--slate-700);font-weight:500' : ''}>${preview}</div>
+                  ${g.unread > 0 && html`<span style="background:var(--teal-600);color:white;font-size:11px;font-weight:700;padding:2px 7px;border-radius:999px;min-width:20px;text-align:center;flex-shrink:0">${g.unread}</span>`}
+                </div>
+              </div>
+            </div>
+          `;
+        })}
+      </div>`
+    }
+  `;
+}
+
+// ============= PEOPLE (Units, Users, Shifts) =============
+function People({ plant, me }) {
+  const [view, setView] = useState('units');
+  const [units, setUnits] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [shifts, setShifts] = useState([]);
+  const [invites, setInvites] = useState([]);
+  const [modal, setModal] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = async () => {
+    setLoading(true);
+    const [u, us, sh, inv] = await Promise.all([
+      sb.from('units').select('*').order('created_at'),
+      sb.from('users').select('*').order('created_at'),
+      sb.from('shifts').select('*').order('start_time'),
+      sb.from('user_invites').select('*').eq('status', 'pending').order('created_at', { ascending:false }),
+    ]);
+    setUnits(u.data || []);
+    setUsers(us.data || []);
+    setShifts(sh.data || []);
+    setInvites(inv.data || []);
+    setLoading(false);
+  };
+
+  useEffect(() => { refresh(); }, []);
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  return html`
+    <div class="page-header"><div><h1>People</h1><div class="sub">Units, team, shifts</div></div></div>
+
+    <div class="auth-tabs" style="margin-bottom:16px">
+      <button class=${'auth-tab' + (view === 'units' ? ' active' : '')} onClick=${() => setView('units')}>Units</button>
+      <button class=${'auth-tab' + (view === 'users' ? ' active' : '')} onClick=${() => setView('users')}>Team</button>
+      <button class=${'auth-tab' + (view === 'shifts' ? ' active' : '')} onClick=${() => setView('shifts')}>Shifts</button>
+    </div>
+
+    ${view === 'units' && html`
+      <div class="section-h">Units · ${units.length}<button class="btn small ghost" onClick=${() => setModal('unit')}>+ Add</button></div>
+      ${units.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🏭</div>No units yet</div></div>` :
+        units.map(u => html`
+          <div class="list-item" key=${u.id} onClick=${() => { setEditTarget(u); setModal('unit'); }}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${u.name}</div>
+                <div class="list-item-sub">${u.address || '—'}</div>
+              </div>
+            </div>
+          </div>
+        `)
+      }
+    `}
+
+    ${view === 'users' && html`
+      ${invites.length > 0 && html`
+        <div class="section-h">Pending Invites · ${invites.length}</div>
+        ${invites.map(i => html`
+          <div class="list-item" key=${i.id} onClick=${() => { setEditTarget(i); setModal('inviteView'); }}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${i.full_name}</div>
+                <div class="list-item-sub">${i.role} · code: <span class="mono" style="color:var(--teal-700);font-weight:600">${i.invite_code}</span></div>
+              </div>
+              <span class="badge amber">Pending</span>
+            </div>
+          </div>
+        `)}
+      `}
+      <div class="section-h">Team · ${users.length}<button class="btn small ghost" onClick=${() => setModal('invite')}>+ Invite</button></div>
+      ${users.map(u => html`
+        <div class="list-item" key=${u.id}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${u.full_name}${u.id === me.id ? ' (you)' : ''}</div>
+              <div class="list-item-sub">${u.phone} · ${u.email || 'no email'}</div>
+            </div>
+            <span class=${'badge ' + (u.role === 'plant_head' ? 'teal' : '')}>${u.role}</span>
+          </div>
+        </div>
+      `)}
+    `}
+
+    ${view === 'shifts' && html`
+      <div class="section-h">Shifts · ${shifts.length}<button class="btn small ghost" onClick=${() => setModal('shift')}>+ Add</button></div>
+      ${shifts.map(s => html`
+        <div class="list-item" key=${s.id} onClick=${() => { setEditTarget(s); setModal('shift'); }}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${s.name}</div>
+              <div class="list-item-sub mono">${s.start_time.slice(0,5)} – ${s.end_time.slice(0,5)}</div>
+            </div>
+            <span class=${'badge ' + (s.is_active ? 'emerald' : '')}>${s.is_active ? 'Active' : 'Inactive'}</span>
+          </div>
+        </div>
+      `)}
+    `}
+
+    ${modal === 'unit' && html`<${UnitModal} plant=${plant} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'shift' && html`<${ShiftModal} plant=${plant} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'invite' && html`<${InviteModal} plant=${plant} me=${me} units=${units} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
+    ${modal === 'inviteView' && html`<${InviteViewModal} invite=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onCancel=${async () => { await sb.from('user_invites').delete().eq('id', editTarget.id); setModal(null); setEditTarget(null); refresh(); showToast('Invite cancelled'); }} />`}
+  `;
+}
+
+function UnitModal({ plant, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget || { name:'', address:'' });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = { plant_id: plant.id, name: form.name, address: form.address || null };
+      const { error } = editTarget
+        ? await sb.from('units').update(payload).eq('id', editTarget.id)
+        : await sb.from('units').insert(payload);
+      if (error) throw error;
+      showToast(editTarget ? 'Unit updated' : 'Unit added');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  const remove = async () => {
+    if (!confirm('Delete this unit? All machines and dies in it will be deleted too.')) return;
+    const { error } = await sb.from('units').delete().eq('id', editTarget.id);
+    if (error) { setError(error.message); return; }
+    showToast('Unit deleted');
+    onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Edit' : 'Add'} Unit</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Unit Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} placeholder="Unit 1" /></div>
+          <div class="field"><label>Address</label><input type="text" value=${form.address || ''} onChange=${e => setForm({...form, address: e.target.value})} placeholder="Optional" /></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
+          ${editTarget && html`<button class="btn danger" type="button" style="margin-top:8px" onClick=${remove}>Delete</button>`}
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function ShiftModal({ plant, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget ? {...editTarget, start_time: editTarget.start_time.slice(0,5), end_time: editTarget.end_time.slice(0,5)} : { name:'', start_time:'06:00', end_time:'14:00', is_active:true });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = { plant_id: plant.id, name: form.name, start_time: form.start_time, end_time: form.end_time, is_active: form.is_active };
+      const { error } = editTarget
+        ? await sb.from('shifts').update(payload).eq('id', editTarget.id)
+        : await sb.from('shifts').insert(payload);
+      if (error) throw error;
+      showToast(editTarget ? 'Shift updated' : 'Shift added');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  const remove = async () => {
+    if (!confirm('Delete this shift?')) return;
+    const { error } = await sb.from('shifts').delete().eq('id', editTarget.id);
+    if (error) { setError(error.message); return; }
+    showToast('Shift deleted');
+    onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Edit' : 'Add'} Shift</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Shift Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} placeholder="Day Shift" /></div>
+          <div class="field-row">
+            <div class="field"><label>Start *</label><input type="time" required value=${form.start_time} onChange=${e => setForm({...form, start_time: e.target.value})} /></div>
+            <div class="field"><label>End *</label><input type="time" required value=${form.end_time} onChange=${e => setForm({...form, end_time: e.target.value})} /></div>
+          </div>
+          <div class="toggle-row">
+            <div class="toggle-label">Active</div>
+            <div class=${'toggle' + (form.is_active ? ' active' : '')} onClick=${() => setForm({...form, is_active: !form.is_active})}></div>
+          </div>
+          <button class="btn" style="margin-top:12px" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
+          ${editTarget && html`<button class="btn danger" type="button" style="margin-top:8px" onClick=${remove}>Delete</button>`}
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function InviteModal({ plant, me, units, onClose, onSaved }) {
+  const [form, setForm] = useState({ full_name:'', phone:'', email:'', role:'supervisor', primary_unit_id: units[0]?.id || '' });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [createdInvite, setCreatedInvite] = useState(null);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const code = generateInviteCode();
+      const { data, error } = await sb.from('user_invites').insert({
+        plant_id: plant.id,
+        invited_by: me.id,
+        full_name: form.full_name,
+        phone: '+91' + form.phone,
+        email: form.email || null,
+        role: form.role,
+        primary_unit_id: form.primary_unit_id || null,
+        invite_code: code,
+        status: 'pending'
+      }).select().single();
+      if (error) throw error;
+      setCreatedInvite(data);
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  if (createdInvite) {
+    const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
+    const inviteUrl = baseUrl + '?code=' + createdInvite.invite_code;
+    const waMessage = encodeURIComponent(
+      `Hi ${createdInvite.full_name}, you've been invited to join ${plant.name} on Loglinkr as ${createdInvite.role}.\n\nSign up here: ${inviteUrl}\n\nOr enter code: ${createdInvite.invite_code}`
+    );
+    const waUrl = createdInvite.phone ? 'https://wa.me/' + createdInvite.phone.replace(/\D/g,'') + '?text=' + waMessage : 'https://wa.me/?text=' + waMessage;
+
+    return html`
+      <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+        <div class="modal">
+          <div class="modal-header">
+            <div class="modal-title">Invite created</div>
+            <button class="close-btn" onClick=${onSaved}>×</button>
+          </div>
+          <p style="font-size:14px;color:var(--slate-600);margin-bottom:8px">Share this with <strong>${createdInvite.full_name}</strong>:</p>
+          <div class="invite-code">${createdInvite.invite_code}</div>
+
+          <div class="field" style="margin-top:14px">
+            <label>Or share this link</label>
+            <input type="text" readOnly value=${inviteUrl} style="font-size:12px" onClick=${e => e.target.select()} />
+          </div>
+
+          <p style="font-size:12px;color:var(--slate-500);margin-bottom:14px;line-height:1.5">
+            They open the link → sign up with email + password → automatically added to your plant. No code typing needed.
+          </p>
+
+          <a href=${waUrl} target="_blank" rel="noopener" class="btn" style="text-decoration:none;display:flex;align-items:center;justify-content:center;gap:8px;background:#25D366">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="white"><path d="M17.5 14.4c-.3-.1-1.7-.8-2-.9-.3-.1-.5-.1-.7.1-.2.3-.7.9-.9 1.1-.2.2-.3.2-.6.1-.3-.1-1.2-.5-2.4-1.5-.9-.8-1.5-1.8-1.7-2.1-.2-.3 0-.5.1-.6.1-.1.3-.3.4-.5.1-.2.2-.3.3-.5.1-.2 0-.4 0-.5 0-.1-.7-1.6-.9-2.2-.2-.6-.5-.5-.7-.5h-.6c-.2 0-.5.1-.8.4-.3.3-1 1-1 2.4 0 1.4 1 2.7 1.2 2.9.1.2 2 3.1 4.9 4.3.7.3 1.2.5 1.6.6.7.2 1.3.2 1.8.1.5-.1 1.7-.7 1.9-1.3.2-.7.2-1.2.2-1.3-.1-.2-.3-.3-.6-.4zM12 2C6.5 2 2 6.5 2 12c0 1.8.5 3.5 1.3 5L2 22l5.2-1.4c1.4.8 3.1 1.2 4.8 1.2 5.5 0 10-4.5 10-10S17.5 2 12 2zm0 18c-1.5 0-3-.4-4.3-1.2l-.3-.2-3.1.8.8-3-.2-.3C4 15.1 3.5 13.6 3.5 12 3.5 7.3 7.3 3.5 12 3.5S20.5 7.3 20.5 12 16.7 20.5 12 20.5z"/></svg>
+            Send via WhatsApp
+          </a>
+          <button class="btn secondary" style="margin-top:8px" onClick=${() => { navigator.clipboard.writeText(inviteUrl); showToast('Link copied'); }}>Copy link</button>
+          <button class="btn ghost" style="margin-top:8px;width:100%" onClick=${onSaved}>Done</button>
+        </div>
+      </div>
+    `;
+  }
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Invite Team Member</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Full Name *</label><input type="text" required value=${form.full_name} onChange=${e => setForm({...form, full_name: e.target.value})} placeholder="Selvam K" /></div>
+          <div class="field"><label>Phone *</label><input type="tel" required maxLength=${10} value=${form.phone} onChange=${e => setForm({...form, phone: e.target.value.replace(/\D/g,'')})} placeholder="9876543210" /></div>
+          <div class="field"><label>Email (optional)</label><input type="email" value=${form.email} onChange=${e => setForm({...form, email: e.target.value})} placeholder="they@email.com" /></div>
+          <div class="field"><label>Role *</label>
+            <select required value=${form.role} onChange=${e => setForm({...form, role: e.target.value})}>
+              <option value="supervisor">Supervisor</option>
+              <option value="qa">Quality (QA)</option>
+              <option value="operator">Operator</option>
+              <option value="toolroom">Toolroom</option>
+              <option value="store">Store</option>
+              <option value="driver">Driver</option>
+              <option value="admin">Admin</option>
+            </select>
+          </div>
+          <div class="field"><label>Primary Unit</label>
+            <select value=${form.primary_unit_id} onChange=${e => setForm({...form, primary_unit_id: e.target.value})}>
+              <option value="">— None —</option>
+              ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
+            </select>
+          </div>
+          <button class="btn" disabled=${loading}>${loading ? 'Creating…' : 'Generate invite'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function InviteViewModal({ invite, onClose, onCancel }) {
+  const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
+  const inviteUrl = baseUrl + '?code=' + invite.invite_code;
+  const waMessage = encodeURIComponent(
+    `Hi ${invite.full_name}, your Loglinkr invite as ${invite.role}:\n\n${inviteUrl}\n\nOr enter code: ${invite.invite_code}`
+  );
+  const waUrl = invite.phone ? 'https://wa.me/' + invite.phone.replace(/\D/g,'') + '?text=' + waMessage : 'https://wa.me/?text=' + waMessage;
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Invite for ${invite.full_name}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card-row"><span class="label">Role</span><span class="value">${invite.role}</span></div>
+        <div class="card-row"><span class="label">Phone</span><span class="value mono">${invite.phone}</span></div>
+        <div class="invite-code">${invite.invite_code}</div>
+        <div class="field" style="margin-top:14px">
+          <label>Invite link</label>
+          <input type="text" readOnly value=${inviteUrl} style="font-size:12px" onClick=${e => e.target.select()} />
+        </div>
+        <a href=${waUrl} target="_blank" rel="noopener" class="btn" style="text-decoration:none;display:flex;align-items:center;justify-content:center;gap:8px;background:#25D366">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="white"><path d="M17.5 14.4c-.3-.1-1.7-.8-2-.9-.3-.1-.5-.1-.7.1-.2.3-.7.9-.9 1.1-.2.2-.3.2-.6.1-.3-.1-1.2-.5-2.4-1.5-.9-.8-1.5-1.8-1.7-2.1-.2-.3 0-.5.1-.6.1-.1.3-.3.4-.5.1-.2.2-.3.3-.5.1-.2 0-.4 0-.5 0-.1-.7-1.6-.9-2.2-.2-.6-.5-.5-.7-.5h-.6c-.2 0-.5.1-.8.4-.3.3-1 1-1 2.4 0 1.4 1 2.7 1.2 2.9.1.2 2 3.1 4.9 4.3.7.3 1.2.5 1.6.6.7.2 1.3.2 1.8.1.5-.1 1.7-.7 1.9-1.3.2-.7.2-1.2.2-1.3-.1-.2-.3-.3-.6-.4zM12 2C6.5 2 2 6.5 2 12c0 1.8.5 3.5 1.3 5L2 22l5.2-1.4c1.4.8 3.1 1.2 4.8 1.2 5.5 0 10-4.5 10-10S17.5 2 12 2zm0 18c-1.5 0-3-.4-4.3-1.2l-.3-.2-3.1.8.8-3-.2-.3C4 15.1 3.5 13.6 3.5 12 3.5 7.3 7.3 3.5 12 3.5S20.5 7.3 20.5 12 16.7 20.5 12 20.5z"/></svg>
+          Send via WhatsApp
+        </a>
+        <button class="btn secondary" style="margin-top:8px" onClick=${() => { navigator.clipboard.writeText(inviteUrl); showToast('Link copied'); }}>Copy link</button>
+        <button class="btn danger" style="margin-top:8px" onClick=${onCancel}>Cancel invite</button>
+      </div>
+    </div>
+  `;
+}
+
+// ============= MORE (navigator) =============
+function More({ plant, me, user, logout, setTab }) {
+  const navItems = [
+    { key:'people', icon:'👥', label:'People · Units, Team, Shifts', sub:'Manage team, units, shifts' },
+    { key:'maintenance', icon:'🔧', label:'Maintenance', sub:'Breakdowns, machine status' },
+    { key:'stocks', icon:'📦', label:'Stocks', sub:'Inventory, items, transactions' },
+    { key:'actions', icon:'✓', label:'Action Hub', sub:'All open commitments' },
+  ];
+
+  return html`
+    <div class="page-header"><div><h1>More</h1><div class="sub">Modules, account, settings</div></div></div>
+
+    <div class="section-h">Modules</div>
+    ${navItems.map(it => html`
+      <div class="list-item" key=${it.key} onClick=${() => setTab(it.key)}>
+        <div class="list-item-row">
+          <div class="list-item-main">
+            <div class="list-item-title">${it.icon}  ${it.label}</div>
+            <div class="list-item-sub">${it.sub}</div>
+          </div>
+          <span style="color:var(--slate-400);font-size:18px">›</span>
+        </div>
+      </div>
+    `)}
+
+    <div class="section-h">Account</div>
+    <div class="card">
+      <div class="card-row"><span class="label">Name</span><span class="value">${me.full_name}</span></div>
+      <div class="card-row"><span class="label">Email</span><span class="value">${user.email}</span></div>
+      <div class="card-row"><span class="label">Phone</span><span class="value mono">${me.phone}</span></div>
+      <div class="card-row"><span class="label">Role</span><span class="value"><span class="badge teal">${me.role}</span></span></div>
+    </div>
+
+    <div class="section-h">Plant</div>
+    <div class="card">
+      <div class="card-row"><span class="label">Name</span><span class="value">${plant.name}</span></div>
+      <div class="card-row"><span class="label">City</span><span class="value">${plant.city}</span></div>
+      <div class="card-row"><span class="label">GSTIN</span><span class="value mono">${plant.gstin || '—'}</span></div>
+      <div class="card-row"><span class="label">IATF</span><span class="value">${plant.iatf_certified ? html`<span class="badge emerald">Yes</span>` : 'No'}</span></div>
+      <div class="card-row"><span class="label">Tier</span><span class="value"><span class="badge teal">${plant.subscription_tier.toUpperCase()}</span></span></div>
+    </div>
+
+    ${me.role === 'plant_head' || me.role === 'admin' ? html`
+      <div class="section-h">Compliance</div>
+      <${AuditLogViewer} plant=${plant} />
+    ` : ''}
+
+    <button class="btn danger" style="margin-top:14px" onClick=${logout}>Log out</button>
+  `;
+}
+
+// ============= AUDIT LOG VIEWER =============
+function AuditLogViewer({ plant }) {
+  const [logs, setLogs] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [open, setOpen] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    const { data } = await sb.from('audit_log').select('*, users:user_id(full_name)').order('created_at', { ascending:false }).limit(100);
+    setLogs(data || []);
+    setLoading(false);
+  };
+
+  useEffect(() => { if (open) load(); }, [open]);
+
+  return html`
+    <div class="card">
+      <div class="card-title" onClick=${() => setOpen(!open)} style="cursor:pointer">
+        Audit Log <span style="color:var(--slate-400);font-size:14px">${open ? '▼' : '›'}</span>
+      </div>
+      ${open && html`
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+          logs.length === 0 ? html`<div class="empty"><div style="font-size:13px">No audit entries yet</div></div>` :
+          html`<div style="max-height:380px;overflow-y:auto;margin-top:8px">
+            ${logs.map(l => html`
+              <div style="padding:8px 0;border-top:1px solid var(--slate-100);font-size:12px" key=${l.id}>
+                <div style="display:flex;justify-content:space-between;gap:8px">
+                  <div>
+                    <span class="badge ${l.action === 'insert' ? 'emerald' : l.action === 'delete' ? 'rose' : 'amber'}">${l.action}</span>
+                    <span style="margin-left:6px;color:var(--slate-700)">${l.table_name}</span>
+                  </div>
+                  <span style="color:var(--slate-400)">${fmtDate(l.created_at)}</span>
+                </div>
+                <div style="color:var(--slate-500);margin-top:2px">${l.users?.full_name || 'system'}</div>
+              </div>
+            `)}
+          </div>`
+        }
+      `}
+    </div>
+  `;
+}
+
+// ============= QUALITY (NCRs) =============
+function Quality({ plant, me }) {
+  const [ncrs, setNcrs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [modal, setModal] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+  const [filter, setFilter] = useState('open');
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    let q = sb.from('mcp_quality_ncrs').select('*, raised_by_user:raised_by(full_name), assigned_to_user:assigned_to(full_name)').order('created_at', { ascending:false });
+    if (filter === 'open') q = q.neq('status', 'closed').neq('status', 'cancelled');
+    else if (filter === 'closed') q = q.eq('status', 'closed');
+    const { data } = await q.limit(100);
+    setNcrs(data || []);
+    setLoading(false);
+  }, [filter]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const openCount = ncrs.filter(n => n.status !== 'closed' && n.status !== 'cancelled').length;
+  const criticalCount = ncrs.filter(n => n.severity === 'critical' && n.status !== 'closed').length;
+
+  return html`
+    <div class="page-header"><div><h1>Quality</h1><div class="sub">NCRs and IATF records</div></div></div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stat ${openCount > 0 ? 'amber' : 'teal'}"><div class="stat-num">${openCount}</div><div class="stat-label">Open</div></div>
+      <div class="stat rose"><div class="stat-num">${criticalCount}</div><div class="stat-label">Critical</div></div>
+      <div class="stat teal"><div class="stat-num">${ncrs.filter(n => n.status === 'closed').length}</div><div class="stat-label">Closed</div></div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (filter === 'open' ? ' active' : '')} onClick=${() => setFilter('open')}>Open</button>
+      <button class=${'auth-tab' + (filter === 'closed' ? ' active' : '')} onClick=${() => setFilter('closed')}>Closed</button>
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
+    </div>
+
+    <div class="section-h">NCRs · ${ncrs.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('ncr'); }}>+ Raise NCR</button></div>
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      ncrs.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✓</div>No NCRs in this filter</div></div>` :
+      ncrs.map(n => html`
+        <div class="list-item" key=${n.id} onClick=${() => { setEditTarget(n); setModal('ncr'); }}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${n.ncr_number} · ${n.title}</div>
+              <div class="list-item-sub">${n.part_number || ''} ${n.qty_affected ? '· ' + n.qty_affected + ' pcs' : ''} · ${n.raised_by_user?.full_name || '?'}</div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+              <span class=${'badge ' + (n.severity === 'critical' ? 'rose' : n.severity === 'major' ? 'amber' : '')}>${n.severity}</span>
+              <span class=${'badge ' + (n.status === 'closed' ? 'emerald' : n.status === 'open' ? 'amber' : '')}>${n.status}</span>
+            </div>
+          </div>
+        </div>
+      `)
+    }
+
+    ${modal === 'ncr' && html`<${NcrModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+  `;
+}
+
+function NcrModal({ plant, me, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget ? {...editTarget} : {
+    title:'', description:'', severity:'minor', source:'manual',
+    part_number:'', qty_affected:'', root_cause:'', corrective_action:''
+  });
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    sb.from('users').select('*').then(({ data }) => setUsers(data || []));
+  }, []);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      if (editTarget) {
+        const updates = {
+          title: form.title, description: form.description,
+          severity: form.severity, status: form.status,
+          part_number: form.part_number || null,
+          qty_affected: form.qty_affected ? parseInt(form.qty_affected) : null,
+          root_cause: form.root_cause || null,
+          corrective_action: form.corrective_action || null,
+          assigned_to: form.assigned_to || null,
+        };
+        if (form.status === 'closed' && !editTarget.closed_at) {
+          updates.closed_at = new Date().toISOString();
+          updates.closed_by = me.id;
+        }
+        const { error } = await sb.from('mcp_quality_ncrs').update(updates).eq('id', editTarget.id);
+        if (error) throw error;
+      } else {
+        const { data: existing } = await sb.from('mcp_quality_ncrs').select('id', { count:'exact', head:true });
+        const num = 'NCR-' + new Date().toISOString().slice(2,7).replace('-','') + '-' + String((existing?.count || 0) + 1).padStart(4,'0');
+        const { error } = await sb.from('mcp_quality_ncrs').insert({
+          plant_id: plant.id,
+          ncr_number: num,
+          source: form.source || 'manual',
+          title: form.title,
+          description: form.description || null,
+          severity: form.severity,
+          raised_by: me.id,
+          assigned_to: form.assigned_to || null,
+          part_number: form.part_number || null,
+          qty_affected: form.qty_affected ? parseInt(form.qty_affected) : null,
+        });
+        if (error) throw error;
+      }
+      showToast(editTarget ? 'NCR updated' : 'NCR raised');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? editTarget.ncr_number : 'Raise NCR'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Title *</label><input type="text" required value=${form.title} onChange=${e => setForm({...form, title: e.target.value})} placeholder="Surface defect on filterhead" /></div>
+          <div class="field"><label>Description</label><textarea rows=${3} value=${form.description || ''} onChange=${e => setForm({...form, description: e.target.value})}></textarea></div>
+          <div class="field-row">
+            <div class="field"><label>Part Number</label><input type="text" value=${form.part_number || ''} onChange=${e => setForm({...form, part_number: e.target.value})} /></div>
+            <div class="field"><label>Qty Affected</label><input type="number" value=${form.qty_affected || ''} onChange=${e => setForm({...form, qty_affected: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Severity</label>
+            <select value=${form.severity} onChange=${e => setForm({...form, severity: e.target.value})}>
+              <option value="minor">Minor</option><option value="major">Major</option><option value="critical">Critical</option>
+            </select>
+          </div>
+          <div class="field"><label>Assigned To</label>
+            <select value=${form.assigned_to || ''} onChange=${e => setForm({...form, assigned_to: e.target.value})}>
+              <option value="">— Unassigned —</option>
+              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+            </select>
+          </div>
+          ${editTarget && html`
+            <div class="field"><label>Status</label>
+              <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
+                <option value="open">Open</option><option value="investigation">Investigation</option>
+                <option value="containment">Containment</option><option value="corrective_action">Corrective Action</option>
+                <option value="verification">Verification</option><option value="closed">Closed</option>
+                <option value="cancelled">Cancelled</option>
+              </select>
+            </div>
+            <div class="field"><label>Root Cause</label><textarea rows=${2} value=${form.root_cause || ''} onChange=${e => setForm({...form, root_cause: e.target.value})}></textarea></div>
+            <div class="field"><label>Corrective Action</label><textarea rows=${2} value=${form.corrective_action || ''} onChange=${e => setForm({...form, corrective_action: e.target.value})}></textarea></div>
+          `}
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update NCR' : 'Raise NCR')}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= MAINTENANCE =============
+function Maintenance({ plant, me }) {
+  const [breakdowns, setBreakdowns] = useState([]);
+  const [machines, setMachines] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [modal, setModal] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState('open');
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    let q = sb.from('mcp_maintenance_breakdowns').select('*, mcp_pdc_machines(code), reported_by_user:reported_by(full_name), attended_by_user:attended_by(full_name)').order('reported_at', { ascending:false });
+    if (filter === 'open') q = q.neq('status', 'resolved').neq('status', 'cancelled');
+    else if (filter === 'resolved') q = q.eq('status', 'resolved');
+    const [b, m, u] = await Promise.all([
+      q.limit(100),
+      sb.from('mcp_pdc_machines').select('*').order('code'),
+      sb.from('users').select('*').order('full_name')
+    ]);
+    setBreakdowns(b.data || []);
+    setMachines(m.data || []);
+    setUsers(u.data || []);
+    setLoading(false);
+  }, [filter]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const openCount = breakdowns.filter(b => b.status !== 'resolved' && b.status !== 'cancelled').length;
+  const machinesDown = machines.filter(m => m.status === 'breakdown').length;
+
+  return html`
+    <div class="page-header"><div><h1>Maintenance</h1><div class="sub">Breakdowns, machine status</div></div></div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stat ${openCount > 0 ? 'rose' : 'teal'}"><div class="stat-num">${openCount}</div><div class="stat-label">Active</div></div>
+      <div class="stat ${machinesDown > 0 ? 'rose' : 'teal'}"><div class="stat-num">${machinesDown}</div><div class="stat-label">Machines Down</div></div>
+      <div class="stat teal"><div class="stat-num">${breakdowns.filter(b => b.status === 'resolved').length}</div><div class="stat-label">Resolved</div></div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (filter === 'open' ? ' active' : '')} onClick=${() => setFilter('open')}>Active</button>
+      <button class=${'auth-tab' + (filter === 'resolved' ? ' active' : '')} onClick=${() => setFilter('resolved')}>Resolved</button>
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
+    </div>
+
+    <div class="section-h">Breakdowns · ${breakdowns.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('breakdown'); }} disabled=${machines.length === 0}>+ Report</button></div>
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      breakdowns.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✓</div>No breakdowns ${machines.length === 0 ? '— add machines first' : ''}</div></div>` :
+      breakdowns.map(b => html`
+        <div class="list-item" key=${b.id} onClick=${() => { setEditTarget(b); setModal('breakdown'); }}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${b.mcp_pdc_machines?.code || 'unknown'} · ${b.description.slice(0,50)}</div>
+              <div class="list-item-sub">By ${b.reported_by_user?.full_name || '?'}${b.attended_by_user ? ' · attended by ' + b.attended_by_user.full_name : ''} · ${fmtDate(b.reported_at)}</div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+              <span class=${'badge ' + (b.status === 'resolved' ? 'emerald' : b.status === 'attended' ? 'amber' : 'rose')}>${b.status}</span>
+              ${b.downtime_minutes && html`<span style="font-size:10px;color:var(--slate-500)">${b.downtime_minutes}m down</span>`}
+            </div>
+          </div>
+        </div>
+      `)
+    }
+
+    <div class="section-h">Machine Status</div>
+    ${machines.map(m => html`
+      <div class="list-item" key=${m.id}>
+        <div class="list-item-row">
+          <div class="list-item-main">
+            <div class="list-item-title">${m.code} · ${m.make || ''} ${m.tonnage ? '· ' + m.tonnage + 'T' : ''}</div>
+          </div>
+          <span class=${'badge ' + (m.status === 'running' ? 'emerald' : m.status === 'breakdown' ? 'rose' : m.status === 'maintenance' ? 'amber' : '')}>${m.status}</span>
+        </div>
+      </div>
+    `)}
+
+    ${modal === 'breakdown' && html`<${BreakdownModal} plant=${plant} me=${me} machines=${machines} users=${users} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+  `;
+}
+
+function BreakdownModal({ plant, me, machines, users, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget ? {...editTarget} : {
+    machine_id: machines[0]?.id || '',
+    description: '',
+    status: 'open',
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      if (editTarget) {
+        const updates = {
+          description: form.description,
+          status: form.status,
+          attended_by: form.attended_by || null,
+          resolution_notes: form.resolution_notes || null,
+        };
+        if (form.status === 'attended' && !editTarget.attended_at) {
+          updates.attended_at = new Date().toISOString();
+          if (!form.attended_by) updates.attended_by = me.id;
+        }
+        if (form.status === 'resolved' && !editTarget.resolved_at) {
+          updates.resolved_at = new Date().toISOString();
+          if (!editTarget.attended_at) updates.attended_at = new Date().toISOString();
+        }
+        const { error } = await sb.from('mcp_maintenance_breakdowns').update(updates).eq('id', editTarget.id);
+        if (error) throw error;
+      } else {
+        const { error } = await sb.from('mcp_maintenance_breakdowns').insert({
+          plant_id: plant.id,
+          machine_id: form.machine_id,
+          description: form.description,
+          reported_by: me.id,
+          status: 'open',
+        });
+        if (error) throw error;
+      }
+      showToast(editTarget ? 'Updated' : 'Breakdown reported');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Update Breakdown' : 'Report Breakdown'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Machine *</label>
+            <select required value=${form.machine_id} onChange=${e => setForm({...form, machine_id: e.target.value})}>
+              ${machines.map(m => html`<option key=${m.id} value=${m.id}>${m.code}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Description *</label><textarea required rows=${3} value=${form.description} onChange=${e => setForm({...form, description: e.target.value})} placeholder="Hydraulic leak, machine stopped" /></div>
+          ${editTarget && html`
+            <div class="field"><label>Status</label>
+              <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
+                <option value="open">Open</option><option value="attended">Attended</option>
+                <option value="resolved">Resolved</option><option value="cancelled">Cancelled</option>
+              </select>
+            </div>
+            <div class="field"><label>Attended By</label>
+              <select value=${form.attended_by || ''} onChange=${e => setForm({...form, attended_by: e.target.value})}>
+                <option value="">— None —</option>
+                ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+              </select>
+            </div>
+            <div class="field"><label>Resolution Notes</label><textarea rows=${2} value=${form.resolution_notes || ''} onChange=${e => setForm({...form, resolution_notes: e.target.value})}></textarea></div>
+          `}
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Report')}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= STOCKS =============
+function Stocks({ plant, me }) {
+  const [items, setItems] = useState([]);
+  const [transactions, setTransactions] = useState([]);
+  const [view, setView] = useState('items');
+  const [modal, setModal] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [i, t] = await Promise.all([
+      sb.from('mcp_stocks_items').select('*').order('name'),
+      sb.from('mcp_stocks_transactions').select('*, mcp_stocks_items(code,name,uom), users:performed_by(full_name)').order('created_at', { ascending:false }).limit(50),
+    ]);
+    setItems(i.data || []);
+    setTransactions(t.data || []);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const lowStockCount = items.filter(i => i.reorder_level && i.current_qty <= i.reorder_level).length;
+
+  return html`
+    <div class="page-header"><div><h1>Stocks</h1><div class="sub">Items, GRN, issues</div></div></div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stat teal"><div class="stat-num">${items.length}</div><div class="stat-label">Items</div></div>
+      <div class="stat ${lowStockCount > 0 ? 'amber' : 'teal'}"><div class="stat-num">${lowStockCount}</div><div class="stat-label">Low</div></div>
+      <div class="stat teal"><div class="stat-num">${transactions.length}</div><div class="stat-label">Recent Txns</div></div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (view === 'items' ? ' active' : '')} onClick=${() => setView('items')}>Items</button>
+      <button class=${'auth-tab' + (view === 'transactions' ? ' active' : '')} onClick=${() => setView('transactions')}>Transactions</button>
+    </div>
+
+    ${view === 'items' && html`
+      <div class="section-h">Items · ${items.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('item'); }}>+ Add</button></div>
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        items.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📦</div>No items yet</div></div>` :
+        items.map(i => {
+          const isLow = i.reorder_level && i.current_qty <= i.reorder_level;
+          return html`
+            <div class="list-item" key=${i.id} onClick=${() => { setEditTarget(i); setModal('item'); }}>
+              <div class="list-item-row">
+                <div class="list-item-main">
+                  <div class="list-item-title">${i.code} · ${i.name}</div>
+                  <div class="list-item-sub">${i.category || 'general'} ${i.reorder_level ? '· reorder at ' + i.reorder_level + ' ' + i.uom : ''}</div>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                  <span class=${'badge ' + (isLow ? 'rose' : 'emerald')}>${fmtNum(i.current_qty)} ${i.uom}</span>
+                  <button class="btn small ghost" onClick=${(e) => { e.stopPropagation(); setEditTarget(i); setModal('txn'); }}>Txn</button>
+                </div>
+              </div>
+            </div>
+          `;
+        })
+      }
+    `}
+
+    ${view === 'transactions' && html`
+      <div class="section-h">Recent Transactions · ${transactions.length}</div>
+      ${transactions.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📋</div>No transactions yet</div></div>` :
+        transactions.map(t => html`
+          <div class="list-item" key=${t.id}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${t.mcp_stocks_items?.code || '?'} · ${t.mcp_stocks_items?.name || ''}</div>
+                <div class="list-item-sub">${t.users?.full_name || '?'} · ${t.reference || ''} · ${fmtDate(t.created_at)}</div>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                <span class=${'badge ' + (['grn','return','adjustment'].includes(t.txn_type) ? 'emerald' : 'rose')}>${t.txn_type} ${['grn','return','adjustment'].includes(t.txn_type) ? '+' : '-'}${fmtNum(t.qty)}</span>
+                <span style="font-size:10px;color:var(--slate-500)">→ ${fmtNum(t.qty_after || 0)}</span>
+              </div>
+            </div>
+          </div>
+        `)
+      }
+    `}
+
+    ${modal === 'item' && html`<${ItemModal} plant=${plant} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'txn' && html`<${TxnModal} plant=${plant} me=${me} item=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+  `;
+}
+
+function ItemModal({ plant, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget || { code:'', name:'', category:'general', uom:'nos', current_qty:0, reorder_level:'', unit_cost:'' });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        code: form.code, name: form.name,
+        category: form.category || 'general',
+        uom: form.uom,
+        current_qty: parseFloat(form.current_qty) || 0,
+        reorder_level: form.reorder_level ? parseFloat(form.reorder_level) : null,
+        unit_cost: form.unit_cost ? parseFloat(form.unit_cost) : null,
+      };
+      const { error } = editTarget
+        ? await sb.from('mcp_stocks_items').update(payload).eq('id', editTarget.id)
+        : await sb.from('mcp_stocks_items').insert(payload);
+      if (error) throw error;
+      showToast(editTarget ? 'Item updated' : 'Item added');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Edit' : 'Add'} Item</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Code *</label><input type="text" required value=${form.code} onChange=${e => setForm({...form, code: e.target.value})} placeholder="ALU-ADC12" /></div>
+            <div class="field"><label>UOM</label>
+              <select value=${form.uom} onChange=${e => setForm({...form, uom: e.target.value})}>
+                <option value="nos">Nos</option><option value="kg">Kg</option><option value="ltr">Ltr</option>
+                <option value="mtr">Mtr</option><option value="set">Set</option><option value="box">Box</option>
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} placeholder="Aluminum ADC-12 ingots" /></div>
+          <div class="field"><label>Category</label>
+            <select value=${form.category} onChange=${e => setForm({...form, category: e.target.value})}>
+              <option value="raw_material">Raw Material</option>
+              <option value="die_spares">Die Spares</option>
+              <option value="consumables">Consumables</option>
+              <option value="tools">Tools</option>
+              <option value="general">General</option>
+            </select>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Current Qty</label><input type="number" step="0.001" value=${form.current_qty} onChange=${e => setForm({...form, current_qty: e.target.value})} /></div>
+            <div class="field"><label>Reorder Level</label><input type="number" step="0.001" value=${form.reorder_level || ''} onChange=${e => setForm({...form, reorder_level: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Unit Cost (₹)</label><input type="number" step="0.01" value=${form.unit_cost || ''} onChange=${e => setForm({...form, unit_cost: e.target.value})} /></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function TxnModal({ plant, me, item, onClose, onSaved }) {
+  const [form, setForm] = useState({ txn_type:'grn', qty:'', reference:'', notes:'' });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const { error } = await sb.from('mcp_stocks_transactions').insert({
+        plant_id: plant.id,
+        item_id: item.id,
+        txn_type: form.txn_type,
+        qty: parseFloat(form.qty),
+        reference: form.reference || null,
+        notes: form.notes || null,
+        performed_by: me.id,
+      });
+      if (error) throw error;
+      showToast('Transaction recorded');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${item.code} · Transaction</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card" style="background:var(--slate-50);margin-bottom:14px">
+          <div class="card-row"><span class="label">Item</span><span class="value">${item.name}</span></div>
+          <div class="card-row"><span class="label">Current</span><span class="value">${fmtNum(item.current_qty)} ${item.uom}</span></div>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Type *</label>
+            <select required value=${form.txn_type} onChange=${e => setForm({...form, txn_type: e.target.value})}>
+              <option value="grn">GRN (receive)</option>
+              <option value="issue">Issue (out)</option>
+              <option value="return">Return (in)</option>
+              <option value="consumption">Consumption</option>
+              <option value="adjustment">Adjustment</option>
+            </select>
+          </div>
+          <div class="field"><label>Quantity * (${item.uom})</label><input type="number" step="0.001" required value=${form.qty} onChange=${e => setForm({...form, qty: e.target.value})} /></div>
+          <div class="field"><label>Reference</label><input type="text" value=${form.reference} onChange=${e => setForm({...form, reference: e.target.value})} placeholder="GRN# / DC# / etc" /></div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : 'Record'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= ACTION HUB =============
+function ActionHub({ plant, me }) {
+  const [actions, setActions] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [filter, setFilter] = useState('open');
+  const [modal, setModal] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    let q = sb.from('actions').select('*, owner_user:owner_id(full_name), assigner:assigned_by(full_name)').order('created_at', { ascending:false });
+    if (filter === 'open') q = q.in('status', ['open','in_progress']);
+    else if (filter === 'mine') q = q.eq('owner_id', me.id);
+    else if (filter === 'completed') q = q.eq('status', 'completed');
+    const [a, u] = await Promise.all([q.limit(100), sb.from('users').select('*')]);
+    setActions(a.data || []);
+    setUsers(u.data || []);
+    setLoading(false);
+  }, [filter, me.id]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const myOpen = actions.filter(a => a.owner_id === me.id && (a.status === 'open' || a.status === 'in_progress')).length;
+
+  return html`
+    <div class="page-header"><div><h1>Action Hub</h1><div class="sub">All open commitments</div></div></div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stat ${myOpen > 0 ? 'amber' : 'teal'}"><div class="stat-num">${myOpen}</div><div class="stat-label">Mine Open</div></div>
+      <div class="stat teal"><div class="stat-num">${actions.filter(a => a.status === 'open' || a.status === 'in_progress').length}</div><div class="stat-label">All Open</div></div>
+      <div class="stat teal"><div class="stat-num">${actions.filter(a => a.status === 'completed').length}</div><div class="stat-label">Completed</div></div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (filter === 'open' ? ' active' : '')} onClick=${() => setFilter('open')}>All Open</button>
+      <button class=${'auth-tab' + (filter === 'mine' ? ' active' : '')} onClick=${() => setFilter('mine')}>Mine</button>
+      <button class=${'auth-tab' + (filter === 'completed' ? ' active' : '')} onClick=${() => setFilter('completed')}>Done</button>
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
+    </div>
+
+    <div class="section-h">Actions · ${actions.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('action'); }}>+ Add</button></div>
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      actions.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✓</div>No actions in this filter</div></div>` :
+      actions.map(a => html`
+        <div class="list-item" key=${a.id} onClick=${() => { setEditTarget(a); setModal('action'); }}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${a.title}</div>
+              <div class="list-item-sub">${a.source_type} · ${a.owner_user?.full_name || 'unassigned'} ${a.due_at ? '· due ' + fmtDate(a.due_at) : ''}</div>
+            </div>
+            <span class=${'badge ' + (a.status === 'completed' ? 'emerald' : a.status === 'cancelled' ? '' : 'amber')}>${a.status}</span>
+          </div>
+        </div>
+      `)
+    }
+
+    ${modal === 'action' && html`<${ActionModal} plant=${plant} me=${me} users=${users} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+  `;
+}
+
+function ActionModal({ plant, me, users, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget ? {...editTarget, due_at: editTarget.due_at ? editTarget.due_at.slice(0,16) : ''} : {
+    title:'', description:'', owner_id:'', due_at:'', source_type:'manual'
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        source_type: form.source_type,
+        title: form.title,
+        description: form.description || null,
+        owner_id: form.owner_id || null,
+        assigned_by: me.id,
+        due_at: form.due_at ? new Date(form.due_at).toISOString() : null,
+        status: form.status || 'open',
+      };
+      if (form.status === 'completed' && !editTarget?.completed_at) {
+        payload.completed_at = new Date().toISOString();
+      }
+      const { error } = editTarget
+        ? await sb.from('actions').update(payload).eq('id', editTarget.id)
+        : await sb.from('actions').insert(payload);
+      if (error) throw error;
+      showToast(editTarget ? 'Action updated' : 'Action added');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Edit Action' : 'Add Action'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Title *</label><input type="text" required value=${form.title} onChange=${e => setForm({...form, title: e.target.value})} placeholder="Order new corepins" /></div>
+          <div class="field"><label>Description</label><textarea rows=${2} value=${form.description || ''} onChange=${e => setForm({...form, description: e.target.value})}></textarea></div>
+          <div class="field"><label>Owner</label>
+            <select value=${form.owner_id || ''} onChange=${e => setForm({...form, owner_id: e.target.value})}>
+              <option value="">— Unassigned —</option>
+              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Due Date</label><input type="datetime-local" value=${form.due_at} onChange=${e => setForm({...form, due_at: e.target.value})} /></div>
+          ${editTarget && html`
+            <div class="field"><label>Status</label>
+              <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
+                <option value="open">Open</option><option value="in_progress">In Progress</option>
+                <option value="completed">Completed</option><option value="cancelled">Cancelled</option>
+              </select>
+            </div>
+          `}
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= SIMPLE TAB (placeholder) =============
+function SimpleTab({ title, sub, comingSoon, block }) {
+  return html`
+    <div class="page-header"><div><h1>${title}</h1><div class="sub">${sub}</div></div></div>
+    ${comingSoon && html`
+      <div class="card">
+        <div class="empty">
+          <div class="icon">🚧</div>
+          <div style="font-weight:600;margin-bottom:6px">Coming in ${block}</div>
+          <div style="font-size:13px">This module is part of the next build phase. The base structure is ready — UI is being built.</div>
+        </div>
+      </div>
+    `}
+  `;
+}
+
+// ============= MOUNT =============
+try {
+  const root = createRoot(document.getElementById('root'));
+  root.render(h(App));
+} catch (err) {
+  document.getElementById('root').innerHTML = '<div style="padding:40px;font-family:monospace;color:#be123c;background:#fff1f2;margin:20px;border-radius:12px;border:1px solid #fecdd3;"><h2 style="margin-bottom:12px;font-family:sans-serif;">Loglinkr crashed during render</h2><pre style="white-space:pre-wrap;font-size:12px;">' + (err.stack || err.message || err) + '</pre></div>';
+  console.error('Loglinkr render error:', err);
+}
+
+// Global error handler to surface async errors
+window.addEventListener('error', (e) => {
+  console.error('Window error:', e.error);
+});
+window.addEventListener('unhandledrejection', (e) => {
+  console.error('Unhandled rejection:', e.reason);
+});
+</script>
+
+</body>
+</html>
