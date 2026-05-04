@@ -5,6 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>Loglinkr</title>
 <meta name="theme-color" content="#0d9488">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Loglinkr">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 
@@ -286,6 +293,102 @@ const createRoot = (container) => ({ render: (el) => render(el, container) });
 const SUPABASE_URL = 'https://wzxowvrvuecybdxymjvi.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind6eG93dnJ2dWVjeWJkeHltanZpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3MjMzMTQsImV4cCI6MjA5MzI5OTMxNH0.GyvHnBtlJTWs8HqMvu0VyRhjme5jbTUWzz9vOAxXhO8';
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// VAPID public key — set after generating with `npx web-push generate-vapid-keys`
+// Replace this placeholder with the public key you set as VAPID_PUBLIC_KEY in Supabase secrets.
+const VAPID_PUBLIC_KEY = 'BMckC21eZxtDc1NotXRz706Zj9fiPo_P6daPfJny9Ypp4xuJfj4Y4ubaGVA9DC7nrYIVsFSTuRxGByQvucLngJo';
+
+// Service worker registration (PWA + push)
+let swRegistration = null;
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').then(reg => {
+    swRegistration = reg;
+    console.log('[SW] registered');
+  }).catch(err => console.warn('[SW] register failed:', err));
+}
+
+// Convert VAPID key (base64url) to Uint8Array
+const urlBase64ToUint8Array = (base64String) => {
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64);
+  const arr = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+};
+
+// Subscribe this device to push notifications and save to DB
+const enablePushNotifications = async (userId, plantId) => {
+  try {
+    if (!swRegistration) return { success: false, reason: 'no_sw' };
+    if (!('PushManager' in window)) return { success: false, reason: 'unsupported' };
+    if (VAPID_PUBLIC_KEY.startsWith('REPLACE')) return { success: false, reason: 'vapid_not_set' };
+
+    // Ask permission first
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') return { success: false, reason: 'denied' };
+
+    // Get existing or new subscription
+    let sub = await swRegistration.pushManager.getSubscription();
+    if (!sub) {
+      sub = await swRegistration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+      });
+    }
+
+    const subJson = sub.toJSON();
+    // Save to DB
+    await sb.from('push_subscriptions').upsert({
+      user_id: userId,
+      plant_id: plantId,
+      endpoint: subJson.endpoint,
+      p256dh_key: subJson.keys.p256dh,
+      auth_key: subJson.keys.auth,
+      user_agent: navigator.userAgent.slice(0, 200),
+      device_label: navigator.platform || 'Unknown',
+    }, { onConflict: 'endpoint' });
+
+    return { success: true };
+  } catch (err) {
+    console.error('Push subscribe failed:', err);
+    return { success: false, reason: err.message };
+  }
+};
+
+// Unsubscribe this device
+const disablePushNotifications = async () => {
+  try {
+    if (!swRegistration) return false;
+    const sub = await swRegistration.pushManager.getSubscription();
+    if (!sub) return true;
+    const endpoint = sub.endpoint;
+    await sub.unsubscribe();
+    await sb.from('push_subscriptions').delete().eq('endpoint', endpoint);
+    return true;
+  } catch (err) {
+    console.error('Push unsubscribe failed:', err);
+    return false;
+  }
+};
+
+// PWA install prompt capture
+let deferredInstallPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredInstallPrompt = e;
+});
+
+const promptInstallApp = async () => {
+  if (!deferredInstallPrompt) {
+    alert('To install Loglinkr:\n• Android Chrome: tap menu → "Install app" or "Add to Home screen"\n• iPhone Safari: tap Share → "Add to Home Screen"\n• Mac/Windows Chrome: click the install icon in URL bar');
+    return false;
+  }
+  deferredInstallPrompt.prompt();
+  const { outcome } = await deferredInstallPrompt.userChoice;
+  deferredInstallPrompt = null;
+  return outcome === 'accepted';
+};
 
 // ============= UTILITIES =============
 const escapeHtml = s => (s || '').toString();
@@ -2151,6 +2254,10 @@ function Chat({ plant, me, user }) {
   const [notifPerm, setNotifPerm] = useState(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
   const [taskFromMsg, setTaskFromMsg] = useState(null);
   const [groupModal, setGroupModal] = useState(false);
+  const [msgMenu, setMsgMenu] = useState(null);
+  const [editMsgTarget, setEditMsgTarget] = useState(null);
+  const [forwardMsgTarget, setForwardMsgTarget] = useState(null);
+  const [groupSettingsTarget, setGroupSettingsTarget] = useState(null);
 
   useEffect(() => { loadGroups(); }, []);
   // Global plant-wide subscription — notifications work even when not on chat tab
@@ -2490,12 +2597,25 @@ function Chat({ plant, me, user }) {
       <div class="chat-thread">
         <div class="thread-header">
           <button class="thread-back" onClick=${() => setActiveGroup(null)}>←</button>
-          <div class="chat-avatar">${activeGroup.name[0] === '#' ? '#' : activeGroup.name[0]}</div>
-          <div>
+          <div class="chat-avatar" onClick=${() => setGroupSettingsTarget(activeGroup)} style="cursor:pointer">${activeGroup.name[0] === '#' ? '#' : activeGroup.name[0]}</div>
+          <div style="flex:1;cursor:pointer" onClick=${() => setGroupSettingsTarget(activeGroup)}>
             <div style="font-weight:600;font-size:14px">${activeGroup.name}</div>
-            <div style="font-size:11px;color:var(--slate-500)">${activeGroup.members.length} member${activeGroup.members.length > 1 ? 's' : ''}</div>
+            <div style="font-size:11px;color:var(--slate-500)">${activeGroup.members.length} member${activeGroup.members.length > 1 ? 's' : ''} · tap for settings</div>
           </div>
+          <button class="thread-back" onClick=${() => setGroupSettingsTarget(activeGroup)}>⚙️</button>
         </div>
+        ${groupSettingsTarget && html`<${GroupSettingsModal} plant=${plant} me=${me} user=${user} group=${groupSettingsTarget} onClose=${() => setGroupSettingsTarget(null)} onChanged=${(updatedGroup) => {
+          if (updatedGroup === null) {
+            // Group deleted or user left
+            setGroupSettingsTarget(null);
+            setActiveGroup(null);
+            loadGroups();
+          } else {
+            setGroupSettingsTarget(updatedGroup);
+            setActiveGroup(updatedGroup);
+            loadGroups();
+          }
+        }} />`}
         <div class="thread-messages" id="threadMessages">
           ${messages.length === 0 ? html`<div class="empty"><div class="icon">💬</div><div style="font-size:13px">No messages yet. Say hi.</div></div>` :
             messages.map(m => {
@@ -2504,9 +2624,12 @@ function Chat({ plant, me, user }) {
               const ex = m._extraction;
               const doc = m._doc;
               const hasImage = atts.length > 0 && atts[0].isImage;
+              const canEdit = isOut;
+              const canDelete = isOut || me.role === 'plant_head' || me.role === 'admin';
               return html`
                 <div class=${'msg ' + (isOut ? 'out' : 'in')} key=${m.id}>
                   ${!isOut && html`<div class="who">${m.users?.full_name || '?'}</div>`}
+                  ${m.forwarded_from_message_id && html`<div style="font-size:10px;opacity:0.7;font-style:italic">↪️ Forwarded</div>`}
                   ${m.body && html`<div>${m.body}</div>`}
                   ${atts.map((a, i) => a.isImage
                     ? html`<a href=${a.url} target="_blank" rel="noopener" key=${i}><img class="attached-img" src=${a.url} alt=${a.name || 'image'} /></a>`
@@ -2527,8 +2650,8 @@ function Chat({ plant, me, user }) {
                     <button class="msg-action-btn" style="margin-top:6px" onClick=${() => triggerExtraction(m, atts[0].url)} title="Extract document">📄 Extract as document</button>
                   `}
                   <div class="ts">
-                    ${fmtDate(m.created_at)}
-                    <button class="msg-action-btn" onClick=${() => setTaskFromMsg(m)} title="Assign as task">✓</button>
+                    ${fmtDate(m.created_at)}${m.edited_at ? ' · edited' : ''}
+                    <button class="msg-action-btn" onClick=${() => setMsgMenu(m)} title="More">⋯</button>
                   </div>
                 </div>
               `;
@@ -2551,6 +2674,22 @@ function Chat({ plant, me, user }) {
           <button onClick=${send} disabled=${uploading || (!input.trim() && !attachment)}>${uploading ? '…' : '→'}</button>
         </div>
         ${taskFromMsg && html`<${AssignTaskFromMsgModal} plant=${plant} me=${me} message=${taskFromMsg} group=${activeGroup} onClose=${() => setTaskFromMsg(null)} onSaved=${() => setTaskFromMsg(null)} />`}
+        ${msgMenu && html`<${MessageActionMenu}
+          message=${msgMenu} me=${me} group=${activeGroup}
+          onClose=${() => setMsgMenu(null)}
+          onAssignTask=${() => { setTaskFromMsg(msgMenu); setMsgMenu(null); }}
+          onEdit=${() => { setEditMsgTarget(msgMenu); setMsgMenu(null); }}
+          onDelete=${async () => {
+            if (!confirm('Delete this message? This cannot be undone.')) return;
+            const { data, error } = await sb.rpc('delete_chat_message', { p_message_id: msgMenu.id });
+            if (error || !data?.success) { alert(error?.message || data?.error || 'Failed'); return; }
+            setMsgMenu(null);
+            loadMessages(activeGroup.id);
+          }}
+          onForward=${() => { setForwardMsgTarget(msgMenu); setMsgMenu(null); }}
+        />`}
+        ${editMsgTarget && html`<${MessageEditModal} message=${editMsgTarget} onClose=${() => setEditMsgTarget(null)} onSaved=${() => { setEditMsgTarget(null); loadMessages(activeGroup.id); }} />`}
+        ${forwardMsgTarget && html`<${MessageForwardModal} plant=${plant} me=${me} message=${forwardMsgTarget} currentGroupId=${activeGroup.id} onClose=${() => setForwardMsgTarget(null)} onSaved=${() => { setForwardMsgTarget(null); }} />`}
       </div>
     `;
   }
@@ -2676,17 +2815,30 @@ function People({ plant, me }) {
         `)}
       `}
       <div class="section-h">Team · ${users.length}<button class="btn small ghost" onClick=${() => setModal('invite')}>+ Invite</button></div>
-      ${users.map(u => html`
-        <div class="list-item" key=${u.id}>
-          <div class="list-item-row">
-            <div class="list-item-main">
-              <div class="list-item-title">${u.full_name}${u.id === me.id ? ' (you)' : ''}</div>
-              <div class="list-item-sub">${u.phone} · ${u.email || 'no email'}</div>
+      ${users.map(u => {
+        const canRemove = (me.role === 'plant_head' || me.role === 'admin') && u.id !== me.id && u.status !== 'inactive';
+        return html`
+          <div class="list-item" key=${u.id}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${u.full_name}${u.id === me.id ? ' (you)' : ''}${u.status === 'inactive' ? ' · inactive' : ''}</div>
+                <div class="list-item-sub">${u.phone} · ${u.email || 'no email'}</div>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                <span class=${'badge ' + (u.role === 'plant_head' ? 'teal' : u.status === 'inactive' ? '' : '')}>${u.role}</span>
+                ${canRemove && html`<button class="btn small danger" onClick=${async () => {
+                  const reason = prompt('Reason for removal (recorded in audit log):', '');
+                  if (reason === null) return;
+                  const { data, error } = await sb.rpc('remove_user_from_plant', { p_user_id: u.id, p_reason: reason || 'No reason provided' });
+                  if (error || !data?.success) { alert(error?.message || data?.error || 'Failed'); return; }
+                  showToast('Removed from organization');
+                  refresh();
+                }}>Remove</button>`}
+              </div>
             </div>
-            <span class=${'badge ' + (u.role === 'plant_head' ? 'teal' : '')}>${u.role}</span>
           </div>
-        </div>
-      `)}
+        `;
+      })}
     `}
 
     ${view === 'shifts' && html`
@@ -3200,7 +3352,87 @@ function More({ plant, me, user, logout, setTab }) {
       <${AuditLogViewer} plant=${plant} />
     ` : ''}
 
+    <div class="section-h">App</div>
+    <${PushNotifSetting} me=${me} plant=${plant} />
+    <${InstallAppCard} />
+
     <button class="btn danger" style="margin-top:14px" onClick=${logout}>Log out</button>
+  `;
+}
+
+// ============= PUSH NOTIFICATION SETTING =============
+function PushNotifSetting({ me, plant }) {
+  const [perm, setPerm] = useState(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
+  const [subscribed, setSubscribed] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => { (async () => {
+    if (!('serviceWorker' in navigator) || !swRegistration) return;
+    try {
+      const sub = await swRegistration.pushManager.getSubscription();
+      setSubscribed(!!sub);
+    } catch (_) {}
+  })(); }, []);
+
+  const toggle = async () => {
+    setBusy(true);
+    try {
+      if (subscribed) {
+        await disablePushNotifications();
+        setSubscribed(false);
+        showToast('Push notifications disabled on this device');
+      } else {
+        const r = await enablePushNotifications(me.id, plant.id);
+        if (r.success) {
+          setPerm('granted');
+          setSubscribed(true);
+          showToast('Push notifications enabled');
+        } else {
+          if (r.reason === 'denied') alert('You blocked notifications. Enable in browser settings to use this.');
+          else if (r.reason === 'unsupported') alert('Your browser does not support push notifications.');
+          else if (r.reason === 'vapid_not_set') alert('Push not configured on server (admin: set VAPID_PUBLIC_KEY).');
+          else alert('Failed: ' + (r.reason || 'unknown'));
+        }
+      }
+    } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div style="font-weight:600;font-size:14px">🔔 Push notifications</div>
+          <div style="font-size:11px;color:var(--slate-500)">${subscribed ? 'Enabled on this device — chat, tasks, alerts' : 'Get alerts even when Loglinkr is closed'}</div>
+        </div>
+        <button class=${'btn small ' + (subscribed ? 'danger' : '')} onClick=${toggle} disabled=${busy}>${subscribed ? 'Disable' : 'Enable'}</button>
+      </div>
+    </div>
+  `;
+}
+
+// ============= INSTALL APP CARD =============
+function InstallAppCard() {
+  const [installed, setInstalled] = useState(window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+  const handleInstall = async () => {
+    const ok = await promptInstallApp();
+    if (ok) setInstalled(true);
+  };
+  if (installed) return html`
+    <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);margin-top:8px">
+      <div style="font-weight:600;font-size:14px;color:var(--emerald-700)">✓ Loglinkr is installed</div>
+      <div style="font-size:11px;color:var(--slate-600)">Running as installed app on this device</div>
+    </div>
+  `;
+  return html`
+    <div class="card" style="margin-top:8px">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+        <div>
+          <div style="font-weight:600;font-size:14px">📲 Install Loglinkr</div>
+          <div style="font-size:11px;color:var(--slate-500)">Add to home screen / dock — opens like a native app</div>
+        </div>
+        <button class="btn small" onClick=${handleInstall}>Install</button>
+      </div>
+    </div>
   `;
 }
 
@@ -5687,6 +5919,237 @@ function QuickItemCreateModal({ plant, prefillName, prefillUom, onClose, onSaved
           </div>
           <button class="btn" disabled=${loading}>${loading ? 'Creating…' : 'Create item'}</button>
         </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= MESSAGE ACTION MENU (sheet on tap of ⋯) =============
+function MessageActionMenu({ message, me, group, onClose, onAssignTask, onEdit, onDelete, onForward }) {
+  const isAuthor = message.sender_id === me.id;
+  const canEdit = isAuthor;
+  const canDelete = isAuthor || me.role === 'plant_head' || me.role === 'admin';
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:380px">
+        <div class="modal-header">
+          <div class="modal-title">Message actions</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card" style="background:var(--slate-50);margin-bottom:14px;font-size:13px;color:var(--slate-700);max-height:120px;overflow:auto">
+          ${message.body || '(attachment only)'}
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <button class="btn ghost" onClick=${onAssignTask}>✓ Assign as task</button>
+          <button class="btn ghost" onClick=${onForward}>↪️ Forward</button>
+          ${canEdit && html`<button class="btn ghost" onClick=${onEdit}>✏️ Edit</button>`}
+          ${canDelete && html`<button class="btn danger" onClick=${onDelete}>🗑️ Delete${!isAuthor ? ' (admin)' : ''}</button>`}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ============= MESSAGE EDIT MODAL =============
+function MessageEditModal({ message, onClose, onSaved }) {
+  const [body, setBody] = useState(message.body || '');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const { data, error } = await sb.rpc('edit_chat_message', {
+        p_message_id: message.id,
+        p_new_body: body.trim(),
+      });
+      if (error || !data?.success) throw new Error(error?.message || data?.error || 'Failed');
+      showToast('Message updated');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Edit message</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Message *</label><textarea required rows=${4} value=${body} onChange=${e => setBody(e.target.value)} autofocus></textarea></div>
+          <button class="btn" disabled=${loading || !body.trim()}>${loading ? 'Saving…' : 'Update'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= MESSAGE FORWARD MODAL =============
+function MessageForwardModal({ plant, me, message, currentGroupId, onClose, onSaved }) {
+  const [groups, setGroups] = useState([]);
+  const [selected, setSelected] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    sb.from('chat_groups').select('*').neq('id', currentGroupId).order('name').then(({ data }) => {
+      setGroups((data || []).filter(g => g.members.includes(me.id)));
+      setLoading(false);
+    });
+  }, []);
+
+  const toggle = (id) => setSelected(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id]);
+
+  const submit = async () => {
+    if (selected.length === 0) { setError('Pick at least one group'); return; }
+    setError(''); setSubmitting(true);
+    try {
+      const { data, error } = await sb.rpc('forward_message_to_groups', {
+        p_source_message_id: message.id,
+        p_target_group_ids: selected,
+      });
+      if (error || !data?.success) throw new Error(error?.message || 'Failed');
+      showToast('Forwarded to ' + data.forwarded_to + ' group' + (data.forwarded_to > 1 ? 's' : ''));
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setSubmitting(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Forward to…</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card" style="background:var(--slate-50);margin-bottom:14px;font-size:13px;color:var(--slate-700);max-height:80px;overflow:auto">
+          ${message.body || '(attachment)'}
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+          groups.length === 0 ? html`<div class="empty">No other groups available</div>` :
+          html`
+            <div style="max-height:300px;overflow-y:auto;border:1px solid var(--slate-200);border-radius:10px;padding:6px;margin-bottom:14px">
+              ${groups.map(g => {
+                const sel = selected.includes(g.id);
+                return html`
+                  <div key=${g.id} onClick=${() => toggle(g.id)} style="padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer;border-radius:8px;${sel ? 'background:var(--teal-50)' : ''}">
+                    <div style="width:20px;height:20px;border:2px solid ${sel ? 'var(--teal-600)' : 'var(--slate-300)'};border-radius:6px;display:flex;align-items:center;justify-content:center;background:${sel ? 'var(--teal-600)' : 'transparent'};color:white;font-size:12px;flex-shrink:0">${sel ? '✓' : ''}</div>
+                    <div style="flex:1"><div style="font-size:14px;font-weight:500">${g.name}</div></div>
+                  </div>
+                `;
+              })}
+            </div>
+            <button class="btn" onClick=${submit} disabled=${submitting || selected.length === 0}>${submitting ? 'Forwarding…' : 'Forward to ' + selected.length + ' group' + (selected.length !== 1 ? 's' : '')}</button>
+          `
+        }
+      </div>
+    </div>
+  `;
+}
+
+// ============= GROUP SETTINGS MODAL (members + leave + delete) =============
+function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
+  const [members, setMembers] = useState([]);
+  const [allUsers, setAllUsers] = useState([]);
+  const [adding, setAdding] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const isOwner = group.created_by === me.id;
+  const canManage = isOwner || me.role === 'plant_head' || me.role === 'admin';
+
+  useEffect(() => { load(); }, [group.id]);
+
+  const load = async () => {
+    const ids = group.members || [];
+    if (ids.length === 0) { setMembers([]); setAllUsers([]); return; }
+    const [m, all] = await Promise.all([
+      sb.from('users').select('id, full_name, role').in('id', ids),
+      sb.from('users').select('id, full_name, role').eq('status', 'active'),
+    ]);
+    setMembers(m.data || []);
+    setAllUsers(all.data || []);
+  };
+
+  const addMember = async (uid) => {
+    setBusy(true); setError('');
+    try {
+      const { data, error } = await sb.rpc('add_group_member', { p_group_id: group.id, p_user_id: uid });
+      if (error || !data?.success) throw new Error(error?.message || data?.error || 'Failed');
+      // Refresh group from DB
+      const { data: g } = await sb.from('chat_groups').select('*').eq('id', group.id).maybeSingle();
+      onChanged(g);
+    } catch (err) { setError(err.message); } finally { setBusy(false); setAdding(false); }
+  };
+
+  const removeMember = async (uid) => {
+    if (uid !== me.id && !confirm('Remove this member from the group?')) return;
+    if (uid === me.id && !confirm('Leave this group?')) return;
+    setBusy(true); setError('');
+    try {
+      const { data, error } = await sb.rpc('remove_group_member', { p_group_id: group.id, p_user_id: uid });
+      if (error || !data?.success) throw new Error(error?.message || data?.error || 'Failed');
+      if (uid === me.id) {
+        onChanged(null);
+      } else {
+        const { data: g } = await sb.from('chat_groups').select('*').eq('id', group.id).maybeSingle();
+        onChanged(g);
+      }
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  };
+
+  const memberIds = members.map(m => m.id);
+  const addable = allUsers.filter(u => !memberIds.includes(u.id));
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${group.name}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+
+        <div class="section-h">Members · ${members.length}${canManage ? html`<button class="btn small ghost" onClick=${() => setAdding(!adding)} disabled=${busy || addable.length === 0}>${adding ? '× Cancel' : '+ Add'}</button>` : ''}</div>
+
+        ${adding && html`
+          <div style="border:1px solid var(--slate-200);border-radius:10px;padding:8px;max-height:200px;overflow:auto;margin-bottom:14px">
+            ${addable.length === 0 ? html`<div class="empty"><div style="font-size:12px">All active users are already in this group.</div></div>` :
+              addable.map(u => html`
+                <div key=${u.id} onClick=${() => addMember(u.id)} style="padding:8px 10px;cursor:pointer;border-radius:6px;display:flex;justify-content:space-between;align-items:center;${busy ? 'opacity:0.5' : ''}" onMouseOver=${e => e.currentTarget.style.background='var(--slate-100)'} onMouseOut=${e => e.currentTarget.style.background=''}>
+                  <div>
+                    <div style="font-size:13px;font-weight:500">${u.full_name}</div>
+                    <div style="font-size:11px;color:var(--slate-500)">${u.role}</div>
+                  </div>
+                  <button class="btn small">+ Add</button>
+                </div>
+              `)
+            }
+          </div>
+        `}
+
+        <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px">
+          ${members.map(m => {
+            const isCreator = m.id === group.created_by;
+            const isMe = m.id === me.id;
+            return html`
+              <div key=${m.id} class="list-item">
+                <div class="list-item-row">
+                  <div class="list-item-main">
+                    <div class="list-item-title">${m.full_name}${isMe ? ' (you)' : ''}${isCreator ? ' · 👑 creator' : ''}</div>
+                    <div class="list-item-sub">${m.role}</div>
+                  </div>
+                  ${(canManage || isMe) && !isCreator && html`<button class="btn small danger" disabled=${busy} onClick=${() => removeMember(m.id)}>${isMe ? 'Leave' : 'Remove'}</button>`}
+                </div>
+              </div>
+            `;
+          })}
+        </div>
+
+        ${!canManage && html`<div style="font-size:11px;color:var(--slate-500);text-align:center;margin-top:6px">Only group creator and plant head can add or remove members.</div>`}
       </div>
     </div>
   `;
