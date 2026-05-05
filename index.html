@@ -6079,17 +6079,16 @@ function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
   const isOwner = group.created_by === me.id;
   const canManage = isOwner || me.role === 'plant_head' || me.role === 'admin';
 
-  useEffect(() => { load(); }, [group.id]);
+  // Re-load whenever the group prop's members array length changes
+  useEffect(() => { load(); }, [group.id, (group.members || []).length, (group.members || []).join(',')]);
 
   const load = async () => {
     const ids = group.members || [];
-    if (ids.length === 0) { setMembers([]); setAllUsers([]); return; }
-    const [m, all] = await Promise.all([
-      sb.from('users').select('id, full_name, role').in('id', ids),
-      sb.from('users').select('id, full_name, role').eq('status', 'active'),
-    ]);
-    setMembers(m.data || []);
+    const all = await sb.from('users').select('id, full_name, role').eq('status', 'active');
     setAllUsers(all.data || []);
+    if (ids.length === 0) { setMembers([]); return; }
+    const m = await sb.from('users').select('id, full_name, role').in('id', ids);
+    setMembers(m.data || []);
   };
 
   const addMember = async (uid) => {
@@ -6097,9 +6096,17 @@ function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
     try {
       const { data, error } = await sb.rpc('add_group_member', { p_group_id: group.id, p_user_id: uid });
       if (error || !data?.success) throw new Error(error?.message || data?.error || 'Failed');
-      // Refresh group from DB
+      // Refresh group from DB and propagate up
       const { data: g } = await sb.from('chat_groups').select('*').eq('id', group.id).maybeSingle();
-      onChanged(g);
+      if (g) {
+        onChanged(g);
+        // Refresh modal members locally too (don't wait for parent re-prop)
+        const ids = g.members || [];
+        if (ids.length > 0) {
+          const m = await sb.from('users').select('id, full_name, role').in('id', ids);
+          setMembers(m.data || []);
+        }
+      }
     } catch (err) { setError(err.message); } finally { setBusy(false); setAdding(false); }
   };
 
@@ -6112,9 +6119,19 @@ function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
       if (error || !data?.success) throw new Error(error?.message || data?.error || 'Failed');
       if (uid === me.id) {
         onChanged(null);
-      } else {
-        const { data: g } = await sb.from('chat_groups').select('*').eq('id', group.id).maybeSingle();
+        return;
+      }
+      const { data: g } = await sb.from('chat_groups').select('*').eq('id', group.id).maybeSingle();
+      if (g) {
         onChanged(g);
+        // Refresh modal members locally
+        const ids = g.members || [];
+        if (ids.length > 0) {
+          const m = await sb.from('users').select('id, full_name, role').in('id', ids);
+          setMembers(m.data || []);
+        } else {
+          setMembers([]);
+        }
       }
     } catch (err) { setError(err.message); } finally { setBusy(false); }
   };
