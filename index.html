@@ -1012,8 +1012,9 @@ function Home({ plant, me, setTab, reload }) {
       sb.from('actions').select('id', { count:'exact', head:true }).eq('status', 'open'),
       sb.from('mcp_quality_ncrs').select('id', { count:'exact', head:true }).neq('status', 'closed').neq('status', 'cancelled'),
       sb.from('mcp_maintenance_breakdowns').select('id', { count:'exact', head:true }).neq('status', 'resolved').neq('status', 'cancelled'),
-      sb.from('mcp_stocks_items').select('id', { count:'exact', head:true }).filter('current_qty', 'lte', 'reorder_level'),
+      sb.from('mcp_stocks_items').select('id, current_qty, reorder_level').not('reorder_level', 'is', null),
     ]);
+    const lowStockCount = (st.data || []).filter(i => parseFloat(i.current_qty || 0) <= parseFloat(i.reorder_level || 0)).length;
     setStats({
       units: u.count || 0,
       users: us.count || 0,
@@ -1023,7 +1024,7 @@ function Home({ plant, me, setTab, reload }) {
       openActions: a.count || 0,
       openNcrs: n.count || 0,
       openBreakdowns: b.count || 0,
-      lowStock: st.count || 0,
+      lowStock: lowStockCount,
     });
     setLoading(false);
   };
@@ -2388,13 +2389,21 @@ function Chat({ plant, me, user }) {
         .gt('created_at', lastReadIso)
         .neq('sender_id', user.id);
 
-      // Last message
-      const { data: lastMsg } = await sb.from('chat_messages')
-        .select('body, attachments, created_at, users(full_name)')
+      // Last message — without users join to avoid RLS issues
+      const { data: lastMsgRaw } = await sb.from('chat_messages')
+        .select('body, attachments, created_at, sender_id')
         .eq('group_id', g.id)
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
+      let lastMsg = null;
+      if (lastMsgRaw) {
+        lastMsg = { ...lastMsgRaw, users: null };
+        if (lastMsgRaw.sender_id) {
+          const { data: sender } = await sb.from('users').select('full_name').eq('id', lastMsgRaw.sender_id).maybeSingle();
+          lastMsg.users = sender;
+        }
+      }
 
       return { ...g, unread: count || 0, lastMsg };
     }));
@@ -2412,8 +2421,30 @@ function Chat({ plant, me, user }) {
   };
 
   const loadMessages = async (groupId) => {
-    const { data: msgs } = await sb.from('chat_messages').select('*, users(full_name)').eq('group_id', groupId).order('created_at').limit(100);
+    // Load messages WITHOUT the join to avoid RLS-on-users blocking the read
+    const { data: msgs, error: msgErr } = await sb.from('chat_messages')
+      .select('*')
+      .eq('group_id', groupId)
+      .order('created_at')
+      .limit(100);
+
+    if (msgErr) {
+      console.error('[Loglinkr] loadMessages error:', msgErr);
+      setMessages([]);
+      return;
+    }
     const messages = msgs || [];
+
+    // Manually fetch sender names (only from active users in our plant)
+    const senderIds = [...new Set(messages.map(m => m.sender_id).filter(Boolean))];
+    const senderMap = {};
+    if (senderIds.length > 0) {
+      const { data: senders } = await sb.from('users').select('id, full_name').in('id', senderIds);
+      (senders || []).forEach(u => { senderMap[u.id] = u; });
+    }
+    for (const m of messages) {
+      m.users = m.sender_id ? (senderMap[m.sender_id] || { full_name: 'Unknown user' }) : null;
+    }
 
     // Fetch extraction status for these messages (if any have images)
     if (messages.length > 0) {
