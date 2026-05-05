@@ -4285,18 +4285,22 @@ function TaskRow({ action, onTap }) {
 function TaskDetail({ plant, me, task: initialTask, users, onClose }) {
   const [task, setTask] = useState(initialTask);
   const [updates, setUpdates] = useState([]);
+  const [childRequests, setChildRequests] = useState([]);
   const [comment, setComment] = useState('');
   const [posting, setPosting] = useState(false);
   const [editing, setEditing] = useState(false);
   const [showOriginalMsg, setShowOriginalMsg] = useState(null);
+  const [helpModal, setHelpModal] = useState(null); // 'help' | 'approval' | null
 
   const refresh = useCallback(async () => {
-    const [t, u] = await Promise.all([
+    const [t, u, c] = await Promise.all([
       sb.from('actions').select('*, owner_user:owner_id(full_name), assigner:assigned_by(full_name), creator:assigned_by(full_name)').eq('id', task.id).maybeSingle(),
-      sb.from('action_updates').select('*, author:author_id(full_name)').eq('action_id', task.id).order('created_at')
+      sb.from('action_updates').select('*, author:author_id(full_name)').eq('action_id', task.id).order('created_at'),
+      sb.from('actions').select('id, title, status, request_type, owner_user:owner_id(full_name)').eq('parent_action_id', task.id).order('created_at'),
     ]);
     if (t.data) setTask(t.data);
     setUpdates(u.data || []);
+    setChildRequests(c.data || []);
   }, [task.id]);
 
   useEffect(() => {
@@ -4309,6 +4313,7 @@ function TaskDetail({ plant, me, task: initialTask, users, onClose }) {
     const channel = sb.channel('task-' + task.id)
       .on('postgres_changes', { event:'*', schema:'public', table:'action_updates', filter:'action_id=eq.' + task.id }, () => refresh())
       .on('postgres_changes', { event:'*', schema:'public', table:'actions', filter:'id=eq.' + task.id }, () => refresh())
+      .on('postgres_changes', { event:'*', schema:'public', table:'actions', filter:'parent_action_id=eq.' + task.id }, () => refresh())
       .subscribe();
     return () => { sb.removeChannel(channel); };
   }, [task.id, refresh]);
@@ -4384,6 +4389,8 @@ function TaskDetail({ plant, me, task: initialTask, users, onClose }) {
           ${task.status === 'open' && html`<button class="btn small" onClick=${() => changeStatus('in_progress')}>Start working</button>`}
           ${task.status === 'in_progress' && html`<button class="btn small ghost" onClick=${() => changeStatus('open')}>Pause</button>`}
           <button class="btn small" style="background:var(--emerald-600)" onClick=${() => { if (confirm('Close this task?')) changeStatus('completed'); }}>✓ Close task</button>
+          <button class="btn small ghost" onClick=${() => setHelpModal('help')}>🤝 Ask for help</button>
+          <button class="btn small ghost" onClick=${() => setHelpModal('approval')}>✅ Request approval</button>
           ${(me.role === 'plant_head' || me.role === 'admin' || task.assigned_by === me.id) && html`
             <button class="btn small danger" onClick=${() => { if (confirm('Cancel this task?')) changeStatus('cancelled'); }}>Cancel</button>
           `}
@@ -4398,6 +4405,21 @@ function TaskDetail({ plant, me, task: initialTask, users, onClose }) {
           </div>
         `}
       </div>
+    `}
+
+    ${childRequests.length > 0 && html`
+      <div class="section-h">Linked Requests · ${childRequests.length}</div>
+      ${childRequests.map(r => html`
+        <div class="list-item" key=${r.id} onClick=${() => onClose(r)}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${r.request_type === 'help' ? '🤝' : '✅'} ${r.title}</div>
+              <div class="list-item-sub">→ ${r.owner_user?.full_name || '?'} · ${r.status}</div>
+            </div>
+            <span class=${'badge ' + (r.status === 'completed' ? 'emerald' : r.status === 'cancelled' ? 'rose' : 'amber')}>${r.status}</span>
+          </div>
+        </div>
+      `)}
     `}
 
     <div class="section-h">Activity · ${updates.length}</div>
@@ -4429,13 +4451,14 @@ function TaskDetail({ plant, me, task: initialTask, users, onClose }) {
     </div>
 
     ${!isClosed && html`
-      <div style="position:sticky;bottom:calc(76px + var(--safe-bottom));background:white;padding:10px 0;margin-top:14px;display:flex;gap:8px;border-top:1px solid var(--slate-100)">
-        <input type="text" value=${comment} onChange=${e => setComment(e.target.value)} onKeyPress=${e => { if (e.key === 'Enter' && !e.shiftKey) postComment(); }} placeholder="Add an update or comment…" style="flex:1;padding:10px 14px;border:1px solid var(--slate-200);border-radius:999px;font-size:14px;outline:none" disabled=${posting} />
-        <button class="btn" style="border-radius:999px;width:auto;padding:10px 18px;flex-shrink:0" onClick=${postComment} disabled=${posting || !comment.trim()}>${posting ? '…' : 'Post'}</button>
+      <div style="position:sticky;bottom:calc(76px + var(--safe-bottom));background:white;padding:12px 0;margin-top:14px;display:flex;gap:8px;border-top:1px solid var(--slate-100);z-index:10">
+        <input type="text" value=${comment} onChange=${e => setComment(e.target.value)} onKeyPress=${e => { if (e.key === 'Enter' && !e.shiftKey) postComment(); }} placeholder="Add an update or comment…" style="flex:1;padding:11px 14px;border:1px solid var(--slate-200);border-radius:999px;font-size:14px;outline:none;font-family:inherit" disabled=${posting} />
+        <button type="button" class="btn" style="border-radius:999px;width:auto;padding:11px 22px;flex-shrink:0;font-weight:600" onClick=${postComment} disabled=${posting || !comment.trim()}>${posting ? '…' : 'Post'}</button>
       </div>
     `}
 
     ${editing && html`<${ActionModal} plant=${plant} me=${me} users=${users} editTarget=${task} onClose=${() => setEditing(false)} onSaved=${() => { setEditing(false); refresh(); }} />`}
+    ${helpModal && html`<${HelpApprovalModal} plant=${plant} me=${me} users=${users} parentTask=${task} requestType=${helpModal} onClose=${() => setHelpModal(null)} onSaved=${() => { setHelpModal(null); refresh(); }} />`}
   `;
 }
 
@@ -6222,6 +6245,86 @@ function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
         </div>
 
         ${!canManage && html`<div style="font-size:11px;color:var(--slate-500);text-align:center;margin-top:6px">Only group creator and plant head can add or remove members.</div>`}
+      </div>
+    </div>
+  `;
+}
+
+// ============= HELP / APPROVAL REQUEST MODAL =============
+function HelpApprovalModal({ plant, me, users, parentTask, requestType, onClose, onSaved }) {
+  const [assigneeId, setAssigneeId] = useState('');
+  const [message, setMessage] = useState('');
+  const [dueAt, setDueAt] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const isHelp = requestType === 'help';
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      if (!assigneeId) throw new Error('Pick someone to ask');
+      if (!message.trim()) throw new Error('Write what you need');
+
+      const { data, error } = await sb.rpc('request_help_or_approval', {
+        p_parent_action_id: parentTask.id,
+        p_request_type: requestType,
+        p_assignee_id: assigneeId,
+        p_message: message.trim(),
+        p_due_at: dueAt ? new Date(dueAt).toISOString() : null,
+      });
+      if (error) throw error;
+      if (!data?.success) throw new Error(data?.error || 'Failed');
+
+      showToast(isHelp ? '🤝 Help requested from ' + data.assignee_name : '✅ Approval requested from ' + data.assignee_name);
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  // Filter out self from assignee list
+  const eligible = users.filter(u => u.id !== me.id && u.status === 'active');
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${isHelp ? '🤝 Ask for Help' : '✅ Request Approval'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card" style="background:var(--slate-50);margin-bottom:14px">
+          <div style="font-size:12px;color:var(--slate-500);margin-bottom:4px">Linked to task</div>
+          <div style="font-size:14px;font-weight:600">${parentTask.title}</div>
+        </div>
+
+        ${error && html`<div class="alert error">${error}</div>`}
+
+        <form onSubmit=${submit}>
+          <div class="field">
+            <label>${isHelp ? 'Ask whom?' : 'Approver'} *</label>
+            <select required value=${assigneeId} onChange=${e => setAssigneeId(e.target.value)}>
+              <option value="">— Select person —</option>
+              ${eligible.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} · ${u.role}</option>`)}
+            </select>
+          </div>
+
+          <div class="field">
+            <label>${isHelp ? 'What help do you need?' : 'What needs approval?'} *</label>
+            <textarea required rows=${4} value=${message} onChange=${e => setMessage(e.target.value)} autofocus
+              placeholder=${isHelp ? "e.g. 'Need 4 corepins from stores by tomorrow morning'" : "e.g. 'Material certificate from supplier OK to receive?'"}></textarea>
+          </div>
+
+          <div class="field">
+            <label>Needed by (optional)</label>
+            <input type="datetime-local" value=${dueAt} onChange=${e => setDueAt(e.target.value)} />
+          </div>
+
+          <div class="alert info" style="margin-bottom:12px;font-size:12px">
+            This creates a new task for them. When they ${isHelp ? 'complete the help' : 'approve'}, your task gets an auto-update.
+            ${!isHelp ? html` <br/><strong>Cancel = rejection.</strong>` : ''}
+          </div>
+
+          <button class="btn" disabled=${loading}>${loading ? 'Sending…' : (isHelp ? '🤝 Send help request' : '✅ Send for approval')}</button>
+        </form>
       </div>
     </div>
   `;
