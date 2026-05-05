@@ -4319,16 +4319,36 @@ function TaskDetail({ plant, me, task: initialTask, users, onClose }) {
   }, [task.id, refresh]);
 
   const postComment = async () => {
-    if (!comment.trim() || posting) return;
+    const text = (comment || '').trim();
+    if (!text) { console.warn('[Loglinkr] empty comment, ignoring'); return; }
+    if (posting) { console.warn('[Loglinkr] already posting'); return; }
+    console.log('[Loglinkr] posting comment:', text);
     setPosting(true);
-    const body = comment.trim();
-    setComment('');
-    const { error } = await sb.from('action_updates').insert({
-      plant_id: plant.id, action_id: task.id,
-      author_id: me.id, update_type: 'comment', body
-    });
-    if (error) alert(error.message);
-    setPosting(false);
+    try {
+      const { data, error } = await sb.from('action_updates').insert({
+        plant_id: plant.id, action_id: task.id,
+        author_id: me.id, update_type: 'comment', body: text
+      }).select().maybeSingle();
+      if (error) {
+        console.error('[Loglinkr] post failed:', error);
+        alert('Failed to post: ' + error.message);
+        return;
+      }
+      console.log('[Loglinkr] posted:', data);
+      setComment('');
+      // Optimistic add so UI shows immediately even if realtime is slow
+      if (data) {
+        setUpdates(prev => {
+          if (prev.some(u => u.id === data.id)) return prev;
+          return [...prev, { ...data, author: { full_name: me.full_name } }];
+        });
+      }
+    } catch (err) {
+      console.error('[Loglinkr] post exception:', err);
+      alert('Failed to post: ' + (err.message || err));
+    } finally {
+      setPosting(false);
+    }
   };
 
   const changeStatus = async (newStatus) => {
@@ -4452,8 +4472,8 @@ function TaskDetail({ plant, me, task: initialTask, users, onClose }) {
 
     ${!isClosed && html`
       <div style="position:sticky;bottom:calc(76px + var(--safe-bottom));background:white;padding:12px 0;margin-top:14px;display:flex;gap:8px;border-top:1px solid var(--slate-100);z-index:10">
-        <input type="text" value=${comment} onChange=${e => setComment(e.target.value)} onKeyPress=${e => { if (e.key === 'Enter' && !e.shiftKey) postComment(); }} placeholder="Add an update or comment…" style="flex:1;padding:11px 14px;border:1px solid var(--slate-200);border-radius:999px;font-size:14px;outline:none;font-family:inherit" disabled=${posting} />
-        <button type="button" class="btn" style="border-radius:999px;width:auto;padding:11px 22px;flex-shrink:0;font-weight:600" onClick=${postComment} disabled=${posting || !comment.trim()}>${posting ? '…' : 'Post'}</button>
+        <input type="text" value=${comment} onInput=${e => setComment(e.target.value)} onChange=${e => setComment(e.target.value)} onKeyPress=${e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); postComment(); } }} placeholder="Add an update or comment…" style="flex:1;padding:11px 14px;border:1px solid var(--slate-200);border-radius:999px;font-size:14px;outline:none;font-family:inherit" />
+        <button type="button" class="btn" style=${'border-radius:999px;width:auto;padding:11px 22px;flex-shrink:0;font-weight:600;' + ((!comment.trim() || posting) ? 'opacity:0.5' : '')} onClick=${postComment}>${posting ? '…' : 'Post'}</button>
       </div>
     `}
 
