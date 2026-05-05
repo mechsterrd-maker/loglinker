@@ -116,7 +116,7 @@ body{
 .tab-label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;width:100%;text-align:center}
 
 /* ================= PAGES ================= */
-.page{display:none;padding:18px;max-width:720px;margin:0 auto}
+.page{display:none;padding:18px 18px calc(96px + var(--safe-bottom));max-width:720px;margin:0 auto}
 .page.active{display:block}
 .page-header{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:20px;gap:12px}
 .page-header h1{font-family:'Bricolage Grotesque',sans-serif;font-size:24px;font-weight:700;line-height:1.1;margin-bottom:2px}
@@ -2334,6 +2334,24 @@ function Chat({ plant, me, user }) {
           showNotification(senderName + ' · ' + activeGroup.name, preview);
         }
       })
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'chat_messages',
+        filter: 'group_id=eq.' + activeGroup.id
+      }, (payload) => {
+        // edited message — update local copy
+        setMessages(prev => prev.map(m => m.id === payload.new.id ? { ...m, ...payload.new } : m));
+      })
+      .on('postgres_changes', {
+        event: 'DELETE',
+        schema: 'public',
+        table: 'chat_messages',
+        filter: 'group_id=eq.' + activeGroup.id
+      }, (payload) => {
+        // hard-deleted message — remove from local list
+        setMessages(prev => prev.filter(m => m.id !== payload.old.id));
+      })
       .subscribe();
     return () => { sb.removeChannel(channel); };
   }, [activeGroup]);
@@ -4374,7 +4392,7 @@ function TaskDetail({ plant, me, task: initialTask, users, onClose }) {
     </div>
 
     ${!isClosed && html`
-      <div style="position:sticky;bottom:0;background:white;padding:10px 0;margin-top:14px;display:flex;gap:8px">
+      <div style="position:sticky;bottom:calc(76px + var(--safe-bottom));background:white;padding:10px 0;margin-top:14px;display:flex;gap:8px;border-top:1px solid var(--slate-100)">
         <input type="text" value=${comment} onChange=${e => setComment(e.target.value)} onKeyPress=${e => { if (e.key === 'Enter' && !e.shiftKey) postComment(); }} placeholder="Add an update or comment…" style="flex:1;padding:10px 14px;border:1px solid var(--slate-200);border-radius:999px;font-size:14px;outline:none" disabled=${posting} />
         <button class="btn" style="border-radius:999px;width:auto;padding:10px 18px;flex-shrink:0" onClick=${postComment} disabled=${posting || !comment.trim()}>${posting ? '…' : 'Post'}</button>
       </div>
