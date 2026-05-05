@@ -963,6 +963,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload }) {
       <${Page} active=${tab === 'stocks'}><${Stocks} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'actions'}><${ActionHub} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'documents'}><${Documents} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'schedules'}><${Schedules} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab}/></${Page}>
@@ -972,7 +973,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload }) {
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
     </div>
   `;
@@ -3362,6 +3363,7 @@ function DailyDigest({ me, setTab }) {
 // ============= MORE (navigator) =============
 function More({ plant, me, user, logout, setTab }) {
   const navItems = [
+    { key:'schedules', icon:'📅', label:'Customer Schedules', sub:'Plan vs actual, weekly buckets, AI extract' },
     { key:'people', icon:'👥', label:'People · Units, Team, Shifts', sub:'Manage team, units, shifts' },
     { key:'maintenance', icon:'🔧', label:'Maintenance', sub:'Breakdowns, machine status' },
     { key:'stocks', icon:'📦', label:'Stocks', sub:'Inventory, items, transactions' },
@@ -6457,6 +6459,697 @@ function QuickTaskInGroupModal({ plant, me, group, onClose, onSaved }) {
           </div>
           <div class="field"><label>Due date</label><input type="datetime-local" value=${form.due_at} onChange=${e => setForm({...form, due_at: e.target.value})} /></div>
           <button class="btn" disabled=${loading}>${loading ? 'Creating…' : '✓ Create task & post to chat'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// SCHEDULES — Customer monthly schedules + plan-vs-actual tracking
+// =================================================================
+function Schedules({ plant, me }) {
+  const [view, setView] = useState('schedules'); // 'schedules' | 'customers'
+  const [activeSchedule, setActiveSchedule] = useState(null);
+  const [activeCustomer, setActiveCustomer] = useState(null);
+
+  if (activeSchedule) {
+    return html`<${ScheduleDetail} plant=${plant} me=${me} schedule=${activeSchedule} onClose=${() => setActiveSchedule(null)} />`;
+  }
+  if (activeCustomer) {
+    return html`<${CustomerDetail} plant=${plant} me=${me} customer=${activeCustomer} onClose=${() => setActiveCustomer(null)} />`;
+  }
+
+  return html`
+    <div class="page-header">
+      <div><h1>📅 Schedules</h1><div class="sub">Customer demand vs supply</div></div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:16px">
+      <button class=${'auth-tab' + (view === 'schedules' ? ' active' : '')} onClick=${() => setView('schedules')}>Schedules</button>
+      <button class=${'auth-tab' + (view === 'customers' ? ' active' : '')} onClick=${() => setView('customers')}>Customers</button>
+    </div>
+
+    ${view === 'schedules' ? html`<${SchedulesList} plant=${plant} me=${me} onOpen=${setActiveSchedule} />` : html`<${CustomersList} plant=${plant} me=${me} onOpen=${setActiveCustomer} />`}
+  `;
+}
+
+// ============= CUSTOMERS LIST =============
+function CustomersList({ plant, me, onOpen }) {
+  const [customers, setCustomers] = useState([]);
+  const [modal, setModal] = useState(false);
+  const [editTarget, setEditTarget] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = async () => {
+    setLoading(true);
+    const { data } = await sb.from('mcp_sched_customers').select('*').order('name');
+    setCustomers(data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, []);
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  return html`
+    <div class="section-h">Customers · ${customers.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal(true); }}>+ Add</button></div>
+    ${customers.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🏭</div>No customers yet. Add Bosch, Sundram, Brakes India etc.</div></div>` :
+      customers.map(c => html`
+        <div class="list-item" key=${c.id} onClick=${() => onOpen(c)}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${c.name}${c.short_code ? ' · ' + c.short_code : ''}</div>
+              <div class="list-item-sub">${c.city || ''}${c.contact_person ? ' · ' + c.contact_person : ''}</div>
+            </div>
+            <span class=${'badge ' + (c.active ? 'emerald' : '')}>${c.active ? 'Active' : 'Inactive'}</span>
+          </div>
+        </div>
+      `)
+    }
+    ${modal && html`<${CustomerModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${() => { setModal(false); setEditTarget(null); }} onSaved=${() => { setModal(false); setEditTarget(null); refresh(); }} />`}
+  `;
+}
+
+function CustomerModal({ plant, me, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget || {
+    name: '', short_code: '', gstin: '', contact_person: '', contact_phone: '', contact_email: '',
+    address: '', city: '', default_payment_terms_days: 45, active: true, notes: ''
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = { ...form, plant_id: plant.id, created_by: me.id };
+      if (editTarget) {
+        const { error } = await sb.from('mcp_sched_customers').update(payload).eq('id', editTarget.id);
+        if (error) throw error;
+      } else {
+        const { error } = await sb.from('mcp_sched_customers').insert(payload);
+        if (error) throw error;
+      }
+      showToast(editTarget ? 'Customer updated' : 'Customer added');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Edit' : 'New'} Customer</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} placeholder="Bosch India Ltd" /></div>
+            <div class="field"><label>Short Code</label><input type="text" value=${form.short_code} onChange=${e => setForm({...form, short_code: e.target.value.toUpperCase()})} placeholder="BOSCH" /></div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>GSTIN</label><input type="text" value=${form.gstin || ''} onChange=${e => setForm({...form, gstin: e.target.value.toUpperCase()})} maxlength="15" /></div>
+            <div class="field"><label>City</label><input type="text" value=${form.city || ''} onChange=${e => setForm({...form, city: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Address</label><textarea rows=${2} value=${form.address || ''} onChange=${e => setForm({...form, address: e.target.value})}></textarea></div>
+          <div class="field-row">
+            <div class="field"><label>Contact Person</label><input type="text" value=${form.contact_person || ''} onChange=${e => setForm({...form, contact_person: e.target.value})} /></div>
+            <div class="field"><label>Phone</label><input type="tel" value=${form.contact_phone || ''} onChange=${e => setForm({...form, contact_phone: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Email</label><input type="email" value=${form.contact_email || ''} onChange=${e => setForm({...form, contact_email: e.target.value})} /></div>
+          <div class="field"><label>Payment Terms (days)</label><input type="number" min=${0} value=${form.default_payment_terms_days || 45} onChange=${e => setForm({...form, default_payment_terms_days: parseInt(e.target.value || 45)})} /></div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes || ''} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <div class="field"><label><input type="checkbox" checked=${form.active} onChange=${e => setForm({...form, active: e.target.checked})} /> Active customer</label></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add customer')}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function CustomerDetail({ plant, me, customer, onClose }) {
+  const [schedules, setSchedules] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = async () => {
+    setLoading(true);
+    const { data } = await sb.from('mcp_sched_schedules').select('*').eq('customer_id', customer.id).order('schedule_month', { ascending: false });
+    setSchedules(data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [customer.id]);
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:0">
+        <h1 style="font-size:18px">${customer.name}</h1>
+        <div class="sub">${customer.short_code || customer.city || ''}</div>
+      </div>
+    </div>
+
+    <div class="card">
+      ${customer.gstin && html`<div class="card-row"><span class="label">GSTIN</span><span class="value mono">${customer.gstin}</span></div>`}
+      ${customer.contact_person && html`<div class="card-row"><span class="label">Contact</span><span class="value">${customer.contact_person} · ${customer.contact_phone || ''}</span></div>`}
+      ${customer.contact_email && html`<div class="card-row"><span class="label">Email</span><span class="value">${customer.contact_email}</span></div>`}
+      <div class="card-row"><span class="label">Payment terms</span><span class="value">${customer.default_payment_terms_days || 45} days</span></div>
+    </div>
+
+    <div class="section-h">Schedules · ${schedules.length}</div>
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      schedules.length === 0 ? html`<div class="empty"><div style="font-size:13px">No schedules yet. Go to Schedules tab to add one.</div></div>` :
+      schedules.map(s => html`
+        <div class="list-item" key=${s.id}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${new Date(s.schedule_month).toLocaleDateString('en-IN', { month:'long', year:'numeric' })}</div>
+              <div class="list-item-sub">${s.customer_ref || 'No ref'} · ${s.source_type}</div>
+            </div>
+            <span class=${'badge ' + (s.status === 'active' ? 'teal' : '')}>${s.status}</span>
+          </div>
+        </div>
+      `)
+    }
+  `;
+}
+
+// ============= SCHEDULES LIST =============
+function SchedulesList({ plant, me, onOpen }) {
+  const [schedules, setSchedules] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [parts, setParts] = useState([]);
+  const [showAdd, setShowAdd] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = async () => {
+    setLoading(true);
+    const [s, c, p] = await Promise.all([
+      sb.from('mcp_sched_schedules').select('*, customer:customer_id(name, short_code)').order('schedule_month', { ascending: false }).limit(50),
+      sb.from('mcp_sched_customers').select('*').eq('active', true).order('name'),
+      sb.from('mcp_pdc_parts').select('id, name, part_number, customer_part_number').order('name'),
+    ]);
+    setSchedules(s.data || []);
+    setCustomers(c.data || []);
+    setParts(p.data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, []);
+
+  // Realtime
+  useEffect(() => {
+    const channel = sb.channel('schedules-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_sched_schedules', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [plant.id]);
+
+  // Compute progress per schedule (single round trip)
+  const [progressMap, setProgressMap] = useState({});
+  useEffect(() => {
+    if (schedules.length === 0) { setProgressMap({}); return; }
+    const ids = schedules.map(s => s.id);
+    sb.from('v_sched_line_progress').select('schedule_id, planned_qty, supplied_qty').in('schedule_id', ids).then(({ data }) => {
+      const m = {};
+      (data || []).forEach(r => {
+        if (!m[r.schedule_id]) m[r.schedule_id] = { planned: 0, supplied: 0 };
+        m[r.schedule_id].planned += parseFloat(r.planned_qty || 0);
+        m[r.schedule_id].supplied += parseFloat(r.supplied_qty || 0);
+      });
+      setProgressMap(m);
+    });
+  }, [schedules]);
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  return html`
+    ${customers.length === 0 ? html`
+      <div class="card" style="background:var(--amber-50);border-color:var(--amber-200)">
+        <div style="font-weight:600;color:var(--amber-700);margin-bottom:6px">⚠️ No customers yet</div>
+        <div style="font-size:13px;color:var(--slate-700);margin-bottom:10px">Add at least one customer (Bosch, Sundram etc.) before creating schedules.</div>
+      </div>
+    ` : ''}
+
+    <div class="section-h">Active Schedules · ${schedules.length}<button class="btn small ghost" onClick=${() => setShowAdd(true)} disabled=${customers.length === 0}>+ New</button></div>
+
+    ${schedules.length === 0 ? html`
+      <div class="card"><div class="empty"><div class="icon">📅</div><div style="font-size:13px">No schedules yet. Tap + New to create one (manual or upload).</div></div></div>
+    ` : schedules.map(s => {
+      const prog = progressMap[s.id] || { planned: 0, supplied: 0 };
+      const pct = prog.planned > 0 ? Math.min(100, (prog.supplied / prog.planned) * 100) : 0;
+      const gap = prog.planned - prog.supplied;
+      return html`
+        <div class="list-item" key=${s.id} onClick=${() => onOpen(s)}>
+          <div class="list-item-row" style="margin-bottom:8px">
+            <div class="list-item-main">
+              <div class="list-item-title">${s.customer?.name || '?'}${s.customer?.short_code ? ' · ' + s.customer.short_code : ''}</div>
+              <div class="list-item-sub">${new Date(s.schedule_month).toLocaleDateString('en-IN', { month:'long', year:'numeric' })}${s.customer_ref ? ' · ' + s.customer_ref : ''}</div>
+            </div>
+            <span class=${'badge ' + (pct >= 90 ? 'emerald' : pct >= 60 ? 'teal' : pct >= 30 ? 'amber' : 'rose')}>${pct.toFixed(0)}%</span>
+          </div>
+          <div style="background:var(--slate-100);height:6px;border-radius:3px;overflow:hidden">
+            <div style="background:${pct >= 90 ? 'var(--emerald-500)' : pct >= 60 ? 'var(--teal-500)' : pct >= 30 ? 'var(--amber-500)' : 'var(--rose-500)'};height:100%;width:${pct}%"></div>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--slate-500);margin-top:4px">
+            <span>${fmtNum(prog.supplied)} / ${fmtNum(prog.planned)} ${gap > 0 ? '· ⚠️ ' + fmtNum(gap) + ' short' : '· ✓ on track'}</span>
+            <span>${s.source_type}</span>
+          </div>
+        </div>
+      `;
+    })}
+
+    ${showAdd && html`<${ScheduleAddModal} plant=${plant} me=${me} customers=${customers} parts=${parts} onClose=${() => setShowAdd(false)} onSaved=${() => { setShowAdd(false); refresh(); }} />`}
+  `;
+}
+
+// ============= NEW SCHEDULE MODAL (manual entry OR AI extract) =============
+function ScheduleAddModal({ plant, me, customers, parts, onClose, onSaved }) {
+  const [mode, setMode] = useState('upload'); // 'upload' | 'manual'
+  const [customerId, setCustomerId] = useState('');
+  const [scheduleMonth, setScheduleMonth] = useState(() => {
+    const d = new Date(); d.setDate(1);
+    return d.toISOString().slice(0, 7); // YYYY-MM
+  });
+  const [customerRef, setCustomerRef] = useState('');
+  const [notes, setNotes] = useState('');
+  const [lines, setLines] = useState([
+    { part_name_raw:'', customer_part_number:'', week_no: 1, planned_qty:'', uom:'nos' }
+  ]);
+
+  // Upload state
+  const [file, setFile] = useState(null);
+  const [extracting, setExtracting] = useState(false);
+  const [extracted, setExtracted] = useState(null);
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const onPickFile = async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setFile(f);
+    setExtracted(null);
+    setError('');
+  };
+
+  const runExtraction = async () => {
+    if (!file) return;
+    setExtracting(true); setError('');
+    try {
+      // Convert file to base64
+      const reader = new FileReader();
+      const dataUrl = await new Promise((resolve, reject) => {
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+      const base64 = dataUrl.split(',')[1];
+      const mediaType = file.type || 'image/jpeg';
+
+      // Call edge function
+      const { data: { session } } = await sb.auth.getSession();
+      const resp = await fetch(SUPABASE_URL + '/functions/v1/extract-schedule', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + (session?.access_token || SUPABASE_ANON_KEY),
+        },
+        body: JSON.stringify({ image_base64: base64, media_type: mediaType }),
+      });
+      const result = await resp.json();
+      if (!resp.ok || !result.success) {
+        throw new Error(result.error || 'Extraction failed');
+      }
+
+      const ex = result.data;
+      setExtracted(ex);
+
+      // Pre-fill form fields
+      if (ex.schedule_month) setScheduleMonth(ex.schedule_month.slice(0, 7));
+      if (ex.customer_ref) setCustomerRef(ex.customer_ref);
+      if (ex.notes) setNotes(ex.notes);
+
+      // Try to match customer
+      if (ex.customer_name && !customerId) {
+        const match = customers.find(c =>
+          c.name.toLowerCase() === ex.customer_name.toLowerCase() ||
+          c.short_code?.toLowerCase() === ex.customer_short_code?.toLowerCase() ||
+          c.name.toLowerCase().includes(ex.customer_name.toLowerCase()) ||
+          ex.customer_name.toLowerCase().includes(c.name.toLowerCase())
+        );
+        if (match) setCustomerId(match.id);
+      }
+
+      // Pre-fill lines
+      if (Array.isArray(ex.lines) && ex.lines.length > 0) {
+        setLines(ex.lines.map(l => ({
+          part_name_raw: l.part_name_raw || '',
+          customer_part_number: l.customer_part_number || '',
+          week_no: l.week_no || 1,
+          planned_qty: l.planned_qty || '',
+          uom: l.uom || 'nos',
+          rate: l.rate || '',
+          required_by_date: l.required_by_date || '',
+        })));
+        setMode('manual'); // Switch to manual view to verify/edit
+      }
+    } catch (err) { setError('AI extract failed: ' + err.message); }
+    finally { setExtracting(false); }
+  };
+
+  const updateLine = (idx, patch) => {
+    setLines(prev => prev.map((l, i) => i === idx ? {...l, ...patch} : l));
+  };
+  const addLine = () => setLines(prev => [...prev, { part_name_raw:'', customer_part_number:'', week_no: 1, planned_qty:'', uom:'nos' }]);
+  const removeLine = (idx) => setLines(prev => prev.filter((_, i) => i !== idx));
+
+  const submit = async () => {
+    setError(''); setLoading(true);
+    try {
+      if (!customerId) throw new Error('Pick a customer');
+      const validLines = lines.filter(l => l.part_name_raw.trim() && parseFloat(l.planned_qty || 0) > 0);
+      if (validLines.length === 0) throw new Error('Add at least one part with quantity');
+
+      const monthDate = scheduleMonth + '-01';
+      const { data, error } = await sb.rpc('create_schedule_with_lines', {
+        p_customer_id: customerId,
+        p_schedule_month: monthDate,
+        p_lines: validLines.map(l => ({
+          part_name_raw: l.part_name_raw.trim(),
+          customer_part_number: l.customer_part_number?.trim() || null,
+          week_no: parseInt(l.week_no || 1),
+          planned_qty: parseFloat(l.planned_qty),
+          uom: l.uom || 'nos',
+          rate: l.rate ? parseFloat(l.rate) : null,
+          required_by_date: l.required_by_date || null,
+        })),
+        p_source_type: extracted ? 'upload' : 'manual',
+        p_customer_ref: customerRef || null,
+        p_notes: notes || null,
+      });
+      if (error) throw error;
+      if (!data?.success) throw new Error(data?.error || 'Failed');
+      showToast(data.replaced ? 'Schedule replaced ✓ ' + data.lines_inserted + ' lines' : 'Schedule created ✓ ' + data.lines_inserted + ' lines');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:720px">
+        <div class="modal-header">
+          <div class="modal-title">📅 New Schedule</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+
+        ${error && html`<div class="alert error">${error}</div>`}
+
+        <div class="auth-tabs" style="margin-bottom:14px">
+          <button class=${'auth-tab' + (mode === 'upload' ? ' active' : '')} onClick=${() => setMode('upload')}>📎 Upload + AI</button>
+          <button class=${'auth-tab' + (mode === 'manual' ? ' active' : '')} onClick=${() => setMode('manual')}>✏️ Manual</button>
+        </div>
+
+        ${mode === 'upload' && html`
+          <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:14px">
+            <div style="font-size:13px;color:var(--slate-700);margin-bottom:10px">Upload customer's schedule (PDF / image / Excel screenshot). Claude will read it and pre-fill the form below.</div>
+            <input type="file" accept="image/*,application/pdf" onChange=${onPickFile} style="font-size:13px" />
+            ${file && html`
+              <div style="margin-top:10px;font-size:12px;color:var(--slate-600)">📎 ${file.name} · ${(file.size/1024).toFixed(0)} KB</div>
+              <button class="btn small" style="margin-top:10px" onClick=${runExtraction} disabled=${extracting}>${extracting ? 'Reading…' : '🔍 Extract with AI'}</button>
+            `}
+            ${extracted && html`
+              <div style="margin-top:10px;padding:10px;background:white;border-radius:8px;font-size:12px">
+                <div style="font-weight:600;color:var(--emerald-700);margin-bottom:4px">✓ Extracted (${extracted.confidence})</div>
+                <div>Customer: ${extracted.customer_name || '?'}</div>
+                <div>Month: ${extracted.schedule_month || '?'}</div>
+                <div>Lines: ${extracted.lines?.length || 0}</div>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:6px">Switch to ✏️ Manual tab to review and edit before saving.</div>
+              </div>
+            `}
+          </div>
+        `}
+
+        ${mode === 'manual' && html`
+          <div class="field-row">
+            <div class="field"><label>Customer *</label>
+              <select required value=${customerId} onChange=${e => setCustomerId(e.target.value)}>
+                <option value="">— Select —</option>
+                ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.short_code ? ' · ' + c.short_code : ''}</option>`)}
+              </select>
+            </div>
+            <div class="field"><label>Month *</label><input type="month" required value=${scheduleMonth} onChange=${e => setScheduleMonth(e.target.value)} /></div>
+          </div>
+
+          <div class="field-row">
+            <div class="field"><label>Customer Ref / PO</label><input type="text" value=${customerRef} onChange=${e => setCustomerRef(e.target.value)} placeholder="SCH-2026-1234" /></div>
+          </div>
+
+          <div class="field"><label>Notes</label><textarea rows=${1} value=${notes} onChange=${e => setNotes(e.target.value)}></textarea></div>
+
+          <div class="section-h" style="margin-top:14px">Lines · ${lines.length}<button class="btn small ghost" onClick=${addLine} type="button">+ Add line</button></div>
+
+          ${lines.map((l, idx) => html`
+            <div key=${idx} class="card" style="padding:10px;margin-bottom:8px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                <div style="font-size:12px;font-weight:600;color:var(--slate-600)">Line ${idx + 1}</div>
+                <button type="button" class="btn small ghost" onClick=${() => removeLine(idx)} style="color:var(--rose-600);padding:2px 6px">×</button>
+              </div>
+              <div class="field-row" style="margin-bottom:6px">
+                <div class="field" style="flex:2"><label style="font-size:11px">Part Name *</label><input type="text" required value=${l.part_name_raw} onChange=${e => updateLine(idx, { part_name_raw: e.target.value })} /></div>
+                <div class="field"><label style="font-size:11px">Customer Code</label><input type="text" value=${l.customer_part_number || ''} onChange=${e => updateLine(idx, { customer_part_number: e.target.value })} /></div>
+              </div>
+              <div class="field-row">
+                <div class="field" style="flex:0.7"><label style="font-size:11px">Week *</label>
+                  <select required value=${l.week_no} onChange=${e => updateLine(idx, { week_no: parseInt(e.target.value) })}>
+                    <option value="1">W1</option><option value="2">W2</option><option value="3">W3</option><option value="4">W4</option><option value="5">W5</option>
+                  </select>
+                </div>
+                <div class="field"><label style="font-size:11px">Qty *</label><input type="number" required step="0.001" min=${0} value=${l.planned_qty} onChange=${e => updateLine(idx, { planned_qty: e.target.value })} /></div>
+                <div class="field" style="flex:0.7"><label style="font-size:11px">UOM</label>
+                  <select value=${l.uom || 'nos'} onChange=${e => updateLine(idx, { uom: e.target.value })}>
+                    <option value="nos">nos</option><option value="kg">kg</option><option value="set">set</option>
+                  </select>
+                </div>
+                <div class="field"><label style="font-size:11px">Required by</label><input type="date" value=${l.required_by_date || ''} onChange=${e => updateLine(idx, { required_by_date: e.target.value })} /></div>
+              </div>
+            </div>
+          `)}
+
+          <button class="btn" onClick=${submit} disabled=${loading} style="margin-top:14px">${loading ? 'Saving…' : '✓ Save schedule'}</button>
+        `}
+      </div>
+    </div>
+  `;
+}
+
+// ============= SCHEDULE DETAIL — Plan vs Actual weekly grid =============
+function ScheduleDetail({ plant, me, schedule, onClose }) {
+  const [progress, setProgress] = useState([]);
+  const [supplies, setSupplies] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [supplyModal, setSupplyModal] = useState(false);
+
+  const refresh = async () => {
+    setLoading(true);
+    const [p, s] = await Promise.all([
+      sb.from('v_sched_line_progress').select('*').eq('schedule_id', schedule.id).order('week_no'),
+      sb.from('mcp_sched_supplies').select('*, recorded_user:recorded_by(full_name)').eq('schedule_id', schedule.id).order('dispatch_date', { ascending: false }),
+    ]);
+    setProgress(p.data || []);
+    setSupplies(s.data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [schedule.id]);
+
+  // Realtime
+  useEffect(() => {
+    const channel = sb.channel('sched-detail-' + schedule.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_sched_supplies', filter:'schedule_id=eq.' + schedule.id }, () => refresh())
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_sched_lines', filter:'schedule_id=eq.' + schedule.id }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [schedule.id]);
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  // Group lines by part for grid view
+  const byPart = {};
+  for (const p of progress) {
+    const key = p.part_name_raw + '|' + (p.customer_part_number || '');
+    if (!byPart[key]) byPart[key] = { part_name: p.part_name_raw, customer_code: p.customer_part_number, weeks: {} };
+    byPart[key].weeks[p.week_no] = p;
+  }
+  const partList = Object.values(byPart);
+
+  const totalPlanned = progress.reduce((s, l) => s + parseFloat(l.planned_qty || 0), 0);
+  const totalSupplied = progress.reduce((s, l) => s + parseFloat(l.supplied_qty || 0), 0);
+  const overallPct = totalPlanned > 0 ? Math.min(100, (totalSupplied / totalPlanned) * 100) : 0;
+  const overallGap = totalPlanned - totalSupplied;
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:0">
+        <h1 style="font-size:18px">${schedule.customer?.name || schedule.customer_id}</h1>
+        <div class="sub">${new Date(schedule.schedule_month).toLocaleDateString('en-IN', { month:'long', year:'numeric' })}${schedule.customer_ref ? ' · ' + schedule.customer_ref : ''}</div>
+      </div>
+      <button class="btn small" onClick=${() => setSupplyModal(true)}>+ Log supply</button>
+    </div>
+
+    <div class="card" style="background:${overallPct >= 90 ? 'var(--emerald-50)' : overallPct >= 60 ? 'var(--teal-50)' : 'var(--amber-50)'};border-color:${overallPct >= 90 ? 'var(--emerald-200)' : overallPct >= 60 ? 'var(--teal-200)' : 'var(--amber-200)'}">
+      <div style="display:flex;justify-content:space-between;margin-bottom:10px">
+        <div>
+          <div style="font-size:12px;color:var(--slate-600);font-weight:600">OVERALL</div>
+          <div style="font-size:24px;font-weight:700;color:${overallPct >= 90 ? 'var(--emerald-700)' : overallPct >= 60 ? 'var(--teal-700)' : 'var(--amber-700)'}">${overallPct.toFixed(1)}%</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:11px;color:var(--slate-500)">SUPPLIED / PLANNED</div>
+          <div style="font-size:14px;font-weight:600">${fmtNum(totalSupplied)} / ${fmtNum(totalPlanned)}</div>
+          ${overallGap > 0 && html`<div style="font-size:12px;color:var(--rose-600);font-weight:600">⚠️ ${fmtNum(overallGap)} short</div>`}
+        </div>
+      </div>
+      <div style="background:white;height:8px;border-radius:4px;overflow:hidden">
+        <div style="background:${overallPct >= 90 ? 'var(--emerald-500)' : overallPct >= 60 ? 'var(--teal-500)' : 'var(--amber-500)'};height:100%;width:${overallPct}%"></div>
+      </div>
+    </div>
+
+    <div class="section-h">Plan vs Actual · by week</div>
+
+    ${partList.length === 0 ? html`<div class="empty"><div style="font-size:13px">No lines in this schedule.</div></div>` :
+      html`
+      <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--slate-200);border-radius:10px;background:white">
+        <table style="width:100%;border-collapse:collapse;font-size:12px;min-width:520px">
+          <thead style="background:var(--slate-50)">
+            <tr>
+              <th style="text-align:left;padding:8px 10px;border-bottom:1px solid var(--slate-200);position:sticky;left:0;background:var(--slate-50);z-index:1;min-width:140px">Part</th>
+              <th style="padding:8px 6px;border-bottom:1px solid var(--slate-200)">W1</th>
+              <th style="padding:8px 6px;border-bottom:1px solid var(--slate-200)">W2</th>
+              <th style="padding:8px 6px;border-bottom:1px solid var(--slate-200)">W3</th>
+              <th style="padding:8px 6px;border-bottom:1px solid var(--slate-200)">W4</th>
+              <th style="padding:8px 6px;border-bottom:1px solid var(--slate-200)">W5</th>
+              <th style="padding:8px 6px;border-bottom:1px solid var(--slate-200)">Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${partList.map((p, i) => {
+              let totalP = 0, totalS = 0;
+              [1,2,3,4,5].forEach(w => {
+                if (p.weeks[w]) { totalP += parseFloat(p.weeks[w].planned_qty || 0); totalS += parseFloat(p.weeks[w].supplied_qty || 0); }
+              });
+              const pct = totalP > 0 ? (totalS / totalP) * 100 : 0;
+              return html`
+                <tr key=${i} style="border-bottom:1px solid var(--slate-100)">
+                  <td style="padding:8px 10px;position:sticky;left:0;background:white;font-weight:500">
+                    <div style="line-height:1.2">${p.part_name}</div>
+                    ${p.customer_code && html`<div style="font-size:10px;color:var(--slate-500);margin-top:2px">${p.customer_code}</div>`}
+                  </td>
+                  ${[1,2,3,4,5].map(w => {
+                    const cell = p.weeks[w];
+                    if (!cell) return html`<td key=${w} style="padding:8px 6px;text-align:center;color:var(--slate-300)">—</td>`;
+                    const cellPct = cell.planned_qty > 0 ? (cell.supplied_qty / cell.planned_qty) * 100 : 0;
+                    const bg = cellPct >= 100 ? 'var(--emerald-50)' : cellPct >= 60 ? 'var(--teal-50)' : cellPct > 0 ? 'var(--amber-50)' : 'transparent';
+                    return html`
+                      <td key=${w} style="padding:8px 6px;text-align:center;background:${bg};border-radius:4px">
+                        <div style="font-weight:600">${fmtNum(cell.supplied_qty)}/${fmtNum(cell.planned_qty)}</div>
+                        ${cell.gap_qty > 0 ? html`<div style="font-size:10px;color:var(--rose-600)">−${fmtNum(cell.gap_qty)}</div>` : cell.supplied_qty >= cell.planned_qty ? html`<div style="font-size:10px;color:var(--emerald-600)">✓</div>` : ''}
+                      </td>
+                    `;
+                  })}
+                  <td style="padding:8px 6px;text-align:center;font-weight:600;background:var(--slate-50)">
+                    <div>${fmtNum(totalS)}/${fmtNum(totalP)}</div>
+                    <div style="font-size:10px;color:${pct >= 90 ? 'var(--emerald-600)' : pct >= 60 ? 'var(--teal-600)' : 'var(--amber-600)'}">${pct.toFixed(0)}%</div>
+                  </td>
+                </tr>
+              `;
+            })}
+          </tbody>
+        </table>
+      </div>
+      `
+    }
+
+    <div class="section-h">Supplies · ${supplies.length}</div>
+    ${supplies.length === 0 ? html`<div class="empty"><div style="font-size:13px">No supplies recorded yet.</div></div>` :
+      supplies.slice(0, 20).map(s => html`
+        <div class="list-item" key=${s.id}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">${fmtNum(s.supplied_qty)} ${s.dc_number ? '· DC ' + s.dc_number : ''}</div>
+              <div class="list-item-sub">${new Date(s.dispatch_date).toLocaleDateString('en-IN')} · ${s.recorded_user?.full_name || '?'}${s.vehicle_number ? ' · ' + s.vehicle_number : ''}</div>
+            </div>
+          </div>
+        </div>
+      `)
+    }
+
+    ${supplyModal && html`<${SupplyEntryModal} plant=${plant} me=${me} schedule=${schedule} progress=${progress} onClose=${() => setSupplyModal(false)} onSaved=${() => { setSupplyModal(false); refresh(); }} />`}
+  `;
+}
+
+// ============= LOG SUPPLY MODAL =============
+function SupplyEntryModal({ plant, me, schedule, progress, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    part_name: '',
+    supplied_qty: '',
+    dispatch_date: new Date().toISOString().slice(0, 10),
+    dc_number: '',
+    invoice_number: '',
+    vehicle_number: '',
+    notes: '',
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  // Distinct parts in this schedule for dropdown
+  const partOptions = [...new Set(progress.map(p => p.part_name_raw))];
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const { data, error } = await sb.rpc('record_supply', {
+        p_customer_id: schedule.customer_id,
+        p_part_name: form.part_name.trim(),
+        p_supplied_qty: parseFloat(form.supplied_qty),
+        p_dispatch_date: form.dispatch_date,
+        p_dc_number: form.dc_number || null,
+        p_invoice_number: form.invoice_number || null,
+        p_vehicle_number: form.vehicle_number || null,
+        p_notes: form.notes || null,
+      });
+      if (error) throw error;
+      if (!data?.success) throw new Error(data?.error || 'Failed');
+      showToast('Supply logged · matched W' + data.matched_week_no);
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">📦 Log Supply</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Part *</label>
+            <input type="text" required list="schedparts-${schedule.id}" value=${form.part_name} onChange=${e => setForm({...form, part_name: e.target.value})} placeholder="Part name or code" />
+            <datalist id=${'schedparts-' + schedule.id}>
+              ${partOptions.map(p => html`<option key=${p} value=${p} />`)}
+            </datalist>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Supplied Qty *</label><input type="number" required step="0.001" min=${0.001} value=${form.supplied_qty} onChange=${e => setForm({...form, supplied_qty: e.target.value})} /></div>
+            <div class="field"><label>Dispatch Date *</label><input type="date" required value=${form.dispatch_date} onChange=${e => setForm({...form, dispatch_date: e.target.value})} /></div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>DC Number</label><input type="text" value=${form.dc_number} onChange=${e => setForm({...form, dc_number: e.target.value})} /></div>
+            <div class="field"><label>Invoice #</label><input type="text" value=${form.invoice_number} onChange=${e => setForm({...form, invoice_number: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Vehicle Number</label><input type="text" value=${form.vehicle_number} onChange=${e => setForm({...form, vehicle_number: e.target.value})} /></div>
+          <div class="field"><label>Notes</label><textarea rows=${1} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Logging…' : 'Log supply'}</button>
         </form>
       </div>
     </div>
