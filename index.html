@@ -3987,6 +3987,11 @@ function Stocks({ plant, me }) {
   const [layout, setLayout] = useState('list'); // list | by_category
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [search, setSearch] = useState('');
+  // Transaction-specific filters
+  const [txnSearch, setTxnSearch] = useState('');
+  const [txnTypeFilter, setTxnTypeFilter] = useState('all'); // all | inward | outward | <specific>
+  const [txnDateFrom, setTxnDateFrom] = useState('');
+  const [txnDateTo, setTxnDateTo] = useState('');
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [activeItem, setActiveItem] = useState(null);
@@ -3996,7 +4001,7 @@ function Stocks({ plant, me }) {
     setLoading(true);
     const [i, t] = await Promise.all([
       sb.from('mcp_stocks_items').select('*').order('name'),
-      sb.from('mcp_stocks_transactions').select('*, mcp_stocks_items(code,name,uom,category), users:performed_by(full_name)').order('created_at', { ascending:false }).limit(100),
+      sb.from('mcp_stocks_transactions').select('*, mcp_stocks_items(code,name,uom,category), users:performed_by(full_name)').order('created_at', { ascending:false }).limit(500),
     ]);
     setItems(i.data || []);
     setTransactions(t.data || []);
@@ -4130,23 +4135,100 @@ function Stocks({ plant, me }) {
     `}
 
     ${view === 'transactions' && html`
-      <div class="section-h">Recent Transactions · ${transactions.length}</div>
-      ${transactions.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📋</div>No transactions yet</div></div>` :
-        transactions.map(t => html`
-          <div class="list-item" key=${t.id}>
-            <div class="list-item-row">
-              <div class="list-item-main">
-                <div class="list-item-title">${t.mcp_stocks_items?.code || '?'} · ${t.mcp_stocks_items?.name || ''}</div>
-                <div class="list-item-sub">${t.users?.full_name || '?'} · ${t.reference || ''} · ${fmtDate(t.created_at)}</div>
-              </div>
-              <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
-                <span class=${'badge ' + (['grn','return','adjustment'].includes(t.txn_type) ? 'emerald' : 'rose')}>${t.txn_type} ${['grn','return','adjustment'].includes(t.txn_type) ? '+' : '-'}${fmtNum(t.qty)}</span>
-                <span style="font-size:10px;color:var(--slate-500)">→ ${fmtNum(t.qty_after || 0)}</span>
-              </div>
+      ${(() => {
+        const INWARD_TYPES = ['grn','return','opening','adjustment_in'];
+        const OUTWARD_TYPES = ['issue','consumption','scrap','adjustment_out'];
+        const TYPE_LABEL = {
+          grn:'GRN', return:'Return', opening:'Opening', adjustment_in:'Adj+',
+          issue:'Issue', consumption:'Consumption', scrap:'Scrap', adjustment_out:'Adj−',
+        };
+
+        // Apply filters
+        let filtered = transactions;
+
+        if (txnTypeFilter === 'inward') filtered = filtered.filter(t => INWARD_TYPES.includes(t.txn_type));
+        else if (txnTypeFilter === 'outward') filtered = filtered.filter(t => OUTWARD_TYPES.includes(t.txn_type));
+        else if (txnTypeFilter !== 'all') filtered = filtered.filter(t => t.txn_type === txnTypeFilter);
+
+        if (txnDateFrom) filtered = filtered.filter(t => t.created_at >= txnDateFrom);
+        if (txnDateTo) filtered = filtered.filter(t => t.created_at <= (txnDateTo + 'T23:59:59'));
+
+        if (txnSearch.trim()) {
+          const q = txnSearch.trim().toLowerCase();
+          filtered = filtered.filter(t =>
+            (t.mcp_stocks_items?.code || '').toLowerCase().includes(q) ||
+            (t.mcp_stocks_items?.name || '').toLowerCase().includes(q) ||
+            (t.reference || '').toLowerCase().includes(q) ||
+            (t.notes || '').toLowerCase().includes(q) ||
+            (t.users?.full_name || '').toLowerCase().includes(q)
+          );
+        }
+
+        // Compute totals from filtered
+        const totalIn = filtered.filter(t => INWARD_TYPES.includes(t.txn_type)).reduce((s, t) => s + parseFloat(t.qty || 0), 0);
+        const totalOut = filtered.filter(t => OUTWARD_TYPES.includes(t.txn_type)).reduce((s, t) => s + parseFloat(t.qty || 0), 0);
+
+        return html`
+          <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px">
+            <input type="search" value=${txnSearch} onChange=${e => setTxnSearch(e.target.value)} placeholder="Search by item, code, reference, person, notes…" style="width:100%;padding:9px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <select value=${txnTypeFilter} onChange=${e => setTxnTypeFilter(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
+                <option value="all">All types</option>
+                <optgroup label="Inward">
+                  <option value="inward">All inward</option>
+                  <option value="grn">GRN only</option>
+                  <option value="return">Return only</option>
+                  <option value="opening">Opening only</option>
+                  <option value="adjustment_in">Adj+ only</option>
+                </optgroup>
+                <optgroup label="Outward">
+                  <option value="outward">All outward</option>
+                  <option value="issue">Issue only</option>
+                  <option value="consumption">Consumption only</option>
+                  <option value="scrap">Scrap only</option>
+                  <option value="adjustment_out">Adj− only</option>
+                </optgroup>
+              </select>
+              <input type="date" value=${txnDateFrom} onChange=${e => setTxnDateFrom(e.target.value)} placeholder="From" style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px" />
+              <input type="date" value=${txnDateTo} onChange=${e => setTxnDateTo(e.target.value)} placeholder="To" style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px" />
+              ${(txnSearch || txnTypeFilter !== 'all' || txnDateFrom || txnDateTo) && html`
+                <button class="btn small ghost" onClick=${() => { setTxnSearch(''); setTxnTypeFilter('all'); setTxnDateFrom(''); setTxnDateTo(''); }} style="padding:7px 12px;font-size:12px">Clear</button>
+              `}
             </div>
           </div>
-        `)
-      }
+
+          <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px">
+            <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${filtered.length}</div><div class="stat-label" style="font-size:10px">SHOWING</div></div>
+            <div class="stat teal" style="padding:8px"><div class="stat-num" style="font-size:16px">+${fmtNum(totalIn)}</div><div class="stat-label" style="font-size:10px">TOTAL IN</div></div>
+            <div class="stat amber" style="padding:8px"><div class="stat-num" style="font-size:16px">−${fmtNum(totalOut)}</div><div class="stat-label" style="font-size:10px">TOTAL OUT</div></div>
+          </div>
+
+          ${transactions.length >= 500 && html`<div class="alert info" style="font-size:11px;padding:6px 10px">Showing latest 500. Apply filters to narrow further.</div>`}
+
+          ${filtered.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📋</div>${transactions.length === 0 ? 'No transactions yet' : 'No matches for current filters'}</div></div>` :
+            filtered.map(t => {
+              const isInward = INWARD_TYPES.includes(t.txn_type);
+              return html`
+                <div class="list-item" key=${t.id} onClick=${() => {
+                  const itm = items.find(i => i.id === t.item_id);
+                  if (itm) setActiveItem(itm);
+                }}>
+                  <div class="list-item-row">
+                    <div class="list-item-main">
+                      <div class="list-item-title">${t.mcp_stocks_items?.code || '?'} · ${t.mcp_stocks_items?.name || ''}</div>
+                      <div class="list-item-sub">${t.users?.full_name || '?'}${t.reference ? ' · ' + t.reference : ''} · ${fmtDate(t.created_at)}</div>
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                      <span class=${'badge ' + (isInward ? 'emerald' : 'rose')}>${TYPE_LABEL[t.txn_type] || t.txn_type} ${isInward ? '+' : '−'}${fmtNum(t.qty)}</span>
+                      <span style="font-size:10px;color:var(--slate-500)">→ ${fmtNum(t.qty_after || 0)} ${t.mcp_stocks_items?.uom || ''}</span>
+                    </div>
+                  </div>
+                </div>
+              `;
+            })
+          }
+        `;
+      })()}
     `}
 
     ${modal === 'item' && html`<${ItemModal} plant=${plant} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
