@@ -3989,6 +3989,7 @@ function Stocks({ plant, me }) {
   const [search, setSearch] = useState('');
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
+  const [activeItem, setActiveItem] = useState(null);
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
@@ -4054,7 +4055,7 @@ function Stocks({ plant, me }) {
   const ItemRow = ({ i }) => {
     const isLow = i.reorder_level && i.current_qty <= i.reorder_level;
     return html`
-      <div class="list-item" key=${i.id} onClick=${() => { setEditTarget(i); setModal('item'); }}>
+      <div class="list-item" key=${i.id} onClick=${() => setActiveItem(i)}>
         <div class="list-item-row">
           <div class="list-item-main">
             <div class="list-item-title">${i.code} · ${i.name}</div>
@@ -4062,12 +4063,19 @@ function Stocks({ plant, me }) {
           </div>
           <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
             <span class=${'badge ' + (isLow ? 'rose' : 'emerald')}>${fmtNum(i.current_qty)} ${i.uom}</span>
-            <button class="btn small ghost" onClick=${(e) => { e.stopPropagation(); setEditTarget(i); setModal('txn'); }}>Txn</button>
+            <div style="display:flex;gap:4px">
+              <button class="btn small" onClick=${(e) => { e.stopPropagation(); setEditTarget({...i, _txnHint:'grn'}); setModal('txn'); }} style="background:var(--emerald-600);color:white;padding:4px 10px">+ In</button>
+              <button class="btn small ghost" onClick=${(e) => { e.stopPropagation(); setEditTarget({...i, _txnHint:'issue'}); setModal('txn'); }} style="padding:4px 10px">− Out</button>
+            </div>
           </div>
         </div>
       </div>
     `;
   };
+
+  if (activeItem) {
+    return html`<${ItemDetail} plant=${plant} me=${me} item=${activeItem} onClose=${() => { setActiveItem(null); refresh(); }} onEdit=${() => { setEditTarget(activeItem); setModal('item'); }} />`;
+  }
 
   return html`
     <div class="page-header"><div><h1>Stocks</h1><div class="sub">Items, GRN, issues, valuation</div></div></div>
@@ -4216,25 +4224,56 @@ function ItemModal({ plant, editTarget, onClose, onSaved }) {
 }
 
 function TxnModal({ plant, me, item, onClose, onSaved }) {
-  const [form, setForm] = useState({ txn_type:'grn', qty:'', reference:'', notes:'' });
+  const [form, setForm] = useState({
+    txn_type: item._txnHint || 'grn',
+    qty:'', reference:'', notes:''
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  const TYPE_GROUPS = [
+    { label: 'Inward', types: [
+      { val:'grn', lbl:'GRN — Material received' },
+      { val:'return', lbl:'Return — Came back from production' },
+      { val:'opening', lbl:'Opening — Initial stock entry' },
+      { val:'adjustment_in', lbl:'Adjustment In — Found extra' },
+    ]},
+    { label: 'Outward', types: [
+      { val:'issue', lbl:'Issue — Sent to production' },
+      { val:'consumption', lbl:'Consumption — Used / consumed' },
+      { val:'scrap', lbl:'Scrap — Discarded' },
+      { val:'adjustment_out', lbl:'Adjustment Out — Missing' },
+    ]},
+  ];
+
+  const isInward = ['grn','return','opening','adjustment_in'].includes(form.txn_type);
+  const newQty = (() => {
+    const q = parseFloat(form.qty || 0);
+    return parseFloat(item.current_qty || 0) + (isInward ? q : -q);
+  })();
 
   const submit = async (e) => {
     e.preventDefault();
     setError(''); setLoading(true);
     try {
+      const q = parseFloat(form.qty);
+      if (!q || q <= 0) throw new Error('Quantity must be > 0');
+      if (!isInward && q > parseFloat(item.current_qty || 0)) {
+        if (!confirm('This will leave stock at ' + fmtNum(parseFloat(item.current_qty || 0) - q) + '. Continue?')) {
+          setLoading(false); return;
+        }
+      }
       const { error } = await sb.from('mcp_stocks_transactions').insert({
         plant_id: plant.id,
         item_id: item.id,
         txn_type: form.txn_type,
-        qty: parseFloat(form.qty),
+        qty: q,
         reference: form.reference || null,
         notes: form.notes || null,
         performed_by: me.id,
       });
       if (error) throw error;
-      showToast('Transaction recorded');
+      showToast((isInward ? '+ ' : '− ') + fmtNum(q) + ' ' + item.uom + ' recorded');
       onSaved();
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
@@ -4243,31 +4282,166 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal">
         <div class="modal-header">
-          <div class="modal-title">${item.code} · Transaction</div>
+          <div class="modal-title">${isInward ? '+ Add stock' : '− Issue stock'}</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
         <div class="card" style="background:var(--slate-50);margin-bottom:14px">
-          <div class="card-row"><span class="label">Item</span><span class="value">${item.name}</span></div>
-          <div class="card-row"><span class="label">Current</span><span class="value">${fmtNum(item.current_qty)} ${item.uom}</span></div>
+          <div class="card-row"><span class="label">Item</span><span class="value">${item.code} · ${item.name}</span></div>
+          <div class="card-row"><span class="label">Current</span><span class="value mono">${fmtNum(item.current_qty)} ${item.uom}</span></div>
+          ${form.qty && parseFloat(form.qty) > 0 && html`
+            <div class="card-row"><span class="label">After</span><span class="value mono" style="color:${isInward ? 'var(--emerald-700)' : 'var(--rose-600)'};font-weight:600">${fmtNum(newQty)} ${item.uom}</span></div>
+          `}
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
         <form onSubmit=${submit}>
           <div class="field"><label>Type *</label>
             <select required value=${form.txn_type} onChange=${e => setForm({...form, txn_type: e.target.value})}>
-              <option value="grn">GRN (receive)</option>
-              <option value="issue">Issue (out)</option>
-              <option value="return">Return (in)</option>
-              <option value="consumption">Consumption</option>
-              <option value="adjustment">Adjustment</option>
+              ${TYPE_GROUPS.map(g => html`
+                <optgroup key=${g.label} label=${g.label}>
+                  ${g.types.map(t => html`<option key=${t.val} value=${t.val}>${t.lbl}</option>`)}
+                </optgroup>
+              `)}
             </select>
           </div>
-          <div class="field"><label>Quantity * (${item.uom})</label><input type="number" step="0.001" required value=${form.qty} onChange=${e => setForm({...form, qty: e.target.value})} /></div>
-          <div class="field"><label>Reference</label><input type="text" value=${form.reference} onChange=${e => setForm({...form, reference: e.target.value})} placeholder="GRN# / DC# / etc" /></div>
+          <div class="field"><label>Quantity * (${item.uom})</label><input type="number" step="0.001" min=${0.001} required value=${form.qty} onChange=${e => setForm({...form, qty: e.target.value})} autoFocus /></div>
+          <div class="field"><label>Reference</label><input type="text" value=${form.reference} onChange=${e => setForm({...form, reference: e.target.value})} placeholder=${isInward ? 'GRN# / Invoice / DC#' : 'Job# / DC# / Reason'} /></div>
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
-          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : 'Record'}</button>
+          <button class="btn" disabled=${loading} style="background:${isInward ? 'var(--emerald-600)' : 'var(--rose-600)'};color:white">${loading ? 'Saving…' : (isInward ? '+ Add to stock' : '− Issue stock')}</button>
         </form>
       </div>
     </div>
+  `;
+}
+
+// ============= ITEM DETAIL — full ledger per item =============
+function ItemDetail({ plant, me, item: initialItem, onClose, onEdit }) {
+  const [item, setItem] = useState(initialItem);
+  const [txns, setTxns] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [txnModal, setTxnModal] = useState(null); // null | 'in' | 'out'
+
+  const refresh = async () => {
+    setLoading(true);
+    const [it, t] = await Promise.all([
+      sb.from('mcp_stocks_items').select('*').eq('id', initialItem.id).single(),
+      sb.from('mcp_stocks_transactions').select('*, users:performed_by(full_name)').eq('item_id', initialItem.id).order('created_at', { ascending:false }).limit(200),
+    ]);
+    if (it.data) setItem(it.data);
+    setTxns(t.data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [initialItem.id]);
+
+  // Realtime updates for this item's transactions
+  useEffect(() => {
+    const channel = sb.channel('item-detail-' + initialItem.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_stocks_transactions', filter:'item_id=eq.' + initialItem.id }, () => refresh())
+      .on('postgres_changes', { event:'UPDATE', schema:'public', table:'mcp_stocks_items', filter:'id=eq.' + initialItem.id }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [initialItem.id]);
+
+  if (loading && txns.length === 0) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  const isLow = item.reorder_level && parseFloat(item.current_qty || 0) <= parseFloat(item.reorder_level || 0);
+  const TYPE_LABELS = {
+    grn:'GRN', return:'Return', opening:'Opening', adjustment_in:'Adj+',
+    issue:'Issue', consumption:'Consumed', scrap:'Scrap', adjustment_out:'Adj−',
+  };
+  const isInwardType = (t) => ['grn','return','opening','adjustment_in'].includes(t);
+
+  // Compute running balance (newest first list, so we work backwards)
+  let running = parseFloat(item.current_qty || 0);
+  const txnsWithRunning = txns.map(t => {
+    const after = running;
+    const signed = isInwardType(t.txn_type) ? Math.abs(parseFloat(t.qty)) : -Math.abs(parseFloat(t.qty));
+    running = after - signed;  // before this txn, balance was after - signed
+    return { ...t, balance_after: after, signed };
+  });
+
+  // Stats
+  const last30 = new Date(); last30.setDate(last30.getDate() - 30);
+  const recent = txns.filter(t => new Date(t.created_at) >= last30);
+  const inLast30 = recent.filter(t => isInwardType(t.txn_type)).reduce((s, t) => s + Math.abs(parseFloat(t.qty || 0)), 0);
+  const outLast30 = recent.filter(t => !isInwardType(t.txn_type)).reduce((s, t) => s + Math.abs(parseFloat(t.qty || 0)), 0);
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:0">
+        <h1 style="font-size:18px">${item.code}</h1>
+        <div class="sub">${item.name}</div>
+      </div>
+      <button class="btn small ghost" onClick=${onEdit}>Edit</button>
+    </div>
+
+    <div class="card" style=${'background:' + (isLow ? 'var(--rose-50)' : 'var(--emerald-50)') + ';border-color:' + (isLow ? 'var(--rose-200)' : 'var(--emerald-200)')}>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div>
+          <div style="font-size:12px;color:var(--slate-600);font-weight:600">CURRENT STOCK</div>
+          <div style="font-size:28px;font-weight:700;color:${isLow ? 'var(--rose-700)' : 'var(--emerald-700)'};font-family:ui-monospace,monospace">${fmtNum(item.current_qty)} <span style="font-size:14px;color:var(--slate-500);font-weight:500">${item.uom}</span></div>
+        </div>
+        <div style="text-align:right">
+          ${item.reorder_level && html`
+            <div style="font-size:11px;color:var(--slate-500)">REORDER AT</div>
+            <div style="font-size:14px;font-weight:600">${fmtNum(item.reorder_level)} ${item.uom}</div>
+          `}
+          ${isLow && html`<div style="font-size:11px;color:var(--rose-600);font-weight:600;margin-top:4px">⚠️ Low stock</div>`}
+        </div>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;margin:14px 0">
+      <button class="btn" style="background:var(--emerald-600);flex:1" onClick=${() => setTxnModal('in')}>+ Add stock</button>
+      <button class="btn" style="background:var(--rose-600);flex:1" onClick=${() => setTxnModal('out')}>− Issue stock</button>
+    </div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(2,1fr);gap:8px">
+      <div class="stat teal" style="padding:10px"><div class="stat-num" style="font-size:18px">+${fmtNum(inLast30)}</div><div class="stat-label" style="font-size:10px">IN · last 30 days</div></div>
+      <div class="stat amber" style="padding:10px"><div class="stat-num" style="font-size:18px">−${fmtNum(outLast30)}</div><div class="stat-label" style="font-size:10px">OUT · last 30 days</div></div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-title">DETAILS</div>
+      <div class="card-row"><span class="label">Category</span><span class="value">${item.category || 'general'}</span></div>
+      ${item.unit_cost && html`<div class="card-row"><span class="label">Unit cost</span><span class="value">₹${item.unit_cost}/${item.uom}</span></div>`}
+      ${item.unit_cost && html`<div class="card-row"><span class="label">Stock value</span><span class="value">₹${(parseFloat(item.current_qty || 0) * parseFloat(item.unit_cost || 0)).toLocaleString('en-IN', {maximumFractionDigits:0})}</span></div>`}
+    </div>
+
+    <div class="section-h">History · ${txns.length} transactions</div>
+    ${txns.length === 0 ? html`
+      <div class="empty"><div style="font-size:13px">No transactions yet. Tap + Add stock to record inward material.</div></div>
+    ` : html`
+      <div style="border:1px solid var(--slate-200);border-radius:10px;background:white;overflow:hidden">
+        ${txnsWithRunning.map((t, idx) => {
+          const inward = isInwardType(t.txn_type);
+          return html`
+            <div key=${t.id} style="display:flex;align-items:center;gap:10px;padding:12px 14px;${idx > 0 ? 'border-top:0.5px solid var(--slate-100);' : ''}">
+              <div style="width:28px;height:28px;border-radius:50%;background:${inward ? 'var(--emerald-100)' : 'var(--rose-100)'};color:${inward ? 'var(--emerald-700)' : 'var(--rose-700)'};display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex-shrink:0">${inward ? '+' : '−'}</div>
+              <div style="flex:1;min-width:0">
+                <div style="font-size:13px;font-weight:500">
+                  <span style="color:${inward ? 'var(--emerald-700)' : 'var(--rose-600)'};font-weight:600">${inward ? '+' : '−'}${fmtNum(Math.abs(parseFloat(t.qty)))} ${item.uom}</span>
+                  <span style="color:var(--slate-400);margin:0 6px">·</span>
+                  <span style="color:var(--slate-700)">${TYPE_LABELS[t.txn_type] || t.txn_type}</span>
+                </div>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                  ${new Date(t.created_at).toLocaleString('en-IN', { dateStyle:'medium', timeStyle:'short' })}
+                  ${t.users?.full_name ? ' · ' + t.users.full_name : ''}
+                  ${t.reference ? ' · ' + t.reference : ''}
+                </div>
+                ${t.notes && html`<div style="font-size:11px;color:var(--slate-500);margin-top:2px;font-style:italic">${t.notes}</div>`}
+              </div>
+              <div style="text-align:right;flex-shrink:0">
+                <div style="font-size:11px;color:var(--slate-500)">balance</div>
+                <div style="font-size:13px;font-weight:600;font-family:ui-monospace,monospace">${fmtNum(t.balance_after)}</div>
+              </div>
+            </div>
+          `;
+        })}
+      </div>
+    `}
+
+    ${txnModal && html`<${TxnModal} plant=${plant} me=${me} item=${{...item, _txnHint: txnModal === 'in' ? 'grn' : 'issue'}} onClose=${() => setTxnModal(null)} onSaved=${() => { setTxnModal(null); refresh(); }} />`}
   `;
 }
 
