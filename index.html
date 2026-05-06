@@ -4066,6 +4066,141 @@ function Quality({ plant, me }) {
   `;
 }
 
+// =================================================================
+// ACTIVITY TIMELINE + COMMENTS — generic component for any entity
+// Usage: <${EntityTimeline} entityType="breakdown" entityId=${id} plant=${plant} me=${me} />
+// =================================================================
+function EntityTimeline({ entityType, entityId, plant, me, allowComments = true }) {
+  const [events, setEvents] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [draft, setDraft] = useState('');
+  const [posting, setPosting] = useState(false);
+
+  const refresh = async () => {
+    const { data, error } = await sb.rpc('get_timeline', { p_entity_type: entityType, p_entity_id: entityId });
+    if (error) console.error('timeline:', error);
+    setEvents(data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [entityType, entityId]);
+
+  // Realtime: refresh on any new activity_log or comment for this entity
+  useEffect(() => {
+    if (!entityId) return;
+    const channel = sb.channel('timeline-' + entityType + '-' + entityId)
+      .on('postgres_changes', { event:'INSERT', schema:'public', table:'activity_log', filter:'entity_id=eq.' + entityId }, () => refresh())
+      .on('postgres_changes', { event:'INSERT', schema:'public', table:'entity_comments', filter:'entity_id=eq.' + entityId }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [entityType, entityId]);
+
+  const postComment = async () => {
+    if (!draft.trim()) return;
+    setPosting(true);
+    try {
+      const { error } = await sb.rpc('post_comment', { p_entity_type: entityType, p_entity_id: entityId, p_body: draft.trim() });
+      if (error) throw error;
+      setDraft('');
+    } catch (err) { alert('Failed: ' + err.message); }
+    finally { setPosting(false); }
+  };
+
+  const fmtRelTime = (ts) => {
+    const d = new Date(ts);
+    return d.toLocaleString('en-IN', { dateStyle:'medium', timeStyle:'short' });
+  };
+
+  // Map event to display
+  const renderEvent = (e) => {
+    const actorInitials = (e.actor_name || '?').split(' ').filter(Boolean).slice(0,2).map(s=>s[0]).join('').toUpperCase() || '?';
+    const isComment = e.event_kind === 'comment';
+
+    let icon, iconBg, label, detail;
+    if (isComment) {
+      icon = '💬'; iconBg = 'var(--teal-100)';
+      label = e.actor_name || 'Someone';
+      detail = e.body;
+    } else {
+      switch (e.event_type) {
+        case 'created':
+          icon = '📌'; iconBg = 'var(--slate-100)';
+          label = (e.actor_name || 'Someone') + ' created this';
+          detail = e.payload?.title ? '"' + e.payload.title + '"' : '';
+          break;
+        case 'status_changed':
+          const to = e.payload?.to;
+          const from = e.payload?.from;
+          icon = to === 'resolved' || to === 'closed' ? '✅' : (to === 'attended' || to === 'in_progress' ? '🟡' : '🔄');
+          iconBg = to === 'resolved' || to === 'closed' ? 'var(--emerald-100)' : 'var(--amber-100)';
+          label = (e.actor_name || 'Someone') + ' changed status';
+          detail = (from || '?') + ' → ' + (to || '?');
+          break;
+        case 'assigned':
+          icon = '👤'; iconBg = 'var(--indigo-50)';
+          label = (e.actor_name || 'Someone') + ' changed assignment';
+          detail = e.payload?.to ? 'Assigned to ' + e.payload.to : 'Unassigned';
+          break;
+        case 'updated':
+          icon = '✏️'; iconBg = 'var(--slate-100)';
+          label = (e.actor_name || 'Someone') + ' updated';
+          if (e.payload?.field === 'resolution_notes') {
+            label = (e.actor_name || 'Someone') + ' added resolution notes';
+            detail = e.payload?.note || '';
+          } else {
+            detail = e.payload?.field || '';
+          }
+          break;
+        default:
+          icon = '•'; iconBg = 'var(--slate-100)';
+          label = (e.actor_name || 'Someone') + ' · ' + e.event_type;
+          detail = '';
+      }
+    }
+
+    return html`
+      <div key=${e.event_id} style="display:flex;gap:10px;align-items:flex-start;padding:8px 0">
+        <div style="width:28px;height:28px;border-radius:50%;background:${iconBg};display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0">${icon}</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;color:var(--slate-700);line-height:1.4">
+            <span style="font-weight:600;color:var(--slate-900)">${label}</span>
+          </div>
+          ${detail && html`<div style="font-size:13px;color:var(--slate-700);margin-top:3px;${isComment ? 'background:var(--teal-50);padding:8px 10px;border-radius:8px;border-left:3px solid var(--teal-500);white-space:pre-wrap' : ''}">${detail}</div>`}
+          <div style="font-size:11px;color:var(--slate-500);margin-top:3px">${fmtRelTime(e.created_at)}</div>
+        </div>
+      </div>
+    `;
+  };
+
+  return html`
+    <div style="border-top:1px solid var(--slate-200);margin-top:14px;padding-top:14px">
+      <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">
+        Activity · ${events.length}
+      </div>
+      ${loading ? html`<div style="padding:14px;text-align:center"><div class="spinner" style="margin:0 auto"></div></div>` :
+       events.length === 0 ? html`<div style="font-size:12px;color:var(--slate-500);padding:8px 0">No activity yet.</div>` :
+       html`<div style="position:relative;padding-left:14px;border-left:2px solid var(--slate-200);margin-left:14px">${events.map(renderEvent)}</div>`
+      }
+      ${allowComments && html`
+        <div style="margin-top:14px;display:flex;gap:8px;align-items:flex-end">
+          <textarea
+            value=${draft}
+            onChange=${e => setDraft(e.target.value)}
+            placeholder="Add an update or note…"
+            rows=${2}
+            style="flex:1;padding:8px 10px;font-size:13px;border:1px solid var(--slate-200);border-radius:8px;font-family:inherit;resize:vertical;min-height:38px"
+          ></textarea>
+          <button
+            class="btn small"
+            onClick=${postComment}
+            disabled=${posting || !draft.trim()}
+            style="padding:8px 14px;flex-shrink:0;height:38px;background:var(--teal-600);color:white"
+          >${posting ? '…' : 'Post'}</button>
+        </div>
+      `}
+    </div>
+  `;
+}
+
 function NcrModal({ plant, me, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget ? {...editTarget} : {
     title:'', description:'', severity:'minor', source:'manual',
@@ -4161,6 +4296,7 @@ function NcrModal({ plant, me, editTarget, onClose, onSaved }) {
           `}
           <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update NCR' : 'Raise NCR')}</button>
         </form>
+        ${editTarget && html`<${EntityTimeline} entityType="ncr" entityId=${editTarget.id} plant=${plant} me=${me} />`}
       </div>
     </div>
   `;
@@ -4324,6 +4460,7 @@ function BreakdownModal({ plant, me, machines, users, editTarget, onClose, onSav
           `}
           <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Report')}</button>
         </form>
+        ${editTarget && html`<${EntityTimeline} entityType="breakdown" entityId=${editTarget.id} plant=${plant} me=${me} />`}
       </div>
     </div>
   `;
