@@ -1205,7 +1205,15 @@ function Home({ plant, me, setTab, reload }) {
     <div class="dashboard-grid">
       <div class="dashboard-col-main">
         <${DailyDigest} me=${me} setTab=${setTab} />
+        <${TodaysProductionCard} plant=${plant} setTab=${setTab} />
+        <${ScheduleStatusCard} plant=${plant} setTab=${setTab} />
         <${StagePendingBanner} plant=${plant} me=${me} setTab=${setTab} />
+      </div>
+
+      <div class="dashboard-col-side">
+        <${TopConcernsCard} plant=${plant} setTab=${setTab} />
+        <${MaterialBurnRateCard} plant=${plant} setTab=${setTab} />
+        <${StageLagCard} plant=${plant} me=${me} setTab=${setTab} />
         <${StockAlerts} plant=${plant} setTab=${setTab} />
 
         ${alerts > 0 && html`
@@ -1249,26 +1257,14 @@ function Home({ plant, me, setTab, reload }) {
           </div>
         `}
       </div>
+    </div>
 
-      <div class="dashboard-col-side">
-        <div>
-          <div class="section-h">Quick Stats</div>
-          <div class="stat-grid stats-4-wide">
-            <div class="stat teal"><div class="stat-num">${stats.units}</div><div class="stat-label">Units</div></div>
-            <div class="stat teal"><div class="stat-num">${stats.users}</div><div class="stat-label">Team</div></div>
-            <div class="stat amber"><div class="stat-num">${stats.machines}</div><div class="stat-label">Machines</div></div>
-            <div class="stat amber"><div class="stat-num">${stats.dies}</div><div class="stat-label">Dies</div></div>
-          </div>
-        </div>
-
-        <div class="card" style="background:var(--slate-900);color:white;border:none">
-          <div class="card-title" style="color:white">Plant Info</div>
-          <div class="card-row" style="border-color:rgba(255,255,255,0.1)"><span class="label" style="color:var(--slate-400)">Plant</span><span class="value" style="color:white">${plant.name}</span></div>
-          <div class="card-row" style="border-color:rgba(255,255,255,0.1)"><span class="label" style="color:var(--slate-400)">GSTIN</span><span class="value" style="color:white">${plant.gstin || '—'}</span></div>
-          <div class="card-row" style="border-color:rgba(255,255,255,0.1)"><span class="label" style="color:var(--slate-400)">IATF</span><span class="value">${plant.iatf_certified ? html`<span class="badge emerald">Certified</span>` : html`<span class="badge">Not certified</span>`}</span></div>
-          <div class="card-row" style="border-color:rgba(255,255,255,0.1)"><span class="label" style="color:var(--slate-400)">Tier</span><span class="value"><span class="badge teal">${plant.subscription_tier.toUpperCase()}</span></span></div>
-        </div>
-      </div>
+    <div class="section-h" style="margin-top:24px">Setup snapshot</div>
+    <div class="stat-grid stats-4-wide" style="grid-template-columns:repeat(4,1fr);gap:8px">
+      <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.units}</div><div class="stat-label" style="font-size:10px">Units</div></div>
+      <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.users}</div><div class="stat-label" style="font-size:10px">Team</div></div>
+      <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.machines}</div><div class="stat-label" style="font-size:10px">Machines</div></div>
+      <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.dies}</div><div class="stat-label" style="font-size:10px">Dies</div></div>
     </div>
   `;
 }
@@ -3293,6 +3289,339 @@ function InviteViewModal({ invite, onClose, onCancel }) {
 }
 
 // ============= STOCK ALERTS (low stock + reorder) =============
+// ============= INSIGHT CARDS (Home dashboard) =============
+
+// 1. TODAY'S PRODUCTION — good/reject % + 7-day sparkline
+function TodaysProductionCard({ plant, setTab }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = async () => {
+    const { data: rows } = await sb.from('v_production_7day').select('*').order('prod_date');
+    setData(rows || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, []);
+
+  if (loading) return html`<div class="card"><div class="card-title">📊 Today's Production</div><div class="loader"><div class="spinner"></div></div></div>`;
+
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const today = data.find(r => r.prod_date === todayStr) || { good_qty:0, reject_qty:0, reject_pct:0, shot_count:0 };
+
+  // Build 7-day series with zero-fill
+  const series = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const ds = d.toISOString().slice(0, 10);
+    const row = data.find(r => r.prod_date === ds);
+    series.push({
+      date: ds,
+      label: d.toLocaleDateString('en-IN', { weekday: 'short' }).slice(0, 1),
+      good: row?.good_qty || 0,
+      reject: row?.reject_qty || 0,
+      total: (row?.good_qty || 0) + (row?.reject_qty || 0),
+    });
+  }
+  const maxBar = Math.max(1, ...series.map(s => s.total));
+
+  return html`
+    <div class="card" onClick=${() => setTab('production')} style="cursor:pointer">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <div class="card-title" style="margin:0">📊 Today's Production</div>
+        <span style="font-size:11px;color:var(--slate-500)">last 7 days →</span>
+      </div>
+      <div style="display:flex;gap:14px;align-items:flex-end;margin-bottom:12px">
+        <div>
+          <div style="font-size:11px;color:var(--slate-500)">GOOD</div>
+          <div style="font-size:22px;font-weight:700;color:var(--emerald-700);font-variant-numeric:tabular-nums">${fmtNum(today.good_qty)}</div>
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--slate-500)">REJECT</div>
+          <div style="font-size:22px;font-weight:700;color:var(--rose-600);font-variant-numeric:tabular-nums">${fmtNum(today.reject_qty)}</div>
+        </div>
+        <div style="margin-left:auto;text-align:right">
+          <div style="font-size:11px;color:var(--slate-500)">REJECT %</div>
+          <div style="font-size:22px;font-weight:700;color:${parseFloat(today.reject_pct) > 3 ? 'var(--rose-600)' : 'var(--emerald-700)'}">${parseFloat(today.reject_pct).toFixed(1)}%</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:4px;align-items:flex-end;height:56px;padding:4px 0">
+        ${series.map(s => {
+          const barH = Math.max(2, (s.total / maxBar) * 50);
+          const goodPct = s.total > 0 ? (s.good / s.total) * 100 : 0;
+          const isToday = s.date === todayStr;
+          return html`
+            <div key=${s.date} style="flex:1;display:flex;flex-direction:column;align-items:center;gap:2px">
+              <div title=${'Good ' + s.good + ' / Reject ' + s.reject} style="width:100%;max-width:30px;height:${barH}px;background:linear-gradient(to top, var(--rose-400) 0%, var(--rose-400) ${100-goodPct}%, var(--emerald-500) ${100-goodPct}%, var(--emerald-500) 100%);border-radius:3px 3px 0 0;opacity:${isToday ? 1 : 0.7};border:${isToday ? '2px solid var(--teal-600)' : 'none'}"></div>
+              <div style="font-size:9px;color:${isToday ? 'var(--teal-700)' : 'var(--slate-500)'};font-weight:${isToday ? 600 : 400}">${s.label}</div>
+            </div>
+          `;
+        })}
+      </div>
+    </div>
+  `;
+}
+
+// 2. SCHEDULE STATUS — current month attainment per customer
+function ScheduleStatusCard({ plant, setTab }) {
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = async () => {
+    const { data: rows } = await sb.from('v_schedule_status_current_month').select('*').order('pct_attainment');
+    setData(rows || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, []);
+
+  if (loading) return html`<div class="card"><div class="card-title">📅 Schedule Status</div><div class="loader"><div class="spinner"></div></div></div>`;
+
+  if (data.length === 0) return html`
+    <div class="card" onClick=${() => setTab('schedules')} style="cursor:pointer">
+      <div class="card-title">📅 Schedule Status</div>
+      <div class="empty" style="padding:14px"><div style="font-size:12px">No active schedules this month. Tap to create one.</div></div>
+    </div>
+  `;
+
+  const totalPlanned = data.reduce((s, r) => s + parseFloat(r.total_planned || 0), 0);
+  const totalSupplied = data.reduce((s, r) => s + parseFloat(r.total_supplied || 0), 0);
+  const overallPct = totalPlanned > 0 ? (totalSupplied / totalPlanned) * 100 : 0;
+  const overdueTotal = data.reduce((s, r) => s + parseInt(r.overdue_lines || 0), 0);
+
+  return html`
+    <div class="card" onClick=${() => setTab('schedules')} style="cursor:pointer">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <div class="card-title" style="margin:0">📅 Schedule Status · This month</div>
+        <span style="font-size:11px;color:var(--slate-500)">${data.length} customers →</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div>
+          <div style="font-size:11px;color:var(--slate-500)">ATTAINMENT</div>
+          <div style="font-size:24px;font-weight:700;color:${overallPct >= 90 ? 'var(--emerald-700)' : overallPct >= 60 ? 'var(--teal-700)' : 'var(--amber-700)'};font-variant-numeric:tabular-nums">${overallPct.toFixed(1)}%</div>
+          <div style="font-size:11px;color:var(--slate-500)">${fmtNum(totalSupplied)} / ${fmtNum(totalPlanned)}</div>
+        </div>
+        ${overdueTotal > 0 && html`
+          <div style="text-align:right">
+            <div style="font-size:11px;color:var(--rose-600);font-weight:600">⚠️ OVERDUE</div>
+            <div style="font-size:18px;font-weight:700;color:var(--rose-600)">${overdueTotal}</div>
+            <div style="font-size:10px;color:var(--slate-500)">delivery slots</div>
+          </div>
+        `}
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        ${data.slice(0, 4).map(r => {
+          const pct = parseFloat(r.pct_attainment || 0);
+          const color = pct >= 90 ? 'var(--emerald-500)' : pct >= 60 ? 'var(--teal-500)' : 'var(--amber-500)';
+          return html`
+            <div key=${r.schedule_id} style="display:flex;align-items:center;gap:8px;font-size:12px">
+              <div style="flex:0 0 90px;font-weight:500;color:var(--slate-700);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.customer_code || r.customer_name}</div>
+              <div style="flex:1;background:var(--slate-100);height:6px;border-radius:3px;overflow:hidden">
+                <div style="background:${color};height:100%;width:${Math.min(100, pct)}%"></div>
+              </div>
+              <div style="flex:0 0 40px;text-align:right;font-weight:600;color:${color};font-size:11px">${pct.toFixed(0)}%</div>
+              ${parseInt(r.overdue_lines || 0) > 0 && html`<span style="color:var(--rose-600);font-size:11px;font-weight:600">${r.overdue_lines}⚠</span>`}
+            </div>
+          `;
+        })}
+      </div>
+    </div>
+  `;
+}
+
+// 3. MATERIAL BURN RATE — days of stock left at current consumption
+function MaterialBurnRateCard({ plant, setTab }) {
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = async () => {
+    // Only show items that have recent consumption (otherwise prediction is meaningless)
+    const { data: rows } = await sb.from('v_material_burn_rate')
+      .select('*')
+      .gt('consumed_7d', 0)
+      .order('days_of_stock_left', { ascending: true, nullsFirst: false })
+      .limit(20);
+    setData(rows || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, []);
+
+  if (loading) return html`<div class="card"><div class="card-title">⚙️ Material Burn Rate</div><div class="loader"><div class="spinner"></div></div></div>`;
+
+  // Top 5 most at risk
+  const atRisk = data.filter(r => ['out_of_stock','critical','warning'].includes(r.risk_level)).slice(0, 5);
+  const safe = data.filter(r => r.risk_level === 'safe' || r.risk_level === 'low');
+
+  if (data.length === 0) return html`
+    <div class="card" onClick=${() => setTab('stocks')} style="cursor:pointer">
+      <div class="card-title">⚙️ Material Burn Rate</div>
+      <div class="empty" style="padding:14px"><div style="font-size:12px">No consumption recorded in last 7 days. Burn rate will appear once issues are logged.</div></div>
+    </div>
+  `;
+
+  return html`
+    <div class="card" onClick=${() => setTab('stocks')} style="cursor:pointer">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <div class="card-title" style="margin:0">⚙️ Material Burn Rate</div>
+        <span style="font-size:11px;color:var(--slate-500)">${atRisk.length} at risk · ${safe.length} safe →</span>
+      </div>
+      ${atRisk.length === 0 ? html`
+        <div style="font-size:12px;color:var(--emerald-700);padding:8px 0">✓ All ${data.length} active items have safe stock buffers</div>
+      ` : html`
+        <div style="display:flex;flex-direction:column;gap:6px">
+          ${atRisk.map(r => {
+            const isOut = r.risk_level === 'out_of_stock';
+            const isCrit = r.risk_level === 'critical';
+            const color = isOut || isCrit ? 'var(--rose-600)' : 'var(--amber-700)';
+            const bg = isOut || isCrit ? 'var(--rose-50)' : 'var(--amber-50)';
+            const daysLabel = isOut ? 'OUT' : (parseFloat(r.days_of_stock_left) < 1 ? '<1d' : Math.round(r.days_of_stock_left) + 'd');
+            return html`
+              <div key=${r.item_id} style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:${bg};border-radius:6px;font-size:12px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-weight:600;color:var(--slate-800);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.code} · ${r.name}</div>
+                  <div style="font-size:10px;color:var(--slate-500);margin-top:1px">${fmtNum(r.current_qty)} ${r.uom} · using ${fmtNum(r.daily_avg_consumption)}/${r.uom}/day</div>
+                </div>
+                <div style="text-align:right;flex-shrink:0">
+                  <div style="font-size:14px;font-weight:700;color:${color};line-height:1.1">${daysLabel}</div>
+                  <div style="font-size:9px;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.05em">${r.risk_level.replace('_', ' ')}</div>
+                </div>
+              </div>
+            `;
+          })}
+        </div>
+      `}
+    </div>
+  `;
+}
+
+// 4. STAGE TRACKING LAG — what hasn't been logged
+function StageLagCard({ plant, me, setTab }) {
+  const [summary, setSummary] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = async () => {
+    const { data } = await sb.from('v_stage_lag_summary').select('*').single();
+    setSummary(data);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, []);
+
+  if (loading) return html`<div class="card"><div class="card-title">📋 Stage Tracking</div><div class="loader"><div class="spinner"></div></div></div>`;
+
+  if (!summary || summary.total_slots === 0) return html`
+    <div class="card" onClick=${() => setTab('production')} style="cursor:pointer">
+      <div class="card-title">📋 Stage Tracking</div>
+      <div class="empty" style="padding:14px"><div style="font-size:12px">No routing steps defined yet. Add stages in Production → Parts.</div></div>
+    </div>
+  `;
+
+  const total = parseInt(summary.total_slots);
+  const unlogged = parseInt(summary.unlogged_slots);
+  const logged = total - unlogged;
+  const pct = total > 0 ? (logged / total) * 100 : 0;
+  const unloggedToday = parseInt(summary.unlogged_today || 0);
+  const unloggedYesterday = parseInt(summary.unlogged_yesterday || 0);
+
+  return html`
+    <div class="card" onClick=${() => setTab('production')} style="cursor:pointer">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <div class="card-title" style="margin:0">📋 Stage Tracking · last 3 days</div>
+        <span style="font-size:11px;color:var(--slate-500)">→</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <div>
+          <div style="font-size:11px;color:var(--slate-500)">COMPLIANCE</div>
+          <div style="font-size:24px;font-weight:700;color:${pct >= 80 ? 'var(--emerald-700)' : pct >= 50 ? 'var(--amber-700)' : 'var(--rose-600)'}">${pct.toFixed(0)}%</div>
+          <div style="font-size:11px;color:var(--slate-500)">${logged} of ${total} slots logged</div>
+        </div>
+        <div style="text-align:right">
+          ${unloggedToday > 0 && html`
+            <div style="font-size:11px;color:var(--slate-500)">TODAY MISSING</div>
+            <div style="font-size:18px;font-weight:700;color:${unloggedToday > 0 ? 'var(--amber-700)' : 'var(--emerald-700)'}">${unloggedToday}</div>
+          `}
+          ${unloggedYesterday > 0 && html`
+            <div style="font-size:11px;color:var(--rose-600);margin-top:4px">⚠️ Y'day: ${unloggedYesterday} missed</div>
+          `}
+        </div>
+      </div>
+      <div style="background:var(--slate-100);height:6px;border-radius:3px;overflow:hidden">
+        <div style="background:${pct >= 80 ? 'var(--emerald-500)' : pct >= 50 ? 'var(--amber-500)' : 'var(--rose-500)'};height:100%;width:${pct}%"></div>
+      </div>
+    </div>
+  `;
+}
+
+// 5. TOP CONCERNS — top NCRs, top breakdown machines, top stock risks (last 30d)
+function TopConcernsCard({ plant, setTab }) {
+  const [ncrs, setNcrs] = useState([]);
+  const [breakdowns, setBreakdowns] = useState([]);
+  const [stockRisks, setStockRisks] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = async () => {
+    const [n, b, s] = await Promise.all([
+      sb.from('v_top_ncrs_30d').select('*').order('ncr_count', { ascending: false }).limit(3),
+      sb.from('v_top_breakdowns_30d').select('*').order('total_downtime_hrs', { ascending: false }).limit(3),
+      sb.from('v_material_burn_rate').select('*').in('risk_level', ['out_of_stock','critical']).limit(3),
+    ]);
+    setNcrs(n.data || []);
+    setBreakdowns(b.data || []);
+    setStockRisks(s.data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, []);
+
+  if (loading) return html`<div class="card"><div class="card-title">🚨 Top Concerns</div><div class="loader"><div class="spinner"></div></div></div>`;
+
+  const hasAny = ncrs.length > 0 || breakdowns.length > 0 || stockRisks.length > 0;
+  if (!hasAny) return html`
+    <div class="card">
+      <div class="card-title">🚨 Top Concerns · last 30 days</div>
+      <div style="font-size:12px;color:var(--emerald-700);padding:8px 0">✓ No major concerns. NCRs, breakdowns, and stocks all look good.</div>
+    </div>
+  `;
+
+  return html`
+    <div class="card">
+      <div class="card-title">🚨 Top Concerns · last 30 days</div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        ${ncrs.length > 0 && html`
+          <div onClick=${() => setTab('quality')} style="cursor:pointer">
+            <div style="font-size:11px;color:var(--rose-600);font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">QUALITY · top NCR parts</div>
+            ${ncrs.map(n => html`
+              <div key=${n.part_name} style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">
+                <span style="color:var(--slate-700)">${n.part_name}</span>
+                <span style="font-weight:600;color:var(--rose-600)">${n.ncr_count} NCR${n.ncr_count > 1 ? 's' : ''}${parseInt(n.open_count) > 0 ? ' · ' + n.open_count + ' open' : ''}</span>
+              </div>
+            `)}
+          </div>
+        `}
+        ${breakdowns.length > 0 && html`
+          <div onClick=${() => setTab('maintenance')} style="cursor:pointer;${ncrs.length > 0 ? 'border-top:0.5px solid var(--slate-200);padding-top:10px' : ''}">
+            <div style="font-size:11px;color:var(--amber-700);font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">MAINTENANCE · top downtime machines</div>
+            ${breakdowns.map(b => html`
+              <div key=${b.machine_id} style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">
+                <span style="color:var(--slate-700)">${b.machine_code}</span>
+                <span style="font-weight:600;color:var(--amber-700)">${parseFloat(b.total_downtime_hrs).toFixed(1)}h · ${b.breakdown_count} time${b.breakdown_count > 1 ? 's' : ''}</span>
+              </div>
+            `)}
+          </div>
+        `}
+        ${stockRisks.length > 0 && html`
+          <div onClick=${() => setTab('stocks')} style="cursor:pointer;${(ncrs.length > 0 || breakdowns.length > 0) ? 'border-top:0.5px solid var(--slate-200);padding-top:10px' : ''}">
+            <div style="font-size:11px;color:var(--rose-600);font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">STOCK · critical risks</div>
+            ${stockRisks.map(s => html`
+              <div key=${s.item_id} style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">
+                <span style="color:var(--slate-700);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px">${s.code} · ${s.name}</span>
+                <span style="font-weight:600;color:var(--rose-600)">${s.risk_level === 'out_of_stock' ? 'OUT' : Math.round(s.days_of_stock_left || 0) + ' days'}</span>
+              </div>
+            `)}
+          </div>
+        `}
+      </div>
+    </div>
+  `;
+}
+
 function StockAlerts({ plant, setTab }) {
   const [alerts, setAlerts] = useState([]);
   const [loading, setLoading] = useState(true);
