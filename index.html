@@ -1045,6 +1045,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload }) {
       <${Page} active=${tab === 'actions'}><${ActionHub} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'documents'}><${Documents} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'schedules'}><${Schedules} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab}/></${Page}>
@@ -1054,7 +1055,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload }) {
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
     </div>
   `;
@@ -1071,6 +1072,7 @@ function TopNavDesktop({ plant, me, initials, tab, setTab, logout, unreadCount }
     { key:'actions', label:'Tasks', icon:'actions' },
     { key:'documents', label:'Documents', icon:'documents' },
     { key:'schedules', label:'Schedules', icon:'schedules' },
+    { key:'reports', label:'Reports', icon:'documents' },
     { key:'chat', label:'Chat', icon:'chat' },
     { key:'people', label:'People', icon:'people' },
   ];
@@ -3833,6 +3835,7 @@ function DailyDigest({ me, setTab }) {
 function More({ plant, me, user, logout, setTab }) {
   const navItems = [
     { key:'schedules', icon:'📅', label:'Customer Schedules', sub:'Plan vs actual, weekly buckets, AI extract' },
+    { key:'reports', icon:'📑', label:'Reports & IATF Documents', sub:'Generate audit-ready reports from live data' },
     { key:'people', icon:'👥', label:'People · Units, Team, Shifts', sub:'Manage team, units, shifts' },
     { key:'maintenance', icon:'🔧', label:'Maintenance', sub:'Breakdowns, machine status' },
     { key:'stocks', icon:'📦', label:'Stocks', sub:'Inventory, items, transactions' },
@@ -8132,6 +8135,966 @@ function SupplyEntryModal({ plant, me, schedule, progress, prefillLine, onClose,
     </div>
   `;
 }
+
+// =================================================================
+// REPORTS & IATF DOCUMENTS — 15 audit-ready reports from live data
+// =================================================================
+
+const REPORT_CATALOG = [
+  // PRODUCTION
+  { id:'daily_production', title:'Daily Production Report', dept:'production', clauses:['8.5','9.1.1.1'], frequency:'daily',
+    desc:'Shift-wise good/reject, machines, parts, operators for any date.', icon:'📊' },
+  { id:'reject_analysis', title:'Reject Analysis (30 days)', dept:'production', clauses:['9.1','10.2'], frequency:'monthly',
+    desc:'Reject % trend by part/machine over last 30 days. Identifies repeat issues.', icon:'📉' },
+  { id:'stage_summary', title:'Stage-wise Production Summary', dept:'production', clauses:['8.5','8.6'], frequency:'monthly',
+    desc:'Per-stage qty rolled up across shifts and date range.', icon:'⚙️' },
+
+  // QUALITY
+  { id:'ncr_register', title:'NCR Register', dept:'quality', clauses:['10.2','8.7'], frequency:'monthly',
+    desc:'All non-conformances raised in selected period — open + closed.', icon:'⚠️' },
+  { id:'ncr_8d', title:'NCR Resolution Timeline (8D-style)', dept:'quality', clauses:['10.2'], frequency:'on_demand',
+    desc:'Full activity trail for a single NCR — root cause to closure.', icon:'🔍' },
+
+  // MAINTENANCE
+  { id:'breakdown_register', title:'Breakdown Register', dept:'maintenance', clauses:['8.5.1.5','7.1.3'], frequency:'monthly',
+    desc:'All machine breakdowns with reported/attended/resolved times.', icon:'🔧' },
+  { id:'mtbf_mttr', title:'MTBF / MTTR per Machine', dept:'maintenance', clauses:['8.5.1.5','9.1'], frequency:'monthly',
+    desc:'Mean Time Between Failures and Mean Time To Repair per machine.', icon:'📊' },
+
+  // SCHEDULES
+  { id:'schedule_attainment', title:'Customer Schedule Attainment', dept:'schedules', clauses:['8.2','9.1.2'], frequency:'monthly',
+    desc:'Plan vs actual delivery by customer for any month.', icon:'📅' },
+  { id:'otd_report', title:'On-Time Delivery (OTD)', dept:'schedules', clauses:['9.1.2'], frequency:'monthly',
+    desc:'On-time vs late deliveries with overdue counts per customer.', icon:'🚚' },
+
+  // STOCKS
+  { id:'stock_movement', title:'Stock Movement Report', dept:'stocks', clauses:['8.5.4','7.5.3'], frequency:'monthly',
+    desc:'All inward/outward transactions in selected date range.', icon:'📦' },
+  { id:'material_traceability', title:'Material Traceability', dept:'stocks', clauses:['8.5.2'], frequency:'on_demand',
+    desc:'Full transaction history of a single item — for batch traceability.', icon:'🔗' },
+
+  // DOCUMENTS / VENDORS
+  { id:'vendor_grn', title:'Vendor GRN Summary', dept:'documents', clauses:['8.4.2','8.5.4'], frequency:'monthly',
+    desc:'GRN-wise inward materials per vendor in date range.', icon:'🏭' },
+  { id:'document_index', title:'Documents Index', dept:'documents', clauses:['7.5'], frequency:'on_demand',
+    desc:'List of all documents on file with type/vendor/amount/date.', icon:'📂' },
+
+  // CROSS-CUTTING
+  { id:'audit_trail', title:'Audit Trail (per entity)', dept:'cross', clauses:['7.5.3','9.2.2'], frequency:'on_demand',
+    desc:'Complete change history for any breakdown/NCR/task/schedule.', icon:'🕒' },
+
+  // PEOPLE
+  { id:'team_snapshot', title:'Team & Roles Snapshot', dept:'people', clauses:['7.1.2','7.2'], frequency:'on_demand',
+    desc:'Active team with roles, departments, contact details.', icon:'👥' },
+];
+
+const DEPT_LABELS = {
+  production:'Production', quality:'Quality', maintenance:'Maintenance',
+  schedules:'Schedules', stocks:'Stocks', documents:'Documents',
+  people:'People', cross:'Cross-cutting'
+};
+
+const FREQ_LABELS = {
+  daily:'Daily', weekly:'Weekly', monthly:'Monthly', on_demand:'On-demand'
+};
+
+function Reports({ plant, me, setTab }) {
+  const [search, setSearch] = useState('');
+  const [deptFilter, setDeptFilter] = useState('all');
+  const [clauseFilter, setClauseFilter] = useState('all');
+  const [freqFilter, setFreqFilter] = useState('all');
+  const [activeReport, setActiveReport] = useState(null);
+
+  // All unique clauses for filter dropdown
+  const allClauses = [...new Set(REPORT_CATALOG.flatMap(r => r.clauses))].sort();
+
+  // Filter logic
+  let filtered = REPORT_CATALOG;
+  if (deptFilter !== 'all') filtered = filtered.filter(r => r.dept === deptFilter);
+  if (clauseFilter !== 'all') filtered = filtered.filter(r => r.clauses.includes(clauseFilter));
+  if (freqFilter !== 'all') filtered = filtered.filter(r => r.frequency === freqFilter);
+  if (search.trim()) {
+    const q = search.trim().toLowerCase();
+    filtered = filtered.filter(r =>
+      r.title.toLowerCase().includes(q) ||
+      r.desc.toLowerCase().includes(q) ||
+      r.dept.toLowerCase().includes(q) ||
+      r.clauses.some(c => c.includes(q))
+    );
+  }
+
+  // Group by department for display
+  const byDept = {};
+  for (const r of filtered) {
+    if (!byDept[r.dept]) byDept[r.dept] = [];
+    byDept[r.dept].push(r);
+  }
+  const deptOrder = ['production','quality','maintenance','schedules','stocks','documents','people','cross'];
+
+  if (activeReport) {
+    return html`<${ReportConfig} plant=${plant} me=${me} report=${activeReport} onClose=${() => setActiveReport(null)} />`;
+  }
+
+  return html`
+    <div class="page-header">
+      <div>
+        <h1>📑 Reports & IATF Documents</h1>
+        <div class="sub">${REPORT_CATALOG.length} reports · audit-ready · live data</div>
+      </div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">
+      <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search by name, description, IATF clause…" style="padding:9px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <select value=${deptFilter} onChange=${e => setDeptFilter(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
+          <option value="all">All departments</option>
+          ${Object.entries(DEPT_LABELS).map(([k, v]) => html`<option key=${k} value=${k}>${v}</option>`)}
+        </select>
+        <select value=${clauseFilter} onChange=${e => setClauseFilter(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
+          <option value="all">All IATF clauses</option>
+          ${allClauses.map(c => html`<option key=${c} value=${c}>Clause ${c}</option>`)}
+        </select>
+        <select value=${freqFilter} onChange=${e => setFreqFilter(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
+          <option value="all">All frequencies</option>
+          ${Object.entries(FREQ_LABELS).map(([k, v]) => html`<option key=${k} value=${k}>${v}</option>`)}
+        </select>
+        ${(search || deptFilter !== 'all' || clauseFilter !== 'all' || freqFilter !== 'all') && html`
+          <button class="btn small ghost" onClick=${() => { setSearch(''); setDeptFilter('all'); setClauseFilter('all'); setFreqFilter('all'); }} style="padding:7px 12px;font-size:12px">Clear</button>
+        `}
+      </div>
+      <div style="font-size:11px;color:var(--slate-500)">${filtered.length} of ${REPORT_CATALOG.length} reports</div>
+    </div>
+
+    ${filtered.length === 0 ? html`<div class="card"><div class="empty"><div style="font-size:13px">No reports match these filters</div></div></div>` :
+      deptOrder.filter(d => byDept[d]?.length).map(dept => html`
+        <div key=${dept} style="margin-bottom:18px">
+          <div class="section-h">${DEPT_LABELS[dept]} · ${byDept[dept].length}</div>
+          <div class="grid-cards">
+            ${byDept[dept].map(r => html`
+              <div key=${r.id} class="list-item" onClick=${() => setActiveReport(r)}>
+                <div style="display:flex;gap:10px;align-items:flex-start">
+                  <div style="font-size:24px;flex-shrink:0">${r.icon}</div>
+                  <div style="flex:1;min-width:0">
+                    <div style="font-weight:600;color:var(--slate-900);font-size:14px;line-height:1.3">${r.title}</div>
+                    <div style="font-size:11px;color:var(--slate-500);margin-top:3px;line-height:1.4">${r.desc}</div>
+                    <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">
+                      ${r.clauses.map(c => html`<span style="background:var(--teal-50);color:var(--teal-700);font-size:10px;padding:2px 6px;border-radius:4px;font-weight:600">Clause ${c}</span>`)}
+                      <span style="background:var(--slate-100);color:var(--slate-600);font-size:10px;padding:2px 6px;border-radius:4px">${FREQ_LABELS[r.frequency]}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            `)}
+          </div>
+        </div>
+      `)
+    }
+  `;
+}
+
+// =================================================================
+// REPORT CONFIG — pick filters/date range, then generate
+// =================================================================
+function ReportConfig({ plant, me, report, onClose }) {
+  // Default: last 30 days
+  const today = new Date().toISOString().slice(0, 10);
+  const monthAgo = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+
+  const [dateFrom, setDateFrom] = useState(monthAgo);
+  const [dateTo, setDateTo] = useState(today);
+  const [singleDate, setSingleDate] = useState(today);
+  const [monthPick, setMonthPick] = useState(today.slice(0, 7));
+  const [entityType, setEntityType] = useState('breakdown');
+  const [entityId, setEntityId] = useState('');
+  const [pickedItem, setPickedItem] = useState('');
+  const [generating, setGenerating] = useState(false);
+
+  // Auxiliary lookups
+  const [items, setItems] = useState([]);  // for material traceability
+  const [ncrs, setNcrs] = useState([]);    // for ncr_8d
+  const [allEntities, setAllEntities] = useState([]);  // for audit_trail
+
+  useEffect(() => {
+    if (report.id === 'material_traceability') {
+      sb.from('mcp_stocks_items').select('id, code, name').order('code').then(({ data }) => setItems(data || []));
+    }
+    if (report.id === 'ncr_8d') {
+      sb.from('mcp_quality_ncrs').select('id, ncr_number, title').order('created_at', { ascending:false }).then(({ data }) => setNcrs(data || []));
+    }
+  }, [report.id]);
+
+  // Load entities for audit trail when entity type changes
+  useEffect(() => {
+    if (report.id !== 'audit_trail') return;
+    let q;
+    if (entityType === 'breakdown') q = sb.from('mcp_maintenance_breakdowns').select('id, description, reported_at').order('reported_at', { ascending:false }).limit(100);
+    else if (entityType === 'ncr') q = sb.from('mcp_quality_ncrs').select('id, ncr_number, title, created_at').order('created_at', { ascending:false }).limit(100);
+    else if (entityType === 'task') q = sb.from('actions').select('id, title, created_at').order('created_at', { ascending:false }).limit(100);
+    else if (entityType === 'schedule') q = sb.from('mcp_sched_schedules').select('id, schedule_month, customer_id, mcp_sched_customers(name)').order('schedule_month', { ascending:false }).limit(50);
+    if (q) q.then(({ data }) => setAllEntities(data || []));
+  }, [report.id, entityType]);
+
+  const generate = async () => {
+    setGenerating(true);
+    try {
+      let html_content;
+      switch (report.id) {
+        case 'daily_production':       html_content = await genDailyProduction(plant, singleDate); break;
+        case 'reject_analysis':        html_content = await genRejectAnalysis(plant, dateFrom, dateTo); break;
+        case 'stage_summary':          html_content = await genStageSummary(plant, dateFrom, dateTo); break;
+        case 'ncr_register':           html_content = await genNcrRegister(plant, dateFrom, dateTo); break;
+        case 'ncr_8d':                 html_content = await genNcr8D(plant, pickedItem); break;
+        case 'breakdown_register':     html_content = await genBreakdownRegister(plant, dateFrom, dateTo); break;
+        case 'mtbf_mttr':              html_content = await genMtbfMttr(plant, dateFrom, dateTo); break;
+        case 'schedule_attainment':    html_content = await genScheduleAttainment(plant, monthPick); break;
+        case 'otd_report':             html_content = await genOtd(plant, monthPick); break;
+        case 'stock_movement':         html_content = await genStockMovement(plant, dateFrom, dateTo); break;
+        case 'material_traceability':  html_content = await genMaterialTraceability(plant, pickedItem); break;
+        case 'vendor_grn':             html_content = await genVendorGrn(plant, dateFrom, dateTo); break;
+        case 'document_index':         html_content = await genDocumentIndex(plant, dateFrom, dateTo); break;
+        case 'audit_trail':            html_content = await genAuditTrail(plant, entityType, pickedItem); break;
+        case 'team_snapshot':          html_content = await genTeamSnapshot(plant); break;
+        default: throw new Error('Unknown report');
+      }
+      // Open in new tab
+      const w = window.open('', '_blank');
+      if (!w) { alert('Please allow popups to open the report'); return; }
+      w.document.open();
+      w.document.write(html_content);
+      w.document.close();
+    } catch (err) {
+      alert('Failed to generate report: ' + (err.message || err));
+      console.error(err);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  // Decide which inputs to show
+  const needsDateRange = ['reject_analysis','stage_summary','ncr_register','breakdown_register','mtbf_mttr','stock_movement','vendor_grn','document_index'].includes(report.id);
+  const needsSingleDate = report.id === 'daily_production';
+  const needsMonth = ['schedule_attainment','otd_report'].includes(report.id);
+  const needsItemPick = report.id === 'material_traceability';
+  const needsNcrPick = report.id === 'ncr_8d';
+  const needsEntityPick = report.id === 'audit_trail';
+  const needsNoInput = report.id === 'team_snapshot';
+
+  const canGenerate = (
+    (needsDateRange && dateFrom && dateTo) ||
+    (needsSingleDate && singleDate) ||
+    (needsMonth && monthPick) ||
+    (needsItemPick && pickedItem) ||
+    (needsNcrPick && pickedItem) ||
+    (needsEntityPick && pickedItem) ||
+    needsNoInput
+  );
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:0">
+        <h1 style="font-size:18px">${report.icon} ${report.title}</h1>
+        <div class="sub">${report.desc}</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">CONFIGURE</div>
+
+      ${needsSingleDate && html`
+        <div class="field"><label>Date *</label><input type="date" value=${singleDate} onChange=${e => setSingleDate(e.target.value)} /></div>
+      `}
+
+      ${needsDateRange && html`
+        <div class="field-row">
+          <div class="field"><label>From *</label><input type="date" value=${dateFrom} onChange=${e => setDateFrom(e.target.value)} /></div>
+          <div class="field"><label>To *</label><input type="date" value=${dateTo} onChange=${e => setDateTo(e.target.value)} /></div>
+        </div>
+      `}
+
+      ${needsMonth && html`
+        <div class="field"><label>Month *</label><input type="month" value=${monthPick} onChange=${e => setMonthPick(e.target.value)} /></div>
+      `}
+
+      ${needsItemPick && html`
+        <div class="field"><label>Item *</label>
+          <select value=${pickedItem} onChange=${e => setPickedItem(e.target.value)}>
+            <option value="">— Select item —</option>
+            ${items.map(i => html`<option key=${i.id} value=${i.id}>${i.code} · ${i.name}</option>`)}
+          </select>
+        </div>
+      `}
+
+      ${needsNcrPick && html`
+        <div class="field"><label>NCR *</label>
+          <select value=${pickedItem} onChange=${e => setPickedItem(e.target.value)}>
+            <option value="">— Select NCR —</option>
+            ${ncrs.map(n => html`<option key=${n.id} value=${n.id}>${n.ncr_number} · ${n.title}</option>`)}
+          </select>
+        </div>
+      `}
+
+      ${needsEntityPick && html`
+        <div class="field-row">
+          <div class="field"><label>Type *</label>
+            <select value=${entityType} onChange=${e => { setEntityType(e.target.value); setPickedItem(''); }}>
+              <option value="breakdown">Breakdown</option>
+              <option value="ncr">NCR</option>
+              <option value="task">Task</option>
+              <option value="schedule">Schedule</option>
+            </select>
+          </div>
+          <div class="field"><label>Pick one *</label>
+            <select value=${pickedItem} onChange=${e => setPickedItem(e.target.value)}>
+              <option value="">— Select —</option>
+              ${allEntities.map(e => {
+                const lbl = e.description || e.ncr_number || e.title || (e.schedule_month ? new Date(e.schedule_month).toLocaleDateString('en-IN', {month:'long', year:'numeric'}) + (e.mcp_sched_customers?.name ? ' · ' + e.mcp_sched_customers.name : '') : e.id);
+                return html`<option key=${e.id} value=${e.id}>${lbl?.slice(0, 60)}</option>`;
+              })}
+            </select>
+          </div>
+        </div>
+      `}
+
+      ${needsNoInput && html`
+        <div style="font-size:13px;color:var(--slate-500);padding:10px 0">No configuration needed. Click Generate.</div>
+      `}
+
+      <button class="btn" onClick=${generate} disabled=${!canGenerate || generating} style="margin-top:10px">${generating ? 'Generating…' : '📄 Generate Report'}</button>
+      <div style="font-size:11px;color:var(--slate-500);margin-top:8px;text-align:center">Report opens in a new tab. Use browser print (Ctrl+P) to save as PDF.</div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-title">ABOUT THIS REPORT</div>
+      <div class="card-row"><span class="label">Department</span><span class="value">${DEPT_LABELS[report.dept]}</span></div>
+      <div class="card-row"><span class="label">IATF Clauses</span><span class="value">${report.clauses.map(c => 'Clause ' + c).join(', ')}</span></div>
+      <div class="card-row"><span class="label">Frequency</span><span class="value">${FREQ_LABELS[report.frequency]}</span></div>
+      <div class="card-row"><span class="label">Data source</span><span class="value">Live Loglinkr database</span></div>
+    </div>
+  `;
+}
+
+// =================================================================
+// REPORT TEMPLATES — all generators share a common layout
+// =================================================================
+function reportShell(plant, title, subtitle, bodyHtml, meta = {}) {
+  const now = new Date().toLocaleString('en-IN', { dateStyle:'long', timeStyle:'short' });
+  const metaRows = Object.entries(meta).map(([k, v]) => `<tr><td style="padding:4px 12px 4px 0;color:#64748b;font-size:11px">${k}</td><td style="padding:4px 0;font-weight:600;font-size:12px">${v}</td></tr>`).join('');
+
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8" />
+<title>${title} · ${plant.name}</title>
+<style>
+  @page { size: A4; margin: 18mm 14mm; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, 'Inter', system-ui, sans-serif; color: #0f172a; font-size: 11px; line-height: 1.45; margin: 0; padding: 24px; max-width: 1100px; margin: 0 auto; }
+  .header { border-bottom: 2px solid #0d9488; padding-bottom: 12px; margin-bottom: 18px; display: flex; justify-content: space-between; align-items: flex-start; }
+  .header-left h1 { margin: 0; font-size: 20px; color: #0f172a; }
+  .header-left .sub { font-size: 12px; color: #64748b; margin-top: 2px; }
+  .header-right { text-align: right; }
+  .header-right .plant { font-size: 13px; font-weight: 700; color: #0f766e; }
+  .header-right .gen { font-size: 10px; color: #64748b; margin-top: 2px; }
+  .meta-block { background: #f8fafc; border: 0.5px solid #e2e8f0; border-radius: 6px; padding: 10px 14px; margin-bottom: 16px; }
+  .meta-block table { font-size: 11px; }
+  table.data { width: 100%; border-collapse: collapse; font-size: 11px; margin-bottom: 14px; }
+  table.data th { background: #f1f5f9; text-align: left; padding: 8px 10px; border-bottom: 1.5px solid #cbd5e1; font-weight: 600; color: #334155; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+  table.data td { padding: 7px 10px; border-bottom: 0.5px solid #e2e8f0; vertical-align: top; }
+  table.data tr:nth-child(even) td { background: #fafafa; }
+  table.data .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
+  .stat-box { background: #f8fafc; border-left: 3px solid #0d9488; padding: 8px 12px; border-radius: 4px; }
+  .stat-num { font-size: 18px; font-weight: 700; color: #0f766e; font-variant-numeric: tabular-nums; }
+  .stat-lbl { font-size: 9px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; font-weight: 600; }
+  .footer { margin-top: 24px; padding-top: 12px; border-top: 0.5px solid #e2e8f0; display: flex; justify-content: space-between; font-size: 9px; color: #94a3b8; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 600; }
+  .badge.green { background: #d1fae5; color: #047857; }
+  .badge.amber { background: #fef3c7; color: #b45309; }
+  .badge.rose { background: #fecaca; color: #be123c; }
+  .badge.slate { background: #e2e8f0; color: #475569; }
+  h2.section { margin: 18px 0 8px 0; font-size: 13px; color: #0f172a; padding-bottom: 4px; border-bottom: 0.5px solid #cbd5e1; }
+  .empty { padding: 24px; text-align: center; color: #94a3b8; background: #f8fafc; border-radius: 6px; font-size: 12px; }
+  @media print { body { padding: 0; } .header { page-break-after: avoid; } table.data { page-break-inside: auto; } table.data tr { page-break-inside: avoid; } button.print { display: none !important; } }
+  button.print { position: fixed; top: 12px; right: 12px; background: #0d9488; color: white; border: none; padding: 8px 16px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.15); z-index: 100; font-family: inherit; }
+  button.print:hover { background: #0f766e; }
+</style>
+</head><body>
+<button class="print" onclick="window.print()">🖨 Print / Save PDF</button>
+<div class="header">
+  <div class="header-left">
+    <h1>${title}</h1>
+    <div class="sub">${subtitle || ''}</div>
+  </div>
+  <div class="header-right">
+    <div class="plant">${plant.name}</div>
+    <div class="gen">Generated ${now}</div>
+    ${plant.gstin ? '<div class="gen">GSTIN: ' + plant.gstin + '</div>' : ''}
+  </div>
+</div>
+${Object.keys(meta).length > 0 ? '<div class="meta-block"><table>' + metaRows + '</table></div>' : ''}
+${bodyHtml}
+<div class="footer">
+  <div>Loglinkr · IATF audit-ready report</div>
+  <div>${now}</div>
+</div>
+</body></html>`;
+}
+
+const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const fmt = (n) => Number(n || 0).toLocaleString('en-IN');
+const fmtDateTime = (s) => s ? new Date(s).toLocaleString('en-IN', { dateStyle:'medium', timeStyle:'short' }) : '—';
+const fmtDate = (s) => s ? new Date(s).toLocaleDateString('en-IN', { dateStyle:'medium' }) : '—';
+
+// 1. DAILY PRODUCTION REPORT
+async function genDailyProduction(plant, date) {
+  const startOfDay = date + 'T00:00:00';
+  const endOfDay = date + 'T23:59:59';
+  const { data: shots } = await sb.from('mcp_pdc_shots')
+    .select('*, units(name), shifts(name), mcp_pdc_machines(code), mcp_pdc_dies(code), mcp_pdc_parts(part_number, name), users:operator_user_id(full_name)')
+    .gte('recorded_at', startOfDay).lte('recorded_at', endOfDay)
+    .order('recorded_at');
+
+  const totalGood = (shots || []).reduce((s, r) => s + (r.shots_good || 0), 0);
+  const totalReject = (shots || []).reduce((s, r) => s + (r.shots_rejected || 0), 0);
+  const total = totalGood + totalReject;
+  const rejectPct = total > 0 ? (totalReject / total * 100).toFixed(2) : '0.00';
+
+  const stats = `
+    <div class="stat-grid">
+      <div class="stat-box"><div class="stat-num">${shots?.length || 0}</div><div class="stat-lbl">Shots Logged</div></div>
+      <div class="stat-box"><div class="stat-num">${fmt(totalGood)}</div><div class="stat-lbl">Good Qty</div></div>
+      <div class="stat-box"><div class="stat-num">${fmt(totalReject)}</div><div class="stat-lbl">Reject Qty</div></div>
+      <div class="stat-box"><div class="stat-num">${rejectPct}%</div><div class="stat-lbl">Reject %</div></div>
+    </div>`;
+
+  const rows = (shots || []).length === 0 ? '<div class="empty">No production shots logged on this date.</div>' :
+    `<table class="data"><thead><tr>
+      <th>Time</th><th>Shift</th><th>Unit</th><th>Machine</th><th>Die</th><th>Part</th>
+      <th>Operator</th><th class="num">Good</th><th class="num">Reject</th><th class="num">Reject %</th>
+    </tr></thead><tbody>
+    ${shots.map(s => {
+      const tot = (s.shots_good || 0) + (s.shots_rejected || 0);
+      const rp = tot > 0 ? ((s.shots_rejected || 0) / tot * 100).toFixed(1) : '0';
+      return `<tr>
+        <td>${new Date(s.recorded_at).toLocaleTimeString('en-IN', {hour:'2-digit', minute:'2-digit'})}</td>
+        <td>${esc(s.shifts?.name || '—')}</td>
+        <td>${esc(s.units?.name || '—')}</td>
+        <td>${esc(s.mcp_pdc_machines?.code || '—')}</td>
+        <td>${esc(s.mcp_pdc_dies?.code || '—')}</td>
+        <td>${esc(s.mcp_pdc_parts?.part_number || s.mcp_pdc_parts?.name || '—')}</td>
+        <td>${esc(s.users?.full_name || '—')}</td>
+        <td class="num">${fmt(s.shots_good)}</td>
+        <td class="num">${fmt(s.shots_rejected)}</td>
+        <td class="num">${rp}%</td>
+      </tr>`;
+    }).join('')}
+    </tbody></table>`;
+
+  return reportShell(plant, 'Daily Production Report', new Date(date).toLocaleDateString('en-IN', {dateStyle:'full'}),
+    stats + '<h2 class="section">Shot-by-shot detail</h2>' + rows,
+    { 'Report Date': new Date(date).toLocaleDateString('en-IN'), 'Total Shots': shots?.length || 0 });
+}
+
+// 2. REJECT ANALYSIS
+async function genRejectAnalysis(plant, from, to) {
+  const { data: shots } = await sb.from('mcp_pdc_shots')
+    .select('shots_good, shots_rejected, recorded_at, mcp_pdc_machines(code), mcp_pdc_parts(part_number, name)')
+    .gte('recorded_at', from).lte('recorded_at', to + 'T23:59:59');
+
+  const byMachine = {}, byPart = {};
+  let totalG = 0, totalR = 0;
+  for (const s of (shots || [])) {
+    const mc = s.mcp_pdc_machines?.code || '—';
+    const pt = s.mcp_pdc_parts?.part_number || s.mcp_pdc_parts?.name || '—';
+    if (!byMachine[mc]) byMachine[mc] = { good:0, reject:0 };
+    if (!byPart[pt]) byPart[pt] = { good:0, reject:0 };
+    byMachine[mc].good += s.shots_good || 0; byMachine[mc].reject += s.shots_rejected || 0;
+    byPart[pt].good += s.shots_good || 0; byPart[pt].reject += s.shots_rejected || 0;
+    totalG += s.shots_good || 0; totalR += s.shots_rejected || 0;
+  }
+  const total = totalG + totalR;
+  const overallPct = total > 0 ? (totalR / total * 100).toFixed(2) : '0.00';
+
+  const rowsM = Object.entries(byMachine).sort((a,b) => (b[1].reject/((b[1].good+b[1].reject)||1)) - (a[1].reject/((a[1].good+a[1].reject)||1))).map(([m, d]) => {
+    const t = d.good + d.reject; const pct = t > 0 ? (d.reject/t*100).toFixed(2) : '0';
+    return `<tr><td>${esc(m)}</td><td class="num">${fmt(d.good)}</td><td class="num">${fmt(d.reject)}</td><td class="num">${fmt(t)}</td><td class="num">${pct}%</td></tr>`;
+  }).join('');
+  const rowsP = Object.entries(byPart).sort((a,b) => (b[1].reject/((b[1].good+b[1].reject)||1)) - (a[1].reject/((a[1].good+a[1].reject)||1))).map(([p, d]) => {
+    const t = d.good + d.reject; const pct = t > 0 ? (d.reject/t*100).toFixed(2) : '0';
+    return `<tr><td>${esc(p)}</td><td class="num">${fmt(d.good)}</td><td class="num">${fmt(d.reject)}</td><td class="num">${fmt(t)}</td><td class="num">${pct}%</td></tr>`;
+  }).join('');
+
+  const body = `
+    <div class="stat-grid">
+      <div class="stat-box"><div class="stat-num">${fmt(totalG)}</div><div class="stat-lbl">Total Good</div></div>
+      <div class="stat-box"><div class="stat-num">${fmt(totalR)}</div><div class="stat-lbl">Total Reject</div></div>
+      <div class="stat-box"><div class="stat-num">${overallPct}%</div><div class="stat-lbl">Overall Reject %</div></div>
+      <div class="stat-box"><div class="stat-num">${shots?.length || 0}</div><div class="stat-lbl">Shots</div></div>
+    </div>
+    <h2 class="section">By Machine</h2>
+    ${rowsM ? '<table class="data"><thead><tr><th>Machine</th><th class="num">Good</th><th class="num">Reject</th><th class="num">Total</th><th class="num">Reject %</th></tr></thead><tbody>' + rowsM + '</tbody></table>' : '<div class="empty">No data</div>'}
+    <h2 class="section">By Part</h2>
+    ${rowsP ? '<table class="data"><thead><tr><th>Part</th><th class="num">Good</th><th class="num">Reject</th><th class="num">Total</th><th class="num">Reject %</th></tr></thead><tbody>' + rowsP + '</tbody></table>' : '<div class="empty">No data</div>'}`;
+
+  return reportShell(plant, 'Reject Analysis', `${fmtDate(from)} to ${fmtDate(to)}`, body,
+    { 'Period': `${fmtDate(from)} → ${fmtDate(to)}`, 'Overall Reject %': overallPct + '%' });
+}
+
+// 3. STAGE SUMMARY
+async function genStageSummary(plant, from, to) {
+  const { data: logs } = await sb.from('mcp_pdc_stage_log')
+    .select('stage, qty_good, qty_rejected, log_date, mcp_pdc_parts(part_number, name)')
+    .gte('log_date', from).lte('log_date', to);
+
+  const byStage = {};
+  for (const l of (logs || [])) {
+    const s = l.stage || 'unknown';
+    if (!byStage[s]) byStage[s] = { good:0, reject:0, count:0 };
+    byStage[s].good += l.qty_good || 0; byStage[s].reject += l.qty_rejected || 0; byStage[s].count++;
+  }
+  const rows = Object.entries(byStage).map(([s, d]) => {
+    const t = d.good + d.reject; const pct = t > 0 ? (d.reject/t*100).toFixed(2) : '0';
+    return `<tr><td><b>${esc(s)}</b></td><td class="num">${d.count}</td><td class="num">${fmt(d.good)}</td><td class="num">${fmt(d.reject)}</td><td class="num">${pct}%</td></tr>`;
+  }).join('');
+
+  return reportShell(plant, 'Stage-wise Production Summary', `${fmtDate(from)} to ${fmtDate(to)}`,
+    rows ? '<table class="data"><thead><tr><th>Stage</th><th class="num">Logs</th><th class="num">Good</th><th class="num">Reject</th><th class="num">Reject %</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<div class="empty">No stage logs in this period</div>',
+    { 'Period': `${fmtDate(from)} → ${fmtDate(to)}` });
+}
+
+// 4. NCR REGISTER
+async function genNcrRegister(plant, from, to) {
+  const { data: ncrs } = await sb.from('mcp_quality_ncrs')
+    .select('*, raised_by_user:raised_by(full_name), assigned_to_user:assigned_to(full_name)')
+    .gte('created_at', from).lte('created_at', to + 'T23:59:59')
+    .order('created_at', { ascending:false });
+
+  const open = (ncrs || []).filter(n => n.status === 'open').length;
+  const closed = (ncrs || []).filter(n => n.status === 'closed').length;
+
+  const rows = (ncrs || []).map(n => {
+    const sev = n.severity ? `<span class="badge ${n.severity === 'major' ? 'rose' : n.severity === 'minor' ? 'amber' : 'slate'}">${esc(n.severity)}</span>` : '—';
+    const st = `<span class="badge ${n.status === 'open' ? 'rose' : n.status === 'closed' ? 'green' : 'slate'}">${esc(n.status)}</span>`;
+    return `<tr>
+      <td><b>${esc(n.ncr_number)}</b></td>
+      <td>${fmtDate(n.created_at)}</td>
+      <td>${esc(n.title || '')}</td>
+      <td>${esc(n.part_number || '—')}</td>
+      <td class="num">${fmt(n.qty_affected)}</td>
+      <td>${sev}</td>
+      <td>${st}</td>
+      <td>${esc(n.raised_by_user?.full_name || '—')}</td>
+      <td>${esc(n.assigned_to_user?.full_name || '—')}</td>
+    </tr>`;
+  }).join('');
+
+  const body = `
+    <div class="stat-grid">
+      <div class="stat-box"><div class="stat-num">${ncrs?.length || 0}</div><div class="stat-lbl">Total NCRs</div></div>
+      <div class="stat-box"><div class="stat-num">${open}</div><div class="stat-lbl">Open</div></div>
+      <div class="stat-box"><div class="stat-num">${closed}</div><div class="stat-lbl">Closed</div></div>
+      <div class="stat-box"><div class="stat-num">${ncrs?.length > 0 ? Math.round(closed/ncrs.length*100) : 0}%</div><div class="stat-lbl">Closure Rate</div></div>
+    </div>
+    ${rows ? '<table class="data"><thead><tr><th>NCR #</th><th>Date</th><th>Title</th><th>Part</th><th class="num">Qty</th><th>Severity</th><th>Status</th><th>Raised By</th><th>Assigned</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<div class="empty">No NCRs in this period</div>'}`;
+
+  return reportShell(plant, 'NCR Register', `${fmtDate(from)} to ${fmtDate(to)}`, body,
+    { 'Period': `${fmtDate(from)} → ${fmtDate(to)}` });
+}
+
+// 5. NCR 8D-style timeline
+async function genNcr8D(plant, ncrId) {
+  const [{ data: ncr }, { data: timeline }] = await Promise.all([
+    sb.from('mcp_quality_ncrs').select('*, raised_by_user:raised_by(full_name), assigned_to_user:assigned_to(full_name)').eq('id', ncrId).single(),
+    sb.rpc('get_timeline', { p_entity_type: 'ncr', p_entity_id: ncrId }),
+  ]);
+  if (!ncr) throw new Error('NCR not found');
+
+  const tlRows = (timeline || []).map(t => {
+    const isComment = t.event_kind === 'comment';
+    const detail = isComment ? esc(t.body) :
+      (t.event_type === 'status_changed' ? `${t.payload?.from || '?'} → ${t.payload?.to || '?'}` :
+       t.event_type === 'created' ? 'NCR created' :
+       t.event_type === 'assigned' ? 'Assignment changed' : esc(JSON.stringify(t.payload || {})));
+    return `<tr><td>${fmtDateTime(t.created_at)}</td><td><b>${esc(t.actor_name || '—')}</b></td><td>${esc(t.event_type)}</td><td>${detail}</td></tr>`;
+  }).join('');
+
+  const meta = {
+    'NCR Number': ncr.ncr_number,
+    'Severity': ncr.severity || '—',
+    'Status': ncr.status,
+    'Raised By': ncr.raised_by_user?.full_name || '—',
+    'Assigned To': ncr.assigned_to_user?.full_name || '—',
+    'Part': ncr.part_number || '—',
+    'Qty Affected': ncr.qty_affected || '—',
+  };
+
+  const body = `
+    <h2 class="section">D1 — Problem Description</h2>
+    <p style="font-size:12px;line-height:1.6">${esc(ncr.title || '—')}</p>
+    <p style="font-size:11px;color:#475569;line-height:1.5">${esc(ncr.description || '')}</p>
+
+    <h2 class="section">D2-D7 — Resolution Timeline</h2>
+    ${tlRows ? '<table class="data"><thead><tr><th>When</th><th>Who</th><th>Event</th><th>Detail</th></tr></thead><tbody>' + tlRows + '</tbody></table>' : '<div class="empty">No timeline events recorded</div>'}
+
+    <h2 class="section">D8 — Closure</h2>
+    <p style="font-size:12px;line-height:1.6">Status: <span class="badge ${ncr.status === 'closed' ? 'green' : 'rose'}">${esc(ncr.status)}</span></p>
+  `;
+
+  return reportShell(plant, 'NCR Resolution Timeline (8D)', ncr.ncr_number + ' · ' + (ncr.title || ''), body, meta);
+}
+
+// 6. BREAKDOWN REGISTER
+async function genBreakdownRegister(plant, from, to) {
+  const { data: bds } = await sb.from('mcp_maintenance_breakdowns')
+    .select('*, mcp_pdc_machines(code), reporter:reported_by(full_name), attendant:attended_by(full_name)')
+    .gte('reported_at', from).lte('reported_at', to + 'T23:59:59')
+    .order('reported_at', { ascending:false });
+
+  const open = (bds || []).filter(b => b.status === 'open').length;
+  const resolved = (bds || []).filter(b => b.status === 'resolved').length;
+  const totalDowntime = (bds || []).reduce((s, b) => {
+    if (b.resolved_at) return s + (new Date(b.resolved_at) - new Date(b.reported_at)) / 3600000;
+    return s;
+  }, 0);
+
+  const rows = (bds || []).map(b => {
+    const dur = b.resolved_at ? ((new Date(b.resolved_at) - new Date(b.reported_at)) / 3600000).toFixed(1) + ' hrs' : 'open';
+    return `<tr>
+      <td>${fmtDateTime(b.reported_at)}</td>
+      <td><b>${esc(b.mcp_pdc_machines?.code || '—')}</b></td>
+      <td>${esc(b.description || '')}</td>
+      <td>${esc(b.reporter?.full_name || '—')}</td>
+      <td>${esc(b.attendant?.full_name || '—')}</td>
+      <td>${fmtDateTime(b.attended_at)}</td>
+      <td>${fmtDateTime(b.resolved_at)}</td>
+      <td>${dur}</td>
+      <td><span class="badge ${b.status === 'resolved' ? 'green' : b.status === 'attended' ? 'amber' : 'rose'}">${esc(b.status)}</span></td>
+    </tr>`;
+  }).join('');
+
+  const body = `
+    <div class="stat-grid">
+      <div class="stat-box"><div class="stat-num">${bds?.length || 0}</div><div class="stat-lbl">Total Breakdowns</div></div>
+      <div class="stat-box"><div class="stat-num">${open}</div><div class="stat-lbl">Open</div></div>
+      <div class="stat-box"><div class="stat-num">${resolved}</div><div class="stat-lbl">Resolved</div></div>
+      <div class="stat-box"><div class="stat-num">${totalDowntime.toFixed(1)}h</div><div class="stat-lbl">Total Downtime</div></div>
+    </div>
+    ${rows ? '<table class="data"><thead><tr><th>Reported</th><th>Machine</th><th>Description</th><th>Reporter</th><th>Attendant</th><th>Attended</th><th>Resolved</th><th>Duration</th><th>Status</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<div class="empty">No breakdowns in this period</div>'}`;
+
+  return reportShell(plant, 'Breakdown Register', `${fmtDate(from)} to ${fmtDate(to)}`, body,
+    { 'Period': `${fmtDate(from)} → ${fmtDate(to)}`, 'Total Downtime': totalDowntime.toFixed(1) + ' hours' });
+}
+
+// 7. MTBF / MTTR
+async function genMtbfMttr(plant, from, to) {
+  const { data: bds } = await sb.from('mcp_maintenance_breakdowns')
+    .select('machine_id, reported_at, resolved_at, mcp_pdc_machines(code)')
+    .gte('reported_at', from).lte('reported_at', to + 'T23:59:59');
+
+  const byMachine = {};
+  for (const b of (bds || [])) {
+    const mc = b.mcp_pdc_machines?.code || '—';
+    if (!byMachine[mc]) byMachine[mc] = { count:0, totalRepair:0, repairCount:0, dates:[] };
+    byMachine[mc].count++;
+    byMachine[mc].dates.push(new Date(b.reported_at));
+    if (b.resolved_at) {
+      const repair = (new Date(b.resolved_at) - new Date(b.reported_at)) / 3600000;
+      byMachine[mc].totalRepair += repair; byMachine[mc].repairCount++;
+    }
+  }
+
+  const rows = Object.entries(byMachine).map(([mc, d]) => {
+    d.dates.sort((a, b) => a - b);
+    let mtbf = '—';
+    if (d.dates.length >= 2) {
+      const gaps = [];
+      for (let i = 1; i < d.dates.length; i++) gaps.push((d.dates[i] - d.dates[i-1]) / 3600000);
+      const avg = gaps.reduce((s, g) => s + g, 0) / gaps.length;
+      mtbf = avg.toFixed(1) + ' hrs';
+    }
+    const mttr = d.repairCount > 0 ? (d.totalRepair / d.repairCount).toFixed(1) + ' hrs' : '—';
+    return `<tr><td><b>${esc(mc)}</b></td><td class="num">${d.count}</td><td class="num">${mtbf}</td><td class="num">${mttr}</td></tr>`;
+  }).join('');
+
+  return reportShell(plant, 'MTBF / MTTR per Machine', `${fmtDate(from)} to ${fmtDate(to)}`,
+    rows ? '<table class="data"><thead><tr><th>Machine</th><th class="num">Breakdowns</th><th class="num">MTBF</th><th class="num">MTTR</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<div class="empty">No breakdowns to compute MTBF/MTTR</div>',
+    { 'Period': `${fmtDate(from)} → ${fmtDate(to)}` });
+}
+
+// 8. SCHEDULE ATTAINMENT
+async function genScheduleAttainment(plant, monthStr) {
+  const monthDate = monthStr + '-01';
+  const { data: rows } = await sb.from('v_schedule_status_current_month').select('*');
+  // Note: view is current_month-only; for historic we'd need a different view
+  // For now, only show if requested month matches current month
+  const isCurrent = new Date().toISOString().slice(0,7) === monthStr;
+  const data = isCurrent ? (rows || []) : [];
+
+  const totalP = data.reduce((s, r) => s + parseFloat(r.total_planned || 0), 0);
+  const totalS = data.reduce((s, r) => s + parseFloat(r.total_supplied || 0), 0);
+  const overallPct = totalP > 0 ? (totalS/totalP*100).toFixed(1) : '0';
+
+  const tblRows = data.map(r => {
+    const pct = parseFloat(r.pct_attainment || 0).toFixed(1);
+    const cls = pct >= 90 ? 'green' : pct >= 60 ? 'amber' : 'rose';
+    return `<tr>
+      <td><b>${esc(r.customer_name)}</b>${r.customer_code ? ' · ' + esc(r.customer_code) : ''}</td>
+      <td class="num">${r.total_lines}</td>
+      <td class="num">${fmt(r.total_planned)}</td>
+      <td class="num">${fmt(r.total_supplied)}</td>
+      <td class="num">${fmt(r.gap_qty)}</td>
+      <td class="num"><span class="badge ${cls}">${pct}%</span></td>
+      <td class="num">${r.overdue_lines || 0}</td>
+    </tr>`;
+  }).join('');
+
+  const body = `
+    ${!isCurrent ? '<div class="empty">Schedule attainment is only available for the current month with the current view. Historic months coming in next iteration.</div>' : ''}
+    <div class="stat-grid">
+      <div class="stat-box"><div class="stat-num">${data.length}</div><div class="stat-lbl">Customers</div></div>
+      <div class="stat-box"><div class="stat-num">${fmt(totalP)}</div><div class="stat-lbl">Planned</div></div>
+      <div class="stat-box"><div class="stat-num">${fmt(totalS)}</div><div class="stat-lbl">Supplied</div></div>
+      <div class="stat-box"><div class="stat-num">${overallPct}%</div><div class="stat-lbl">Overall</div></div>
+    </div>
+    ${tblRows ? '<table class="data"><thead><tr><th>Customer</th><th class="num">Lines</th><th class="num">Planned</th><th class="num">Supplied</th><th class="num">Gap</th><th class="num">% Achv</th><th class="num">Overdue</th></tr></thead><tbody>' + tblRows + '</tbody></table>' : (isCurrent ? '<div class="empty">No active schedules this month</div>' : '')}`;
+
+  return reportShell(plant, 'Customer Schedule Attainment',
+    new Date(monthDate).toLocaleDateString('en-IN', { month:'long', year:'numeric' }), body,
+    { 'Month': new Date(monthDate).toLocaleDateString('en-IN', { month:'long', year:'numeric' }), 'Overall Attainment': overallPct + '%' });
+}
+
+// 9. OTD REPORT
+async function genOtd(plant, monthStr) {
+  const monthDate = monthStr + '-01';
+  // Pull lines with their supplies for the month
+  const { data: scheds } = await sb.from('mcp_sched_schedules').select('id, customer_id, mcp_sched_customers(name, short_code)').eq('schedule_month', monthDate).eq('status','active');
+  const schedIds = (scheds || []).map(s => s.id);
+  const { data: lines } = await sb.from('mcp_sched_lines').select('id, schedule_id, delivery_date, planned_qty, part_name_raw').in('schedule_id', schedIds.length ? schedIds : ['00000000-0000-0000-0000-000000000000']);
+  const { data: supplies } = await sb.from('mcp_sched_supplies').select('schedule_line_id, dispatch_date, supplied_qty').in('schedule_id', schedIds.length ? schedIds : ['00000000-0000-0000-0000-000000000000']);
+
+  const supByLine = {};
+  for (const s of (supplies || [])) {
+    if (!supByLine[s.schedule_line_id]) supByLine[s.schedule_line_id] = { qty:0, earliest: null };
+    supByLine[s.schedule_line_id].qty += parseFloat(s.supplied_qty);
+    if (!supByLine[s.schedule_line_id].earliest || s.dispatch_date < supByLine[s.schedule_line_id].earliest) supByLine[s.schedule_line_id].earliest = s.dispatch_date;
+  }
+
+  let onTime = 0, late = 0, pending = 0;
+  const rows = (lines || []).map(l => {
+    const sup = supByLine[l.id] || { qty: 0, earliest: null };
+    const fulfilled = sup.qty >= parseFloat(l.planned_qty);
+    let status = 'pending', cls = 'amber';
+    if (fulfilled) {
+      if (sup.earliest && sup.earliest <= l.delivery_date) { status = 'on-time'; cls = 'green'; onTime++; }
+      else { status = 'late'; cls = 'rose'; late++; }
+    } else {
+      pending++;
+      if (l.delivery_date < new Date().toISOString().slice(0,10)) { status = 'overdue'; cls = 'rose'; }
+    }
+    const sched = (scheds || []).find(s => s.id === l.schedule_id);
+    return `<tr>
+      <td>${esc(sched?.mcp_sched_customers?.short_code || sched?.mcp_sched_customers?.name || '—')}</td>
+      <td>${fmtDate(l.delivery_date)}</td>
+      <td>${esc(l.part_name_raw)}</td>
+      <td class="num">${fmt(l.planned_qty)}</td>
+      <td class="num">${fmt(sup.qty)}</td>
+      <td>${sup.earliest ? fmtDate(sup.earliest) : '—'}</td>
+      <td><span class="badge ${cls}">${status}</span></td>
+    </tr>`;
+  }).join('');
+
+  const totalLines = (lines || []).length;
+  const otdPct = (onTime + late) > 0 ? (onTime / (onTime + late) * 100).toFixed(1) : '—';
+
+  const body = `
+    <div class="stat-grid">
+      <div class="stat-box"><div class="stat-num">${totalLines}</div><div class="stat-lbl">Delivery Lines</div></div>
+      <div class="stat-box"><div class="stat-num">${onTime}</div><div class="stat-lbl">On Time</div></div>
+      <div class="stat-box"><div class="stat-num">${late}</div><div class="stat-lbl">Late</div></div>
+      <div class="stat-box"><div class="stat-num">${otdPct}%</div><div class="stat-lbl">OTD %</div></div>
+    </div>
+    ${rows ? '<table class="data"><thead><tr><th>Customer</th><th>Due Date</th><th>Part</th><th class="num">Planned</th><th class="num">Supplied</th><th>Earliest Dispatch</th><th>Status</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<div class="empty">No schedule lines for this month</div>'}`;
+
+  return reportShell(plant, 'On-Time Delivery (OTD)',
+    new Date(monthDate).toLocaleDateString('en-IN', {month:'long', year:'numeric'}), body,
+    { 'Month': new Date(monthDate).toLocaleDateString('en-IN', {month:'long', year:'numeric'}), 'OTD%': otdPct + '%' });
+}
+
+// 10. STOCK MOVEMENT
+async function genStockMovement(plant, from, to) {
+  const { data: txns } = await sb.from('mcp_stocks_transactions')
+    .select('*, mcp_stocks_items(code, name, uom), users:performed_by(full_name)')
+    .gte('created_at', from).lte('created_at', to + 'T23:59:59')
+    .order('created_at', { ascending: false }).limit(2000);
+
+  const INWARD = ['grn','return','opening','adjustment_in'];
+  const isInw = (t) => INWARD.includes(t);
+
+  const totIn = (txns || []).filter(t => isInw(t.txn_type)).reduce((s, t) => s + Math.abs(parseFloat(t.qty)), 0);
+  const totOut = (txns || []).filter(t => !isInw(t.txn_type)).reduce((s, t) => s + Math.abs(parseFloat(t.qty)), 0);
+
+  const rows = (txns || []).map(t => `<tr>
+    <td>${fmtDateTime(t.created_at)}</td>
+    <td><b>${esc(t.mcp_stocks_items?.code || '—')}</b> · ${esc(t.mcp_stocks_items?.name || '')}</td>
+    <td><span class="badge ${isInw(t.txn_type) ? 'green' : 'rose'}">${esc(t.txn_type)}</span></td>
+    <td class="num">${isInw(t.txn_type) ? '+' : '−'}${fmt(Math.abs(t.qty))} ${esc(t.mcp_stocks_items?.uom || '')}</td>
+    <td class="num">${fmt(t.qty_after)}</td>
+    <td>${esc(t.reference || '—')}</td>
+    <td>${esc(t.users?.full_name || '—')}</td>
+  </tr>`).join('');
+
+  const body = `
+    <div class="stat-grid">
+      <div class="stat-box"><div class="stat-num">${txns?.length || 0}</div><div class="stat-lbl">Transactions</div></div>
+      <div class="stat-box"><div class="stat-num">+${fmt(totIn)}</div><div class="stat-lbl">Total Inward</div></div>
+      <div class="stat-box"><div class="stat-num">−${fmt(totOut)}</div><div class="stat-lbl">Total Outward</div></div>
+      <div class="stat-box"><div class="stat-num">${fmt(totIn - totOut)}</div><div class="stat-lbl">Net Movement</div></div>
+    </div>
+    ${rows ? '<table class="data"><thead><tr><th>When</th><th>Item</th><th>Type</th><th class="num">Qty</th><th class="num">Balance After</th><th>Reference</th><th>By</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<div class="empty">No transactions in this period</div>'}`;
+
+  return reportShell(plant, 'Stock Movement Report', `${fmtDate(from)} to ${fmtDate(to)}`, body,
+    { 'Period': `${fmtDate(from)} → ${fmtDate(to)}` });
+}
+
+// 11. MATERIAL TRACEABILITY
+async function genMaterialTraceability(plant, itemId) {
+  const [{ data: item }, { data: txns }] = await Promise.all([
+    sb.from('mcp_stocks_items').select('*').eq('id', itemId).single(),
+    sb.from('mcp_stocks_transactions').select('*, users:performed_by(full_name)').eq('item_id', itemId).order('created_at', { ascending:true }),
+  ]);
+  if (!item) throw new Error('Item not found');
+
+  const INWARD = ['grn','return','opening','adjustment_in'];
+  const isInw = (t) => INWARD.includes(t);
+
+  const rows = (txns || []).map(t => `<tr>
+    <td>${fmtDateTime(t.created_at)}</td>
+    <td><span class="badge ${isInw(t.txn_type) ? 'green' : 'rose'}">${esc(t.txn_type)}</span></td>
+    <td class="num">${isInw(t.txn_type) ? '+' : '−'}${fmt(Math.abs(t.qty))}</td>
+    <td class="num">${fmt(t.qty_after)}</td>
+    <td>${esc(t.reference || '—')}</td>
+    <td>${esc(t.notes || '')}</td>
+    <td>${esc(t.users?.full_name || '—')}</td>
+  </tr>`).join('');
+
+  const body = `
+    <div class="stat-grid">
+      <div class="stat-box"><div class="stat-num">${fmt(item.current_qty)}</div><div class="stat-lbl">Current Stock (${item.uom})</div></div>
+      <div class="stat-box"><div class="stat-num">${txns?.length || 0}</div><div class="stat-lbl">Transactions</div></div>
+      <div class="stat-box"><div class="stat-num">${fmt(item.reorder_level || 0)}</div><div class="stat-lbl">Reorder Level</div></div>
+      <div class="stat-box"><div class="stat-num">${item.unit_cost ? '₹' + fmt(item.unit_cost) : '—'}</div><div class="stat-lbl">Unit Cost</div></div>
+    </div>
+    ${rows ? '<table class="data"><thead><tr><th>When</th><th>Type</th><th class="num">Qty</th><th class="num">Balance</th><th>Reference</th><th>Notes</th><th>By</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<div class="empty">No transaction history</div>'}`;
+
+  return reportShell(plant, 'Material Traceability', `${item.code} · ${item.name}`, body,
+    { 'Item Code': item.code, 'Description': item.name, 'Category': item.category || '—', 'UOM': item.uom });
+}
+
+// 12. VENDOR GRN SUMMARY
+async function genVendorGrn(plant, from, to) {
+  const { data: docs } = await sb.from('mcp_logistics_documents')
+    .select('*, vendor:vendor_id(name, short_code)')
+    .gte('document_date', from).lte('document_date', to)
+    .order('document_date', { ascending:false });
+
+  const grouped = {};
+  for (const d of (docs || [])) {
+    const v = d.vendor?.name || d.vendor_name || 'Unknown';
+    if (!grouped[v]) grouped[v] = { docs:[], totalAmt:0 };
+    grouped[v].docs.push(d);
+    grouped[v].totalAmt += parseFloat(d.total_amount || 0);
+  }
+
+  const sections = Object.entries(grouped).map(([vendor, g]) => {
+    const drows = g.docs.map(d => `<tr>
+      <td>${fmtDate(d.document_date)}</td>
+      <td>${esc(d.doc_type || '—')}</td>
+      <td><b>${esc(d.doc_number || '—')}</b></td>
+      <td class="num">${d.total_amount ? '₹' + fmt(d.total_amount) : '—'}</td>
+      <td>${esc(d.notes || '')}</td>
+    </tr>`).join('');
+    return `<h2 class="section">${esc(vendor)} · ${g.docs.length} docs · ₹${fmt(g.totalAmt)}</h2>
+      <table class="data"><thead><tr><th>Date</th><th>Type</th><th>Doc #</th><th class="num">Amount</th><th>Notes</th></tr></thead><tbody>${drows}</tbody></table>`;
+  }).join('');
+
+  return reportShell(plant, 'Vendor GRN Summary', `${fmtDate(from)} to ${fmtDate(to)}`,
+    sections || '<div class="empty">No documents in this period</div>',
+    { 'Period': `${fmtDate(from)} → ${fmtDate(to)}`, 'Vendors': Object.keys(grouped).length });
+}
+
+// 13. DOCUMENT INDEX
+async function genDocumentIndex(plant, from, to) {
+  const { data: docs } = await sb.from('mcp_logistics_documents')
+    .select('*, vendor:vendor_id(name)')
+    .gte('document_date', from).lte('document_date', to)
+    .order('document_date', { ascending:false });
+  const rows = (docs || []).map(d => `<tr>
+    <td>${fmtDate(d.document_date)}</td>
+    <td>${esc(d.doc_type || '—')}</td>
+    <td><b>${esc(d.doc_number || '—')}</b></td>
+    <td>${esc(d.vendor?.name || d.vendor_name || '—')}</td>
+    <td class="num">${d.total_amount ? '₹' + fmt(d.total_amount) : '—'}</td>
+    <td><span class="badge ${d.status === 'paid' || d.status === 'approved' ? 'green' : 'slate'}">${esc(d.status || '—')}</span></td>
+  </tr>`).join('');
+  return reportShell(plant, 'Documents Index', `${fmtDate(from)} to ${fmtDate(to)}`,
+    rows ? '<table class="data"><thead><tr><th>Date</th><th>Type</th><th>Number</th><th>Vendor/Customer</th><th class="num">Amount</th><th>Status</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<div class="empty">No documents in this period</div>',
+    { 'Period': `${fmtDate(from)} → ${fmtDate(to)}`, 'Total docs': docs?.length || 0 });
+}
+
+// 14. AUDIT TRAIL (per entity)
+async function genAuditTrail(plant, entityType, entityId) {
+  const { data: timeline } = await sb.rpc('get_timeline', { p_entity_type: entityType, p_entity_id: entityId });
+  // Get entity details for header
+  let entityLabel = '—';
+  try {
+    if (entityType === 'breakdown') {
+      const { data } = await sb.from('mcp_maintenance_breakdowns').select('description, mcp_pdc_machines(code), reported_at').eq('id', entityId).single();
+      entityLabel = (data?.mcp_pdc_machines?.code || '?') + ' · ' + (data?.description || '');
+    } else if (entityType === 'ncr') {
+      const { data } = await sb.from('mcp_quality_ncrs').select('ncr_number, title').eq('id', entityId).single();
+      entityLabel = (data?.ncr_number || '?') + ' · ' + (data?.title || '');
+    } else if (entityType === 'task') {
+      const { data } = await sb.from('actions').select('title').eq('id', entityId).single();
+      entityLabel = data?.title || '—';
+    } else if (entityType === 'schedule') {
+      const { data } = await sb.from('mcp_sched_schedules').select('schedule_month, mcp_sched_customers(name)').eq('id', entityId).single();
+      entityLabel = (data?.mcp_sched_customers?.name || '?') + ' · ' + (data?.schedule_month ? new Date(data.schedule_month).toLocaleDateString('en-IN', {month:'long',year:'numeric'}) : '');
+    }
+  } catch (e) { /* ignore */ }
+
+  const rows = (timeline || []).map(t => {
+    const isComment = t.event_kind === 'comment';
+    const detail = isComment ? esc(t.body) :
+      (t.event_type === 'status_changed' ? `${esc(t.payload?.from || '?')} → ${esc(t.payload?.to || '?')}` :
+       t.event_type === 'created' ? esc(t.payload?.title || 'Created') :
+       t.event_type === 'assigned' ? 'Assignment changed' :
+       t.event_type === 'updated' ? esc(t.payload?.note || t.payload?.field || 'Updated') :
+       esc(JSON.stringify(t.payload || {})));
+    return `<tr><td>${fmtDateTime(t.created_at)}</td><td><b>${esc(t.actor_name || '—')}</b></td><td>${esc(t.event_type)}</td><td>${detail}</td></tr>`;
+  }).join('');
+
+  return reportShell(plant, 'Audit Trail', entityType.toUpperCase() + ' · ' + entityLabel,
+    rows ? '<table class="data"><thead><tr><th>When</th><th>Who</th><th>Event</th><th>Detail</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<div class="empty">No timeline events recorded</div>',
+    { 'Entity': entityType, 'Reference': entityLabel });
+}
+
+// 15. TEAM SNAPSHOT
+async function genTeamSnapshot(plant) {
+  const { data: users } = await sb.from('users').select('*').eq('plant_id', plant.id).order('full_name');
+  const rows = (users || []).map(u => `<tr>
+    <td><b>${esc(u.full_name || '—')}</b></td>
+    <td>${esc(u.email || '—')}</td>
+    <td>${esc(u.phone || '—')}</td>
+    <td>${esc(u.role || '—')}</td>
+    <td>${esc(u.department || '—')}</td>
+    <td>${esc(u.status || '—')}</td>
+  </tr>`).join('');
+  return reportShell(plant, 'Team & Roles Snapshot', plant.name,
+    rows ? '<table class="data"><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Role</th><th>Department</th><th>Status</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<div class="empty">No team members yet</div>',
+    { 'Plant': plant.name, 'Total': users?.length || 0 });
+}
+
+// ========== END REPORTS MODULE ==========
+
 
 // ============= SIMPLE TAB (placeholder) =============
 function SimpleTab({ title, sub, comingSoon, block }) {
