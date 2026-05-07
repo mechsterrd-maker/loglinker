@@ -8420,6 +8420,409 @@ const IATF_RECORDS = [
     note:'kWh per shift / per machine, sustainability tracking' },
 ];
 
+// =================================================================
+// DOCUMENT NUMBER MANAGER — bulk setup + individual edit + history
+// =================================================================
+function DocNumberManager({ plant, me }) {
+  const [docNums, setDocNums] = useState({});  // { report_id: {doc_number, revision, ...} }
+  const [loading, setLoading] = useState(true);
+  const [editTarget, setEditTarget] = useState(null);
+  const [historyTarget, setHistoryTarget] = useState(null);
+  const [showBulk, setShowBulk] = useState(false);
+
+  const refresh = async () => {
+    const { data } = await sb.from('report_doc_numbers').select('*');
+    const map = {};
+    for (const r of (data || [])) map[r.report_id] = r;
+    setDocNums(map);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, []);
+
+  // All built reports (block 1) — these need doc numbers
+  const builtReports = IATF_RECORDS.filter(r => r.block === 1);
+
+  // Group by department
+  const byDept = {};
+  for (const r of builtReports) {
+    if (!byDept[r.dept]) byDept[r.dept] = [];
+    byDept[r.dept].push(r);
+  }
+
+  const assigned = builtReports.filter(r => docNums[r.reportId]).length;
+  const unassigned = builtReports.length - assigned;
+
+  return html`
+    <div class="card" style="background:linear-gradient(135deg, var(--teal-700), var(--teal-600));color:white;border:none;margin-bottom:14px">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div style="font-size:11px;opacity:0.85;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">DOCUMENT NUMBERS</div>
+          <div style="font-size:32px;font-weight:700;line-height:1">${assigned} <span style="font-size:14px;opacity:0.85">of ${builtReports.length}</span></div>
+          <div style="font-size:12px;opacity:0.9;margin-top:4px">${unassigned > 0 ? unassigned + ' reports need doc numbers' : '✓ All reports numbered'}</div>
+        </div>
+        <button class="btn" style="background:white;color:var(--teal-700);font-weight:600" onClick=${() => setShowBulk(true)}>⚡ Bulk Setup</button>
+      </div>
+    </div>
+
+    <div style="font-size:11px;color:var(--slate-500);margin-bottom:14px;line-height:1.5">
+      Set permanent document numbers for each report. Once assigned, every generated PDF includes the doc number, revision, and effective date in the header — IATF audit-ready. Tap any report to edit. Tap 🕒 to view revision history.
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      Object.entries(byDept).map(([dept, reports]) => html`
+        <div key=${dept} style="margin-bottom:18px">
+          <div class="section-h">${DEPT_LABELS[dept] || dept} · ${reports.length}</div>
+          <div class="grid-cards">
+            ${reports.map(rec => {
+              const reportObj = REPORT_CATALOG.find(rc => rc.id === rec.reportId);
+              const docInfo = docNums[rec.reportId];
+              return html`
+                <div key=${rec.reportId} class="list-item" style="border-left:3px solid ${docInfo ? 'var(--emerald-500)' : 'var(--amber-400)'}">
+                  <div style="display:flex;gap:10px;align-items:flex-start">
+                    <div style="font-size:20px;flex-shrink:0">${reportObj?.icon || '📄'}</div>
+                    <div style="flex:1;min-width:0">
+                      <div style="font-weight:600;color:var(--slate-900);font-size:13px;line-height:1.3">${rec.name}</div>
+                      ${docInfo ? html`
+                        <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                          <span style="background:var(--emerald-50);color:var(--emerald-800);font-weight:700;font-size:12px;padding:3px 8px;border-radius:4px;font-family:monospace">${docInfo.doc_number}</span>
+                          <span style="font-size:11px;color:var(--slate-700);font-weight:600">Rev ${docInfo.revision}</span>
+                          <span style="font-size:11px;color:var(--slate-500)">${docInfo.effective_date ? new Date(docInfo.effective_date).toLocaleDateString('en-IN', {day:'2-digit', month:'short', year:'2-digit'}) : '—'}</span>
+                        </div>
+                        ${docInfo.issued_by && html`<div style="font-size:11px;color:var(--slate-500);margin-top:3px">Issued by: ${docInfo.issued_by}</div>`}
+                      ` : html`
+                        <div style="margin-top:6px;font-size:11px;color:var(--amber-700);font-weight:600">⚠ Not assigned yet</div>
+                      `}
+                      <div style="display:flex;gap:8px;margin-top:8px">
+                        <button class="btn small" style="padding:4px 10px;font-size:11px" onClick=${() => setEditTarget(rec)}>${docInfo ? 'Edit' : 'Assign'}</button>
+                        ${docInfo && html`<button class="btn small ghost" style="padding:4px 10px;font-size:11px" onClick=${() => setHistoryTarget(rec)}>🕒 History</button>`}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              `;
+            })}
+          </div>
+        </div>
+      `)
+    }
+
+    ${showBulk && html`<${BulkDocNumberModal} plant=${plant} me=${me} reports=${builtReports} existing=${docNums} onClose=${() => setShowBulk(false)} onSaved=${() => { setShowBulk(false); refresh(); }} />`}
+    ${editTarget && html`<${DocNumberEditModal} plant=${plant} me=${me} record=${editTarget} existing=${docNums[editTarget.reportId]} onClose=${() => setEditTarget(null)} onSaved=${() => { setEditTarget(null); refresh(); }} />`}
+    ${historyTarget && html`<${DocNumberHistoryModal} plant=${plant} record=${historyTarget} onClose=${() => setHistoryTarget(null)} />`}
+  `;
+}
+
+// ============= BULK DOC NUMBER MODAL =============
+function BulkDocNumberModal({ plant, me, reports, existing, onClose, onSaved }) {
+  // Default prefixes by dept
+  const [prefixes, setPrefixes] = useState({
+    production: 'PRD', quality: 'QA', maintenance: 'MTC',
+    schedules: 'SCH', stocks: 'STK', documents: 'DOC',
+    people: 'HR', cross: 'GEN'
+  });
+  const [overwrite, setOverwrite] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  // Build report_meta payload — use record-name+clause as report_id key (matches IATF_RECORDS uniqueness)
+  // But for active reports, use reportId (which matches REPORT_CATALOG)
+  const reportPayload = reports.map(r => ({ report_id: r.reportId, dept: r.dept }));
+
+  // Existing assigned for this plant
+  const alreadyAssigned = reports.filter(r => existing[r.reportId]).length;
+
+  // Distinct depts in this set
+  const depts = [...new Set(reports.map(r => r.dept))];
+
+  // Preview: how doc numbers will look
+  const preview = useMemo(() => {
+    const seqByDept = {};
+    // Initialize from existing
+    for (const dept of depts) {
+      const prefix = prefixes[dept] || dept.slice(0,3).toUpperCase();
+      let count = 0;
+      for (const repId of Object.keys(existing)) {
+        const dn = existing[repId];
+        if (dn.doc_number && dn.doc_number.startsWith(prefix + '-FRM-')) count++;
+      }
+      seqByDept[dept] = count;
+    }
+    return reports.map(r => {
+      const existingFor = existing[r.reportId];
+      if (existingFor && !overwrite) {
+        return { ...r, preview: existingFor.doc_number, status: 'kept' };
+      }
+      const prefix = prefixes[r.dept] || r.dept.slice(0,3).toUpperCase();
+      seqByDept[r.dept] = (seqByDept[r.dept] || 0) + 1;
+      const num = prefix + '-FRM-' + String(seqByDept[r.dept]).padStart(3, '0');
+      return { ...r, preview: num, status: existingFor ? 'overwrite' : 'new' };
+    });
+  }, [prefixes, overwrite, reports, existing, depts]);
+
+  const submit = async () => {
+    setLoading(true); setError('');
+    try {
+      const { data, error: err } = await sb.rpc('bulk_assign_doc_numbers', {
+        p_prefixes: prefixes,
+        p_reports: reportPayload,
+        p_overwrite: overwrite
+      });
+      if (err) throw err;
+      if (data && !data.success) throw new Error(data.error || 'Bulk assignment failed');
+      onSaved();
+    } catch (e) {
+      setError(e.message);
+      setLoading(false);
+    }
+  };
+
+  return html`
+    <div class="modal-backdrop" onClick=${onClose}>
+      <div class="modal" onClick=${e => e.stopPropagation()} style="max-width:720px;max-height:90vh;overflow-y:auto">
+        <div class="modal-header">
+          <div class="modal-title">⚡ Bulk Document Number Setup</div>
+          <button class="close-x" onClick=${onClose}>×</button>
+        </div>
+
+        <div style="font-size:12px;color:var(--slate-600);margin-bottom:14px;line-height:1.5">
+          Set department prefixes once — Loglinkr auto-numbers all <b>${reports.length} reports</b> with sequential doc numbers like <code style="background:var(--slate-100);padding:1px 4px;border-radius:3px">QA-FRM-001</code>. You can edit any individually later.
+        </div>
+
+        <div class="section-h">DEPARTMENT PREFIXES</div>
+        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:16px">
+          ${depts.map(dept => html`
+            <div key=${dept} class="field" style="margin:0">
+              <label style="font-size:11px">${DEPT_LABELS[dept] || dept}</label>
+              <input
+                type="text"
+                value=${prefixes[dept] || ''}
+                onChange=${e => setPrefixes({...prefixes, [dept]: e.target.value.toUpperCase()})}
+                placeholder=${dept.slice(0,3).toUpperCase()}
+                style="text-transform:uppercase;font-family:monospace"
+                maxLength="6"
+              />
+            </div>
+          `)}
+        </div>
+
+        ${alreadyAssigned > 0 && html`
+          <div style="background:var(--amber-50);border:1px solid var(--amber-200);border-radius:6px;padding:10px 12px;margin-bottom:14px">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:var(--amber-900)">
+              <input type="checkbox" checked=${overwrite} onChange=${e => setOverwrite(e.target.checked)} />
+              <span><b>${alreadyAssigned}</b> reports already have doc numbers. Check this box to <b>overwrite them</b>. Otherwise they'll be kept as-is.</span>
+            </label>
+          </div>
+        `}
+
+        <div class="section-h">PREVIEW</div>
+        <div style="max-height:280px;overflow-y:auto;border:0.5px solid var(--slate-200);border-radius:6px">
+          <table style="width:100%;font-size:12px;border-collapse:collapse">
+            <thead style="position:sticky;top:0;background:var(--slate-50)">
+              <tr>
+                <th style="text-align:left;padding:8px 10px;border-bottom:0.5px solid var(--slate-200);font-size:10px;text-transform:uppercase;color:var(--slate-600)">Report</th>
+                <th style="text-align:left;padding:8px 10px;border-bottom:0.5px solid var(--slate-200);font-size:10px;text-transform:uppercase;color:var(--slate-600)">Doc Number</th>
+                <th style="text-align:left;padding:8px 10px;border-bottom:0.5px solid var(--slate-200);font-size:10px;text-transform:uppercase;color:var(--slate-600)">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${preview.map(p => html`
+                <tr key=${p.reportId} style="border-bottom:0.5px solid var(--slate-100)">
+                  <td style="padding:6px 10px">${p.name}</td>
+                  <td style="padding:6px 10px;font-family:monospace;font-weight:600">${p.preview}</td>
+                  <td style="padding:6px 10px">
+                    ${p.status === 'kept' ? html`<span class="badge slate" style="font-size:10px">kept</span>` :
+                      p.status === 'overwrite' ? html`<span class="badge amber" style="font-size:10px">overwrite</span>` :
+                      html`<span class="badge emerald" style="font-size:10px">new</span>`}
+                  </td>
+                </tr>
+              `)}
+            </tbody>
+          </table>
+        </div>
+
+        ${error && html`<div style="color:var(--rose-600);font-size:12px;margin-top:10px">${error}</div>`}
+
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <button class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
+          <button class="btn" onClick=${submit} disabled=${loading} style="flex:2">${loading ? 'Assigning…' : '✓ Apply to All ' + reports.length + ' Reports'}</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ============= EDIT INDIVIDUAL DOC NUMBER =============
+function DocNumberEditModal({ plant, me, record, existing, onClose, onSaved }) {
+  const [docNumber, setDocNumber] = useState(existing?.doc_number || '');
+  const [revision, setRevision] = useState(existing?.revision || '00');
+  const [effectiveDate, setEffectiveDate] = useState(existing?.effective_date || new Date().toISOString().slice(0, 10));
+  const [issuedBy, setIssuedBy] = useState(existing?.issued_by || me.full_name || '');
+  const [approvedBy, setApprovedBy] = useState(existing?.approved_by || '');
+  const [notes, setNotes] = useState(existing?.notes || '');
+  const [bumpRev, setBumpRev] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  // Auto-bump revision suggestion when editing
+  useEffect(() => {
+    if (bumpRev && existing) {
+      const cur = parseInt(existing.revision) || 0;
+      setRevision(String(cur + 1).padStart(2, '0'));
+      setEffectiveDate(new Date().toISOString().slice(0, 10));
+    } else if (!bumpRev && existing) {
+      setRevision(existing.revision);
+    }
+  }, [bumpRev]);
+
+  const submit = async () => {
+    if (!docNumber.trim()) { setError('Doc number required'); return; }
+    setLoading(true); setError('');
+    try {
+      const { data, error: err } = await sb.rpc('set_doc_number', {
+        p_report_id: record.reportId,
+        p_doc_number: docNumber.trim(),
+        p_revision: revision.trim() || '00',
+        p_effective_date: effectiveDate,
+        p_issued_by: issuedBy.trim() || null,
+        p_approved_by: approvedBy.trim() || null,
+        p_notes: notes.trim() || null,
+      });
+      if (err) throw err;
+      if (data && !data.success) throw new Error(data.error || 'Save failed');
+      onSaved();
+    } catch (e) {
+      setError(e.message);
+      setLoading(false);
+    }
+  };
+
+  return html`
+    <div class="modal-backdrop" onClick=${onClose}>
+      <div class="modal" onClick=${e => e.stopPropagation()} style="max-width:520px">
+        <div class="modal-header">
+          <div class="modal-title">${existing ? 'Edit' : 'Assign'} Document Number</div>
+          <button class="close-x" onClick=${onClose}>×</button>
+        </div>
+
+        <div style="font-size:12px;color:var(--slate-600);margin-bottom:14px">
+          <b>${record.name}</b>
+          <div style="font-size:11px;color:var(--slate-500);margin-top:2px">Clause ${record.clause} · ${DEPT_LABELS[record.dept]}</div>
+        </div>
+
+        ${existing && html`
+          <label style="display:flex;align-items:center;gap:8px;background:var(--teal-50);padding:8px 10px;border-radius:6px;font-size:12px;cursor:pointer;margin-bottom:14px">
+            <input type="checkbox" checked=${bumpRev} onChange=${e => setBumpRev(e.target.checked)} />
+            <span>Bump revision (current: <b>Rev ${existing.revision}</b>) — auto-set today's date</span>
+          </label>
+        `}
+
+        <div class="field-row">
+          <div class="field" style="flex:2">
+            <label>Document Number *</label>
+            <input
+              type="text"
+              value=${docNumber}
+              onChange=${e => setDocNumber(e.target.value.toUpperCase())}
+              placeholder="QA-FRM-001"
+              style="font-family:monospace;text-transform:uppercase"
+            />
+          </div>
+          <div class="field" style="flex:1">
+            <label>Revision *</label>
+            <input
+              type="text"
+              value=${revision}
+              onChange=${e => setRevision(e.target.value)}
+              placeholder="00"
+              maxLength="4"
+              style="font-family:monospace"
+            />
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Effective Date *</label>
+          <input type="date" value=${effectiveDate} onChange=${e => setEffectiveDate(e.target.value)} />
+        </div>
+
+        <div class="field-row">
+          <div class="field"><label>Issued By</label>
+            <input type="text" value=${issuedBy} onChange=${e => setIssuedBy(e.target.value)} placeholder="Name / Role" />
+          </div>
+          <div class="field"><label>Approved By</label>
+            <input type="text" value=${approvedBy} onChange=${e => setApprovedBy(e.target.value)} placeholder="Name / Role" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label>${bumpRev ? 'Reason for Revision *' : 'Notes (optional)'}</label>
+          <textarea value=${notes} onChange=${e => setNotes(e.target.value)} placeholder=${bumpRev ? 'Why is this revision being raised?' : 'Optional notes…'} rows="2"></textarea>
+        </div>
+
+        ${error && html`<div style="color:var(--rose-600);font-size:12px;margin-top:6px">${error}</div>`}
+
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <button class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
+          <button class="btn" onClick=${submit} disabled=${loading} style="flex:2">${loading ? 'Saving…' : '✓ Save'}</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ============= REVISION HISTORY MODAL =============
+function DocNumberHistoryModal({ plant, record, onClose }) {
+  const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    sb.from('report_doc_number_history')
+      .select('*')
+      .eq('report_id', record.reportId)
+      .order('changed_at', { ascending: false })
+      .then(({ data }) => { setHistory(data || []); setLoading(false); });
+  }, []);
+
+  return html`
+    <div class="modal-backdrop" onClick=${onClose}>
+      <div class="modal" onClick=${e => e.stopPropagation()} style="max-width:600px;max-height:85vh;overflow-y:auto">
+        <div class="modal-header">
+          <div class="modal-title">🕒 Revision History</div>
+          <button class="close-x" onClick=${onClose}>×</button>
+        </div>
+
+        <div style="font-size:12px;color:var(--slate-600);margin-bottom:14px">
+          <b>${record.name}</b>
+          <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${history.length} changes recorded</div>
+        </div>
+
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+         history.length === 0 ? html`<div class="empty">No history yet</div>` :
+         html`
+          <div style="position:relative;padding-left:14px;border-left:2px solid var(--slate-200)">
+            ${history.map((h, i) => html`
+              <div key=${h.id} style="padding:10px 0 10px 14px;position:relative">
+                <div style="position:absolute;left:-21px;top:14px;width:14px;height:14px;border-radius:50%;background:${h.change_type === 'created' ? 'var(--emerald-500)' : h.change_type === 'revision_bumped' ? 'var(--teal-500)' : 'var(--slate-400)'};border:2px solid white;box-shadow:0 0 0 1px var(--slate-200)"></div>
+                <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:4px">
+                  <span style="font-family:monospace;font-weight:700;font-size:13px;color:var(--slate-900)">${h.doc_number}</span>
+                  <span style="background:var(--teal-50);color:var(--teal-700);font-size:11px;padding:2px 8px;border-radius:4px;font-weight:600">Rev ${h.revision}</span>
+                  <span class=${'badge ' + (h.change_type === 'created' ? 'emerald' : h.change_type === 'revision_bumped' ? 'teal' : 'slate')} style="font-size:10px">${h.change_type.replace('_', ' ')}</span>
+                </div>
+                <div style="font-size:11px;color:var(--slate-500)">
+                  ${h.changed_by_name || 'Unknown'} · ${new Date(h.changed_at).toLocaleString('en-IN', {dateStyle:'medium', timeStyle:'short'})}
+                </div>
+                ${h.effective_date && html`<div style="font-size:11px;color:var(--slate-600);margin-top:2px">Effective: ${new Date(h.effective_date).toLocaleDateString('en-IN', {dateStyle:'medium'})}</div>`}
+                ${h.issued_by && html`<div style="font-size:11px;color:var(--slate-600);margin-top:2px">Issued by: ${h.issued_by}${h.approved_by ? ' · Approved by: ' + h.approved_by : ''}</div>`}
+                ${h.change_reason && html`<div style="font-size:11px;color:var(--slate-700);margin-top:4px;background:var(--slate-50);padding:6px 8px;border-radius:4px">${h.change_reason}</div>`}
+              </div>
+            `)}
+          </div>
+        `}
+      </div>
+    </div>
+  `;
+}
+
 function Reports({ plant, me, setTab }) {
   const [view, setView] = useState('catalog'); // 'catalog' | 'coverage'
   const [search, setSearch] = useState('');
@@ -8505,6 +8908,7 @@ function Reports({ plant, me, setTab }) {
     <div class="auth-tabs" style="margin-bottom:16px">
       <button class=${'auth-tab' + (view === 'catalog' ? ' active' : '')} onClick=${() => setView('catalog')}>📋 Active Reports (${REPORT_CATALOG.length})</button>
       <button class=${'auth-tab' + (view === 'coverage' ? ' active' : '')} onClick=${() => setView('coverage')}>🗺️ IATF Coverage Map (${totalRecords})</button>
+      <button class=${'auth-tab' + (view === 'docnums' ? ' active' : '')} onClick=${() => setView('docnums')}>🔖 Document Numbers</button>
     </div>
 
     ${view === 'coverage' ? html`
@@ -8644,6 +9048,8 @@ function Reports({ plant, me, setTab }) {
         });
       })()}
 
+    ` : view === 'docnums' ? html`
+      <${DocNumberManager} plant=${plant} me=${me} />
     ` : html`
       <!-- =================== ACTIVE CATALOG VIEW (existing) =================== -->
       <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">
@@ -8741,23 +9147,26 @@ function ReportConfig({ plant, me, report, onClose }) {
   const generate = async () => {
     setGenerating(true);
     try {
+      // Fetch doc number for this report (if assigned) and inject into plant for shell
+      const { data: docInfo } = await sb.from('report_doc_numbers').select('*').eq('report_id', report.id).maybeSingle();
+      const plantWithDoc = { ...plant, _docInfo: docInfo || null };
       let html_content;
       switch (report.id) {
-        case 'daily_production':       html_content = await genDailyProduction(plant, singleDate); break;
-        case 'reject_analysis':        html_content = await genRejectAnalysis(plant, dateFrom, dateTo); break;
-        case 'stage_summary':          html_content = await genStageSummary(plant, dateFrom, dateTo); break;
-        case 'ncr_register':           html_content = await genNcrRegister(plant, dateFrom, dateTo); break;
-        case 'ncr_8d':                 html_content = await genNcr8D(plant, pickedItem); break;
-        case 'breakdown_register':     html_content = await genBreakdownRegister(plant, dateFrom, dateTo); break;
-        case 'mtbf_mttr':              html_content = await genMtbfMttr(plant, dateFrom, dateTo); break;
-        case 'schedule_attainment':    html_content = await genScheduleAttainment(plant, monthPick); break;
-        case 'otd_report':             html_content = await genOtd(plant, monthPick); break;
-        case 'stock_movement':         html_content = await genStockMovement(plant, dateFrom, dateTo); break;
-        case 'material_traceability':  html_content = await genMaterialTraceability(plant, pickedItem); break;
-        case 'vendor_grn':             html_content = await genVendorGrn(plant, dateFrom, dateTo); break;
-        case 'document_index':         html_content = await genDocumentIndex(plant, dateFrom, dateTo); break;
-        case 'audit_trail':            html_content = await genAuditTrail(plant, entityType, pickedItem); break;
-        case 'team_snapshot':          html_content = await genTeamSnapshot(plant); break;
+        case 'daily_production':       html_content = await genDailyProduction(plantWithDoc, singleDate); break;
+        case 'reject_analysis':        html_content = await genRejectAnalysis(plantWithDoc, dateFrom, dateTo); break;
+        case 'stage_summary':          html_content = await genStageSummary(plantWithDoc, dateFrom, dateTo); break;
+        case 'ncr_register':           html_content = await genNcrRegister(plantWithDoc, dateFrom, dateTo); break;
+        case 'ncr_8d':                 html_content = await genNcr8D(plantWithDoc, pickedItem); break;
+        case 'breakdown_register':     html_content = await genBreakdownRegister(plantWithDoc, dateFrom, dateTo); break;
+        case 'mtbf_mttr':              html_content = await genMtbfMttr(plantWithDoc, dateFrom, dateTo); break;
+        case 'schedule_attainment':    html_content = await genScheduleAttainment(plantWithDoc, monthPick); break;
+        case 'otd_report':             html_content = await genOtd(plantWithDoc, monthPick); break;
+        case 'stock_movement':         html_content = await genStockMovement(plantWithDoc, dateFrom, dateTo); break;
+        case 'material_traceability':  html_content = await genMaterialTraceability(plantWithDoc, pickedItem); break;
+        case 'vendor_grn':             html_content = await genVendorGrn(plantWithDoc, dateFrom, dateTo); break;
+        case 'document_index':         html_content = await genDocumentIndex(plantWithDoc, dateFrom, dateTo); break;
+        case 'audit_trail':            html_content = await genAuditTrail(plantWithDoc, entityType, pickedItem); break;
+        case 'team_snapshot':          html_content = await genTeamSnapshot(plantWithDoc); break;
         default: throw new Error('Unknown report');
       }
       // Open in new tab
@@ -8927,6 +9336,7 @@ function reportShell(plant, title, subtitle, bodyHtml, meta = {}) {
   <div class="header-left">
     <h1>${title}</h1>
     <div class="sub">${subtitle || ''}</div>
+    ${plant._docInfo ? `<div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center"><span style="background:#ccfbf1;color:#0f766e;font-family:monospace;font-weight:700;font-size:12px;padding:3px 8px;border-radius:4px">${plant._docInfo.doc_number}</span><span style="background:#f1f5f9;color:#334155;font-size:11px;padding:3px 8px;border-radius:4px;font-weight:600">Rev ${plant._docInfo.revision}</span><span style="font-size:11px;color:#64748b">Effective ${plant._docInfo.effective_date ? new Date(plant._docInfo.effective_date).toLocaleDateString('en-IN', {dateStyle:'medium'}) : '—'}</span></div>${plant._docInfo.issued_by ? `<div style="font-size:11px;color:#64748b;margin-top:3px">Issued by: ${plant._docInfo.issued_by}${plant._docInfo.approved_by ? ' · Approved by: ' + plant._docInfo.approved_by : ''}</div>` : ''}` : ''}
   </div>
   <div class="header-right">
     <div class="plant">${plant.name}</div>
