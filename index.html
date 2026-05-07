@@ -1140,7 +1140,7 @@ function Home({ plant, me, setTab, reload }) {
     const [u, us, m, d, s, a, n, b, st] = await Promise.all([
       sb.from('units').select('id', { count:'exact', head:true }),
       sb.from('users').select('id', { count:'exact', head:true }),
-      sb.from('mcp_pdc_machines').select('id', { count:'exact', head:true }),
+      sb.from('machines').select('id', { count:'exact', head:true }),
       sb.from('mcp_pdc_dies').select('id', { count:'exact', head:true }),
       sb.from('mcp_pdc_shots').select('id', { count:'exact', head:true }).gte('recorded_at', today.toISOString()),
       sb.from('actions').select('id', { count:'exact', head:true }).eq('status', 'open'),
@@ -1289,9 +1289,9 @@ function Production({ plant, me }) {
   const refresh = useCallback(async () => {
     setLoading(true);
     const [m, d, s, p, u, sh, us] = await Promise.all([
-      sb.from('mcp_pdc_machines').select('*, units(name)').order('code'),
+      sb.from('machines').select('*, units(name)').order('code'),
       sb.from('mcp_pdc_dies').select('*').order('code'),
-      sb.from('mcp_pdc_shots').select('*, units(name), shifts(name), mcp_pdc_dies(code,part_number), mcp_pdc_machines(code), users:operator_user_id(full_name)').order('recorded_at', { ascending:false }).limit(50),
+      sb.from('mcp_pdc_shots').select('*, units(name), shifts(name), mcp_pdc_dies(code,part_number), machines(code), users:operator_user_id(full_name)').order('recorded_at', { ascending:false }).limit(50),
       sb.from('mcp_pdc_parts').select('*').order('part_number'),
       sb.from('units').select('*').order('name'),
       sb.from('shifts').select('*').order('start_time'),
@@ -1363,7 +1363,7 @@ function Production({ plant, me }) {
         <div class="list-item" key=${s.id}>
           <div class="list-item-row">
             <div class="list-item-main">
-              <div class="list-item-title">${s.mcp_pdc_dies?.code || '?'} on ${s.mcp_pdc_machines?.code || '?'} · ${fmtNum(s.shots_good)} good${s.shots_rejected > 0 ? ' / ' + s.shots_rejected + ' rej' : ''}</div>
+              <div class="list-item-title">${s.mcp_pdc_dies?.code || '?'} on ${s.machines?.code || '?'} · ${fmtNum(s.shots_good)} good${s.shots_rejected > 0 ? ' / ' + s.shots_rejected + ' rej' : ''}</div>
               <div class="list-item-sub">${s.units?.name} · ${s.shifts?.name} · ${s.users?.full_name || '?'}</div>
             </div>
             <div class="list-item-meta">${fmtDate(s.recorded_at)}</div>
@@ -1438,7 +1438,7 @@ function Production({ plant, me }) {
           <div class="list-item" key=${s.id}>
             <div class="list-item-row">
               <div class="list-item-main">
-                <div class="list-item-title">${s.mcp_pdc_dies?.code || '?'} on ${s.mcp_pdc_machines?.code || '?'} · ${fmtNum(s.shots_good)} good${s.shots_rejected > 0 ? ' / ' + s.shots_rejected + ' rej' : ''}</div>
+                <div class="list-item-title">${s.mcp_pdc_dies?.code || '?'} on ${s.machines?.code || '?'} · ${fmtNum(s.shots_good)} good${s.shots_rejected > 0 ? ' / ' + s.shots_rejected + ' rej' : ''}</div>
                 <div class="list-item-sub">${s.units?.name} · ${s.shifts?.name} · ${s.users?.full_name || '?'}</div>
               </div>
               <div class="list-item-meta">${fmtDate(s.recorded_at)}</div>
@@ -1575,7 +1575,7 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
     ]);
     setRoute(r.data);
     if (r.data) {
-      const { data: stps } = await sb.from('mcp_pdc_route_steps').select('*, mcp_pdc_machines(code)').eq('route_id', r.data.id).order('seq');
+      const { data: stps } = await sb.from('mcp_pdc_route_steps').select('*, machines(code)').eq('route_id', r.data.id).order('seq');
       setSteps(stps || []);
     } else {
       setSteps([]);
@@ -1656,7 +1656,7 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
                   </div>
                   <div class="list-item-sub">
                     <span class="badge teal">${s.op_type}</span>
-                    ${s.mcp_pdc_machines?.code ? ' · ' + s.mcp_pdc_machines.code : ''}
+                    ${s.machines?.code ? ' · ' + s.machines.code : ''}
                     ${s.cycle_time_sec ? ' · ' + s.cycle_time_sec + 's cycle' : ''}
                     ${s.outsource_vendor ? ' · ' + s.outsource_vendor : ''}
                     ${s.inspection_required ? ' · 🔍 inspection' : ''}
@@ -1906,9 +1906,23 @@ function BomModal({ plant, parentPart, parts, stockItems, onClose, onSaved }) {
 
 // ============= MACHINE MODAL =============
 function MachineModal({ plant, units, editTarget, onClose, onSaved }) {
-  const [form, setForm] = useState(editTarget || { code:'', make:'', model:'', tonnage:'', unit_id: units[0]?.id || '', status:'idle' });
+  const [form, setForm] = useState(editTarget || {
+    code:'', make:'', model:'', category:'pdc',
+    tonnage:'', unit_id: units[0]?.id || '', status:'idle',
+    attributes: {}
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // Initialize attributes from existing record
+  useEffect(() => {
+    if (editTarget) {
+      setForm(prev => ({ ...prev, attributes: editTarget.attributes || {} }));
+    }
+  }, [editTarget?.id]);
+
+  const cat = form.category || 'pdc';
+  const setAttr = (k, v) => setForm({ ...form, attributes: { ...form.attributes, [k]: v } });
 
   const submit = async (e) => {
     e.preventDefault();
@@ -1922,27 +1936,70 @@ function MachineModal({ plant, units, editTarget, onClose, onSaved }) {
         tonnage: form.tonnage ? parseInt(form.tonnage) : null,
         unit_id: form.unit_id,
         status: form.status,
+        category: form.category || 'pdc',
+        attributes: form.attributes || {},
       };
       const { error } = editTarget
-        ? await sb.from('mcp_pdc_machines').update(payload).eq('id', editTarget.id)
-        : await sb.from('mcp_pdc_machines').insert(payload);
+        ? await sb.from('machines').update(payload).eq('id', editTarget.id)
+        : await sb.from('machines').insert(payload);
       if (error) throw error;
       showToast(editTarget ? 'Machine updated' : 'Machine added');
       onSaved();
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
+    } catch (err) { setError(err.message); }
+    finally { setLoading(false); }
   };
 
   const remove = async () => {
     if (!confirm('Delete this machine? Past shots referencing it will keep working.')) return;
-    const { error } = await sb.from('mcp_pdc_machines').delete().eq('id', editTarget.id);
+    const { error } = await sb.from('machines').delete().eq('id', editTarget.id);
     if (error) { setError(error.message); return; }
-    showToast('Machine deleted');
-    onSaved();
+    showToast('Machine deleted'); onSaved();
   };
+
+  // Category-specific attribute fields
+  const attrFields = (() => {
+    switch (cat) {
+      case 'pdc': return [
+        { k:'tonnage', label:'Tonnage', type:'number', placeholder:'250' },
+        { k:'shot_size_g', label:'Shot size (g)', type:'number', placeholder:'500' },
+      ];
+      case 'cnc': return [
+        { k:'cnc_type', label:'CNC type', type:'select', options:['Turning','VMC','HMC','Mill-turn','Other'] },
+        { k:'spindle_rpm_max', label:'Max spindle RPM', type:'number', placeholder:'8000' },
+        { k:'axes', label:'Axes', type:'select', options:['2','3','4','5'] },
+      ];
+      case 'press': return [
+        { k:'tonnage', label:'Tonnage', type:'number', placeholder:'100' },
+        { k:'press_type', label:'Press type', type:'select', options:['Mechanical','Hydraulic','Pneumatic'] },
+      ];
+      case 'trimming': return [
+        { k:'tonnage', label:'Tonnage', type:'number', placeholder:'30' },
+      ];
+      case 'drilling': return [
+        { k:'spindle_rpm_max', label:'Max spindle RPM', type:'number', placeholder:'3000' },
+        { k:'drill_diameter_max_mm', label:'Max drill ⌀ (mm)', type:'number', placeholder:'25' },
+      ];
+      case 'grinding': return [
+        { k:'grinding_type', label:'Grinding type', type:'select', options:['Surface','Cylindrical','Centerless','Internal','Other'] },
+      ];
+      case 'heat_treatment': return [
+        { k:'furnace_type', label:'Furnace type', type:'select', options:['Pit','Box','Vacuum','Induction','Other'] },
+        { k:'max_temp_c', label:'Max temp (°C)', type:'number', placeholder:'1200' },
+      ];
+      case 'inspection': return [
+        { k:'inspection_type', label:'Inspection type', type:'select', options:['CMM','Profile projector','Hardness tester','Surface roughness','Visual','Other'] },
+        { k:'accuracy_um', label:'Accuracy (µm)', type:'number', placeholder:'5' },
+      ];
+      case 'welding': return [
+        { k:'weld_type', label:'Welding type', type:'select', options:['MIG','TIG','Spot','Arc','Other'] },
+      ];
+      case 'injection_moulding': return [
+        { k:'tonnage', label:'Clamping tonnage', type:'number', placeholder:'150' },
+        { k:'shot_size_g', label:'Shot size (g)', type:'number' },
+      ];
+      default: return [];
+    }
+  })();
 
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
@@ -1953,12 +2010,56 @@ function MachineModal({ plant, units, editTarget, onClose, onSaved }) {
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
         <form onSubmit=${submit}>
-          <div class="field"><label>Machine Code *</label><input type="text" required value=${form.code} onChange=${e => setForm({...form, code: e.target.value})} placeholder="PDC-01" /></div>
           <div class="field-row">
-            <div class="field"><label>Make</label><input type="text" value=${form.make || ''} onChange=${e => setForm({...form, make: e.target.value})} placeholder="Toshiba" /></div>
-            <div class="field"><label>Tonnage</label><input type="number" value=${form.tonnage || ''} onChange=${e => setForm({...form, tonnage: e.target.value})} placeholder="250" /></div>
+            <div class="field" style="flex:1"><label>Machine Code *</label>
+              <input type="text" required value=${form.code} onChange=${e => setForm({...form, code: e.target.value})} placeholder="PDC-01 / CNC-03 / GR-02" />
+            </div>
+            <div class="field" style="flex:1"><label>Category *</label>
+              <select required value=${cat} onChange=${e => setForm({...form, category: e.target.value, attributes: {}})}>
+                <option value="pdc">Pressure Die Casting</option>
+                <option value="cnc">CNC</option>
+                <option value="press">Press</option>
+                <option value="trimming">Trimming</option>
+                <option value="drilling">Drilling</option>
+                <option value="grinding">Grinding</option>
+                <option value="heat_treatment">Heat treatment</option>
+                <option value="injection_moulding">Injection moulding</option>
+                <option value="rolling">Rolling</option>
+                <option value="forging">Forging</option>
+                <option value="welding">Welding</option>
+                <option value="assembly">Assembly</option>
+                <option value="inspection">Inspection</option>
+                <option value="painting">Painting</option>
+                <option value="plating">Plating</option>
+                <option value="testing">Testing</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
           </div>
-          <div class="field"><label>Model</label><input type="text" value=${form.model || ''} onChange=${e => setForm({...form, model: e.target.value})} placeholder="DC-250J" /></div>
+          <div class="field-row">
+            <div class="field"><label>Make</label><input type="text" value=${form.make || ''} onChange=${e => setForm({...form, make: e.target.value})} placeholder="Toshiba / Mazak / BFW" /></div>
+            <div class="field"><label>Model</label><input type="text" value=${form.model || ''} onChange=${e => setForm({...form, model: e.target.value})} placeholder="DC-250J" /></div>
+          </div>
+          ${attrFields.length > 0 && html`
+            <div style="background:var(--slate-50);padding:10px 12px;border-radius:8px;margin:10px 0">
+              <div style="font-size:11px;color:var(--slate-500);font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">${cat.toUpperCase()} attributes</div>
+              <div class="field-row" style="flex-wrap:wrap">
+                ${attrFields.map(f => html`
+                  <div key=${f.k} class="field" style="flex:1;min-width:140px;margin-bottom:0">
+                    <label>${f.label}</label>
+                    ${f.type === 'select' ? html`
+                      <select value=${form.attributes?.[f.k] || ''} onChange=${e => setAttr(f.k, e.target.value)}>
+                        <option value="">—</option>
+                        ${f.options.map(o => html`<option key=${o} value=${o}>${o}</option>`)}
+                      </select>
+                    ` : html`
+                      <input type=${f.type} value=${form.attributes?.[f.k] || ''} onChange=${e => setAttr(f.k, e.target.value)} placeholder=${f.placeholder || ''} />
+                    `}
+                  </div>
+                `)}
+              </div>
+            </div>
+          `}
           <div class="field-row">
             <div class="field"><label>Unit *</label>
               <select required value=${form.unit_id} onChange=${e => setForm({...form, unit_id: e.target.value})}>
@@ -2749,7 +2850,7 @@ function Chat({ plant, me, user }) {
 
     // Auto-extract documents — ONLY in groups marked for logistics (saves API cost on casual chat)
     const groupName = (activeGroup?.name || '').toLowerCase();
-    const isLogisticsGroup = groupName.includes('logistic') || groupName.includes('bill') || groupName.includes('invoice') || groupName.includes('document');
+    const isLogisticsGroup = groupName.includes('logistic') || groupName.includes('bill') || groupName.includes('invoice') || groupName.includes('document') || groupName.includes('vendor') || groupName.includes('supplier') || groupName.includes('grn') || groupName.includes('purchase') || groupName.includes('dc') || groupName.includes('inward');
     if (inserted && attachments.length > 0 && attachments[0].isImage && isLogisticsGroup) {
       try {
         const { data: queueId, error: enqErr } = await sb.rpc('enqueue_chat_image_for_extraction', {
@@ -4317,12 +4418,12 @@ function Maintenance({ plant, me }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    let q = sb.from('mcp_maintenance_breakdowns').select('*, mcp_pdc_machines(code), reported_by_user:reported_by(full_name), attended_by_user:attended_by(full_name)').order('reported_at', { ascending:false });
+    let q = sb.from('mcp_maintenance_breakdowns').select('*, machines(code), reported_by_user:reported_by(full_name), attended_by_user:attended_by(full_name)').order('reported_at', { ascending:false });
     if (filter === 'open') q = q.neq('status', 'resolved').neq('status', 'cancelled');
     else if (filter === 'resolved') q = q.eq('status', 'resolved');
     const [b, m, u] = await Promise.all([
       q.limit(100),
-      sb.from('mcp_pdc_machines').select('*').order('code'),
+      sb.from('machines').select('*').order('code'),
       sb.from('users').select('*').order('full_name')
     ]);
     setBreakdowns(b.data || []);
@@ -4358,7 +4459,7 @@ function Maintenance({ plant, me }) {
         <div class="list-item" key=${b.id} onClick=${() => { setEditTarget(b); setModal('breakdown'); }}>
           <div class="list-item-row">
             <div class="list-item-main">
-              <div class="list-item-title">${b.mcp_pdc_machines?.code || 'unknown'} · ${b.description.slice(0,50)}</div>
+              <div class="list-item-title">${b.machines?.code || 'unknown'} · ${b.description.slice(0,50)}</div>
               <div class="list-item-sub">By ${b.reported_by_user?.full_name || '?'}${b.attended_by_user ? ' · attended by ' + b.attended_by_user.full_name : ''} · ${fmtDate(b.reported_at)}</div>
             </div>
             <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
@@ -9715,7 +9816,7 @@ async function genDailyProduction(plant, date) {
   const startOfDay = date + 'T00:00:00';
   const endOfDay = date + 'T23:59:59';
   const { data: shots } = await sb.from('mcp_pdc_shots')
-    .select('*, units(name), shifts(name), mcp_pdc_machines(code), mcp_pdc_dies(code), mcp_pdc_parts(part_number, name), users:operator_user_id(full_name)')
+    .select('*, units(name), shifts(name), machines(code), mcp_pdc_dies(code), mcp_pdc_parts(part_number, name), users:operator_user_id(full_name)')
     .gte('recorded_at', startOfDay).lte('recorded_at', endOfDay)
     .order('recorded_at');
 
@@ -9744,7 +9845,7 @@ async function genDailyProduction(plant, date) {
         <td>${new Date(s.recorded_at).toLocaleTimeString('en-IN', {hour:'2-digit', minute:'2-digit'})}</td>
         <td>${esc(s.shifts?.name || '—')}</td>
         <td>${esc(s.units?.name || '—')}</td>
-        <td>${esc(s.mcp_pdc_machines?.code || '—')}</td>
+        <td>${esc(s.machines?.code || '—')}</td>
         <td>${esc(s.mcp_pdc_dies?.code || '—')}</td>
         <td>${esc(s.mcp_pdc_parts?.part_number || s.mcp_pdc_parts?.name || '—')}</td>
         <td>${esc(s.users?.full_name || '—')}</td>
@@ -9763,13 +9864,13 @@ async function genDailyProduction(plant, date) {
 // 2. REJECT ANALYSIS
 async function genRejectAnalysis(plant, from, to) {
   const { data: shots } = await sb.from('mcp_pdc_shots')
-    .select('shots_good, shots_rejected, recorded_at, mcp_pdc_machines(code), mcp_pdc_parts(part_number, name)')
+    .select('shots_good, shots_rejected, recorded_at, machines(code), mcp_pdc_parts(part_number, name)')
     .gte('recorded_at', from).lte('recorded_at', to + 'T23:59:59');
 
   const byMachine = {}, byPart = {};
   let totalG = 0, totalR = 0;
   for (const s of (shots || [])) {
-    const mc = s.mcp_pdc_machines?.code || '—';
+    const mc = s.machines?.code || '—';
     const pt = s.mcp_pdc_parts?.part_number || s.mcp_pdc_parts?.name || '—';
     if (!byMachine[mc]) byMachine[mc] = { good:0, reject:0 };
     if (!byPart[pt]) byPart[pt] = { good:0, reject:0 };
@@ -9911,7 +10012,7 @@ async function genNcr8D(plant, ncrId) {
 // 6. BREAKDOWN REGISTER
 async function genBreakdownRegister(plant, from, to) {
   const { data: bds } = await sb.from('mcp_maintenance_breakdowns')
-    .select('*, mcp_pdc_machines(code), reporter:reported_by(full_name), attendant:attended_by(full_name)')
+    .select('*, machines(code), reporter:reported_by(full_name), attendant:attended_by(full_name)')
     .gte('reported_at', from).lte('reported_at', to + 'T23:59:59')
     .order('reported_at', { ascending:false });
 
@@ -9926,7 +10027,7 @@ async function genBreakdownRegister(plant, from, to) {
     const dur = b.resolved_at ? ((new Date(b.resolved_at) - new Date(b.reported_at)) / 3600000).toFixed(1) + ' hrs' : 'open';
     return `<tr>
       <td>${rpFmtDateTime(b.reported_at)}</td>
-      <td><b>${esc(b.mcp_pdc_machines?.code || '—')}</b></td>
+      <td><b>${esc(b.machines?.code || '—')}</b></td>
       <td>${esc(b.description || '')}</td>
       <td>${esc(b.reporter?.full_name || '—')}</td>
       <td>${esc(b.attendant?.full_name || '—')}</td>
@@ -9953,12 +10054,12 @@ async function genBreakdownRegister(plant, from, to) {
 // 7. MTBF / MTTR
 async function genMtbfMttr(plant, from, to) {
   const { data: bds } = await sb.from('mcp_maintenance_breakdowns')
-    .select('machine_id, reported_at, resolved_at, mcp_pdc_machines(code)')
+    .select('machine_id, reported_at, resolved_at, machines(code)')
     .gte('reported_at', from).lte('reported_at', to + 'T23:59:59');
 
   const byMachine = {};
   for (const b of (bds || [])) {
-    const mc = b.mcp_pdc_machines?.code || '—';
+    const mc = b.machines?.code || '—';
     if (!byMachine[mc]) byMachine[mc] = { count:0, totalRepair:0, repairCount:0, dates:[] };
     byMachine[mc].count++;
     byMachine[mc].dates.push(new Date(b.reported_at));
@@ -10213,8 +10314,8 @@ async function genAuditTrail(plant, entityType, entityId) {
   let entityLabel = '—';
   try {
     if (entityType === 'breakdown') {
-      const { data } = await sb.from('mcp_maintenance_breakdowns').select('description, mcp_pdc_machines(code), reported_at').eq('id', entityId).single();
-      entityLabel = (data?.mcp_pdc_machines?.code || '?') + ' · ' + (data?.description || '');
+      const { data } = await sb.from('mcp_maintenance_breakdowns').select('description, machines(code), reported_at').eq('id', entityId).single();
+      entityLabel = (data?.machines?.code || '?') + ' · ' + (data?.description || '');
     } else if (entityType === 'ncr') {
       const { data } = await sb.from('mcp_quality_ncrs').select('ncr_number, title').eq('id', entityId).single();
       entityLabel = (data?.ncr_number || '?') + ' · ' + (data?.title || '');
