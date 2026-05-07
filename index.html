@@ -8439,33 +8439,50 @@ function DocNumberManager({ plant, me }) {
   };
   useEffect(() => { refresh(); }, []);
 
-  // All built reports (block 1) — these need doc numbers
-  const builtReports = IATF_RECORDS.filter(r => r.block === 1);
+  // Stable unique key for any record — uses reportId for active, slug for coming-soon
+  const recordKey = (r) => r.reportId || ('iatf__' + (r.name + '_' + r.clause).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, ''));
+
+  // ALL records get doc numbers (active + coming-soon)
+  const allRecords = IATF_RECORDS;
+
+  // Filter view
+  const [statusFilter, setStatusFilter] = useState('all'); // 'all' | 'active' | 'coming'
+  let visibleRecords = allRecords;
+  if (statusFilter === 'active') visibleRecords = allRecords.filter(r => r.block === 1);
+  else if (statusFilter === 'coming') visibleRecords = allRecords.filter(r => r.block !== 1);
 
   // Group by department
   const byDept = {};
-  for (const r of builtReports) {
+  for (const r of visibleRecords) {
     if (!byDept[r.dept]) byDept[r.dept] = [];
     byDept[r.dept].push(r);
   }
 
-  const assigned = builtReports.filter(r => docNums[r.reportId]).length;
-  const unassigned = builtReports.length - assigned;
+  const totalAssigned = allRecords.filter(r => docNums[recordKey(r)]).length;
+  const totalRecords = allRecords.length;
+  const activeAssigned = allRecords.filter(r => r.block === 1 && docNums[recordKey(r)]).length;
+  const activeTotal = allRecords.filter(r => r.block === 1).length;
 
   return html`
     <div class="card" style="background:linear-gradient(135deg, var(--teal-700), var(--teal-600));color:white;border:none;margin-bottom:14px">
       <div style="display:flex;justify-content:space-between;align-items:center">
         <div>
           <div style="font-size:11px;opacity:0.85;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">DOCUMENT NUMBERS</div>
-          <div style="font-size:32px;font-weight:700;line-height:1">${assigned} <span style="font-size:14px;opacity:0.85">of ${builtReports.length}</span></div>
-          <div style="font-size:12px;opacity:0.9;margin-top:4px">${unassigned > 0 ? unassigned + ' reports need doc numbers' : '✓ All reports numbered'}</div>
+          <div style="font-size:32px;font-weight:700;line-height:1">${totalAssigned} <span style="font-size:14px;opacity:0.85">of ${totalRecords}</span></div>
+          <div style="font-size:12px;opacity:0.9;margin-top:4px">${activeAssigned}/${activeTotal} live · ${totalAssigned - activeAssigned}/${totalRecords - activeTotal} planned numbered</div>
         </div>
         <button class="btn" style="background:white;color:var(--teal-700);font-weight:600" onClick=${() => setShowBulk(true)}>⚡ Bulk Setup</button>
       </div>
     </div>
 
     <div style="font-size:11px;color:var(--slate-500);margin-bottom:14px;line-height:1.5">
-      Set permanent document numbers for each report. Once assigned, every generated PDF includes the doc number, revision, and effective date in the header — IATF audit-ready. Tap any report to edit. Tap 🕒 to view revision history.
+      Permanent document numbers for the full IATF master register (all ${totalRecords} records). Active reports include the doc number/rev/date in every generated PDF. Coming-soon records reserve their numbers for when the future block ships. Tap any record to edit, 🕒 for revision history.
+    </div>
+
+    <div style="display:flex;gap:6px;margin-bottom:14px">
+      <button class=${'btn small ' + (statusFilter === 'all' ? '' : 'ghost')} onClick=${() => setStatusFilter('all')} style="padding:6px 12px;font-size:12px">All ${totalRecords}</button>
+      <button class=${'btn small ' + (statusFilter === 'active' ? '' : 'ghost')} onClick=${() => setStatusFilter('active')} style="padding:6px 12px;font-size:12px">Live ${activeTotal}</button>
+      <button class=${'btn small ' + (statusFilter === 'coming' ? '' : 'ghost')} onClick=${() => setStatusFilter('coming')} style="padding:6px 12px;font-size:12px">Coming soon ${totalRecords - activeTotal}</button>
     </div>
 
     ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
@@ -8474,14 +8491,20 @@ function DocNumberManager({ plant, me }) {
           <div class="section-h">${DEPT_LABELS[dept] || dept} · ${reports.length}</div>
           <div class="grid-cards">
             ${reports.map(rec => {
+              const key = recordKey(rec);
               const reportObj = REPORT_CATALOG.find(rc => rc.id === rec.reportId);
-              const docInfo = docNums[rec.reportId];
+              const docInfo = docNums[key];
+              const isLive = rec.block === 1;
+              const borderColor = docInfo ? 'var(--emerald-500)' : (isLive ? 'var(--amber-400)' : 'var(--slate-300)');
               return html`
-                <div key=${rec.reportId} class="list-item" style="border-left:3px solid ${docInfo ? 'var(--emerald-500)' : 'var(--amber-400)'}">
+                <div key=${key} class="list-item" style="border-left:3px solid ${borderColor}; ${!isLive ? 'background:var(--slate-50)' : ''}">
                   <div style="display:flex;gap:10px;align-items:flex-start">
-                    <div style="font-size:20px;flex-shrink:0">${reportObj?.icon || '📄'}</div>
+                    <div style="font-size:20px;flex-shrink:0;${!isLive ? 'opacity:0.6' : ''}">${reportObj?.icon || '📄'}</div>
                     <div style="flex:1;min-width:0">
-                      <div style="font-weight:600;color:var(--slate-900);font-size:13px;line-height:1.3">${rec.name}</div>
+                      <div style="display:flex;align-items:flex-start;gap:6px">
+                        <div style="font-weight:600;color:var(--slate-900);font-size:13px;line-height:1.3;flex:1">${rec.name}</div>
+                        ${isLive ? html`<span class="badge emerald" style="font-size:9px;padding:2px 6px;flex-shrink:0">LIVE</span>` : html`<span style="background:var(--slate-100);color:var(--slate-500);font-size:9px;padding:2px 6px;border-radius:999px;font-weight:600;flex-shrink:0">B${rec.block}</span>`}
+                      </div>
                       ${docInfo ? html`
                         <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
                           <span style="background:var(--emerald-50);color:var(--emerald-800);font-weight:700;font-size:12px;padding:3px 8px;border-radius:4px;font-family:monospace">${docInfo.doc_number}</span>
@@ -8490,11 +8513,11 @@ function DocNumberManager({ plant, me }) {
                         </div>
                         ${docInfo.issued_by && html`<div style="font-size:11px;color:var(--slate-500);margin-top:3px">Issued by: ${docInfo.issued_by}</div>`}
                       ` : html`
-                        <div style="margin-top:6px;font-size:11px;color:var(--amber-700);font-weight:600">⚠ Not assigned yet</div>
+                        <div style="margin-top:6px;font-size:11px;color:${isLive ? 'var(--amber-700)' : 'var(--slate-500)'};font-weight:600">${isLive ? '⚠ Not assigned yet' : 'Number not reserved yet'}</div>
                       `}
                       <div style="display:flex;gap:8px;margin-top:8px">
-                        <button class="btn small" style="padding:4px 10px;font-size:11px" onClick=${() => setEditTarget(rec)}>${docInfo ? 'Edit' : 'Assign'}</button>
-                        ${docInfo && html`<button class="btn small ghost" style="padding:4px 10px;font-size:11px" onClick=${() => setHistoryTarget(rec)}>🕒 History</button>`}
+                        <button class="btn small" style="padding:4px 10px;font-size:11px" onClick=${() => setEditTarget({...rec, _key: key})}>${docInfo ? 'Edit' : (isLive ? 'Assign' : 'Reserve')}</button>
+                        ${docInfo && html`<button class="btn small ghost" style="padding:4px 10px;font-size:11px" onClick=${() => setHistoryTarget({...rec, _key: key})}>🕒 History</button>`}
                       </div>
                     </div>
                   </div>
@@ -8506,14 +8529,14 @@ function DocNumberManager({ plant, me }) {
       `)
     }
 
-    ${showBulk && html`<${BulkDocNumberModal} plant=${plant} me=${me} reports=${builtReports} existing=${docNums} onClose=${() => setShowBulk(false)} onSaved=${() => { setShowBulk(false); refresh(); }} />`}
-    ${editTarget && html`<${DocNumberEditModal} plant=${plant} me=${me} record=${editTarget} existing=${docNums[editTarget.reportId]} onClose=${() => setEditTarget(null)} onSaved=${() => { setEditTarget(null); refresh(); }} />`}
+    ${showBulk && html`<${BulkDocNumberModal} plant=${plant} me=${me} reports=${allRecords} existing=${docNums} recordKey=${recordKey} onClose=${() => setShowBulk(false)} onSaved=${() => { setShowBulk(false); refresh(); }} />`}
+    ${editTarget && html`<${DocNumberEditModal} plant=${plant} me=${me} record=${editTarget} existing=${docNums[editTarget._key]} onClose=${() => setEditTarget(null)} onSaved=${() => { setEditTarget(null); refresh(); }} />`}
     ${historyTarget && html`<${DocNumberHistoryModal} plant=${plant} record=${historyTarget} onClose=${() => setHistoryTarget(null)} />`}
   `;
 }
 
 // ============= BULK DOC NUMBER MODAL =============
-function BulkDocNumberModal({ plant, me, reports, existing, onClose, onSaved }) {
+function BulkDocNumberModal({ plant, me, reports, existing, recordKey, onClose, onSaved }) {
   // Default prefixes by dept
   const [prefixes, setPrefixes] = useState({
     production: 'PRD', quality: 'QA', maintenance: 'MTC',
@@ -8526,10 +8549,10 @@ function BulkDocNumberModal({ plant, me, reports, existing, onClose, onSaved }) 
 
   // Build report_meta payload — use record-name+clause as report_id key (matches IATF_RECORDS uniqueness)
   // But for active reports, use reportId (which matches REPORT_CATALOG)
-  const reportPayload = reports.map(r => ({ report_id: r.reportId, dept: r.dept }));
+  const reportPayload = reports.map(r => ({ report_id: recordKey(r), dept: r.dept }));
 
   // Existing assigned for this plant
-  const alreadyAssigned = reports.filter(r => existing[r.reportId]).length;
+  const alreadyAssigned = reports.filter(r => existing[recordKey(r)]).length;
 
   // Distinct depts in this set
   const depts = [...new Set(reports.map(r => r.dept))];
@@ -8548,7 +8571,7 @@ function BulkDocNumberModal({ plant, me, reports, existing, onClose, onSaved }) 
       seqByDept[dept] = count;
     }
     return reports.map(r => {
-      const existingFor = existing[r.reportId];
+      const existingFor = existing[recordKey(r)];
       if (existingFor && !overwrite) {
         return { ...r, preview: existingFor.doc_number, status: 'kept' };
       }
@@ -8626,7 +8649,7 @@ function BulkDocNumberModal({ plant, me, reports, existing, onClose, onSaved }) 
             </thead>
             <tbody>
               ${preview.map(p => html`
-                <tr key=${p.reportId} style="border-bottom:0.5px solid var(--slate-100)">
+                <tr key=${recordKey(p)} style="border-bottom:0.5px solid var(--slate-100)">
                   <td style="padding:6px 10px">${p.name}</td>
                   <td style="padding:6px 10px;font-family:monospace;font-weight:600">${p.preview}</td>
                   <td style="padding:6px 10px">
@@ -8679,7 +8702,7 @@ function DocNumberEditModal({ plant, me, record, existing, onClose, onSaved }) {
     setLoading(true); setError('');
     try {
       const { data, error: err } = await sb.rpc('set_doc_number', {
-        p_report_id: record.reportId,
+        p_report_id: record._key || record.reportId,
         p_doc_number: docNumber.trim(),
         p_revision: revision.trim() || '00',
         p_effective_date: effectiveDate,
@@ -8778,7 +8801,7 @@ function DocNumberHistoryModal({ plant, record, onClose }) {
   useEffect(() => {
     sb.from('report_doc_number_history')
       .select('*')
-      .eq('report_id', record.reportId)
+      .eq('report_id', record._key || record.reportId)
       .order('changed_at', { ascending: false })
       .then(({ data }) => { setHistory(data || []); setLoading(false); });
   }, []);
