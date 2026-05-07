@@ -6503,27 +6503,227 @@ function StageLog({ plant, me, parts, machines, dies, units, shifts, users }) {
 }
 
 // ============= STAGE LOG ENTRY MODAL =============
+// =================================================================
+// LOG TEMPLATES — per-stage field definitions for production logging
+// Each stage defines:
+//   commonFieldsOverride: rename "Good"/"Rejected" labels per stage context
+//   showMachine: whether to show Machine dropdown
+//   showDie: whether to show Die dropdown (PDC only)
+//   extraFields: array of category-specific JSONB attributes
+// =================================================================
+const LOG_TEMPLATES = {
+  pdc: {
+    label: 'PDC (casting)',
+    qtyLabel: 'Shots good',
+    rejectLabel: 'Shots rejected',
+    showMachine: true,
+    showDie: true,
+    rejectReasons: ['Dimension','Surface','Crack','Cold-shut','Porosity','Flash','Mis-run','Blow-hole','Other'],
+    extraFields: [
+      { k:'mould_temp_c', label:'Mould temp (°C)', type:'number', placeholder:'200' },
+      { k:'cycle_time_sec', label:'Cycle time (sec)', type:'number', placeholder:'45' },
+    ],
+  },
+  trimming: {
+    label: 'Trimming',
+    qtyLabel: 'Pieces good',
+    rejectLabel: 'Pieces rejected',
+    showMachine: true,
+    showDie: false,
+    rejectReasons: ['Burr','Dimension','Tool damage','Other'],
+    extraFields: [],
+  },
+  cnc: {
+    label: 'CNC',
+    qtyLabel: 'Pieces good',
+    rejectLabel: 'Pieces rejected',
+    showMachine: true,
+    showDie: false,
+    rejectReasons: ['Dimension','Surface finish','Tool wear','Setup','Programming','Crash','Other'],
+    extraFields: [
+      { k:'tool_number', label:'Tool #', type:'text', placeholder:'T01' },
+      { k:'cycle_time_min', label:'Cycle time (min)', type:'number', placeholder:'2.5' },
+      { k:'spindle_rpm', label:'Spindle RPM', type:'number', placeholder:'2000' },
+    ],
+  },
+  vmc: {
+    label: 'VMC',
+    qtyLabel: 'Pieces good',
+    rejectLabel: 'Pieces rejected',
+    showMachine: true,
+    showDie: false,
+    rejectReasons: ['Dimension','Surface finish','Tool wear','Programming','Crash','Other'],
+    extraFields: [
+      { k:'tool_number', label:'Tool #', type:'text' },
+      { k:'cycle_time_min', label:'Cycle time (min)', type:'number' },
+    ],
+  },
+  lathe: {
+    label: 'Lathe',
+    qtyLabel: 'Pieces good',
+    rejectLabel: 'Pieces rejected',
+    showMachine: true,
+    showDie: false,
+    rejectReasons: ['Dimension','Surface finish','Tool wear','Other'],
+    extraFields: [
+      { k:'tool_number', label:'Tool #', type:'text' },
+    ],
+  },
+  press: {
+    label: 'Press',
+    qtyLabel: 'Strokes good',
+    rejectLabel: 'Strokes rejected',
+    showMachine: true,
+    showDie: true,
+    rejectReasons: ['Bend','Tear','Crack','Dimension','Surface','Other'],
+    extraFields: [
+      { k:'tonnage_used', label:'Tonnage used', type:'number' },
+    ],
+  },
+  drilling: {
+    label: 'Drilling',
+    qtyLabel: 'Holes good',
+    rejectLabel: 'Holes rejected',
+    showMachine: true,
+    showDie: false,
+    rejectReasons: ['Dimension','Position','Burr','Drill broken','Other'],
+    extraFields: [
+      { k:'drill_diameter_mm', label:'Drill ⌀ (mm)', type:'number' },
+      { k:'depth_mm', label:'Depth (mm)', type:'number' },
+    ],
+  },
+  tapping: {
+    label: 'Tapping',
+    qtyLabel: 'Holes good',
+    rejectLabel: 'Holes rejected',
+    showMachine: true,
+    showDie: false,
+    rejectReasons: ['Thread broken','Tap broken','Wrong size','Other'],
+    extraFields: [
+      { k:'thread_size', label:'Thread size', type:'text', placeholder:'M8 x 1.25' },
+    ],
+  },
+  deflashing: {
+    label: 'Deflashing',
+    qtyLabel: 'Pieces good',
+    rejectLabel: 'Pieces rejected',
+    showMachine: false,
+    showDie: false,
+    rejectReasons: ['Dimension','Surface damage','Other'],
+    extraFields: [],
+  },
+  shot_blast: {
+    label: 'Shot Blast',
+    qtyLabel: 'Pieces good',
+    rejectLabel: 'Pieces rejected',
+    showMachine: true,
+    showDie: false,
+    rejectReasons: ['Surface','Damage','Other'],
+    extraFields: [
+      { k:'blast_time_min', label:'Blast time (min)', type:'number' },
+    ],
+  },
+  plating: {
+    label: 'Plating',
+    qtyLabel: 'Pieces good',
+    rejectLabel: 'Pieces rejected',
+    showMachine: false,
+    showDie: false,
+    rejectReasons: ['Coating thickness','Adhesion','Color','Pitting','Other'],
+    extraFields: [
+      { k:'plating_type', label:'Plating type', type:'select', options:['Zinc','Nickel','Chrome','E-coat','Other'] },
+      { k:'thickness_um', label:'Thickness (µm)', type:'number' },
+      { k:'bath_no', label:'Bath #', type:'text' },
+    ],
+  },
+  painting: {
+    label: 'Painting',
+    qtyLabel: 'Pieces good',
+    rejectLabel: 'Pieces rejected',
+    showMachine: false,
+    showDie: false,
+    rejectReasons: ['Color','Thickness','Run','Crater','Dust','Other'],
+    extraFields: [
+      { k:'paint_color', label:'Paint colour', type:'text' },
+      { k:'paint_batch', label:'Paint batch #', type:'text' },
+      { k:'thickness_um', label:'Thickness (µm)', type:'number' },
+    ],
+  },
+  heat_treat: {
+    label: 'Heat Treatment',
+    qtyLabel: 'Batch size',
+    rejectLabel: 'Pieces rejected',
+    showMachine: true,
+    showDie: false,
+    rejectReasons: ['Hardness low','Hardness high','Crack','Distortion','Other'],
+    extraFields: [
+      { k:'batch_number', label:'Batch #', type:'text' },
+      { k:'temp_c', label:'Temp (°C)', type:'number' },
+      { k:'hold_time_min', label:'Hold time (min)', type:'number' },
+      { k:'hardness_hrc', label:'Hardness (HRC)', type:'number' },
+    ],
+  },
+  inspection: {
+    label: 'Final Inspection',
+    qtyLabel: 'Pieces accepted',
+    rejectLabel: 'Pieces rejected',
+    showMachine: false,
+    showDie: false,
+    rejectReasons: ['Dimension','Surface','Function','Visual','Other'],
+    extraFields: [
+      { k:'inspection_type', label:'Type', type:'select', options:['100%','Sampling','First-piece','Last-piece'] },
+      { k:'sample_size', label:'Sample size', type:'number' },
+    ],
+  },
+  packing: {
+    label: 'Packing',
+    qtyLabel: 'Pieces packed',
+    rejectLabel: 'Pieces rejected',
+    showMachine: false,
+    showDie: false,
+    rejectReasons: ['Damaged','Mis-pack','Other'],
+    extraFields: [
+      { k:'box_count', label:'Box count', type:'number' },
+      { k:'box_qty', label:'Pieces per box', type:'number' },
+    ],
+  },
+  dispatch: {
+    label: 'Dispatch',
+    qtyLabel: 'Pieces dispatched',
+    rejectLabel: 'Returned',
+    showMachine: false,
+    showDie: false,
+    rejectReasons: ['Wrong qty','Wrong part','Damage','Other'],
+    extraFields: [
+      { k:'dc_number', label:'DC number', type:'text' },
+      { k:'vehicle_number', label:'Vehicle #', type:'text' },
+    ],
+  },
+  outsource: {
+    label: 'Outsource',
+    qtyLabel: 'Pieces sent / received good',
+    rejectLabel: 'Returned',
+    showMachine: false,
+    showDie: false,
+    rejectReasons: ['Quality','Delay','Other'],
+    extraFields: [
+      { k:'vendor_name', label:'Vendor', type:'text' },
+      { k:'sent_qty', label:'Sent qty', type:'number' },
+    ],
+  },
+  other: {
+    label: 'Other',
+    qtyLabel: 'Good (qty)',
+    rejectLabel: 'Rejected',
+    showMachine: true,
+    showDie: false,
+    rejectReasons: ['Other'],
+    extraFields: [],
+  },
+};
+
 function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, shifts, users, defaultDate, onClose, onSaved }) {
-  const STAGE_OPTIONS = [
-    {v:'pdc', l:'PDC (casting)'},
-    {v:'trimming', l:'Trimming'},
-    {v:'cnc', l:'CNC'},
-    {v:'vmc', l:'VMC'},
-    {v:'lathe', l:'Lathe'},
-    {v:'press', l:'Press'},
-    {v:'drilling', l:'Drilling'},
-    {v:'tapping', l:'Tapping'},
-    {v:'deflashing', l:'Deflashing'},
-    {v:'shot_blast', l:'Shot Blast'},
-    {v:'plating', l:'Plating'},
-    {v:'painting', l:'Painting'},
-    {v:'heat_treat', l:'Heat Treatment'},
-    {v:'inspection', l:'Final Inspection'},
-    {v:'packing', l:'Packing'},
-    {v:'dispatch', l:'Dispatch'},
-    {v:'outsource', l:'Outsource'},
-    {v:'other', l:'Other'},
-  ];
+  const STAGE_OPTIONS = Object.entries(LOG_TEMPLATES).map(([v, t]) => ({ v, l: t.label }));
 
   // If filling pendingEntry, prefill from it; else default
   const isReconcile = !!pendingEntry?.id;
@@ -6540,6 +6740,7 @@ function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, 
     die_id: pendingEntry.die_id || '',
     operator_user_id: pendingEntry.operator_user_id || me.id,
     notes: pendingEntry.notes || '',
+    category_attrs: pendingEntry.category_attrs || {},
   } : {
     log_date: defaultDate || new Date().toISOString().slice(0,10),
     shift_id: shifts[0]?.id || '',
@@ -6553,6 +6754,7 @@ function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, 
     die_id: '',
     operator_user_id: me.id,
     notes: '',
+    category_attrs: {},
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -6574,6 +6776,7 @@ function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, 
         p_die_id: form.die_id || null,
         p_operator_user_id: form.operator_user_id || null,
         p_notes: form.notes || null,
+        p_category_attrs: form.category_attrs || {},
       });
       if (error) throw error;
       if (!data?.success) throw new Error(data?.error || 'Failed');
@@ -6581,6 +6784,10 @@ function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, 
       onSaved();
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
+
+  // Resolve current template (fallback to 'other' if unknown stage)
+  const tpl = LOG_TEMPLATES[form.stage] || LOG_TEMPLATES.other;
+  const setAttr = (k, v) => setForm({ ...form, category_attrs: { ...form.category_attrs, [k]: v } });
 
   // Auto-detect stage from part route on part change (for new entries)
   return html`
@@ -6611,7 +6818,7 @@ function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, 
             </select>
           </div>
           <div class="field"><label>Stage *</label>
-            <select required value=${form.stage} disabled=${isReconcile} onChange=${e => setForm({...form, stage: e.target.value})}>
+            <select required value=${form.stage} disabled=${isReconcile} onChange=${e => setForm({...form, stage: e.target.value, category_attrs: {}, reject_reason: ''})}>
               ${STAGE_OPTIONS.map(s => html`<option key=${s.v} value=${s.v}>${s.l}</option>`)}
             </select>
           </div>
@@ -6621,20 +6828,24 @@ function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, 
               ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
             </select>
           </div>
-          ${form.stage === 'pdc' && html`
+          ${(tpl.showMachine || tpl.showDie) && html`
             <div class="field-row">
-              <div class="field"><label>Machine</label>
-                <select value=${form.machine_id} onChange=${e => setForm({...form, machine_id: e.target.value})}>
-                  <option value="">— None —</option>
-                  ${machines.map(m => html`<option key=${m.id} value=${m.id}>${m.code}</option>`)}
-                </select>
-              </div>
-              <div class="field"><label>Die</label>
-                <select value=${form.die_id} onChange=${e => setForm({...form, die_id: e.target.value})}>
-                  <option value="">— None —</option>
-                  ${dies.map(d => html`<option key=${d.id} value=${d.id}>${d.code}</option>`)}
-                </select>
-              </div>
+              ${tpl.showMachine && html`
+                <div class="field"><label>Machine</label>
+                  <select value=${form.machine_id} onChange=${e => setForm({...form, machine_id: e.target.value})}>
+                    <option value="">— None —</option>
+                    ${machines.map(m => html`<option key=${m.id} value=${m.id}>${m.code}${m.category && m.category !== 'pdc' ? ' (' + m.category + ')' : ''}</option>`)}
+                  </select>
+                </div>
+              `}
+              ${tpl.showDie && html`
+                <div class="field"><label>Die</label>
+                  <select value=${form.die_id} onChange=${e => setForm({...form, die_id: e.target.value})}>
+                    <option value="">— None —</option>
+                    ${dies.map(d => html`<option key=${d.id} value=${d.id}>${d.code}</option>`)}
+                  </select>
+                </div>
+              `}
             </div>
           `}
           <div class="field"><label>Operator</label>
@@ -6643,15 +6854,35 @@ function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, 
             </select>
           </div>
           <div class="field-row">
-            <div class="field"><label>Good * (qty)</label><input type="number" required min=${0} step="0.01" value=${form.qty_good} onChange=${e => setForm({...form, qty_good: e.target.value})} /></div>
-            <div class="field"><label>Rejected</label><input type="number" min=${0} step="0.01" value=${form.qty_rejected} onChange=${e => setForm({...form, qty_rejected: e.target.value})} /></div>
+            <div class="field"><label>${tpl.qtyLabel} *</label><input type="number" required min=${0} step="0.01" value=${form.qty_good} onChange=${e => setForm({...form, qty_good: e.target.value})} /></div>
+            <div class="field"><label>${tpl.rejectLabel}</label><input type="number" min=${0} step="0.01" value=${form.qty_rejected} onChange=${e => setForm({...form, qty_rejected: e.target.value})} /></div>
           </div>
           ${parseFloat(form.qty_rejected) > 0 && html`
             <div class="field"><label>Reject reason</label>
               <select value=${form.reject_reason} onChange=${e => setForm({...form, reject_reason: e.target.value})}>
                 <option value="">— Select —</option>
-                <option>Dimension</option><option>Surface</option><option>Crack</option><option>Cold-shut</option><option>Porosity</option><option>Flash</option><option>Other</option>
+                ${tpl.rejectReasons.map(r => html`<option key=${r} value=${r}>${r}</option>`)}
               </select>
+            </div>
+          `}
+          ${tpl.extraFields.length > 0 && html`
+            <div style="background:var(--slate-50);padding:10px 12px;border-radius:8px;margin:8px 0">
+              <div style="font-size:11px;color:var(--slate-500);font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">${tpl.label} details</div>
+              <div class="field-row" style="flex-wrap:wrap">
+                ${tpl.extraFields.map(f => html`
+                  <div key=${f.k} class="field" style="flex:1;min-width:140px;margin-bottom:0">
+                    <label>${f.label}</label>
+                    ${f.type === 'select' ? html`
+                      <select value=${form.category_attrs?.[f.k] || ''} onChange=${e => setAttr(f.k, e.target.value)}>
+                        <option value="">—</option>
+                        ${f.options.map(o => html`<option key=${o} value=${o}>${o}</option>`)}
+                      </select>
+                    ` : html`
+                      <input type=${f.type} value=${form.category_attrs?.[f.k] || ''} onChange=${e => setAttr(f.k, e.target.value)} placeholder=${f.placeholder || ''} />
+                    `}
+                  </div>
+                `)}
+              </div>
             </div>
           `}
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
