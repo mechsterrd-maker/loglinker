@@ -8494,6 +8494,9 @@ function AIAuditor({ plant, me }) {
     setError(''); setRunning(true); setConfirmType(null);
     try {
       const { data: { session } } = await sb.auth.getSession();
+      if (!session?.access_token) {
+        throw new Error('No active session — please log out and log back in');
+      }
       const res = await fetch(SUPABASE_URL + '/functions/v1/run-ai-audit', {
         method: 'POST',
         headers: {
@@ -8503,8 +8506,12 @@ function AIAuditor({ plant, me }) {
         },
         body: JSON.stringify({ audit_type: auditType }),
       });
-      const data = await res.json();
-      if (!res.ok || !data.success) throw new Error(data.error || 'Audit failed');
+      // Try to parse JSON; if status is not OK and body isn't JSON, show raw
+      let data;
+      const text = await res.text();
+      try { data = JSON.parse(text); }
+      catch { throw new Error('Server returned: ' + res.status + ' ' + text.slice(0, 200)); }
+      if (!res.ok || !data.success) throw new Error(data.error || ('HTTP ' + res.status));
       // Show the run we just completed
       setActiveRun(data.run_id);
       await refresh();
