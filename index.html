@@ -8423,6 +8423,324 @@ const IATF_RECORDS = [
 // =================================================================
 // DOCUMENT NUMBER MANAGER — bulk setup + individual edit + history
 // =================================================================
+// =================================================================
+// AI AUDITOR — runs an AI-powered audit pass and shows findings
+// =================================================================
+const AUDIT_TYPES = {
+  quick: {
+    label: 'Quick Audit',
+    icon: '⚡',
+    desc: 'Last 48 hours · uses Haiku 4.5 · fast turnaround',
+    cost_range: '₹4–10',
+    duration: '15–30 sec',
+    best_for: 'Daily morning check, on-demand',
+  },
+  weekly: {
+    label: 'Weekly Deep Audit',
+    icon: '📊',
+    desc: 'Last 7 days · uses Sonnet 4.5 · deeper reasoning',
+    cost_range: '₹15–30',
+    duration: '30–60 sec',
+    best_for: 'Monday weekly review',
+  },
+  pre_iatf: {
+    label: 'Pre-IATF Audit',
+    icon: '🎯',
+    desc: 'Last 90 days · uses Sonnet 4.5 · comprehensive',
+    cost_range: '₹40–80',
+    duration: '60–120 sec',
+    best_for: 'Before quarterly/annual IATF audit',
+  },
+};
+
+const VERDICT_STYLES = {
+  green:  { color:'#047857', bg:'#d1fae5', label:'GREEN · Healthy', emoji:'✅' },
+  yellow: { color:'#b45309', bg:'#fef3c7', label:'YELLOW · Watch', emoji:'⚠️' },
+  orange: { color:'#c2410c', bg:'#ffedd5', label:'ORANGE · Action needed', emoji:'🟠' },
+  red:    { color:'#be123c', bg:'#fecaca', label:'RED · Audit risk', emoji:'🚨' },
+};
+
+const SEVERITY_STYLES = {
+  critical: { color:'#be123c', bg:'#fecaca', label:'CRITICAL', icon:'🚨' },
+  warning:  { color:'#b45309', bg:'#fef3c7', label:'WARNING',  icon:'⚠️' },
+  info:     { color:'#475569', bg:'#f1f5f9', label:'INFO',     icon:'ℹ️' },
+  positive: { color:'#047857', bg:'#d1fae5', label:'POSITIVE', icon:'✓' },
+};
+
+function AIAuditor({ plant, me }) {
+  const [audits, setAudits] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState('');
+  const [confirmType, setConfirmType] = useState(null);  // 'quick' | 'weekly' | 'pre_iatf'
+  const [activeRun, setActiveRun] = useState(null);
+
+  const refresh = async () => {
+    const { data } = await sb.from('ai_audit_runs').select('*').order('created_at', { ascending: false }).limit(20);
+    setAudits(data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, []);
+
+  // Realtime updates
+  useEffect(() => {
+    const ch = sb.channel('audit-runs')
+      .on('postgres_changes', { event:'*', schema:'public', table:'ai_audit_runs' }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(ch); };
+  }, []);
+
+  const runAudit = async (auditType) => {
+    setError(''); setRunning(true); setConfirmType(null);
+    try {
+      const { data: { session } } = await sb.auth.getSession();
+      const res = await fetch(`${window.SUPA_URL || sb.supabaseUrl}/functions/v1/run-ai-audit`, {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + session.access_token,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ audit_type: auditType }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.error || 'Audit failed');
+      // Show the run we just completed
+      setActiveRun(data.run_id);
+      await refresh();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const lastAudit = audits[0];
+  const lastByType = {};
+  for (const a of audits) {
+    if (a.status === 'completed' && !lastByType[a.audit_type]) lastByType[a.audit_type] = a;
+  }
+
+  if (activeRun) {
+    const run = audits.find(a => a.id === activeRun);
+    if (run) return html`<${AuditDetailView} run=${run} onBack=${() => setActiveRun(null)} />`;
+  }
+
+  return html`
+    <div class="card" style="background:linear-gradient(135deg, var(--teal-700), var(--teal-600));color:white;border:none;margin-bottom:14px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start">
+        <div>
+          <div style="font-size:11px;opacity:0.85;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">🤖 AI AUDITOR</div>
+          <div style="font-size:22px;font-weight:700;line-height:1.2;margin-top:4px">Let Claude review your plant</div>
+          <div style="font-size:12px;opacity:0.9;margin-top:6px">Pick an audit type below. Claude reads your plant data and returns IATF-style findings with evidence.</div>
+        </div>
+      </div>
+    </div>
+
+    ${error && html`
+      <div class="card" style="background:var(--rose-50);border-color:var(--rose-200);margin-bottom:14px">
+        <div style="font-size:13px;color:var(--rose-700)">${error}</div>
+      </div>
+    `}
+
+    <div class="section-h">RUN AN AUDIT</div>
+    <div class="grid-cards" style="margin-bottom:18px">
+      ${Object.entries(AUDIT_TYPES).map(([key, cfg]) => {
+        const last = lastByType[key];
+        return html`
+          <div key=${key} class="list-item" style="cursor:pointer" onClick=${() => !running && setConfirmType(key)}>
+            <div style="display:flex;gap:12px;align-items:flex-start">
+              <div style="font-size:28px;flex-shrink:0">${cfg.icon}</div>
+              <div style="flex:1;min-width:0">
+                <div style="font-weight:600;color:var(--slate-900);font-size:14px">${cfg.label}</div>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:2px;line-height:1.5">${cfg.desc}</div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
+                  <span style="background:var(--teal-50);color:var(--teal-700);font-size:10px;padding:2px 6px;border-radius:4px;font-weight:600">~${cfg.cost_range}/audit</span>
+                  <span style="background:var(--slate-100);color:var(--slate-600);font-size:10px;padding:2px 6px;border-radius:4px">${cfg.duration}</span>
+                </div>
+                ${last && html`
+                  <div style="font-size:11px;color:var(--slate-500);margin-top:8px">
+                    Last run: ${new Date(last.created_at).toLocaleDateString('en-IN', {dateStyle:'medium'})} ·
+                    <span style="color:${VERDICT_STYLES[last.verdict]?.color || 'inherit'};font-weight:600">${VERDICT_STYLES[last.verdict]?.emoji || ''} ${last.verdict?.toUpperCase() || ''}</span>
+                  </div>
+                `}
+              </div>
+            </div>
+          </div>
+        `;
+      })}
+    </div>
+
+    <div class="section-h">RECENT AUDITS</div>
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+     audits.length === 0 ? html`<div class="card"><div class="empty"><div style="font-size:13px">No audits yet. Tap one of the cards above to run your first.</div></div></div>` :
+     html`
+      <div style="display:flex;flex-direction:column;gap:8px">
+        ${audits.map(a => {
+          const verdict = VERDICT_STYLES[a.verdict] || VERDICT_STYLES.yellow;
+          const findings = a.findings || [];
+          const critical = findings.filter(f => f.severity === 'critical').length;
+          const warnings = findings.filter(f => f.severity === 'warning').length;
+          return html`
+            <div key=${a.id} class="list-item" onClick=${() => a.status === 'completed' && setActiveRun(a.id)} style=${a.status === 'completed' ? 'cursor:pointer' : 'opacity:0.7'}>
+              <div style="display:flex;gap:10px;align-items:flex-start">
+                <div style="font-size:22px;flex-shrink:0">${AUDIT_TYPES[a.audit_type]?.icon || '📋'}</div>
+                <div style="flex:1;min-width:0">
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                    <div style="flex:1;min-width:0">
+                      <div style="font-weight:600;color:var(--slate-900);font-size:13px">${AUDIT_TYPES[a.audit_type]?.label || a.audit_type}</div>
+                      <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${new Date(a.created_at).toLocaleString('en-IN', {dateStyle:'medium', timeStyle:'short'})} · by ${a.triggered_by_name || 'system'}</div>
+                    </div>
+                    ${a.status === 'completed' && a.verdict ? html`
+                      <span style="background:${verdict.bg};color:${verdict.color};font-size:11px;padding:3px 8px;border-radius:999px;font-weight:700;flex-shrink:0">${verdict.emoji} ${a.verdict.toUpperCase()}</span>
+                    ` : a.status === 'running' ? html`<span class="badge amber">⏳ running</span>` : a.status === 'failed' ? html`<span class="badge rose">✗ failed</span>` : ''}
+                  </div>
+                  ${a.status === 'completed' && a.summary && html`<div style="font-size:12px;color:var(--slate-700);margin-top:6px;line-height:1.5">${a.summary}</div>`}
+                  ${a.status === 'completed' && html`
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;font-size:11px;color:var(--slate-500)">
+                      ${critical > 0 && html`<span style="color:var(--rose-600);font-weight:600">${critical} critical</span>`}
+                      ${warnings > 0 && html`<span style="color:var(--amber-700);font-weight:600">${warnings} warning${warnings>1?'s':''}</span>`}
+                      <span>${findings.length} total findings</span>
+                      <span>·</span>
+                      <span>₹${a.estimated_cost_inr || '—'}</span>
+                    </div>
+                  `}
+                  ${a.status === 'failed' && html`<div style="font-size:11px;color:var(--rose-600);margin-top:4px">${a.error_message || 'Unknown error'}</div>`}
+                </div>
+              </div>
+            </div>
+          `;
+        })}
+      </div>
+     `
+    }
+
+    ${confirmType && html`<${AuditConfirmModal} type=${confirmType} running=${running} onConfirm=${runAudit} onClose=${() => setConfirmType(null)} />`}
+  `;
+}
+
+// =================================================================
+// CONFIRM AUDIT MODAL — show cost estimate, confirm before running
+// =================================================================
+function AuditConfirmModal({ type, running, onConfirm, onClose }) {
+  const cfg = AUDIT_TYPES[type];
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" onClick=${e => e.stopPropagation()} style="max-width:460px">
+        <div class="modal-header">
+          <div class="modal-title">${cfg.icon} Run ${cfg.label}?</div>
+          <button class="close-x" onClick=${onClose}>×</button>
+        </div>
+
+        <div style="background:var(--teal-50);border-left:3px solid var(--teal-500);padding:12px 14px;border-radius:6px;margin-bottom:14px">
+          <div style="font-size:12px;color:var(--slate-700);line-height:1.5">${cfg.desc}</div>
+        </div>
+
+        <div class="card-row"><span class="label">Estimated cost</span><span class="value" style="font-weight:700">${cfg.cost_range}</span></div>
+        <div class="card-row"><span class="label">Time</span><span class="value">${cfg.duration}</span></div>
+        <div class="card-row"><span class="label">Best for</span><span class="value">${cfg.best_for}</span></div>
+
+        <div style="font-size:11px;color:var(--slate-500);margin:14px 0;line-height:1.5">
+          Claude will read up to the last ${type === 'quick' ? '2 days' : type === 'weekly' ? '7 days' : '90 days'} of plant data (production, NCRs, breakdowns, schedules, stocks) and return findings as a JSON report. Cost is approximate — actual usage will be logged.
+        </div>
+
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <button class="btn ghost" onClick=${onClose} style="flex:1" disabled=${running}>Cancel</button>
+          <button class="btn" onClick=${() => onConfirm(type)} disabled=${running} style="flex:2">${running ? 'Running…' : '✓ Run audit'}</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// AUDIT DETAIL VIEW — full findings of one audit
+// =================================================================
+function AuditDetailView({ run, onBack }) {
+  const findings = run.findings || [];
+  const verdict = VERDICT_STYLES[run.verdict] || VERDICT_STYLES.yellow;
+
+  // Group by severity
+  const bySeverity = { critical: [], warning: [], info: [], positive: [] };
+  for (const f of findings) {
+    if (bySeverity[f.severity]) bySeverity[f.severity].push(f);
+  }
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onBack}>← Back</button>
+      <div style="flex:1;min-width:0">
+        <h1 style="font-size:18px">${AUDIT_TYPES[run.audit_type]?.icon} ${AUDIT_TYPES[run.audit_type]?.label}</h1>
+        <div class="sub">${new Date(run.created_at).toLocaleString('en-IN', {dateStyle:'long', timeStyle:'short'})}</div>
+      </div>
+    </div>
+
+    <div class="card" style="background:${verdict.bg};border:none;margin-bottom:14px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap">
+        <div style="flex:1;min-width:200px">
+          <div style="font-size:11px;font-weight:700;color:${verdict.color};text-transform:uppercase;letter-spacing:0.05em">VERDICT</div>
+          <div style="font-size:24px;font-weight:700;color:${verdict.color};margin-top:2px">${verdict.emoji} ${verdict.label}</div>
+          ${run.summary && html`<div style="font-size:13px;color:var(--slate-800);margin-top:8px;line-height:1.5">${run.summary}</div>`}
+        </div>
+        <div style="text-align:right;flex-shrink:0">
+          <div style="font-size:11px;color:var(--slate-600)">Cost</div>
+          <div style="font-size:18px;font-weight:700;color:var(--slate-900)">₹${run.estimated_cost_inr || '—'}</div>
+          <div style="font-size:10px;color:var(--slate-500)">${run.input_tokens || 0} in · ${run.output_tokens || 0} out</div>
+        </div>
+      </div>
+    </div>
+
+    ${run.records_examined && Object.keys(run.records_examined).length > 0 && html`
+      <div class="card" style="margin-bottom:14px">
+        <div class="card-title">DATA EXAMINED</div>
+        <div style="display:flex;gap:14px;flex-wrap:wrap;font-size:12px">
+          ${Object.entries(run.records_examined).map(([k, v]) => html`<div><span style="color:var(--slate-500)">${k}:</span> <b>${v}</b></div>`)}
+        </div>
+      </div>
+    `}
+
+    ${findings.length === 0 ? html`<div class="card"><div class="empty">No findings returned</div></div>` :
+      html`
+        ${['critical', 'warning', 'info', 'positive'].map(sev => {
+          const items = bySeverity[sev];
+          if (items.length === 0) return null;
+          const style = SEVERITY_STYLES[sev];
+          return html`
+            <div key=${sev} style="margin-bottom:18px">
+              <div class="section-h" style="color:${style.color}">${style.icon} ${style.label} · ${items.length}</div>
+              <div style="display:flex;flex-direction:column;gap:8px">
+                ${items.map((f, i) => html`
+                  <div key=${i} class="list-item" style="border-left:3px solid ${style.color}">
+                    <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+                      <div style="flex:1;min-width:0">
+                        <div style="font-weight:600;color:var(--slate-900);font-size:13px">${f.title}</div>
+                        <div style="font-size:12px;color:var(--slate-700);margin-top:6px;line-height:1.5">${f.detail}</div>
+                        ${f.refs && f.refs.length > 0 && html`
+                          <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:8px">
+                            ${f.refs.map(r => html`<span style="background:var(--slate-100);color:var(--slate-700);font-size:10px;padding:2px 6px;border-radius:4px;font-family:monospace;font-weight:600">${r}</span>`)}
+                          </div>
+                        `}
+                        ${f.recommendation && html`
+                          <div style="background:var(--teal-50);border-left:2px solid var(--teal-500);padding:8px 10px;border-radius:4px;margin-top:8px;font-size:12px;color:var(--teal-900);line-height:1.5">
+                            <b>Recommended action:</b> ${f.recommendation}
+                          </div>
+                        `}
+                      </div>
+                      <div style="display:flex;flex-direction:column;gap:4px;flex-shrink:0">
+                        ${f.department && html`<span style="background:var(--slate-100);color:var(--slate-600);font-size:10px;padding:2px 6px;border-radius:4px;font-weight:500">${f.department}</span>`}
+                        ${f.clause && html`<span style="background:var(--teal-50);color:var(--teal-700);font-size:10px;padding:2px 6px;border-radius:4px;font-weight:600">Clause ${f.clause}</span>`}
+                      </div>
+                    </div>
+                  </div>
+                `)}
+              </div>
+            </div>
+          `;
+        })}
+      `
+    }
+  `;
+}
+
 function DocNumberManager({ plant, me }) {
   const [docNums, setDocNums] = useState({});  // { report_id: {doc_number, revision, ...} }
   const [loading, setLoading] = useState(true);
@@ -8932,6 +9250,7 @@ function Reports({ plant, me, setTab }) {
       <button class=${'auth-tab' + (view === 'catalog' ? ' active' : '')} onClick=${() => setView('catalog')}>📋 Active Reports (${REPORT_CATALOG.length})</button>
       <button class=${'auth-tab' + (view === 'coverage' ? ' active' : '')} onClick=${() => setView('coverage')}>🗺️ IATF Coverage Map (${totalRecords})</button>
       <button class=${'auth-tab' + (view === 'docnums' ? ' active' : '')} onClick=${() => setView('docnums')}>🔖 Document Numbers</button>
+      <button class=${'auth-tab' + (view === 'ai_audit' ? ' active' : '')} onClick=${() => setView('ai_audit')}>🤖 AI Auditor</button>
     </div>
 
     ${view === 'coverage' ? html`
@@ -9073,6 +9392,8 @@ function Reports({ plant, me, setTab }) {
 
     ` : view === 'docnums' ? html`
       <${DocNumberManager} plant=${plant} me=${me} />
+    ` : view === 'ai_audit' ? html`
+      <${AIAuditor} plant=${plant} me=${me} />
     ` : html`
       <!-- =================== ACTIVE CATALOG VIEW (existing) =================== -->
       <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">
