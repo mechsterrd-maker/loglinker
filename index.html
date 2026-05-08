@@ -1348,6 +1348,7 @@ function Production({ plant, me }) {
       <button class=${'auth-tab' + (view === 'machines' ? ' active' : '')} onClick=${() => setView('machines')}>Machines</button>
       <button class=${'auth-tab' + (view === 'dies' ? ' active' : '')} onClick=${() => setView('dies')}>Dies</button>
       <button class=${'auth-tab' + (view === 'tools' ? ' active' : '')} onClick=${() => setView('tools')}>🔧 Tools</button>
+      <button class=${'auth-tab' + (view === 'forecast' ? ' active' : '')} onClick=${() => setView('forecast')}>🔮 Forecast</button>
       <button class=${'auth-tab' + (view === 'shots' ? ' active' : '')} onClick=${() => setView('shots')}>Shots</button>
     </div>
 
@@ -1508,9 +1509,9 @@ function Production({ plant, me }) {
                 <span style="font-size:11px;color:var(--slate-500)">${grouped[k].length} item${grouped[k].length>1?'s':''}</span>
               </div>
               ${grouped[k].map(t => html`
-                <div class="list-item" key=${t.id} onClick=${() => { setEditTarget(t); setModal('tool'); }}>
+                <div class="list-item" key=${t.id}>
                   <div class="list-item-row">
-                    <div class="list-item-main">
+                    <div class="list-item-main" onClick=${() => { setEditTarget(t); setModal('tool'); }} style="cursor:pointer;flex:1">
                       <div class="list-item-title">${t.code} · ${t.name}</div>
                       <div class="list-item-sub">
                         ${t.make ? t.make + ' · ' : ''}
@@ -1520,6 +1521,7 @@ function Production({ plant, me }) {
                         ${t.stock_item_id ? ' · 📦 stock-linked' : ''}
                       </div>
                     </div>
+                    <button class="btn small ghost" style="padding:4px 10px;font-size:11px;flex-shrink:0" onClick=${(e) => { e.stopPropagation(); setEditTarget(t); setModal('tool_assign'); }}>🎯 Assign</button>
                   </div>
                 </div>
               `)}
@@ -1528,6 +1530,8 @@ function Production({ plant, me }) {
         })()
       }
     `}
+
+    ${view === 'forecast' && html`<${ToolForecastView} plant=${plant} setModal=${setModal} setEditTarget=${setEditTarget} />`}
 
     ${view === 'shots' && html`
       <div class="section-h">Shots · ${shots.length}<button class="btn small ghost" onClick=${() => setModal('shot')} disabled=${machines.length === 0 || dies.length === 0}>+ Log</button></div>
@@ -1551,6 +1555,7 @@ function Production({ plant, me }) {
     ${modal === 'machine_bulk' && html`<${MachineBulkAddModal} plant=${plant} units=${units} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'die' && html`<${DieModal} plant=${plant} me=${me} parts=${parts} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'tool' && html`<${ToolModal} plant=${plant} me=${me} machines=${machines} stockItems=${stockItems} parts=${parts} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'tool_assign' && html`<${ToolAssignmentModal} plant=${plant} tool=${editTarget} parts=${parts} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'shot' && html`<${ShotModal} plant=${plant} me=${me} units=${units} shifts=${shifts} machines=${machines} dies=${dies} parts=${parts} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
   `;
 }
@@ -1698,6 +1703,251 @@ function ToolModal({ plant, me, machines, stockItems, parts, editTarget, onClose
           ${editTarget && html`<button class="btn danger" type="button" style="margin-top:8px" onClick=${remove}>Delete</button>`}
         </form>
       </div>
+    </div>
+  `;
+}
+
+// ============= TOOL ASSIGNMENT MODAL =============
+// Pick which (part × operation) route steps use this tool.
+function ToolAssignmentModal({ plant, tool, parts, onClose, onSaved }) {
+  const [routeSteps, setRouteSteps] = useState([]);
+  const [existing, setExisting] = useState([]); // currently assigned route_step_ids
+  const [selected, setSelected] = useState(new Set());
+  const [qtyMap, setQtyMap] = useState({});  // route_step_id -> qty_per_change
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [filterPart, setFilterPart] = useState('');
+
+  useEffect(() => {
+    (async () => {
+      const [rsRes, exRes] = await Promise.all([
+        sb.from('v_part_route_steps').select('*').order('part_id').order('op_seq'),
+        sb.from('part_op_tools').select('route_step_id, qty_per_change').eq('tool_id', tool.id),
+      ]);
+      setRouteSteps(rsRes.data || []);
+      const ex = exRes.data || [];
+      setExisting(ex.map(e => e.route_step_id));
+      setSelected(new Set(ex.map(e => e.route_step_id)));
+      const qm = {};
+      ex.forEach(e => { qm[e.route_step_id] = e.qty_per_change; });
+      setQtyMap(qm);
+      setLoading(false);
+    })();
+  }, [tool.id]);
+
+  const toggle = (stepId) => {
+    setSelected(s => {
+      const n = new Set(s);
+      if (n.has(stepId)) n.delete(stepId);
+      else { n.add(stepId); setQtyMap(q => ({ ...q, [stepId]: q[stepId] || 1 })); }
+      return n;
+    });
+  };
+
+  const save = async () => {
+    setSaving(true); setError('');
+    try {
+      const newIds = [...selected];
+      const toRemove = existing.filter(id => !selected.has(id));
+      const toUpsert = newIds.map(id => ({
+        plant_id: plant.id,
+        route_step_id: id,
+        tool_id: tool.id,
+        qty_per_change: qtyMap[id] || 1,
+        is_primary: true,
+      }));
+
+      if (toRemove.length > 0) {
+        const { error: delErr } = await sb.from('part_op_tools').delete()
+          .eq('tool_id', tool.id)
+          .in('route_step_id', toRemove);
+        if (delErr) throw delErr;
+      }
+
+      if (toUpsert.length > 0) {
+        const { error: upsertErr } = await sb.from('part_op_tools')
+          .upsert(toUpsert, { onConflict: 'route_step_id,tool_id' });
+        if (upsertErr) throw upsertErr;
+      }
+
+      showToast('Tool assignments saved');
+      onSaved();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) return html`
+    <div class="modal-backdrop active"><div class="modal"><div class="loader"><div class="spinner"></div></div></div></div>
+  `;
+
+  // Group route steps by part
+  const stepsByPart = new Map();
+  for (const rs of routeSteps) {
+    if (filterPart && rs.part_id !== filterPart) continue;
+    if (!stepsByPart.has(rs.part_id)) stepsByPart.set(rs.part_id, []);
+    stepsByPart.get(rs.part_id).push(rs);
+  }
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:620px">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">🎯 Assign tool to operations</div>
+            <div style="font-size:12px;color:var(--slate-500);font-weight:400;margin-top:2px">${tool.code} · ${tool.name}</div>
+          </div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+
+        <div class="field" style="margin-bottom:10px"><label style="font-size:11px">Filter by part</label>
+          <select value=${filterPart} onChange=${e => setFilterPart(e.target.value)}>
+            <option value="">— All parts (${routeSteps.length} ops) —</option>
+            ${parts.map(p => {
+              const c = routeSteps.filter(rs => rs.part_id === p.id).length;
+              if (c === 0) return null;
+              return html`<option key=${p.id} value=${p.id}>${p.part_number} (${c} ops)</option>`;
+            })}
+          </select>
+        </div>
+
+        <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">
+          ${selected.size} of ${routeSteps.length} operations selected · check ones where this tool is used
+        </div>
+
+        ${stepsByPart.size === 0 ? html`<div class="empty" style="padding:20px;text-align:center;color:var(--slate-500);font-size:13px">No route steps. Define routes for parts first.</div>` :
+          html`
+            <div style="max-height:50vh;overflow-y:auto;display:flex;flex-direction:column;gap:10px">
+              ${[...stepsByPart.entries()].map(([partId, steps]) => {
+                const part = parts.find(p => p.id === partId);
+                return html`
+                  <div key=${partId}>
+                    <div style="font-size:11px;font-weight:700;color:var(--slate-700);text-transform:uppercase;letter-spacing:0.05em;padding:6px 10px;background:var(--slate-100);border-radius:6px">
+                      ${part?.part_number || '?'} · ${part?.name || ''}
+                    </div>
+                    ${steps.map(rs => {
+                      const isSel = selected.has(rs.route_step_id);
+                      return html`
+                        <div key=${rs.route_step_id} style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--slate-100)">
+                          <input type="checkbox" checked=${isSel} onChange=${() => toggle(rs.route_step_id)} style="width:auto;margin:0" />
+                          <div style="flex:1;min-width:0">
+                            <div style="font-size:13px;color:var(--slate-800)"><b>Op ${rs.op_seq}</b> · ${rs.op_name}</div>
+                            <div style="font-size:11px;color:var(--slate-500)">${rs.op_type}${rs.cycle_time_sec ? ' · ' + rs.cycle_time_sec + 's' : ''}</div>
+                          </div>
+                          ${isSel && html`
+                            <div style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--slate-600)">
+                              <span>qty:</span>
+                              <input type="number" min="1" value=${qtyMap[rs.route_step_id] || 1} onChange=${e => setQtyMap(q => ({ ...q, [rs.route_step_id]: parseInt(e.target.value) || 1 }))} style="width:50px;font-size:12px;padding:3px 6px;text-align:center" />
+                            </div>
+                          `}
+                        </div>
+                      `;
+                    })}
+                  </div>
+                `;
+              })}
+            </div>
+          `
+        }
+
+        <button class="btn" onClick=${save} disabled=${saving} style="margin-top:14px;width:100%">${saving ? 'Saving…' : `Save ${selected.size} assignment${selected.size === 1 ? '' : 's'}`}</button>
+      </div>
+    </div>
+  `;
+}
+
+// ============= TOOL FORECAST VIEW =============
+function ToolForecastView({ plant, setModal, setEditTarget }) {
+  const [forecast, setForecast] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data, error } = await sb.from('v_tool_demand_30d').select('*').order('shortage_qty', { ascending: false, nullsFirst: false });
+    if (!error) setForecast(data || []);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { refresh(); }, []);
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  if (forecast.length === 0) {
+    return html`
+      <div class="card">
+        <div class="card-title">🔮 Tool Demand Forecast · next 30 days</div>
+        <div class="empty" style="padding:20px;text-align:center">
+          <div style="color:var(--slate-600);font-size:13px;margin-bottom:6px">No forecast data yet</div>
+          <div style="font-size:11px;color:var(--slate-500);line-height:1.6">
+            Forecast appears when:<br/>
+            1. Tools are added in 🔧 Tools tab<br/>
+            2. Tools are <b>assigned</b> to part-operations (tap 🎯 Assign on a tool)<br/>
+            3. Customer schedules have open lines for those parts
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  const totalShortage = forecast.filter(f => f.shortage_qty > 0).length;
+  const totalRequired = forecast.reduce((sum, f) => sum + (parseFloat(f.required_qty_30d) || 0), 0);
+
+  return html`
+    <div class="card" style="background:linear-gradient(135deg, var(--teal-700), var(--teal-600));color:white;border:none;margin-bottom:14px">
+      <div style="font-size:11px;opacity:0.85;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">🔮 TOOL DEMAND · NEXT 30 DAYS</div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-top:6px">
+        <div>
+          <div style="font-size:24px;font-weight:700;line-height:1.1">${totalRequired} pcs needed</div>
+          <div style="font-size:12px;opacity:0.9;margin-top:2px">across ${forecast.length} tool${forecast.length === 1 ? '' : 's'} · 20% safety buffer applied</div>
+        </div>
+        ${totalShortage > 0 && html`
+          <div style="background:rgba(255,255,255,0.2);padding:6px 12px;border-radius:6px;font-size:12px;font-weight:700">
+            ⚠️ ${totalShortage} short
+          </div>
+        `}
+      </div>
+    </div>
+
+    <div class="section-h">FORECAST DETAILS</div>
+    <div style="display:flex;flex-direction:column;gap:6px">
+      ${forecast.map(f => {
+        const shortage = parseFloat(f.shortage_qty) || 0;
+        const required = parseFloat(f.required_qty_30d) || 0;
+        const stock = parseFloat(f.current_stock_qty) || 0;
+        const shortagePct = required > 0 ? (stock / required * 100) : 100;
+        return html`
+          <div key=${f.tool_id} class="list-item" style="border-left:3px solid ${shortage > 0 ? 'var(--rose-500)' : 'var(--emerald-500)'}">
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${f.tool_code} · ${f.tool_name}</div>
+                <div class="list-item-sub">
+                  Demand: <b>${f.total_pieces_planned || 0}</b> pcs ·
+                  Life: ${f.pieces_per_tool || '—'} pcs/tool ·
+                  Stock: <b>${stock} ${f.uom || ''}</b>
+                </div>
+                ${required > 0 && html`
+                  <div style="margin-top:6px;height:6px;background:var(--slate-200);border-radius:3px;overflow:hidden">
+                    <div style="width:${Math.min(shortagePct, 100)}%;height:100%;background:${shortagePct >= 100 ? 'var(--emerald-500)' : shortagePct >= 50 ? 'var(--amber-500)' : 'var(--rose-500)'}"></div>
+                  </div>
+                `}
+              </div>
+              <div style="text-align:right;flex-shrink:0">
+                <div style="font-size:11px;color:var(--slate-500)">required</div>
+                <div style="font-size:16px;font-weight:700;color:var(--slate-900)">${required || '—'}</div>
+                ${shortage > 0 && html`<div style="font-size:11px;color:var(--rose-600);font-weight:600;margin-top:2px">⚠️ short ${shortage}</div>`}
+              </div>
+            </div>
+          </div>
+        `;
+      })}
+    </div>
+
+    <div style="font-size:11px;color:var(--slate-500);margin-top:14px;padding:10px 12px;background:var(--slate-50);border-radius:6px;line-height:1.6">
+      💡 <b>How this is calculated:</b> Demand reads open schedule lines for the next 30 days, multiplies by tool assignments per route step, divides by tool life × corners, applies 20% safety buffer. PO generation comes in next phase.
     </div>
   `;
 }
@@ -3849,6 +4099,7 @@ function TodaysProductionCard({ plant, setTab }) {
 function ScheduleStatusCard({ plant, setTab }) {
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [drilldown, setDrilldown] = useState(false);
 
   const refresh = async () => {
     const { data: rows } = await sb.from('v_schedule_status_current_month').select('*').order('pct_attainment');
@@ -3872,10 +4123,10 @@ function ScheduleStatusCard({ plant, setTab }) {
   const overdueTotal = data.reduce((s, r) => s + parseInt(r.overdue_lines || 0), 0);
 
   return html`
-    <div class="card" onClick=${() => setTab('schedules')} style="cursor:pointer">
+    <div class="card" onClick=${() => setDrilldown(true)} style="cursor:pointer">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
         <div class="card-title" style="margin:0">📅 Schedule Status · This month</div>
-        <span style="font-size:11px;color:var(--slate-500)">${data.length} customers →</span>
+        <span style="font-size:11px;color:var(--slate-500)">${data.length} customer${data.length === 1 ? '' : 's'} · tap for details ▸</span>
       </div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
         <div>
@@ -3908,6 +4159,44 @@ function ScheduleStatusCard({ plant, setTab }) {
         })}
       </div>
     </div>
+
+    ${drilldown && html`
+      <${DrillDownDrawer}
+        title="📅 Schedule Status — All customers"
+        subtitle="${overallPct.toFixed(1)}% attainment · ${overdueTotal > 0 ? overdueTotal + ' overdue lines' : 'on track'}"
+        items=${data}
+        renderItem=${(r) => {
+          const pct = parseFloat(r.pct_attainment || 0);
+          const color = pct >= 90 ? 'var(--emerald-700)' : pct >= 60 ? 'var(--teal-700)' : 'var(--amber-700)';
+          const bg = pct >= 90 ? 'var(--emerald-50)' : pct >= 60 ? 'var(--teal-50)' : 'var(--amber-50)';
+          const overdue = parseInt(r.overdue_lines || 0);
+          return html`
+            <div key=${r.schedule_id} style="padding:10px 12px;background:${bg};border-left:3px solid ${color};border-radius:6px">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-weight:600;color:var(--slate-900);font-size:13px">${r.customer_name}${r.customer_code ? ' · ' + r.customer_code : ''}</div>
+                  <div style="font-size:11px;color:var(--slate-600);margin-top:4px">
+                    Planned: <b>${fmtNum(r.total_planned)}</b> ·
+                    Supplied: <b>${fmtNum(r.total_supplied)}</b>
+                    ${parseInt(r.due_today_lines || 0) > 0 ? ' · ' + r.due_today_lines + ' due today' : ''}
+                  </div>
+                  ${overdue > 0 && html`<div style="font-size:11px;color:var(--rose-700);font-weight:600;margin-top:4px">⚠️ ${overdue} overdue line${overdue > 1 ? 's' : ''}</div>`}
+                </div>
+                <div style="text-align:right;flex-shrink:0">
+                  <div style="font-size:18px;font-weight:700;color:${color}">${pct.toFixed(0)}%</div>
+                </div>
+              </div>
+              <div style="margin-top:6px;height:6px;background:var(--slate-200);border-radius:3px;overflow:hidden">
+                <div style="background:${color};height:100%;width:${Math.min(100, pct)}%"></div>
+              </div>
+            </div>
+          `;
+        }}
+        ctaLabel="Open Schedules tab"
+        onCtaClick=${() => { setTab('schedules'); setDrilldown(false); }}
+        onClose=${() => setDrilldown(false)}
+      />
+    `}
   `;
 }
 
@@ -3915,6 +4204,7 @@ function ScheduleStatusCard({ plant, setTab }) {
 function MaterialBurnRateCard({ plant, setTab }) {
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [drilldown, setDrilldown] = useState(false);
 
   const refresh = async () => {
     // Only show items that have recent consumption (otherwise prediction is meaningless)
@@ -3942,10 +4232,10 @@ function MaterialBurnRateCard({ plant, setTab }) {
   `;
 
   return html`
-    <div class="card" onClick=${() => setTab('stocks')} style="cursor:pointer">
+    <div class="card" onClick=${() => setDrilldown(true)} style="cursor:pointer">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
         <div class="card-title" style="margin:0">⚙️ Material Burn Rate</div>
-        <span style="font-size:11px;color:var(--slate-500)">${atRisk.length} at risk · ${safe.length} safe →</span>
+        <span style="font-size:11px;color:var(--slate-500)">${atRisk.length} at risk · ${safe.length} safe · tap for details ▸</span>
       </div>
       ${atRisk.length === 0 ? html`
         <div style="font-size:12px;color:var(--emerald-700);padding:8px 0">✓ All ${data.length} active items have safe stock buffers</div>
@@ -3973,17 +4263,67 @@ function MaterialBurnRateCard({ plant, setTab }) {
         </div>
       `}
     </div>
+
+    ${drilldown && html`
+      <${DrillDownDrawer}
+        title="⚙️ Material Burn Rate — All items"
+        subtitle="Last 7 days consumption · ${atRisk.length} at risk · ${data.length} active items"
+        items=${data}
+        renderItem=${(r) => {
+          const isOut = r.risk_level === 'out_of_stock';
+          const isCrit = r.risk_level === 'critical';
+          const isWarn = r.risk_level === 'warning';
+          const sty = isOut ? { color:'var(--rose-700)', bg:'var(--rose-50)', border:'var(--rose-500)', label:'OUT' } :
+                      isCrit ? { color:'var(--rose-700)', bg:'var(--rose-50)', border:'var(--rose-500)', label:'CRITICAL' } :
+                      isWarn ? { color:'var(--amber-700)', bg:'var(--amber-50)', border:'var(--amber-500)', label:'WARNING' } :
+                      { color:'var(--emerald-700)', bg:'var(--emerald-50)', border:'var(--emerald-500)', label:r.risk_level.toUpperCase() };
+          const daysLabel = isOut ? 'OUT' : (r.days_of_stock_left == null ? '—' : Math.round(r.days_of_stock_left) + ' days');
+          return html`
+            <div key=${r.item_id} style="padding:10px 12px;background:${sty.bg};border-left:3px solid ${sty.border};border-radius:6px">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-weight:600;color:var(--slate-900);font-size:13px">${r.code} · ${r.name}</div>
+                  <div style="font-size:11px;color:var(--slate-600);margin-top:4px">
+                    Current: <b>${fmtNum(r.current_qty)} ${r.uom || ''}</b>
+                    ${r.daily_avg_consumption ? ' · Daily burn: ' + fmtNum(r.daily_avg_consumption) + '/day' : ''}
+                    ${r.consumed_7d ? ' · 7-day: ' + fmtNum(r.consumed_7d) : ''}
+                  </div>
+                </div>
+                <div style="text-align:right;flex-shrink:0">
+                  <span style="background:${sty.color};color:white;font-size:10px;font-weight:700;padding:3px 8px;border-radius:999px">${sty.label}</span>
+                  <div style="font-size:14px;font-weight:700;color:${sty.color};margin-top:4px">${daysLabel}</div>
+                </div>
+              </div>
+            </div>
+          `;
+        }}
+        ctaLabel="Open Stocks tab"
+        onCtaClick=${() => { setTab('stocks'); setDrilldown(false); }}
+        onClose=${() => setDrilldown(false)}
+      />
+    `}
   `;
 }
 
 // 4. STAGE TRACKING LAG — what hasn't been logged
 function StageLagCard({ plant, me, setTab }) {
   const [summary, setSummary] = useState(null);
+  const [details, setDetails] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [drilldown, setDrilldown] = useState(false);
 
   const refresh = async () => {
-    const { data } = await sb.from('v_stage_lag_summary').select('*').single();
-    setSummary(data);
+    const [sumRes, detRes] = await Promise.all([
+      sb.from('v_stage_lag_summary').select('*').single(),
+      sb.from('mcp_pdc_stage_log')
+        .select('id, log_date, stage, status, mcp_pdc_parts(part_number, name), shifts(name)')
+        .in('status', ['pending','provisional'])
+        .gte('log_date', new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10))
+        .order('log_date', { ascending: false })
+        .limit(50),
+    ]);
+    setSummary(sumRes.data);
+    setDetails(detRes.data || []);
     setLoading(false);
   };
   useEffect(() => { refresh(); }, []);
@@ -4005,10 +4345,10 @@ function StageLagCard({ plant, me, setTab }) {
   const unloggedYesterday = parseInt(summary.unlogged_yesterday || 0);
 
   return html`
-    <div class="card" onClick=${() => setTab('production')} style="cursor:pointer">
+    <div class="card" onClick=${() => setDrilldown(true)} style="cursor:pointer">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
         <div class="card-title" style="margin:0">📋 Stage Tracking · last 3 days</div>
-        <span style="font-size:11px;color:var(--slate-500)">→</span>
+        <span style="font-size:11px;color:var(--slate-500)">tap for details ▸</span>
       </div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
         <div>
@@ -4030,21 +4370,79 @@ function StageLagCard({ plant, me, setTab }) {
         <div style="background:${pct >= 80 ? 'var(--emerald-500)' : pct >= 50 ? 'var(--amber-500)' : 'var(--rose-500)'};height:100%;width:${pct}%"></div>
       </div>
     </div>
+
+    ${drilldown && html`
+      <${DrillDownDrawer}
+        title="📋 Stage Tracking — Pending entries"
+        subtitle="${pct.toFixed(0)}% compliance · ${unlogged} slot${unlogged === 1 ? '' : 's'} unlogged in last 3 days"
+        items=${details}
+        emptyMsg="${unlogged === 0 ? '✓ All caught up — no pending entries' : 'No detail rows. The summary shows ' + unlogged + ' missing — open Production tab to investigate.'}"
+        renderItem=${(d) => {
+          const isYesterday = d.log_date < new Date().toISOString().slice(0, 10);
+          const sty = isYesterday ? { color:'var(--rose-700)', bg:'var(--rose-50)', border:'var(--rose-500)' } : { color:'var(--amber-700)', bg:'var(--amber-50)', border:'var(--amber-500)' };
+          return html`
+            <div key=${d.id} style="padding:10px 12px;background:${sty.bg};border-left:3px solid ${sty.border};border-radius:6px">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-weight:600;color:var(--slate-900);font-size:13px">${d.mcp_pdc_parts?.part_number || '?'} · ${d.stage}</div>
+                  <div style="font-size:11px;color:var(--slate-600);margin-top:2px">${d.log_date} · ${d.shifts?.name || ''}${d.mcp_pdc_parts?.name ? ' · ' + d.mcp_pdc_parts.name : ''}</div>
+                </div>
+                <span style="background:${sty.color};color:white;font-size:10px;font-weight:700;padding:3px 8px;border-radius:999px;flex-shrink:0">${d.status.toUpperCase()}</span>
+              </div>
+            </div>
+          `;
+        }}
+        ctaLabel="Open Production tab"
+        onCtaClick=${() => { setTab('production'); setDrilldown(false); }}
+        onClose=${() => setDrilldown(false)}
+      />
+    `}
   `;
 }
 
 // 5. TOP CONCERNS — top NCRs, top breakdown machines, top stock risks (last 30d)
+// =================================================================
+// DRILL-DOWN DRAWER — bottom-sheet that shows specific records inline
+// without navigating away. Any insight card can open it.
+// =================================================================
+function DrillDownDrawer({ title, subtitle, items, renderItem, ctaLabel, onCtaClick, onClose, emptyMsg }) {
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:520px">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">${title}</div>
+            ${subtitle && html`<div style="font-size:12px;color:var(--slate-500);font-weight:400;margin-top:2px">${subtitle}</div>`}
+          </div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${items && items.length > 0 ? html`
+          <div style="display:flex;flex-direction:column;gap:8px;max-height:50vh;overflow-y:auto;margin-bottom:14px">
+            ${items.map((item, idx) => renderItem(item, idx))}
+          </div>
+        ` : html`
+          <div class="empty" style="padding:20px;text-align:center;color:var(--slate-500);font-size:13px">${emptyMsg || 'Nothing to show'}</div>
+        `}
+        ${ctaLabel && onCtaClick && html`
+          <button class="btn" onClick=${onCtaClick} style="width:100%">${ctaLabel} →</button>
+        `}
+      </div>
+    </div>
+  `;
+}
+
 function TopConcernsCard({ plant, setTab }) {
   const [ncrs, setNcrs] = useState([]);
   const [breakdowns, setBreakdowns] = useState([]);
   const [stockRisks, setStockRisks] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [drilldown, setDrilldown] = useState(null);  // 'quality' | 'maintenance' | 'stocks' | null
 
   const refresh = async () => {
     const [n, b, s] = await Promise.all([
-      sb.from('v_top_ncrs_30d').select('*').order('ncr_count', { ascending: false }).limit(3),
-      sb.from('v_top_breakdowns_30d').select('*').order('total_downtime_hrs', { ascending: false }).limit(3),
-      sb.from('v_material_burn_rate').select('*').in('risk_level', ['out_of_stock','critical']).limit(3),
+      sb.from('v_top_ncrs_30d').select('*').order('ncr_count', { ascending: false }).limit(10),
+      sb.from('v_top_breakdowns_30d').select('*').order('total_downtime_hrs', { ascending: false }).limit(10),
+      sb.from('v_material_burn_rate').select('*').in('risk_level', ['out_of_stock','critical','warning']).limit(10),
     ]);
     setNcrs(n.data || []);
     setBreakdowns(b.data || []);
@@ -4068,10 +4466,13 @@ function TopConcernsCard({ plant, setTab }) {
       <div class="card-title">🚨 Top Concerns · last 30 days</div>
       <div style="display:flex;flex-direction:column;gap:10px">
         ${ncrs.length > 0 && html`
-          <div onClick=${() => setTab('quality')} style="cursor:pointer">
-            <div style="font-size:11px;color:var(--rose-600);font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">QUALITY · top NCR parts</div>
-            ${ncrs.map(n => html`
-              <div key=${n.part_name} style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">
+          <div onClick=${() => setDrilldown('quality')} style="cursor:pointer;padding:6px;margin:-6px;border-radius:6px" onMouseOver=${e => e.currentTarget.style.background = 'var(--slate-50)'} onMouseOut=${e => e.currentTarget.style.background = 'transparent'}>
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div style="font-size:11px;color:var(--rose-600);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">QUALITY · top NCR parts</div>
+              <span style="font-size:10px;color:var(--slate-500)">tap for details ▸</span>
+            </div>
+            ${ncrs.slice(0, 3).map(n => html`
+              <div key=${n.part_name} style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;margin-top:2px">
                 <span style="color:var(--slate-700)">${n.part_name}</span>
                 <span style="font-weight:600;color:var(--rose-600)">${n.ncr_count} NCR${n.ncr_count > 1 ? 's' : ''}${parseInt(n.open_count) > 0 ? ' · ' + n.open_count + ' open' : ''}</span>
               </div>
@@ -4079,10 +4480,13 @@ function TopConcernsCard({ plant, setTab }) {
           </div>
         `}
         ${breakdowns.length > 0 && html`
-          <div onClick=${() => setTab('maintenance')} style="cursor:pointer;${ncrs.length > 0 ? 'border-top:0.5px solid var(--slate-200);padding-top:10px' : ''}">
-            <div style="font-size:11px;color:var(--amber-700);font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">MAINTENANCE · top downtime machines</div>
-            ${breakdowns.map(b => html`
-              <div key=${b.machine_id} style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">
+          <div onClick=${() => setDrilldown('maintenance')} style="cursor:pointer;padding:6px;margin:-6px;border-radius:6px;${ncrs.length > 0 ? 'border-top:0.5px solid var(--slate-200);padding-top:10px;margin-top:4px' : ''}" onMouseOver=${e => e.currentTarget.style.background = 'var(--slate-50)'} onMouseOut=${e => e.currentTarget.style.background = 'transparent'}>
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div style="font-size:11px;color:var(--amber-700);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">MAINTENANCE · top downtime machines</div>
+              <span style="font-size:10px;color:var(--slate-500)">tap for details ▸</span>
+            </div>
+            ${breakdowns.slice(0, 3).map(b => html`
+              <div key=${b.machine_id} style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;margin-top:2px">
                 <span style="color:var(--slate-700)">${b.machine_code}</span>
                 <span style="font-weight:600;color:var(--amber-700)">${parseFloat(b.total_downtime_hrs).toFixed(1)}h · ${b.breakdown_count} time${b.breakdown_count > 1 ? 's' : ''}</span>
               </div>
@@ -4090,18 +4494,100 @@ function TopConcernsCard({ plant, setTab }) {
           </div>
         `}
         ${stockRisks.length > 0 && html`
-          <div onClick=${() => setTab('stocks')} style="cursor:pointer;${(ncrs.length > 0 || breakdowns.length > 0) ? 'border-top:0.5px solid var(--slate-200);padding-top:10px' : ''}">
-            <div style="font-size:11px;color:var(--rose-600);font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">STOCK · critical risks</div>
-            ${stockRisks.map(s => html`
-              <div key=${s.item_id} style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">
+          <div onClick=${() => setDrilldown('stocks')} style="cursor:pointer;padding:6px;margin:-6px;border-radius:6px;${(ncrs.length > 0 || breakdowns.length > 0) ? 'border-top:0.5px solid var(--slate-200);padding-top:10px;margin-top:4px' : ''}" onMouseOver=${e => e.currentTarget.style.background = 'var(--slate-50)'} onMouseOut=${e => e.currentTarget.style.background = 'transparent'}>
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div style="font-size:11px;color:var(--rose-600);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">STOCK · critical risks</div>
+              <span style="font-size:10px;color:var(--slate-500)">tap for details ▸</span>
+            </div>
+            ${stockRisks.slice(0, 3).map(s => html`
+              <div key=${s.item_id} style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;margin-top:2px">
                 <span style="color:var(--slate-700);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px">${s.code} · ${s.name}</span>
-                <span style="font-weight:600;color:var(--rose-600)">${s.risk_level === 'out_of_stock' ? 'OUT' : Math.round(s.days_of_stock_left || 0) + ' days'}</span>
+                <span style="font-weight:600;color:${s.risk_level === 'out_of_stock' ? 'var(--rose-600)' : s.risk_level === 'critical' ? 'var(--rose-600)' : 'var(--amber-700)'}">${s.risk_level === 'out_of_stock' ? 'OUT' : Math.round(s.days_of_stock_left || 0) + ' days'}</span>
               </div>
             `)}
           </div>
         `}
       </div>
     </div>
+
+    ${drilldown === 'quality' && html`
+      <${DrillDownDrawer}
+        title="🚨 Top NCR parts (last 30 days)"
+        subtitle="${ncrs.length} part${ncrs.length === 1 ? '' : 's'} with NCRs"
+        items=${ncrs}
+        renderItem=${(n, i) => html`
+          <div key=${i} style="padding:10px 12px;background:var(--rose-50);border-left:3px solid var(--rose-500);border-radius:6px">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+              <div style="flex:1;min-width:0">
+                <div style="font-weight:600;color:var(--slate-900);font-size:13px">${n.part_name}</div>
+                <div style="font-size:11px;color:var(--slate-600);margin-top:2px">${n.ncr_count} NCR${n.ncr_count > 1 ? 's' : ''} in 30 days · ${n.open_count} still open</div>
+              </div>
+              ${parseInt(n.open_count) > 0 && html`<span class="badge rose">${n.open_count} open</span>`}
+            </div>
+          </div>
+        `}
+        ctaLabel="Go to Quality tab"
+        onCtaClick=${() => { setTab('quality'); setDrilldown(null); }}
+        onClose=${() => setDrilldown(null)}
+      />
+    `}
+
+    ${drilldown === 'maintenance' && html`
+      <${DrillDownDrawer}
+        title="⚙️ Top downtime machines (last 30 days)"
+        subtitle="${breakdowns.length} machine${breakdowns.length === 1 ? '' : 's'} with breakdowns"
+        items=${breakdowns}
+        renderItem=${(b, i) => html`
+          <div key=${i} style="padding:10px 12px;background:var(--amber-50);border-left:3px solid var(--amber-500);border-radius:6px">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+              <div style="flex:1;min-width:0">
+                <div style="font-weight:600;color:var(--slate-900);font-size:13px">${b.machine_code}</div>
+                <div style="font-size:11px;color:var(--slate-600);margin-top:2px">
+                  ${b.breakdown_count} breakdown${b.breakdown_count > 1 ? 's' : ''} ·
+                  ${parseFloat(b.total_downtime_hrs).toFixed(1)} hours total downtime
+                  ${b.avg_resolution_hrs ? ' · avg ' + parseFloat(b.avg_resolution_hrs).toFixed(1) + 'h to resolve' : ''}
+                </div>
+              </div>
+              <span class="badge amber">${parseFloat(b.total_downtime_hrs).toFixed(1)}h</span>
+            </div>
+          </div>
+        `}
+        ctaLabel="Go to Maintenance tab"
+        onCtaClick=${() => { setTab('maintenance'); setDrilldown(null); }}
+        onClose=${() => setDrilldown(null)}
+      />
+    `}
+
+    ${drilldown === 'stocks' && html`
+      <${DrillDownDrawer}
+        title="📦 Stock at risk"
+        subtitle="${stockRisks.length} item${stockRisks.length === 1 ? '' : 's'} need attention"
+        items=${stockRisks}
+        renderItem=${(s, i) => {
+          const sty = s.risk_level === 'out_of_stock' ? { color:'var(--rose-700)', bg:'var(--rose-50)', label:'OUT OF STOCK', border:'var(--rose-500)' } :
+                      s.risk_level === 'critical' ? { color:'var(--rose-700)', bg:'var(--rose-50)', label:'CRITICAL', border:'var(--rose-500)' } :
+                      { color:'var(--amber-700)', bg:'var(--amber-50)', label:'WARNING', border:'var(--amber-500)' };
+          return html`
+            <div key=${i} style="padding:10px 12px;background:${sty.bg};border-left:3px solid ${sty.border};border-radius:6px">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-weight:600;color:var(--slate-900);font-size:13px">${s.code} · ${s.name}</div>
+                  <div style="font-size:11px;color:var(--slate-600);margin-top:2px">
+                    Current: <b>${s.current_qty} ${s.uom || ''}</b>
+                    ${s.days_of_stock_left != null ? ' · ' + Math.round(s.days_of_stock_left) + ' days left at current burn' : ''}
+                    ${s.daily_burn_rate ? ' · ' + parseFloat(s.daily_burn_rate).toFixed(1) + '/day' : ''}
+                  </div>
+                </div>
+                <span style="background:${sty.color};color:white;font-size:10px;font-weight:700;padding:3px 8px;border-radius:999px;flex-shrink:0">${sty.label}</span>
+              </div>
+            </div>
+          `;
+        }}
+        ctaLabel="Go to Stocks tab"
+        onCtaClick=${() => { setTab('stocks'); setDrilldown(null); }}
+        onClose=${() => setDrilldown(null)}
+      />
+    `}
   `;
 }
 
@@ -4109,6 +4595,7 @@ function StockAlerts({ plant, setTab }) {
   const [alerts, setAlerts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [collapsed, setCollapsed] = useState(false);
+  const [drillItem, setDrillItem] = useState(null);
 
   useEffect(() => { load(); }, [plant?.id]);
 
@@ -4150,7 +4637,7 @@ function StockAlerts({ plant, setTab }) {
           ${alerts.slice(0, 12).map(a => {
             const isOut = parseFloat(a.current_qty) === 0;
             return html`
-              <div key=${a.id} onClick=${() => setTab('stocks')} style="background:white;padding:10px 12px;border-radius:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:8px">
+              <div key=${a.id} onClick=${() => setDrillItem(a)} style="background:white;padding:10px 12px;border-radius:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:8px">
                 <div style="flex:1;min-width:0">
                   <div style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${a.code} · ${a.name}</div>
                   <div style="font-size:11px;color:var(--slate-500)">${lblMap[a.category || 'general']} · reorder at ${a.reorder_level}</div>
@@ -4159,11 +4646,34 @@ function StockAlerts({ plant, setTab }) {
               </div>
             `;
           })}
-          ${alerts.length > 12 && html`<div style="font-size:11px;color:var(--slate-500);text-align:center;padding:6px">+ ${alerts.length - 12} more — tap any item to manage</div>`}
+          ${alerts.length > 12 && html`<div style="font-size:11px;color:var(--slate-500);text-align:center;padding:6px">+ ${alerts.length - 12} more — tap any item for details</div>`}
           <button class="btn small ghost" style="margin-top:6px" onClick=${() => setTab('stocks')}>Open Stocks →</button>
         </div>
       `}
     </div>
+
+    ${drillItem && html`
+      <${DrillDownDrawer}
+        title="📦 ${drillItem.code} · ${drillItem.name}"
+        subtitle=${parseFloat(drillItem.current_qty) === 0 ? 'OUT OF STOCK' : 'Below reorder level'}
+        items=${[drillItem]}
+        renderItem=${(it) => {
+          const isOut = parseFloat(it.current_qty) === 0;
+          const sty = isOut ? { color:'var(--rose-700)', bg:'var(--rose-50)', border:'var(--rose-500)' } : { color:'var(--amber-700)', bg:'var(--amber-50)', border:'var(--amber-500)' };
+          return html`
+            <div style="padding:12px 14px;background:${sty.bg};border-left:3px solid ${sty.border};border-radius:6px">
+              <div class="card-row"><span class="label">Current qty</span><span class="value" style="font-weight:700;color:${sty.color}">${fmtNum(it.current_qty)} ${it.uom || ''}</span></div>
+              <div class="card-row"><span class="label">Reorder level</span><span class="value">${it.reorder_level} ${it.uom || ''}</span></div>
+              <div class="card-row"><span class="label">Category</span><span class="value">${lblMap[it.category || 'general']}</span></div>
+              <div class="card-row"><span class="label">Status</span><span class="value" style="font-weight:700;color:${sty.color}">${isOut ? '🚨 OUT OF STOCK' : '⚠️ Below reorder · need to procure'}</span></div>
+            </div>
+          `;
+        }}
+        ctaLabel="Open in Stocks tab"
+        onCtaClick=${() => { setTab('stocks'); setDrillItem(null); }}
+        onClose=${() => setDrillItem(null)}
+      />
+    `}
   `;
 }
 
