@@ -10555,6 +10555,46 @@ const REPORT_CATALOG = [
   // PEOPLE
   { id:'team_snapshot', title:'Team & Roles Snapshot', dept:'people', clauses:['7.1.2','7.2'], frequency:'on_demand',
     desc:'Active team with roles, departments, contact details.', icon:'👥' },
+
+  // TOOLS (NEW)
+  { id:'tool_life_consumption', title:'Tool Life & Consumption', dept:'production', clauses:['7.1.3','8.5.1.5'], frequency:'monthly',
+    desc:'Per tool: total shots, current life used, change events, cost per piece.', icon:'🔨' },
+  { id:'tool_change_frequency', title:'Tool Change Frequency', dept:'production', clauses:['8.5.1.5'], frequency:'monthly',
+    desc:'How often each tool/corner changed across machines + reasons.', icon:'🔁' },
+  { id:'tool_demand_forecast', title:'30-Day Tool Demand Forecast', dept:'production', clauses:['8.1','7.1.3'], frequency:'monthly',
+    desc:'Predicted tool consumption next 30 days based on schedule × life.', icon:'🔮' },
+  { id:'tool_assignment_matrix', title:'Tool Assignment Matrix (Part × Op)', dept:'production', clauses:['8.5.1','7.5.3'], frequency:'on_demand',
+    desc:'Which tool is assigned to which part operation — for traceability.', icon:'🎯' },
+
+  // PLAN VS SUPPLY (NEW)
+  { id:'plan_vs_supply', title:'Plan vs Supply (Recovery)', dept:'schedules', clauses:['8.2','9.1.2'], frequency:'weekly',
+    desc:'Per schedule line: planned, supplied, gap, required vs current rate, recovery verdict.', icon:'📈' },
+  { id:'part_attainment_rollup', title:'Part-Level Attainment Rollup', dept:'schedules', clauses:['8.2','9.1.2'], frequency:'monthly',
+    desc:'Each part: total planned, supplied, yet-to-supply across customers and weeks.', icon:'📦' },
+
+  // AI AUDITS (NEW)
+  { id:'ai_audit_history', title:'AI Audit History', dept:'cross', clauses:['9.2','9.3'], frequency:'monthly',
+    desc:'All AI Quick/Weekly/Pre-IATF audit runs with findings + recommendations.', icon:'🤖' },
+
+  // INTER-UNIT (NEW)
+  { id:'interunit_transfers', title:'Inter-Unit Material Transfers', dept:'stocks', clauses:['8.5.4','8.5.2'], frequency:'monthly',
+    desc:'All DCs between units of this plant — sent vs received, in-transit aging.', icon:'🔀' },
+
+  // ACTIVITY (NEW)
+  { id:'entity_activity_timeline', title:'Entity Activity Timeline', dept:'cross', clauses:['7.5.3','9.2.2'], frequency:'on_demand',
+    desc:'Chronological events for any single record — who did what, when.', icon:'⏱️' },
+
+  // PER-UNIT ROLLUPS (NEW)
+  { id:'per_unit_dashboard', title:'Per-Unit Dashboard Rollup', dept:'cross', clauses:['9.1.1','9.1.3'], frequency:'monthly',
+    desc:'Side-by-side metrics: shots, rejects, NCRs, breakdowns, attainment per unit.', icon:'🏭' },
+
+  // SHIFT SEGMENTS (NEW — multi-row shift entries)
+  { id:'shift_segment_log', title:'Shift Segment Log', dept:'production', clauses:['8.5.1','9.1.1.1'], frequency:'on_demand',
+    desc:'Multi-row shift entries: machine × operation × run × tool change events.', icon:'🕐' },
+
+  // OPERATOR PERFORMANCE (NEW)
+  { id:'operator_performance', title:'Operator Performance (30 days)', dept:'production', clauses:['7.1.2','7.2'], frequency:'monthly',
+    desc:'Per operator: total qty produced, reject %, hours logged, parts handled.', icon:'👷' },
 ];
 
 const DEPT_LABELS = {
@@ -11888,6 +11928,20 @@ function ReportConfig({ plant, me, report, onClose }) {
         case 'document_index':         html_content = await genDocumentIndex(plantWithDoc, dateFrom, dateTo); break;
         case 'audit_trail':            html_content = await genAuditTrail(plantWithDoc, entityType, pickedItem); break;
         case 'team_snapshot':          html_content = await genTeamSnapshot(plantWithDoc); break;
+
+        // NEW REPORTS
+        case 'tool_life_consumption':    html_content = await genToolLifeConsumption(plantWithDoc, dateFrom, dateTo); break;
+        case 'tool_change_frequency':    html_content = await genToolChangeFrequency(plantWithDoc, dateFrom, dateTo); break;
+        case 'tool_demand_forecast':     html_content = await genToolDemandForecast(plantWithDoc); break;
+        case 'tool_assignment_matrix':   html_content = await genToolAssignmentMatrix(plantWithDoc); break;
+        case 'plan_vs_supply':           html_content = await genPlanVsSupply(plantWithDoc); break;
+        case 'part_attainment_rollup':   html_content = await genPartAttainmentRollup(plantWithDoc); break;
+        case 'ai_audit_history':         html_content = await genAiAuditHistory(plantWithDoc, dateFrom, dateTo); break;
+        case 'interunit_transfers':      html_content = await genInterunitTransfers(plantWithDoc, dateFrom, dateTo); break;
+        case 'entity_activity_timeline': html_content = await genEntityActivityTimeline(plantWithDoc, entityType, pickedItem); break;
+        case 'per_unit_dashboard':       html_content = await genPerUnitDashboard(plantWithDoc, dateFrom, dateTo); break;
+        case 'shift_segment_log':        html_content = await genShiftSegmentLog(plantWithDoc, dateFrom, dateTo); break;
+        case 'operator_performance':     html_content = await genOperatorPerformance(plantWithDoc, dateFrom, dateTo); break;
         default: throw new Error('Unknown report');
       }
       // Open in new tab
@@ -12626,6 +12680,235 @@ async function genTeamSnapshot(plant) {
   return reportShell(plant, 'Team & Roles Snapshot', plant.name,
     rows ? '<table class="data"><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Role</th><th>Department</th><th>Status</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<div class="empty">No team members yet</div>',
     { 'Plant': plant.name, 'Total': users?.length || 0 });
+}
+
+// ========== NEW REPORTS (post-multi-unit) ==========
+
+async function genToolLifeConsumption(plant, from, to) {
+  const { data: tools } = await sb.from('tools_master').select('*').order('code');
+  const { data: events } = await sb.from('tool_change_events').select('*').gte('event_at', from).lte('event_at', to + 'T23:59:59');
+  const byTool = new Map();
+  for (const t of tools || []) byTool.set(t.id, { tool: t, changes: 0, total_shots: 0, current_life: t.life_used || 0 });
+  for (const e of events || []) {
+    const r = byTool.get(e.tool_id);
+    if (r) { r.changes++; r.total_shots += e.shots_at_change || 0; }
+  }
+  const rows = [...byTool.values()].sort((a,b) => b.changes - a.changes).map(r => `<tr>
+    <td><b>${esc(r.tool.code)}</b></td><td>${esc(r.tool.category || '-')}</td>
+    <td>${esc(r.tool.life_target || '-')}</td><td>${r.current_life}</td>
+    <td>${r.changes}</td><td>${r.total_shots}</td>
+    <td>₹${r.tool.cost_per_unit ? (r.tool.cost_per_unit * r.changes).toFixed(0) : '-'}</td>
+  </tr>`).join('');
+  return reportShell(plant, 'Tool Life & Consumption', `${from} to ${to}`,
+    rows ? `<table class="data"><thead><tr><th>Tool</th><th>Category</th><th>Life Target</th><th>Life Used Now</th><th>Changes</th><th>Shots</th><th>Total Cost</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No tools or events</div>',
+    { Period: `${from} to ${to}`, Tools: tools?.length || 0, Events: events?.length || 0 });
+}
+
+async function genToolChangeFrequency(plant, from, to) {
+  const { data: events } = await sb.from('tool_change_events').select('*, tools_master(code, category), machines(code)').gte('event_at', from).lte('event_at', to + 'T23:59:59').order('event_at', { ascending: false });
+  const rows = (events || []).map(e => `<tr>
+    <td>${new Date(e.event_at).toLocaleString('en-IN')}</td>
+    <td><b>${esc(e.tools_master?.code || '-')}</b></td>
+    <td>${esc(e.machines?.code || '-')}</td>
+    <td>${esc(e.corner || '-')}</td>
+    <td>${e.shots_at_change || 0}</td>
+    <td>${esc(e.reason || '-')}</td>
+  </tr>`).join('');
+  return reportShell(plant, 'Tool Change Frequency', `${from} to ${to}`,
+    rows ? `<table class="data"><thead><tr><th>When</th><th>Tool</th><th>Machine</th><th>Corner</th><th>Shots</th><th>Reason</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No tool changes in period</div>',
+    { Period: `${from} to ${to}`, Total_changes: events?.length || 0 });
+}
+
+async function genToolDemandForecast(plant) {
+  const { data: forecast } = await sb.from('v_tool_demand_30d').select('*').order('expected_changes', { ascending: false });
+  const rows = (forecast || []).map(f => `<tr>
+    <td><b>${esc(f.tool_code || '-')}</b></td>
+    <td>${esc(f.category || '-')}</td>
+    <td>${f.parts_using || 0}</td>
+    <td>${f.qty_planned || 0}</td>
+    <td>${f.life_target || '-'}</td>
+    <td><b>${f.expected_changes || 0}</b></td>
+    <td>${f.tools_needed_with_buffer || 0}</td>
+  </tr>`).join('');
+  return reportShell(plant, '30-Day Tool Demand Forecast', plant.name,
+    rows ? `<table class="data"><thead><tr><th>Tool</th><th>Category</th><th>Parts Using</th><th>Qty Planned</th><th>Life Target</th><th>Expected Changes</th><th>Procure (1.2x)</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No forecast — link tools to parts first</div>',
+    { Tools_in_forecast: forecast?.length || 0 });
+}
+
+async function genToolAssignmentMatrix(plant) {
+  const { data: assignments } = await sb.from('part_op_tools').select('*, mcp_pdc_parts(part_number, name), tools_master(code, category)').order('created_at', { ascending: false });
+  const rows = (assignments || []).map(a => `<tr>
+    <td><b>${esc(a.mcp_pdc_parts?.part_number || '-')}</b></td>
+    <td>${esc(a.mcp_pdc_parts?.name || '-')}</td>
+    <td>${esc(a.operation || '-')}</td>
+    <td>${esc(a.tools_master?.code || '-')}</td>
+    <td>${esc(a.tools_master?.category || '-')}</td>
+  </tr>`).join('');
+  return reportShell(plant, 'Tool Assignment Matrix', plant.name,
+    rows ? `<table class="data"><thead><tr><th>Part #</th><th>Part Name</th><th>Operation</th><th>Tool</th><th>Category</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No tool assignments yet</div>',
+    { Total_assignments: assignments?.length || 0 });
+}
+
+async function genPlanVsSupply(plant) {
+  const { data: rows } = await sb.from('v_plan_vs_supply').select('*').order('effective_due_date');
+  const trs = (rows || []).map(r => `<tr>
+    <td>${esc(r.customer_name || '-')}</td>
+    <td><b>${esc(r.part_number || r.part_name_raw || '-')}</b></td>
+    <td>W${r.week_no || '-'}</td>
+    <td>${r.effective_due_date || '-'}</td>
+    <td style="text-align:right">${r.planned_qty || 0}</td>
+    <td style="text-align:right">${r.supplied_qty || 0}</td>
+    <td style="text-align:right;color:${r.gap_qty > 0 ? '#be123c' : '#047857'}">${r.gap_qty || 0}</td>
+    <td>${r.pct_supplied || 0}%</td>
+    <td>${esc(r.status || '-')}</td>
+  </tr>`).join('');
+  return reportShell(plant, 'Plan vs Supply', plant.name,
+    trs ? `<table class="data"><thead><tr><th>Customer</th><th>Part</th><th>Week</th><th>Due</th><th>Planned</th><th>Supplied</th><th>Gap</th><th>%</th><th>Status</th></tr></thead><tbody>${trs}</tbody></table>` : '<div class="empty">No active schedule lines</div>',
+    { Lines: rows?.length || 0 });
+}
+
+async function genPartAttainmentRollup(plant) {
+  const { data: rows } = await sb.from('v_plan_vs_supply').select('*');
+  const byPart = new Map();
+  for (const r of rows || []) {
+    const k = r.part_number || r.part_name_raw || '?';
+    if (!byPart.has(k)) byPart.set(k, { part: k, name: r.part_name, customers: new Set(), planned: 0, supplied: 0, lines: 0 });
+    const p = byPart.get(k);
+    p.customers.add(r.customer_name);
+    p.planned += parseFloat(r.planned_qty || 0);
+    p.supplied += parseFloat(r.supplied_qty || 0);
+    p.lines++;
+  }
+  const arr = [...byPart.values()].sort((a,b) => (b.planned - b.supplied) - (a.planned - a.supplied));
+  const trs = arr.map(p => {
+    const gap = Math.max(p.planned - p.supplied, 0);
+    const pct = p.planned > 0 ? ((p.supplied / p.planned) * 100).toFixed(0) : 0;
+    return `<tr>
+      <td><b>${esc(p.part)}</b>${p.name ? ` · ${esc(p.name)}` : ''}</td>
+      <td>${[...p.customers].join(', ')}</td>
+      <td>${p.lines}</td>
+      <td style="text-align:right">${p.planned.toFixed(0)}</td>
+      <td style="text-align:right">${p.supplied.toFixed(0)}</td>
+      <td style="text-align:right;color:${gap > 0 ? '#be123c' : '#047857'}"><b>${gap.toFixed(0)}</b></td>
+      <td>${pct}%</td>
+    </tr>`;
+  }).join('');
+  return reportShell(plant, 'Part-Level Attainment Rollup', plant.name,
+    trs ? `<table class="data"><thead><tr><th>Part</th><th>Customers</th><th>Lines</th><th>Planned</th><th>Supplied</th><th>Yet to Supply</th><th>%</th></tr></thead><tbody>${trs}</tbody></table>` : '<div class="empty">No schedule data</div>',
+    { Total_parts: arr.length });
+}
+
+async function genAiAuditHistory(plant, from, to) {
+  const { data: runs } = await sb.from('ai_audit_runs').select('*').gte('created_at', from).lte('created_at', to + 'T23:59:59').order('created_at', { ascending: false });
+  const rows = (runs || []).map(r => `<tr>
+    <td>${new Date(r.created_at).toLocaleString('en-IN')}</td>
+    <td><b>${esc(r.audit_type || '-')}</b></td>
+    <td>${esc(r.scope || '-')}</td>
+    <td>${r.findings_count || 0}</td>
+    <td>${r.severity_high || 0} high · ${r.severity_med || 0} med · ${r.severity_low || 0} low</td>
+    <td>${esc(r.status || '-')}</td>
+  </tr>`).join('');
+  return reportShell(plant, 'AI Audit History', `${from} to ${to}`,
+    rows ? `<table class="data"><thead><tr><th>When</th><th>Type</th><th>Scope</th><th>Findings</th><th>Severity</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No audits in this period</div>',
+    { Period: `${from} to ${to}`, Total_runs: runs?.length || 0 });
+}
+
+async function genInterunitTransfers(plant, from, to) {
+  const { data: trs } = await sb.from('interunit_transfers').select('*, from_unit:from_unit_id(name), to_unit:to_unit_id(name)').gte('transfer_date', from).lte('transfer_date', to).order('transfer_date', { ascending: false });
+  const rows = (trs || []).map(t => `<tr>
+    <td>${t.transfer_date}</td>
+    <td>${esc(t.dc_number || '-')}</td>
+    <td>${esc(t.from_unit?.name || '-')} → ${esc(t.to_unit?.name || '-')}</td>
+    <td><span class="badge ${t.status === 'received' ? 'emerald' : t.status === 'in_transit' ? 'amber' : ''}">${esc(t.status || '-')}</span></td>
+    <td>${t.received_at ? new Date(t.received_at).toLocaleString('en-IN') : '—'}</td>
+    <td>${esc(t.notes || '-')}</td>
+  </tr>`).join('');
+  return reportShell(plant, 'Inter-Unit Material Transfers', `${from} to ${to}`,
+    rows ? `<table class="data"><thead><tr><th>Date</th><th>DC #</th><th>From → To</th><th>Status</th><th>Received</th><th>Notes</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No inter-unit transfers</div>',
+    { Period: `${from} to ${to}`, Total: trs?.length || 0 });
+}
+
+async function genEntityActivityTimeline(plant, entityType, entityId) {
+  if (!entityId) return reportShell(plant, 'Entity Activity Timeline', '—', '<div class="empty">Pick an entity first</div>');
+  const { data: logs } = await sb.from('activity_log').select('*, users(full_name)').eq('entity_type', entityType).eq('entity_id', entityId).order('created_at', { ascending: true });
+  const rows = (logs || []).map(l => `<tr>
+    <td>${new Date(l.created_at).toLocaleString('en-IN')}</td>
+    <td>${esc(l.users?.full_name || 'system')}</td>
+    <td><b>${esc(l.action || '-')}</b></td>
+    <td>${esc(l.summary || '')}</td>
+  </tr>`).join('');
+  return reportShell(plant, 'Entity Activity Timeline', `${entityType} · ${entityId.slice(0,8)}…`,
+    rows ? `<table class="data"><thead><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No activity logged</div>',
+    { Entity_type: entityType, Events: logs?.length || 0 });
+}
+
+async function genPerUnitDashboard(plant, from, to) {
+  const { data: units } = await sb.from('units').select('*').order('name');
+  const sections = [];
+  for (const u of units || []) {
+    const [shotsRes, ncrRes, bdRes, supRes] = await Promise.all([
+      sb.from('mcp_pdc_shots').select('shots_good, shots_rejected', { count: 'exact' }).eq('unit_id', u.id).gte('created_at', from).lte('created_at', to + 'T23:59:59'),
+      sb.from('mcp_quality_ncrs').select('id', { count: 'exact', head: true }).eq('unit_id', u.id).gte('created_at', from).lte('created_at', to + 'T23:59:59'),
+      sb.from('mcp_maint_breakdowns').select('id, downtime_minutes', { count: 'exact' }).eq('unit_id', u.id).gte('reported_at', from).lte('reported_at', to + 'T23:59:59'),
+      sb.from('mcp_sched_supplies').select('supplied_qty').eq('unit_id', u.id).gte('dispatch_date', from).lte('dispatch_date', to),
+    ]);
+    const totalGood = (shotsRes.data || []).reduce((s, r) => s + (r.shots_good || 0), 0);
+    const totalReject = (shotsRes.data || []).reduce((s, r) => s + (r.shots_rejected || 0), 0);
+    const totalDowntime = (bdRes.data || []).reduce((s, r) => s + (r.downtime_minutes || 0), 0);
+    const totalSupplied = (supRes.data || []).reduce((s, r) => s + parseFloat(r.supplied_qty || 0), 0);
+    sections.push(`<tr>
+      <td><b>${esc(u.name)}</b></td>
+      <td style="text-align:right">${totalGood}</td>
+      <td style="text-align:right">${totalReject}</td>
+      <td style="text-align:right">${totalGood + totalReject > 0 ? ((totalReject/(totalGood+totalReject))*100).toFixed(1) : 0}%</td>
+      <td style="text-align:right">${ncrRes.count || 0}</td>
+      <td style="text-align:right">${bdRes.count || 0}</td>
+      <td style="text-align:right">${(totalDowntime / 60).toFixed(1)}h</td>
+      <td style="text-align:right">${totalSupplied.toFixed(0)}</td>
+    </tr>`);
+  }
+  return reportShell(plant, 'Per-Unit Dashboard Rollup', `${from} to ${to}`,
+    sections.length ? `<table class="data"><thead><tr><th>Unit</th><th>Good</th><th>Reject</th><th>Reject %</th><th>NCRs</th><th>Breakdowns</th><th>Downtime</th><th>Supplied</th></tr></thead><tbody>${sections.join('')}</tbody></table>` : '<div class="empty">No units</div>',
+    { Period: `${from} to ${to}`, Units: units?.length || 0 });
+}
+
+async function genShiftSegmentLog(plant, from, to) {
+  const { data: segs } = await sb.from('mcp_pdc_shift_segments').select('*, machines(code), mcp_pdc_parts(part_number)').gte('log_date', from).lte('log_date', to).order('log_date', { ascending: false });
+  const rows = (segs || []).map(s => `<tr>
+    <td>${s.log_date}</td>
+    <td>${esc(s.machines?.code || '-')}</td>
+    <td>${esc(s.mcp_pdc_parts?.part_number || '-')}</td>
+    <td>${esc(s.operation || '-')}</td>
+    <td style="text-align:right">${s.qty_good || 0}</td>
+    <td style="text-align:right">${s.qty_rejected || 0}</td>
+    <td>${s.setup_change ? '✓' : ''}</td>
+    <td>${s.tool_changed ? '✓' : ''}</td>
+  </tr>`).join('');
+  return reportShell(plant, 'Shift Segment Log', `${from} to ${to}`,
+    rows ? `<table class="data"><thead><tr><th>Date</th><th>Machine</th><th>Part</th><th>Operation</th><th>Good</th><th>Reject</th><th>Setup</th><th>Tool Δ</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No shift segments</div>',
+    { Period: `${from} to ${to}`, Segments: segs?.length || 0 });
+}
+
+async function genOperatorPerformance(plant, from, to) {
+  const { data: shots } = await sb.from('mcp_pdc_shots').select('operator_user_id, shots_good, shots_rejected, users:operator_user_id(full_name)').gte('created_at', from).lte('created_at', to + 'T23:59:59');
+  const byOp = new Map();
+  for (const s of shots || []) {
+    if (!s.operator_user_id) continue;
+    if (!byOp.has(s.operator_user_id)) byOp.set(s.operator_user_id, { name: s.users?.full_name || '?', good: 0, reject: 0, shots: 0 });
+    const o = byOp.get(s.operator_user_id);
+    o.good += s.shots_good || 0; o.reject += s.shots_rejected || 0; o.shots++;
+  }
+  const arr = [...byOp.values()].sort((a,b) => b.good - a.good);
+  const rows = arr.map(o => `<tr>
+    <td><b>${esc(o.name)}</b></td>
+    <td style="text-align:right">${o.shots}</td>
+    <td style="text-align:right">${o.good}</td>
+    <td style="text-align:right">${o.reject}</td>
+    <td style="text-align:right">${o.good + o.reject > 0 ? ((o.reject/(o.good+o.reject))*100).toFixed(1) : 0}%</td>
+  </tr>`).join('');
+  return reportShell(plant, 'Operator Performance', `${from} to ${to}`,
+    rows ? `<table class="data"><thead><tr><th>Operator</th><th>Shifts Logged</th><th>Good</th><th>Reject</th><th>Reject %</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No operator data</div>',
+    { Period: `${from} to ${to}`, Operators: arr.length });
 }
 
 // ========== END REPORTS MODULE ==========
