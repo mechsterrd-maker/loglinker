@@ -9173,6 +9173,7 @@ function PlanVsSupplyView({ plant, me }) {
   const [search, setSearch] = useState('');
   const [selectedRow, setSelectedRow] = useState(null);
   const [machineCount, setMachineCount] = useState(null);
+  const [groupBy, setGroupBy] = useState('line'); // 'line' | 'part'
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -9263,6 +9264,12 @@ function PlanVsSupplyView({ plant, me }) {
       </div>
     </div>
 
+    <!-- View mode toggle -->
+    <div style="display:flex;gap:6px;margin-bottom:10px;background:var(--slate-100);padding:3px;border-radius:8px;width:fit-content">
+      <button class=${'btn small ' + (groupBy === 'line' ? '' : 'ghost')} onClick=${() => setGroupBy('line')} style="padding:5px 12px;font-size:12px;background:${groupBy === 'line' ? 'white' : 'transparent'};color:${groupBy === 'line' ? 'var(--slate-900)' : 'var(--slate-600)'};box-shadow:${groupBy === 'line' ? '0 1px 3px rgba(0,0,0,0.1)' : 'none'};border:none">📋 By Line</button>
+      <button class=${'btn small ' + (groupBy === 'part' ? '' : 'ghost')} onClick=${() => setGroupBy('part')} style="padding:5px 12px;font-size:12px;background:${groupBy === 'part' ? 'white' : 'transparent'};color:${groupBy === 'part' ? 'var(--slate-900)' : 'var(--slate-600)'};box-shadow:${groupBy === 'part' ? '0 1px 3px rgba(0,0,0,0.1)' : 'none'};border:none">📦 By Part</button>
+    </div>
+
     <!-- Filters -->
     <div class="card" style="margin-bottom:14px;padding:10px 14px">
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -9284,12 +9291,116 @@ function PlanVsSupplyView({ plant, me }) {
         <button class="btn small ghost" onClick=${exportCsv} style="padding:5px 10px;font-size:11px;flex-shrink:0">⬇ CSV</button>
       </div>
       <div style="font-size:11px;color:var(--slate-500);margin-top:8px">
-        Showing ${filtered.length} of ${rows.length} schedule lines
+        ${groupBy === 'line' ? `Showing ${filtered.length} of ${rows.length} schedule lines` : `Showing ${filtered.length} lines · grouped into part rollup`}
       </div>
     </div>
 
     <!-- Table -->
     ${filtered.length === 0 ? html`<div class="card"><div class="empty"><div style="font-size:13px">${rows.length === 0 ? 'No schedule lines yet. Create or upload schedules in the Schedules tab first.' : 'No lines match current filters.'}</div></div></div>` :
+      groupBy === 'part' ? (() => {
+        // Aggregate by part_id (or part_name_raw if no part_id)
+        const byPart = new Map();
+        for (const r of filtered) {
+          const key = r.part_id || ('raw:' + (r.part_name_raw || '').toLowerCase());
+          if (!byPart.has(key)) {
+            byPart.set(key, {
+              key,
+              part_id: r.part_id,
+              part_number: r.part_number,
+              part_name: r.part_name,
+              part_name_raw: r.part_name_raw,
+              customers: new Set(),
+              line_count: 0,
+              planned_total: 0,
+              supplied_total: 0,
+              earliest_due: null,
+              latest_due: null,
+              statuses: { completed: 0, on_track: 0, at_risk: 0, due_today: 0, overdue: 0, unknown: 0 },
+              current_daily_rate: parseFloat(r.current_daily_rate || 0),  // same per part — view computes by part_id
+              pending_lines: [],
+            });
+          }
+          const p = byPart.get(key);
+          p.customers.add(r.customer_name);
+          p.line_count += 1;
+          p.planned_total += parseFloat(r.planned_qty || 0);
+          p.supplied_total += parseFloat(r.supplied_qty || 0);
+          if (r.effective_due_date) {
+            if (!p.earliest_due || r.effective_due_date < p.earliest_due) p.earliest_due = r.effective_due_date;
+            if (!p.latest_due || r.effective_due_date > p.latest_due) p.latest_due = r.effective_due_date;
+          }
+          p.statuses[r.status || 'unknown'] = (p.statuses[r.status || 'unknown'] || 0) + 1;
+          if (r.gap_qty > 0) p.pending_lines.push(r);
+        }
+        // Sort: most short first
+        const partRows = [...byPart.values()].sort((a, b) => {
+          const gapA = a.planned_total - a.supplied_total;
+          const gapB = b.planned_total - b.supplied_total;
+          return gapB - gapA;
+        });
+        return html`
+          <div class="card" style="padding:0;overflow-x:auto">
+            <table style="width:100%;font-size:12px;border-collapse:collapse">
+              <thead>
+                <tr style="background:var(--slate-100);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:var(--slate-600)">
+                  <th style="padding:10px 8px;text-align:left;font-weight:700">Part</th>
+                  <th style="padding:10px 6px;text-align:center;font-weight:700">Customers</th>
+                  <th style="padding:10px 6px;text-align:right;font-weight:700">Planned</th>
+                  <th style="padding:10px 6px;text-align:right;font-weight:700">Supplied</th>
+                  <th style="padding:10px 6px;text-align:right;font-weight:700">Yet to Supply</th>
+                  <th style="padding:10px 6px;text-align:center;font-weight:700;min-width:70px">% Done</th>
+                  <th style="padding:10px 6px;text-align:center;font-weight:700">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${partRows.map(p => {
+                  const gap = Math.max(p.planned_total - p.supplied_total, 0);
+                  const pct = p.planned_total > 0 ? (p.supplied_total / p.planned_total * 100) : 0;
+                  // Worst status decides row color
+                  const worst = p.statuses.overdue > 0 ? 'overdue' :
+                                p.statuses.at_risk > 0 ? 'at_risk' :
+                                p.statuses.due_today > 0 ? 'due_today' :
+                                p.statuses.on_track > 0 ? 'on_track' :
+                                p.statuses.completed > 0 ? 'completed' : 'unknown';
+                  const sty = STATUS_STYLES[worst];
+                  const isAlert = worst === 'overdue' || worst === 'at_risk' || worst === 'due_today';
+                  return html`
+                    <tr key=${p.key} style="border-bottom:1px solid var(--slate-100);${isAlert ? 'background:' + sty.bg + '40' : ''}">
+                      <td style="padding:8px;color:var(--slate-800)">
+                        <div style="font-weight:600;font-size:12px">${p.part_number || p.part_name_raw || '—'}</div>
+                        ${p.part_name && html`<div style="font-size:11px;color:var(--slate-500);margin-top:1px">${p.part_name}</div>`}
+                        <div style="font-size:10px;color:var(--slate-400);margin-top:2px">${p.line_count} line${p.line_count > 1 ? 's' : ''}${p.earliest_due ? ' · earliest ' + p.earliest_due : ''}</div>
+                      </td>
+                      <td style="padding:8px 6px;text-align:center;color:var(--slate-600);font-size:11px">
+                        ${[...p.customers].slice(0, 2).join(', ')}${p.customers.size > 2 ? ' +' + (p.customers.size - 2) : ''}
+                      </td>
+                      <td style="padding:8px 6px;text-align:right;font-weight:600;color:var(--slate-800);font-variant-numeric:tabular-nums">${fmtNum(p.planned_total)}</td>
+                      <td style="padding:8px 6px;text-align:right;color:var(--emerald-700);font-weight:600;font-variant-numeric:tabular-nums">${fmtNum(p.supplied_total)}</td>
+                      <td style="padding:8px 6px;text-align:right;color:${gap > 0 ? 'var(--rose-700)' : 'var(--emerald-700)'};font-weight:700;font-variant-numeric:tabular-nums;font-size:13px">${fmtNum(gap)}</td>
+                      <td style="padding:8px 6px">
+                        <div style="display:flex;align-items:center;gap:4px">
+                          <div style="flex:1;background:var(--slate-200);height:6px;border-radius:3px;overflow:hidden;min-width:40px">
+                            <div style="width:${Math.min(100, pct)}%;height:100%;background:${pct >= 100 ? 'var(--emerald-500)' : pct >= 70 ? 'var(--teal-500)' : pct >= 40 ? 'var(--amber-500)' : 'var(--rose-500)'}"></div>
+                          </div>
+                          <span style="font-size:10px;color:var(--slate-600);font-weight:600;font-variant-numeric:tabular-nums;min-width:32px;text-align:right">${pct.toFixed(0)}%</span>
+                        </div>
+                      </td>
+                      <td style="padding:8px 6px;text-align:center">
+                        <div style="display:flex;flex-direction:column;gap:2px;align-items:center">
+                          ${p.statuses.overdue > 0 && html`<span style="background:${STATUS_STYLES.overdue.color};color:white;font-size:9px;font-weight:700;padding:2px 6px;border-radius:999px">🚨 ${p.statuses.overdue}</span>`}
+                          ${p.statuses.at_risk > 0 && html`<span style="background:${STATUS_STYLES.at_risk.color};color:white;font-size:9px;font-weight:700;padding:2px 6px;border-radius:999px">⚠️ ${p.statuses.at_risk}</span>`}
+                          ${p.statuses.due_today > 0 && html`<span style="background:${STATUS_STYLES.due_today.color};color:white;font-size:9px;font-weight:700;padding:2px 6px;border-radius:999px">⏰ ${p.statuses.due_today}</span>`}
+                          ${p.statuses.completed > 0 && p.statuses.overdue === 0 && p.statuses.at_risk === 0 && p.statuses.due_today === 0 && html`<span style="background:${STATUS_STYLES.completed.color};color:white;font-size:9px;font-weight:700;padding:2px 6px;border-radius:999px">✓ ${p.statuses.completed}</span>`}
+                        </div>
+                      </td>
+                    </tr>
+                  `;
+                })}
+              </tbody>
+            </table>
+          </div>
+        `;
+      })() :
       html`
         <div class="card" style="padding:0;overflow-x:auto">
           <table style="width:100%;font-size:12px;border-collapse:collapse">
@@ -10157,9 +10268,16 @@ function ScheduleDetail({ plant, me, schedule, onClose }) {
                     </td>
                   `;
                 })}
-                <td style="padding:6px 4px;text-align:center;background:var(--slate-50);font-weight:700">
-                  <div>${fmtNum(p.totalP)}</div>
-                  ${p.totalS > 0 && html`<div style="font-size:9px;color:${p.totalS >= p.totalP ? 'var(--emerald-600)' : 'var(--amber-600)'}">${((p.totalS/p.totalP)*100).toFixed(0)}%</div>`}
+                <td style="padding:6px 4px;text-align:center;background:var(--slate-50);font-weight:700;min-width:90px">
+                  <div style="font-size:12px;color:var(--slate-800)">${fmtNum(p.totalP)}</div>
+                  ${p.totalS > 0 ? html`
+                    <div style="font-size:10px;color:var(--emerald-700);font-weight:600;margin-top:2px">+${fmtNum(p.totalS)} supplied</div>
+                    ${p.totalP > p.totalS && html`<div style="font-size:10px;color:var(--rose-700);font-weight:600;margin-top:1px">−${fmtNum(p.totalP - p.totalS)} short</div>`}
+                    <div style="font-size:9px;color:${p.totalS >= p.totalP ? 'var(--emerald-600)' : 'var(--amber-600)'};margin-top:1px">${((p.totalS/p.totalP)*100).toFixed(0)}%</div>
+                  ` : html`
+                    <div style="font-size:10px;color:var(--rose-700);font-weight:600;margin-top:2px">${fmtNum(p.totalP)} pending</div>
+                    <div style="font-size:9px;color:var(--slate-400);margin-top:1px">0%</div>
+                  `}
                 </td>
               </tr>
             `)}
