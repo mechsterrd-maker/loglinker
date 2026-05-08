@@ -895,6 +895,27 @@ function App() {
   const [tab, setTab] = useState('home');
   const [loading, setLoading] = useState(true);
   const [pendingInvite, setPendingInvite] = useState(null);
+  const [accessibleUnits, setAccessibleUnits] = useState([]);
+  const [activeUnit, setActiveUnit] = useState(null);
+
+  // Load accessible units after auth
+  const loadUnits = useCallback(async () => {
+    const { data, error } = await sb.rpc('my_accessible_units');
+    if (error) { console.warn('my_accessible_units:', error); return; }
+    setAccessibleUnits(data || []);
+    const active = (data || []).find(u => u.is_active) || (data || [])[0];
+    setActiveUnit(active || null);
+  }, []);
+
+  const switchUnit = useCallback(async (unitId) => {
+    const { data, error } = await sb.rpc('switch_active_unit', { p_unit_id: unitId });
+    if (error || !data?.success) { showToast(error?.message || data?.error || 'Switch failed'); return; }
+    // Refresh JWT so RLS sees new active_unit_id
+    await sb.auth.refreshSession();
+    await loadUnits();
+    showToast('Switched unit · reloading');
+    setTimeout(() => window.location.reload(), 400);
+  }, [loadUnits]);
 
   // Read invite code from URL on first load
   const urlCode = useMemo(() => {
@@ -959,6 +980,8 @@ function App() {
     }
     setPlant(plantRow);
     setMe(userRow);
+    // Load accessible units once profile is set
+    await loadUnits();
     // Clear URL params on successful load
     if (window.location.search) {
       window.history.replaceState({}, '', window.location.pathname);
@@ -981,11 +1004,11 @@ function App() {
   if (!user) return html`<${AuthScreen} onAuth=${handleAuth} pendingInviteCode=${urlCode} />`;
   if (!plant) return html`<${Wizard} user=${user} pendingInvite=${pendingInvite} onDone=${(p) => loadProfile(user)} />`;
 
-  return html`<${Shell} user=${user} plant=${plant} me=${me} tab=${tab} setTab=${setTab} logout=${logout} reload=${() => loadProfile(user)} />`;
+  return html`<${Shell} user=${user} plant=${plant} me=${me} tab=${tab} setTab=${setTab} logout=${logout} reload=${() => loadProfile(user)} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />`;
 }
 
 // ============= APP SHELL =============
-function Shell({ user, plant, me, tab, setTab, logout, reload }) {
+function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, activeUnit, switchUnit }) {
   const initials = (me.full_name || user.email).split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
   const [unreadCount, setUnreadCount] = useState(0);
 
@@ -1029,26 +1052,34 @@ function Shell({ user, plant, me, tab, setTab, logout, reload }) {
           <div class="topbar-logo">L</div>
           <div>
             <div class="topbar-title">Loglinkr</div>
-            <div style="font-size:11px;color:var(--slate-500);margin-top:-2px">${plant.name}</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:-2px">${plant.name}${activeUnit ? ' · ' + activeUnit.unit_name : ''}</div>
           </div>
         </div>
-        <div class="topbar-right">
+        <div class="topbar-right" style="display:flex;align-items:center;gap:8px">
+          ${accessibleUnits && accessibleUnits.length > 1 && html`
+            <select value=${activeUnit?.unit_id || ''} onChange=${e => switchUnit(e.target.value)} title="Switch unit" style="padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:6px;background:white">
+              ${accessibleUnits.map(u => html`<option key=${u.unit_id} value=${u.unit_id}>${u.unit_name} (${u.role})</option>`)}
+            </select>
+          `}
+          ${accessibleUnits && accessibleUnits.length === 1 && html`
+            <span style="font-size:11px;color:var(--slate-500);padding:4px 8px;background:var(--slate-100);border-radius:6px">${accessibleUnits[0].unit_name}</span>
+          `}
           <div class="topbar-user" onClick=${logout} title="Log out">${initials}</div>
         </div>
       </div>
 
-      <${Page} active=${tab === 'home'}><${Home} plant=${plant} me=${me} setTab=${setTab} reload=${reload} /></${Page}>
-      <${Page} active=${tab === 'production'}><${Production} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'quality'}><${Quality} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'maintenance'}><${Maintenance} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'stocks'}><${Stocks} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'actions'}><${ActionHub} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'documents'}><${Documents} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'schedules'}><${Schedules} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
+      <${Page} active=${tab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} reload=${reload} /></${Page}>
+      <${Page} active=${tab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'quality'}><${Quality} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'maintenance'}><${Maintenance} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'stocks'}><${Stocks} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'actions'}><${ActionHub} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'documents'}><${Documents} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'schedules'}><${Schedules} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} /></${Page}>
-      <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab}/></${Page}>
+      <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
+      <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
 
       <div class="tabbar">
         <${TabBtn} icon="home" label="Home" active=${tab === 'home'} onClick=${() => setTab('home')} />
@@ -4823,7 +4854,128 @@ function DailyDigest({ me, setTab }) {
 }
 
 // ============= MORE (navigator) =============
-function More({ plant, me, user, logout, setTab }) {
+// ============= UNIT ACCESS MODAL (manager+) =============
+function UnitAccessModal({ plant, me, onClose }) {
+  const [units, setUnits] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [grants, setGrants] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [pickUser, setPickUser] = useState('');
+  const [pickUnit, setPickUnit] = useState('');
+  const [pickRole, setPickRole] = useState('operator');
+  const [error, setError] = useState('');
+
+  const load = async () => {
+    setLoading(true);
+    const [uRes, peopleRes, gRes] = await Promise.all([
+      sb.from('units').select('id, name').order('name'),
+      sb.from('users').select('id, full_name, role, status').eq('status','active').order('full_name'),
+      sb.from('user_unit_access').select('id, user_id, unit_id, role, granted_at, granted_by'),
+    ]);
+    setUnits(uRes.data || []);
+    setUsers(peopleRes.data || []);
+    setGrants(gRes.data || []);
+    setLoading(false);
+  };
+  useEffect(() => { load(); }, []);
+
+  const grant = async () => {
+    setError('');
+    if (!pickUser || !pickUnit) { setError('Pick user + unit'); return; }
+    const { data, error: err } = await sb.rpc('grant_unit_access', { p_user_id: pickUser, p_unit_id: pickUnit, p_role: pickRole });
+    if (err || !data?.success) { setError(err?.message || data?.error || 'Failed'); return; }
+    showToast('Access granted');
+    setPickUser(''); setPickUnit(''); setPickRole('operator');
+    load();
+  };
+
+  const revoke = async (userId, unitId) => {
+    if (!confirm('Revoke this access?')) return;
+    const { data, error: err } = await sb.rpc('revoke_unit_access', { p_user_id: userId, p_unit_id: unitId });
+    if (err || !data?.success) { setError(err?.message || data?.error || 'Failed'); return; }
+    showToast('Revoked');
+    load();
+  };
+
+  if (loading) return html`<div class="modal-backdrop active"><div class="modal"><div class="loader"><div class="spinner"></div></div></div></div>`;
+
+  // Group grants by user
+  const grantsByUser = new Map();
+  for (const g of grants) {
+    if (!grantsByUser.has(g.user_id)) grantsByUser.set(g.user_id, []);
+    grantsByUser.get(g.user_id).push(g);
+  }
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:580px">
+        <div class="modal-header">
+          <div class="modal-title">🔐 Unit Access Management</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+
+        <div class="card" style="background:var(--teal-50);padding:10px 12px;margin-bottom:12px;border-left:3px solid var(--teal-500)">
+          <div style="font-size:11px;font-weight:700;color:var(--teal-700);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">+ GRANT ACCESS</div>
+          <div class="field-row" style="margin-bottom:6px">
+            <div class="field" style="margin:0"><label style="font-size:11px">User</label>
+              <select value=${pickUser} onChange=${e => setPickUser(e.target.value)} style="font-size:12px">
+                <option value="">— Pick user —</option>
+                ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+              </select>
+            </div>
+            <div class="field" style="margin:0"><label style="font-size:11px">Unit</label>
+              <select value=${pickUnit} onChange=${e => setPickUnit(e.target.value)} style="font-size:12px">
+                <option value="">— Pick unit —</option>
+                ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
+              </select>
+            </div>
+          </div>
+          <div class="field-row" style="margin-bottom:0">
+            <div class="field" style="margin:0;flex:2"><label style="font-size:11px">Role in this unit</label>
+              <select value=${pickRole} onChange=${e => setPickRole(e.target.value)} style="font-size:12px">
+                <option value="operator">Operator (entry only)</option>
+                <option value="supervisor">Supervisor</option>
+                <option value="manager">Manager (can grant access)</option>
+                <option value="admin">Admin</option>
+              </select>
+            </div>
+            <button class="btn small" onClick=${grant} style="font-size:12px;align-self:flex-end;margin-bottom:0">Grant</button>
+          </div>
+        </div>
+
+        <div style="font-size:11px;font-weight:700;color:var(--slate-700);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">CURRENT GRANTS</div>
+        ${grantsByUser.size === 0 ? html`<div class="empty" style="padding:14px;text-align:center;font-size:12px;color:var(--slate-500)">No grants yet</div>` :
+          html`<div style="max-height:40vh;overflow-y:auto;display:flex;flex-direction:column;gap:6px">
+            ${[...grantsByUser.entries()].map(([userId, gs]) => {
+              const u = users.find(x => x.id === userId);
+              return html`
+                <div key=${userId} style="border:1px solid var(--slate-200);border-radius:8px;padding:10px 12px">
+                  <div style="font-weight:600;font-size:13px;color:var(--slate-800);margin-bottom:4px">${u?.full_name || 'Unknown'}</div>
+                  <div style="display:flex;flex-direction:column;gap:4px">
+                    ${gs.map(g => {
+                      const unit = units.find(u => u.id === g.unit_id);
+                      return html`
+                        <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;padding:4px 0">
+                          <span style="color:var(--slate-700)">${unit?.name || '?'} · <span class="badge ${g.role === 'manager' || g.role === 'admin' ? 'teal' : ''}">${g.role}</span></span>
+                          <button class="btn small ghost" style="padding:2px 8px;font-size:10px;color:var(--rose-600)" onClick=${() => revoke(g.user_id, g.unit_id)}>Revoke</button>
+                        </div>
+                      `;
+                    })}
+                  </div>
+                </div>
+              `;
+            })}
+          </div>`
+        }
+      </div>
+    </div>
+  `;
+}
+
+// ============= MORE =============
+function More({ plant, me, user, logout, setTab, activeUnit, accessibleUnits }) {
+  const [unitAccessOpen, setUnitAccessOpen] = useState(false);
   const navItems = [
     { key:'schedules', icon:'📅', label:'Customer Schedules', sub:'Plan vs actual, weekly buckets, AI extract' },
     { key:'reports', icon:'📑', label:'Reports & IATF Documents', sub:'Generate audit-ready reports from live data' },
@@ -4833,6 +4985,9 @@ function More({ plant, me, user, logout, setTab }) {
     { key:'actions', icon:'✓', label:'Action Hub', sub:'All open commitments' },
     { key:'documents', icon:'📄', label:'Documents · Bills', sub:'Invoices, DCs, payments, vendors' },
   ];
+
+  const isManager = (me.role === 'plant_head' || me.role === 'admin') ||
+    (accessibleUnits || []).some(u => u.role === 'manager' || u.role === 'admin');
 
   return html`
     <div class="page-header"><div><h1>More</h1><div class="sub">Modules, account, settings</div></div></div>
@@ -4866,6 +5021,20 @@ function More({ plant, me, user, logout, setTab }) {
       <div class="card-row"><span class="label">IATF</span><span class="value">${plant.iatf_certified ? html`<span class="badge emerald">Yes</span>` : 'No'}</span></div>
       <div class="card-row"><span class="label">Tier</span><span class="value"><span class="badge teal">${plant.subscription_tier.toUpperCase()}</span></span></div>
     </div>
+
+    <div class="section-h">Units</div>
+    <div class="card">
+      <div class="card-row"><span class="label">Active unit</span><span class="value"><span class="badge teal">${activeUnit?.unit_name || '—'}</span></span></div>
+      <div class="card-row"><span class="label">My access</span><span class="value">${(accessibleUnits || []).length} unit${(accessibleUnits || []).length === 1 ? '' : 's'}</span></div>
+      ${(accessibleUnits || []).map(u => html`
+        <div class="card-row" key=${u.unit_id}><span class="label">${u.unit_name}</span><span class="value"><span class="badge ${u.role === 'manager' || u.role === 'admin' ? 'teal' : ''}">${u.role}</span></span></div>
+      `)}
+      ${isManager && html`
+        <button class="btn small ghost" style="width:100%;margin-top:8px" onClick=${() => setUnitAccessOpen(true)}>Manage unit access →</button>
+      `}
+    </div>
+
+    ${unitAccessOpen && html`<${UnitAccessModal} plant=${plant} me=${me} onClose=${() => setUnitAccessOpen(false)} />`}
 
     ${me.role === 'plant_head' || me.role === 'admin' ? html`
       <div class="section-h">Compliance</div>
