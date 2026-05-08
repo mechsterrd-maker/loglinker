@@ -9142,10 +9142,214 @@ function Schedules({ plant, me }) {
 
     <div class="auth-tabs" style="margin-bottom:16px">
       <button class=${'auth-tab' + (view === 'schedules' ? ' active' : '')} onClick=${() => setView('schedules')}>Schedules</button>
+      <button class=${'auth-tab' + (view === 'plan_vs_supply' ? ' active' : '')} onClick=${() => setView('plan_vs_supply')}>📊 Plan vs Supply</button>
       <button class=${'auth-tab' + (view === 'customers' ? ' active' : '')} onClick=${() => setView('customers')}>Customers</button>
     </div>
 
-    ${view === 'schedules' ? html`<${SchedulesList} plant=${plant} me=${me} onOpen=${setActiveSchedule} />` : html`<${CustomersList} plant=${plant} me=${me} onOpen=${setActiveCustomer} />`}
+    ${view === 'schedules' ? html`<${SchedulesList} plant=${plant} me=${me} onOpen=${setActiveSchedule} />` :
+      view === 'plan_vs_supply' ? html`<${PlanVsSupplyView} plant=${plant} me=${me} />` :
+      html`<${CustomersList} plant=${plant} me=${me} onOpen=${setActiveCustomer} />`}
+  `;
+}
+
+// =================================================================
+// PLAN VS SUPPLY VIEW — comparative table across all schedule lines
+// Layer 1 of 3 (Layers 2+3 build on this in future sessions)
+// =================================================================
+const STATUS_STYLES = {
+  completed: { color:'#047857', bg:'#d1fae5', label:'COMPLETED', emoji:'✓' },
+  on_track:  { color:'#0369a1', bg:'#dbeafe', label:'ON TRACK',  emoji:'→' },
+  due_today: { color:'#b45309', bg:'#fef3c7', label:'DUE TODAY',  emoji:'⏰' },
+  at_risk:   { color:'#c2410c', bg:'#ffedd5', label:'AT RISK',   emoji:'⚠️' },
+  overdue:   { color:'#be123c', bg:'#fecaca', label:'OVERDUE',   emoji:'🚨' },
+  unknown:   { color:'#475569', bg:'#f1f5f9', label:'—',          emoji:'·' },
+};
+
+function PlanVsSupplyView({ plant, me }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [statusFilter, setStatusFilter] = useState('all'); // all | overdue | at_risk | due_today | on_track | completed
+  const [customerFilter, setCustomerFilter] = useState('all');
+  const [search, setSearch] = useState('');
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data, error } = await sb.from('v_plan_vs_supply')
+      .select('*')
+      .order('effective_due_date', { ascending: true, nullsFirst: false });
+    if (!error) setRows(data || []);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { refresh(); }, []);
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  // Customer dropdown options
+  const customers = [...new Map(rows.map(r => [r.customer_id, { id: r.customer_id, name: r.customer_name, code: r.customer_code }])).values()];
+
+  // Filter
+  const filtered = rows.filter(r => {
+    if (statusFilter !== 'all' && r.status !== statusFilter) return false;
+    if (customerFilter !== 'all' && r.customer_id !== customerFilter) return false;
+    if (search) {
+      const q = search.toLowerCase();
+      if (!(r.part_number || '').toLowerCase().includes(q) &&
+          !(r.part_name_raw || '').toLowerCase().includes(q) &&
+          !(r.part_name || '').toLowerCase().includes(q)) return false;
+    }
+    return true;
+  });
+
+  // Summary counts
+  const summary = {
+    total: rows.length,
+    overdue: rows.filter(r => r.status === 'overdue').length,
+    at_risk: rows.filter(r => r.status === 'at_risk').length,
+    due_today: rows.filter(r => r.status === 'due_today').length,
+    on_track: rows.filter(r => r.status === 'on_track').length,
+    completed: rows.filter(r => r.status === 'completed').length,
+  };
+
+  const totalPlanned = rows.reduce((s, r) => s + parseFloat(r.planned_qty || 0), 0);
+  const totalSupplied = rows.reduce((s, r) => s + parseFloat(r.supplied_qty || 0), 0);
+  const overallPct = totalPlanned > 0 ? (totalSupplied / totalPlanned * 100) : 0;
+
+  // CSV export
+  const exportCsv = () => {
+    const cols = ['Customer','Part #','Part Name','Week','Required Date','Planned','Supplied','Gap','% Done','Status','Days Left','Required Rate','Current Rate'];
+    const rowsCsv = filtered.map(r => [
+      (r.customer_name || '').replace(/,/g, ' '),
+      r.part_number || r.part_name_raw,
+      (r.part_name || '').replace(/,/g, ' '),
+      'W' + r.week_no,
+      r.effective_due_date || '',
+      r.planned_qty,
+      r.supplied_qty,
+      r.gap_qty,
+      r.pct_supplied + '%',
+      r.status,
+      r.days_remaining ?? '',
+      r.required_daily_rate ?? '',
+      r.current_daily_rate || 0,
+    ].map(v => `"${v ?? ''}"`).join(','));
+    const csv = [cols.join(','), ...rowsCsv].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `plan-vs-supply-${new Date().toISOString().slice(0,10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return html`
+    <!-- Header summary -->
+    <div class="card" style="background:linear-gradient(135deg, var(--teal-700), var(--teal-600));color:white;border:none;margin-bottom:14px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap">
+        <div>
+          <div style="font-size:11px;opacity:0.85;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">📊 PLAN VS SUPPLY</div>
+          <div style="font-size:24px;font-weight:700;line-height:1.1;margin-top:4px">${overallPct.toFixed(1)}%</div>
+          <div style="font-size:12px;opacity:0.9;margin-top:2px">${fmtNum(totalSupplied)} of ${fmtNum(totalPlanned)} pcs delivered</div>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          ${summary.overdue > 0 && html`<span style="background:rgba(255,255,255,0.2);padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700">🚨 ${summary.overdue} overdue</span>`}
+          ${summary.at_risk > 0 && html`<span style="background:rgba(255,255,255,0.2);padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700">⚠️ ${summary.at_risk} at risk</span>`}
+          ${summary.due_today > 0 && html`<span style="background:rgba(255,255,255,0.2);padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700">⏰ ${summary.due_today} due today</span>`}
+        </div>
+      </div>
+    </div>
+
+    <!-- Filters -->
+    <div class="card" style="margin-bottom:14px;padding:10px 14px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <div class="field" style="margin:0;flex:1;min-width:150px">
+          <input type="text" placeholder="Search part name/number…" value=${search} onChange=${e => setSearch(e.target.value)} style="font-size:12px;padding:5px 8px" />
+        </div>
+        <select value=${statusFilter} onChange=${e => setStatusFilter(e.target.value)} style="font-size:12px;padding:5px 8px;flex-shrink:0">
+          <option value="all">All status (${summary.total})</option>
+          <option value="overdue">🚨 Overdue (${summary.overdue})</option>
+          <option value="at_risk">⚠️ At risk (${summary.at_risk})</option>
+          <option value="due_today">⏰ Due today (${summary.due_today})</option>
+          <option value="on_track">→ On track (${summary.on_track})</option>
+          <option value="completed">✓ Completed (${summary.completed})</option>
+        </select>
+        <select value=${customerFilter} onChange=${e => setCustomerFilter(e.target.value)} style="font-size:12px;padding:5px 8px;flex-shrink:0">
+          <option value="all">All customers</option>
+          ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}</option>`)}
+        </select>
+        <button class="btn small ghost" onClick=${exportCsv} style="padding:5px 10px;font-size:11px;flex-shrink:0">⬇ CSV</button>
+      </div>
+      <div style="font-size:11px;color:var(--slate-500);margin-top:8px">
+        Showing ${filtered.length} of ${rows.length} schedule lines
+      </div>
+    </div>
+
+    <!-- Table -->
+    ${filtered.length === 0 ? html`<div class="card"><div class="empty"><div style="font-size:13px">${rows.length === 0 ? 'No schedule lines yet. Create or upload schedules in the Schedules tab first.' : 'No lines match current filters.'}</div></div></div>` :
+      html`
+        <div class="card" style="padding:0;overflow-x:auto">
+          <table style="width:100%;font-size:12px;border-collapse:collapse">
+            <thead>
+              <tr style="background:var(--slate-100);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:var(--slate-600)">
+                <th style="padding:10px 8px;text-align:left;font-weight:700;position:sticky;top:0;background:var(--slate-100)">Customer · Part</th>
+                <th style="padding:10px 6px;text-align:center;font-weight:700">Week</th>
+                <th style="padding:10px 6px;text-align:center;font-weight:700">Due</th>
+                <th style="padding:10px 6px;text-align:right;font-weight:700">Planned</th>
+                <th style="padding:10px 6px;text-align:right;font-weight:700">Supplied</th>
+                <th style="padding:10px 6px;text-align:right;font-weight:700">Gap</th>
+                <th style="padding:10px 6px;text-align:center;font-weight:700;min-width:60px">% Done</th>
+                <th style="padding:10px 6px;text-align:center;font-weight:700">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${filtered.map(r => {
+                const sty = STATUS_STYLES[r.status] || STATUS_STYLES.unknown;
+                const partLabel = r.part_number || r.part_name_raw || '—';
+                const isOverdueOrRisk = r.status === 'overdue' || r.status === 'at_risk' || r.status === 'due_today';
+                return html`
+                  <tr key=${r.line_id} style="border-bottom:1px solid var(--slate-100);${isOverdueOrRisk ? 'background:' + sty.bg + '40' : ''}">
+                    <td style="padding:8px;color:var(--slate-800)">
+                      <div style="font-weight:600;font-size:12px">${r.customer_code || r.customer_name}</div>
+                      <div style="font-size:11px;color:var(--slate-500);margin-top:1px">${partLabel}${r.part_name ? ' · ' + r.part_name : ''}</div>
+                    </td>
+                    <td style="padding:8px 6px;text-align:center;color:var(--slate-600);font-size:11px">W${r.week_no}</td>
+                    <td style="padding:8px 6px;text-align:center;color:var(--slate-600);font-size:11px;white-space:nowrap">
+                      ${r.effective_due_date || '—'}
+                      ${r.days_remaining != null && r.status !== 'completed' && html`
+                        <div style="font-size:10px;color:${r.days_remaining < 0 ? 'var(--rose-600)' : r.days_remaining <= 2 ? 'var(--amber-700)' : 'var(--slate-500)'};margin-top:1px;font-weight:600">
+                          ${r.days_remaining < 0 ? Math.abs(r.days_remaining) + 'd late' : r.days_remaining === 0 ? 'today' : r.days_remaining + 'd left'}
+                        </div>
+                      `}
+                    </td>
+                    <td style="padding:8px 6px;text-align:right;font-weight:600;color:var(--slate-800);font-variant-numeric:tabular-nums">${fmtNum(r.planned_qty)}</td>
+                    <td style="padding:8px 6px;text-align:right;color:var(--slate-700);font-variant-numeric:tabular-nums">${fmtNum(r.supplied_qty)}</td>
+                    <td style="padding:8px 6px;text-align:right;color:${r.gap_qty > 0 ? 'var(--rose-700)' : 'var(--emerald-700)'};font-weight:600;font-variant-numeric:tabular-nums">${fmtNum(r.gap_qty)}</td>
+                    <td style="padding:8px 6px">
+                      <div style="display:flex;align-items:center;gap:4px">
+                        <div style="flex:1;background:var(--slate-200);height:5px;border-radius:3px;overflow:hidden;min-width:30px">
+                          <div style="width:${Math.min(100, r.pct_supplied)}%;height:100%;background:${r.pct_supplied >= 100 ? 'var(--emerald-500)' : r.pct_supplied >= 70 ? 'var(--teal-500)' : r.pct_supplied >= 40 ? 'var(--amber-500)' : 'var(--rose-500)'}"></div>
+                        </div>
+                        <span style="font-size:10px;color:var(--slate-600);font-weight:600;font-variant-numeric:tabular-nums;min-width:32px;text-align:right">${r.pct_supplied}%</span>
+                      </div>
+                    </td>
+                    <td style="padding:8px 6px;text-align:center">
+                      <span style="background:${sty.bg};color:${sty.color};font-size:10px;font-weight:700;padding:3px 8px;border-radius:999px;white-space:nowrap">
+                        ${sty.emoji} ${sty.label}
+                      </span>
+                    </td>
+                  </tr>
+                `;
+              })}
+            </tbody>
+          </table>
+        </div>
+      `
+    }
+
+    <div style="font-size:11px;color:var(--slate-500);margin-top:14px;padding:10px 12px;background:var(--slate-50);border-radius:6px;line-height:1.6">
+      💡 <b>Layer 1 of 3.</b> This view shows the comparison only.<br/>
+      <b>Coming next:</b> Layer 2 = per-row recovery math (required vs current rate, action suggestions). Layer 3 = full project plan / Gantt.
+    </div>
   `;
 }
 
