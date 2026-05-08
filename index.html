@@ -1281,6 +1281,8 @@ function Production({ plant, me }) {
   const [units, setUnits] = useState([]);
   const [shifts, setShifts] = useState([]);
   const [users, setUsers] = useState([]);
+  const [tools, setTools] = useState([]);
+  const [stockItems, setStockItems] = useState([]);
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [activePart, setActivePart] = useState(null);
@@ -1288,7 +1290,7 @@ function Production({ plant, me }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [m, d, s, p, u, sh, us] = await Promise.all([
+    const [m, d, s, p, u, sh, us, t, si] = await Promise.all([
       sb.from('machines').select('*, units(name)').order('code'),
       sb.from('mcp_pdc_dies').select('*').order('code'),
       sb.from('mcp_pdc_shots').select('*, units(name), shifts(name), mcp_pdc_dies(code,part_number), machines(code), users:operator_user_id(full_name)').order('recorded_at', { ascending:false }).limit(50),
@@ -1296,6 +1298,8 @@ function Production({ plant, me }) {
       sb.from('units').select('*').order('name'),
       sb.from('shifts').select('*').order('start_time'),
       sb.from('users').select('*').order('full_name'),
+      sb.from('tools_master').select('*').eq('is_active', true).order('code'),
+      sb.from('mcp_stocks_items').select('id, code, name, current_qty, uom').order('code'),
     ]);
     setMachines(m.data || []);
     setDies(d.data || []);
@@ -1304,6 +1308,8 @@ function Production({ plant, me }) {
     setUnits(u.data || []);
     setShifts(sh.data || []);
     setUsers(us.data || []);
+    setTools(t.data || []);
+    setStockItems(si.data || []);
     setLoading(false);
   }, []);
 
@@ -1341,6 +1347,7 @@ function Production({ plant, me }) {
       <button class=${'auth-tab' + (view === 'parts' ? ' active' : '')} onClick=${() => setView('parts')}>Parts</button>
       <button class=${'auth-tab' + (view === 'machines' ? ' active' : '')} onClick=${() => setView('machines')}>Machines</button>
       <button class=${'auth-tab' + (view === 'dies' ? ' active' : '')} onClick=${() => setView('dies')}>Dies</button>
+      <button class=${'auth-tab' + (view === 'tools' ? ' active' : '')} onClick=${() => setView('tools')}>🔧 Tools</button>
       <button class=${'auth-tab' + (view === 'shots' ? ' active' : '')} onClick=${() => setView('shots')}>Shots</button>
     </div>
 
@@ -1433,7 +1440,7 @@ function Production({ plant, me }) {
                   <div class="list-item" key=${m.id} onClick=${() => { setEditTarget(m); setModal('machine'); }}>
                     <div class="list-item-row">
                       <div class="list-item-main">
-                        <div class="list-item-title">${m.code} ${m.make ? '· ' + m.make : ''} ${m.model || ''}</div>
+                        <div class="list-item-title">${m.code}${m.display_name ? ' (' + m.display_name + ')' : ''} ${m.make ? '· ' + m.make : ''} ${m.model || ''}</div>
                         <div class="list-item-sub">
                           ${m.units?.name || '—'}
                           ${m.tonnage ? ' · ' + m.tonnage + 'T' : ''}
@@ -1473,6 +1480,55 @@ function Production({ plant, me }) {
       }
     `}
 
+    ${view === 'tools' && html`
+      <div class="section-h">
+        Tools / Inserts · ${tools.length}
+        <button class="btn small ghost" style="margin-left:auto" onClick=${() => { setEditTarget(null); setModal('tool'); }}>+ Add Tool</button>
+      </div>
+      ${tools.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🔧</div>No tools yet. Add inserts, drills, taps, end-mills here.<br/><span style="font-size:11px">Tools can optionally link to a stock item for auto-decrement on change.</span></div></div>` :
+        (() => {
+          // Group by kind
+          const grouped = {};
+          for (const t of tools) {
+            const k = t.kind || 'other';
+            if (!grouped[k]) grouped[k] = [];
+            grouped[k].push(t);
+          }
+          const KIND_LABELS = {
+            insert:'Inserts (carbide)', drill:'Drills', tap:'Taps',
+            end_mill:'End Mills', reamer:'Reamers', wheel:'Grinding Wheels',
+            broach:'Broaches', other:'Other Tools',
+          };
+          const order = ['insert','drill','tap','end_mill','reamer','wheel','broach','other'];
+          const sortedKinds = Object.keys(grouped).sort((a,b) => (order.indexOf(a) - order.indexOf(b)));
+          return sortedKinds.map(k => html`
+            <div key=${k} style="margin-bottom:14px">
+              <div style="display:flex;align-items:center;gap:8px;margin:14px 0 6px;padding:6px 10px;background:var(--slate-100);border-radius:6px">
+                <span style="font-size:11px;font-weight:700;color:var(--slate-700);text-transform:uppercase;letter-spacing:0.05em">${KIND_LABELS[k] || k}</span>
+                <span style="font-size:11px;color:var(--slate-500)">${grouped[k].length} item${grouped[k].length>1?'s':''}</span>
+              </div>
+              ${grouped[k].map(t => html`
+                <div class="list-item" key=${t.id} onClick=${() => { setEditTarget(t); setModal('tool'); }}>
+                  <div class="list-item-row">
+                    <div class="list-item-main">
+                      <div class="list-item-title">${t.code} · ${t.name}</div>
+                      <div class="list-item-sub">
+                        ${t.make ? t.make + ' · ' : ''}
+                        ${t.grade ? t.grade + ' · ' : ''}
+                        ${t.life_value} ${t.life_unit}
+                        ${t.kind === 'insert' && t.corners_per_insert > 1 ? ' · ' + t.corners_per_insert + ' corners' : ''}
+                        ${t.stock_item_id ? ' · 📦 stock-linked' : ''}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              `)}
+            </div>
+          `);
+        })()
+      }
+    `}
+
     ${view === 'shots' && html`
       <div class="section-h">Shots · ${shots.length}<button class="btn small ghost" onClick=${() => setModal('shot')} disabled=${machines.length === 0 || dies.length === 0}>+ Log</button></div>
       ${shots.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📊</div>No shots logged yet</div></div>` :
@@ -1494,12 +1550,159 @@ function Production({ plant, me }) {
     ${modal === 'machine' && html`<${MachineModal} plant=${plant} units=${units} users=${users} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'machine_bulk' && html`<${MachineBulkAddModal} plant=${plant} units=${units} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'die' && html`<${DieModal} plant=${plant} me=${me} parts=${parts} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'tool' && html`<${ToolModal} plant=${plant} me=${me} machines=${machines} stockItems=${stockItems} parts=${parts} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'shot' && html`<${ShotModal} plant=${plant} me=${me} units=${units} shifts=${shifts} machines=${machines} dies=${dies} parts=${parts} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
   `;
 }
 
+// ============= TOOL MODAL =============
+// Add/edit a tool: insert/drill/tap/end-mill etc.
+// Optional stock link, life specs, applicable machines/parts.
+function ToolModal({ plant, me, machines, stockItems, parts, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget || {
+    code:'', name:'', kind:'insert', make:'', grade:'', geometry:'',
+    life_unit:'pieces', life_value:1000, corners_per_insert:1,
+    stock_item_id:'', cost_per_piece:'',
+    applicable_machines:[], applicable_categories:[], applicable_parts:[],
+    notes:'', is_active:true,
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        code: form.code.trim(),
+        name: form.name.trim(),
+        kind: form.kind,
+        make: form.make || null,
+        grade: form.grade || null,
+        geometry: form.geometry || null,
+        life_unit: form.life_unit,
+        life_value: parseFloat(form.life_value) || 0,
+        corners_per_insert: parseInt(form.corners_per_insert) || 1,
+        stock_item_id: form.stock_item_id || null,
+        cost_per_piece: form.cost_per_piece ? parseFloat(form.cost_per_piece) : null,
+        applicable_machines: form.applicable_machines || [],
+        applicable_categories: form.applicable_categories || [],
+        applicable_parts: form.applicable_parts || [],
+        notes: form.notes || null,
+        is_active: form.is_active !== false,
+      };
+      const { error: err } = editTarget
+        ? await sb.from('tools_master').update(payload).eq('id', editTarget.id)
+        : await sb.from('tools_master').insert(payload);
+      if (err) throw err;
+      showToast(editTarget ? 'Tool updated' : 'Tool added');
+      onSaved();
+    } catch (err) { setError(err.message); }
+    finally { setLoading(false); }
+  };
+
+  const remove = async () => {
+    if (!confirm('Delete this tool? Past tool-change events stay; tool is removed.')) return;
+    const { error } = await sb.from('tools_master').delete().eq('id', editTarget.id);
+    if (error) { setError(error.message); return; }
+    showToast('Tool deleted');
+    onSaved();
+  };
+
+  const isInsert = form.kind === 'insert';
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Edit Tool' : 'Add Tool'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field" style="flex:1"><label>Tool code *</label>
+              <input type="text" required value=${form.code} onChange=${e => setForm({...form, code: e.target.value})} placeholder="CNMG-120408-PM" />
+            </div>
+            <div class="field" style="flex:1"><label>Kind *</label>
+              <select required value=${form.kind} onChange=${e => setForm({...form, kind: e.target.value, corners_per_insert: e.target.value === 'insert' ? form.corners_per_insert : 1})}>
+                <option value="insert">Insert (carbide)</option>
+                <option value="drill">Drill</option>
+                <option value="tap">Tap</option>
+                <option value="end_mill">End mill</option>
+                <option value="reamer">Reamer</option>
+                <option value="wheel">Grinding wheel</option>
+                <option value="broach">Broach</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Name / description *</label>
+            <input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} placeholder="Turning insert 80° rhombic for OD turning" />
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Make</label><input type="text" value=${form.make || ''} onChange=${e => setForm({...form, make: e.target.value})} placeholder="Sandvik / Mitsubishi" /></div>
+            <div class="field"><label>Grade</label><input type="text" value=${form.grade || ''} onChange=${e => setForm({...form, grade: e.target.value})} placeholder="GC4225" /></div>
+          </div>
+          ${isInsert && html`
+            <div class="field-row">
+              <div class="field"><label>Geometry</label><input type="text" value=${form.geometry || ''} onChange=${e => setForm({...form, geometry: e.target.value})} placeholder="PM / PR / WMX" /></div>
+              <div class="field"><label>Corners per insert *</label>
+                <select required value=${form.corners_per_insert} onChange=${e => setForm({...form, corners_per_insert: parseInt(e.target.value)})}>
+                  <option value="1">1 (single-edge)</option>
+                  <option value="2">2 corners</option>
+                  <option value="3">3 corners</option>
+                  <option value="4">4 corners</option>
+                  <option value="6">6 corners</option>
+                  <option value="8">8 corners</option>
+                </select>
+              </div>
+            </div>
+          `}
+
+          <div style="background:var(--slate-50);padding:10px 12px;border-radius:8px;margin:8px 0">
+            <div style="font-size:11px;color:var(--slate-500);font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">EXPECTED LIFE</div>
+            <div class="field-row" style="margin-bottom:0">
+              <div class="field" style="margin-bottom:0"><label>Per ${isInsert ? 'corner' : 'tool'}</label>
+                <input type="number" min="0" step="1" value=${form.life_value} onChange=${e => setForm({...form, life_value: e.target.value})} placeholder="1000" />
+              </div>
+              <div class="field" style="margin-bottom:0"><label>Unit</label>
+                <select value=${form.life_unit} onChange=${e => setForm({...form, life_unit: e.target.value})}>
+                  <option value="pieces">pieces</option>
+                  <option value="minutes">minutes (runtime)</option>
+                  <option value="shifts">shifts</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div style="background:var(--teal-50);padding:10px 12px;border-radius:8px;margin:8px 0;border-left:3px solid var(--teal-500)">
+            <div style="font-size:11px;color:var(--teal-700);font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">📦 STOCK LINK (optional)</div>
+            <div class="field" style="margin-bottom:8px"><label style="font-size:11px">Stock item</label>
+              <select value=${form.stock_item_id || ''} onChange=${e => setForm({...form, stock_item_id: e.target.value})}>
+                <option value="">— Not linked (event-only tracking) —</option>
+                ${stockItems.map(s => html`<option key=${s.id} value=${s.id}>${s.code} · ${s.name} (qty ${s.current_qty} ${s.uom})</option>`)}
+              </select>
+            </div>
+            <div class="field" style="margin-bottom:0"><label style="font-size:11px">Cost per piece (₹) — optional</label>
+              <input type="number" min="0" step="0.01" value=${form.cost_per_piece || ''} onChange=${e => setForm({...form, cost_per_piece: e.target.value})} placeholder="350.00" />
+            </div>
+            <div style="font-size:10px;color:var(--slate-500);margin-top:6px">If linked, every tool change auto-decrements stock + creates txn.</div>
+          </div>
+
+          <div class="field"><label>Notes</label>
+            <textarea rows=${2} value=${form.notes || ''} onChange=${e => setForm({...form, notes: e.target.value})} placeholder="Use for OD finishing only · feed 0.2mm/rev"></textarea>
+          </div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add Tool')}</button>
+          ${editTarget && html`<button class="btn danger" type="button" style="margin-top:8px" onClick=${remove}>Delete</button>`}
+        </form>
+      </div>
+    </div>
+  `;
+}
+
 // ============= MACHINE MODAL =============
-// ============= PART MODAL =============
 function PartModal({ plant, me, dies, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget || {
     part_number: '', revision: 'A', name: '', description: '',
@@ -1954,7 +2157,7 @@ function BomModal({ plant, parentPart, parts, stockItems, onClose, onSaved }) {
 // ============= MACHINE MODAL =============
 function MachineModal({ plant, units, users, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget || {
-    code:'', make:'', model:'', category:'pdc',
+    code:'', display_name:'', make:'', model:'', category:'pdc',
     tonnage:'', unit_id: units[0]?.id || '', status:'idle',
     default_supervisor_id: '',
     attributes: {}
@@ -1987,6 +2190,7 @@ function MachineModal({ plant, units, users, editTarget, onClose, onSaved }) {
         category: form.category || 'pdc',
         attributes: form.attributes || {},
         default_supervisor_id: form.default_supervisor_id || null,
+        display_name: form.display_name || null,
       };
       const { error } = editTarget
         ? await sb.from('machines').update(payload).eq('id', editTarget.id)
@@ -2084,6 +2288,9 @@ function MachineModal({ plant, units, users, editTarget, onClose, onSaved }) {
                 <option value="other">Other</option>
               </select>
             </div>
+          </div>
+          <div class="field"><label>Display name (alias) <span style="font-size:11px;color:var(--slate-500);font-weight:400">— optional, what shop floor calls it (e.g., "C-1" while system has "CNC-01")</span></label>
+            <input type="text" value=${form.display_name || ''} onChange=${e => setForm({...form, display_name: e.target.value})} placeholder="C-1" />
           </div>
           <div class="field-row">
             <div class="field"><label>Make</label><input type="text" value=${form.make || ''} onChange=${e => setForm({...form, make: e.target.value})} placeholder="Toshiba / Mazak / BFW" /></div>
