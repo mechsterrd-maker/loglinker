@@ -1393,19 +1393,61 @@ function Production({ plant, me }) {
     `}
 
     ${view === 'machines' && html`
-      <div class="section-h">Machines · ${machines.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('machine'); }}>+ Add</button></div>
+      <div class="section-h">
+        Machines · ${machines.length}
+        <span style="margin-left:auto;display:flex;gap:6px">
+          <button class="btn small ghost" onClick=${() => setModal('machine_bulk')}>+ Add Many</button>
+          <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('machine'); }}>+ Add One</button>
+        </span>
+      </div>
       ${machines.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">⚙️</div>No machines yet</div></div>` :
-        machines.map(m => html`
-          <div class="list-item" key=${m.id} onClick=${() => { setEditTarget(m); setModal('machine'); }}>
-            <div class="list-item-row">
-              <div class="list-item-main">
-                <div class="list-item-title">${m.code} · ${m.make || ''} ${m.model || ''}</div>
-                <div class="list-item-sub">${m.units?.name || ''} · ${m.tonnage ? m.tonnage + 'T' : '—'}</div>
+        (() => {
+          // Group by category
+          const grouped = {};
+          for (const m of machines) {
+            const cat = m.category || 'pdc';
+            if (!grouped[cat]) grouped[cat] = [];
+            grouped[cat].push(m);
+          }
+          const CAT_LABELS = {
+            pdc:'Pressure Die Casting', cnc:'CNC', vmc:'VMC', lathe:'Lathe',
+            press:'Press', trimming:'Trimming', drilling:'Drilling',
+            grinding:'Grinding', heat_treatment:'Heat Treatment',
+            injection_moulding:'Injection Moulding', rolling:'Rolling',
+            forging:'Forging', welding:'Welding', assembly:'Assembly',
+            inspection:'Inspection', painting:'Painting', plating:'Plating',
+            testing:'Testing', other:'Other',
+          };
+          // Display order: pdc, cnc, vmc, lathe, press, trimming, then alphabetical
+          const order = ['pdc','cnc','vmc','lathe','press','trimming','drilling','grinding','heat_treatment','injection_moulding','rolling','forging','welding','assembly','inspection','painting','plating','testing','other'];
+          const sortedCats = Object.keys(grouped).sort((a,b) => (order.indexOf(a) - order.indexOf(b)));
+          return sortedCats.map(cat => html`
+            <div key=${cat} style="margin-bottom:14px">
+              <div style="display:flex;align-items:center;gap:8px;margin:14px 0 6px;padding:6px 10px;background:var(--slate-100);border-radius:6px">
+                <span style="font-size:11px;font-weight:700;color:var(--slate-700);text-transform:uppercase;letter-spacing:0.05em">${CAT_LABELS[cat] || cat}</span>
+                <span style="font-size:11px;color:var(--slate-500)">${grouped[cat].length} machine${grouped[cat].length>1?'s':''}</span>
               </div>
-              <span class=${'badge ' + (m.status === 'running' ? 'emerald' : m.status === 'breakdown' ? 'rose' : m.status === 'maintenance' ? 'amber' : '')}>${m.status}</span>
+              ${grouped[cat].map(m => {
+                const supervisor = users.find(u => u.id === m.default_supervisor_id);
+                return html`
+                  <div class="list-item" key=${m.id} onClick=${() => { setEditTarget(m); setModal('machine'); }}>
+                    <div class="list-item-row">
+                      <div class="list-item-main">
+                        <div class="list-item-title">${m.code} ${m.make ? '· ' + m.make : ''} ${m.model || ''}</div>
+                        <div class="list-item-sub">
+                          ${m.units?.name || '—'}
+                          ${m.tonnage ? ' · ' + m.tonnage + 'T' : ''}
+                          ${supervisor ? ' · 👤 ' + supervisor.full_name : ''}
+                        </div>
+                      </div>
+                      <span class=${'badge ' + (m.status === 'running' ? 'emerald' : m.status === 'breakdown' ? 'rose' : m.status === 'maintenance' ? 'amber' : '')}>${m.status}</span>
+                    </div>
+                  </div>
+                `;
+              })}
             </div>
-          </div>
-        `)
+          `);
+        })()
       }
     `}
 
@@ -1449,7 +1491,8 @@ function Production({ plant, me }) {
     `}
 
     ${modal === 'part' && html`<${PartModal} plant=${plant} me=${me} dies=${dies} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
-    ${modal === 'machine' && html`<${MachineModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'machine' && html`<${MachineModal} plant=${plant} units=${units} users=${users} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'machine_bulk' && html`<${MachineBulkAddModal} plant=${plant} units=${units} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'die' && html`<${DieModal} plant=${plant} me=${me} parts=${parts} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'shot' && html`<${ShotModal} plant=${plant} me=${me} units=${units} shifts=${shifts} machines=${machines} dies=${dies} parts=${parts} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
   `;
@@ -1909,10 +1952,11 @@ function BomModal({ plant, parentPart, parts, stockItems, onClose, onSaved }) {
 }
 
 // ============= MACHINE MODAL =============
-function MachineModal({ plant, units, editTarget, onClose, onSaved }) {
+function MachineModal({ plant, units, users, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget || {
     code:'', make:'', model:'', category:'pdc',
     tonnage:'', unit_id: units[0]?.id || '', status:'idle',
+    default_supervisor_id: '',
     attributes: {}
   });
   const [loading, setLoading] = useState(false);
@@ -1942,6 +1986,7 @@ function MachineModal({ plant, units, editTarget, onClose, onSaved }) {
         status: form.status,
         category: form.category || 'pdc',
         attributes: form.attributes || {},
+        default_supervisor_id: form.default_supervisor_id || null,
       };
       const { error } = editTarget
         ? await sb.from('machines').update(payload).eq('id', editTarget.id)
@@ -2076,8 +2121,132 @@ function MachineModal({ plant, units, editTarget, onClose, onSaved }) {
               </select>
             </div>
           </div>
+          <div class="field"><label>Default Supervisor <span style="font-size:11px;color:var(--slate-500);font-weight:400">(auto-fills as operator on bulk entry)</span></label>
+            <select value=${form.default_supervisor_id || ''} onChange=${e => setForm({...form, default_supervisor_id: e.target.value})}>
+              <option value="">— None —</option>
+              ${(users || []).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+            </select>
+          </div>
           <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
           ${editTarget && html`<button class="btn danger" type="button" style="margin-top:8px" onClick=${remove}>Delete</button>`}
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= MACHINE BULK ADD MODAL =============
+// Paste a list of machine codes, pick category once, all created in one go.
+function MachineBulkAddModal({ plant, units, users, onClose, onSaved }) {
+  const [category, setCategory] = useState('cnc');
+  const [codes, setCodes] = useState('');
+  const [unitId, setUnitId] = useState(units[0]?.id || '');
+  const [supervisorId, setSupervisorId] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [results, setResults] = useState(null);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true); setResults(null);
+    try {
+      // Parse codes — split on newline or comma, trim, dedupe
+      const list = codes.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+      if (list.length === 0) throw new Error('No machine codes entered');
+      if (list.length > 50) throw new Error('Maximum 50 machines per bulk add');
+
+      const payload = list.map(code => ({
+        plant_id: plant.id,
+        code,
+        category,
+        unit_id: unitId,
+        status: 'idle',
+        default_supervisor_id: supervisorId || null,
+        attributes: {},
+      }));
+
+      const { data, error: err } = await sb.from('machines').insert(payload).select('id, code');
+      if (err) throw err;
+
+      setResults({ created: data.length, codes: data.map(d => d.code) });
+      showToast(`${data.length} machines added`);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (results) {
+    return html`
+      <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onSaved(); }}>
+        <div class="modal">
+          <div class="modal-header">
+            <div class="modal-title">✅ ${results.created} machines added</div>
+            <button class="close-btn" onClick=${onSaved}>×</button>
+          </div>
+          <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200)">
+            <div style="font-size:12px;color:var(--slate-700);line-height:1.6">
+              ${results.codes.join(' · ')}
+            </div>
+          </div>
+          <button class="btn" onClick=${onSaved} style="margin-top:14px">Done</button>
+        </div>
+      </div>
+    `;
+  }
+
+  const previewCount = codes.split(/[\n,]+/).map(s => s.trim()).filter(Boolean).length;
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">+ Add Many Machines</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Category *</label>
+            <select required value=${category} onChange=${e => setCategory(e.target.value)}>
+              <option value="pdc">Pressure Die Casting</option>
+              <option value="cnc">CNC</option>
+              <option value="vmc">VMC</option>
+              <option value="lathe">Lathe</option>
+              <option value="press">Press</option>
+              <option value="trimming">Trimming</option>
+              <option value="drilling">Drilling</option>
+              <option value="grinding">Grinding</option>
+              <option value="heat_treatment">Heat treatment</option>
+              <option value="injection_moulding">Injection moulding</option>
+              <option value="welding">Welding</option>
+              <option value="assembly">Assembly</option>
+              <option value="inspection">Inspection</option>
+              <option value="painting">Painting</option>
+              <option value="plating">Plating</option>
+              <option value="other">Other</option>
+            </select>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Unit *</label>
+              <select required value=${unitId} onChange=${e => setUnitId(e.target.value)}>
+                ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
+              </select>
+            </div>
+            <div class="field"><label>Default Supervisor</label>
+              <select value=${supervisorId} onChange=${e => setSupervisorId(e.target.value)}>
+                <option value="">— None —</option>
+                ${(users || []).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Machine codes <span style="font-size:11px;color:var(--slate-500);font-weight:400">(one per line, or comma-separated)</span></label>
+            <textarea rows=${8} value=${codes} onChange=${e => setCodes(e.target.value)} placeholder=${'CNC-01\nCNC-02\nCNC-03'} style="font-family:monospace;font-size:13px"></textarea>
+          </div>
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">
+            ${previewCount} machine${previewCount === 1 ? '' : 's'} will be added · all in <b>${category}</b> category · same unit + supervisor
+          </div>
+          <button class="btn" disabled=${loading || previewCount === 0}>${loading ? 'Adding…' : `Add ${previewCount} machine${previewCount === 1 ? '' : 's'}`}</button>
         </form>
       </div>
     </div>
@@ -6379,6 +6548,7 @@ function StageLog({ plant, me, parts, machines, dies, units, shifts, users }) {
   const [filterStatus, setFilterStatus] = useState('all');
   const [logTarget, setLogTarget] = useState(null);
   const [overrideTarget, setOverrideTarget] = useState(null);
+  const [bulkOpen, setBulkOpen] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
@@ -6454,7 +6624,12 @@ function StageLog({ plant, me, parts, machines, dies, units, shifts, users }) {
       </div>
     </div>
 
-    <div class="section-h">Stage Log · ${filterDate}<button class="btn small" onClick=${() => setLogTarget({})} disabled=${parts.length === 0}>+ Log entry</button></div>
+    <div class="section-h">Stage Log · ${filterDate}
+      <span style="margin-left:auto;display:flex;gap:6px">
+        <button class="btn small ghost" onClick=${() => setBulkOpen(true)} disabled=${parts.length === 0 || machines.length === 0}>📋 Bulk Log</button>
+        <button class="btn small" onClick=${() => setLogTarget({})} disabled=${parts.length === 0}>+ Log entry</button>
+      </span>
+    </div>
 
     ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
       logs.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📋</div>No entries for this date. Tap "+ Log entry" to record production.${parts.length === 0 ? ' Add a part first.' : ''}</div></div>` :
@@ -6502,13 +6677,249 @@ function StageLog({ plant, me, parts, machines, dies, units, shifts, users }) {
     }
 
     ${logTarget && html`<${StageLogModal} plant=${plant} me=${me} pendingEntry=${logTarget.id ? logTarget : null} parts=${parts} machines=${machines} dies=${dies} units=${units} shifts=${shifts} users=${users} defaultDate=${filterDate} onClose=${() => setLogTarget(null)} onSaved=${() => { setLogTarget(null); refresh(); }} />`}
+    ${bulkOpen && html`<${BulkLogModal} plant=${plant} me=${me} parts=${parts} machines=${machines} units=${units} shifts=${shifts} users=${users} defaultDate=${filterDate} onClose=${() => setBulkOpen(false)} onSaved=${() => { setBulkOpen(false); refresh(); }} />`}
     ${overrideTarget && html`<${StageOverrideModal} plant=${plant} me=${me} entry=${overrideTarget} onClose=${() => setOverrideTarget(null)} onSaved=${() => { setOverrideTarget(null); refresh(); }} />`}
   `;
 }
 
 // ============= STAGE LOG ENTRY MODAL =============
 // =================================================================
-// LOG TEMPLATES — per-stage field definitions for production logging
+// BULK LOG MODAL — log production for ALL machines in a category at once
+// Pick Date + Shift + Category → see all machines as rows → fill qty → submit
+// =================================================================
+function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaultDate, onClose, onSaved }) {
+  const [logDate, setLogDate] = useState(defaultDate || new Date().toISOString().slice(0,10));
+  const [shiftId, setShiftId] = useState(shifts[0]?.id || '');
+  const [unitId, setUnitId] = useState(units[0]?.id || '');
+  const [category, setCategory] = useState('');
+  const [bulkPartId, setBulkPartId] = useState('');     // "set all to same part" shortcut
+  const [rows, setRows] = useState([]);                 // one row per machine in this category
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [results, setResults] = useState(null);
+
+  // Categories present in this plant's machines
+  const categories = [...new Set(machines.map(m => m.category || 'pdc'))].sort();
+  const CAT_LABELS = {
+    pdc:'Pressure Die Casting', cnc:'CNC', vmc:'VMC', lathe:'Lathe',
+    press:'Press', trimming:'Trimming', drilling:'Drilling',
+    grinding:'Grinding', heat_treatment:'Heat Treatment',
+    injection_moulding:'Injection Moulding', welding:'Welding',
+    assembly:'Assembly', inspection:'Inspection', painting:'Painting',
+    plating:'Plating', testing:'Testing', other:'Other',
+  };
+
+  // When category changes, populate rows
+  useEffect(() => {
+    if (!category) { setRows([]); return; }
+    const catMachines = machines.filter(m => (m.category || 'pdc') === category);
+    setRows(catMachines.map(m => ({
+      machine_id: m.id,
+      machine_code: m.code,
+      part_id: bulkPartId || '',
+      qty_good: '',
+      qty_rejected: '',
+      reject_reason: '',
+      operator_user_id: m.default_supervisor_id || me.id,
+      setup_change: false,
+    })));
+  }, [category, machines.length]);
+
+  const updateRow = (idx, field, value) => {
+    setRows(rs => rs.map((r, i) => i === idx ? { ...r, [field]: value } : r));
+  };
+
+  const applyBulkPart = (partId) => {
+    setBulkPartId(partId);
+    if (partId) setRows(rs => rs.map(r => ({ ...r, part_id: partId })));
+  };
+
+  // Stage = same as category for stage_log (pdc, cnc, etc.)
+  // For categories not in production_stage enum, we map to 'other'
+  const stageFor = (cat) => {
+    const validStages = ['pdc','trimming','cnc','vmc','lathe','press','drilling','tapping','deflashing','shot_blast','plating','painting','heat_treat','inspection','packing','dispatch','outsource','other'];
+    if (cat === 'heat_treatment') return 'heat_treat';
+    if (validStages.includes(cat)) return cat;
+    return 'other';
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true); setResults(null);
+    try {
+      // Validate: for any row with qty > 0, part must be selected
+      const filledRows = rows.filter(r => parseFloat(r.qty_good || 0) > 0 || parseFloat(r.qty_rejected || 0) > 0);
+      if (filledRows.length === 0) throw new Error('No quantities entered');
+      const missingPart = filledRows.filter(r => !r.part_id);
+      if (missingPart.length > 0) throw new Error(`Part required for: ${missingPart.map(r => r.machine_code).join(', ')}`);
+      const missingOp = filledRows.filter(r => !r.operator_user_id);
+      if (missingOp.length > 0) throw new Error(`Operator required for: ${missingOp.map(r => r.machine_code).join(', ')}`);
+
+      const stage = stageFor(category);
+      const payload = filledRows.map(r => ({
+        log_date: logDate,
+        shift_id: shiftId,
+        unit_id: unitId,
+        part_id: r.part_id,
+        stage,
+        qty_good: parseFloat(r.qty_good || 0),
+        qty_rejected: parseFloat(r.qty_rejected || 0),
+        reject_reason: r.reject_reason || null,
+        machine_id: r.machine_id,
+        die_id: null,
+        operator_user_id: r.operator_user_id,
+        notes: null,
+        category_attrs: r.setup_change ? { setup_change: true } : {},
+      }));
+
+      const { data, error: err } = await sb.rpc('log_stage_entries_bulk', { p_entries: payload });
+      if (err) throw err;
+      if (!data?.success) throw new Error(data?.error || 'Bulk log failed');
+
+      const successCount = (data.results || []).filter(r => r.status === 'success').length;
+      const failedCount = (data.results || []).filter(r => r.status === 'failed').length;
+      const skippedCount = (data.results || []).filter(r => r.status === 'skipped').length;
+
+      setResults({
+        success: successCount,
+        failed: failedCount,
+        skipped: skippedCount,
+        details: data.results || [],
+      });
+      showToast(`✓ ${successCount} logged${failedCount > 0 ? ` · ${failedCount} failed` : ''}`);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Results view
+  if (results) {
+    return html`
+      <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onSaved(); }}>
+        <div class="modal" style="max-width:520px">
+          <div class="modal-header">
+            <div class="modal-title">📋 Bulk log results</div>
+            <button class="close-btn" onClick=${onSaved}>×</button>
+          </div>
+          <div class="card-row" style="background:var(--emerald-50);padding:8px 12px;border-radius:6px;margin-bottom:6px"><span class="label">✓ Logged</span><span class="value" style="font-weight:700;color:var(--emerald-700)">${results.success}</span></div>
+          ${results.failed > 0 && html`<div class="card-row" style="background:var(--rose-50);padding:8px 12px;border-radius:6px;margin-bottom:6px"><span class="label">✗ Failed</span><span class="value" style="font-weight:700;color:var(--rose-700)">${results.failed}</span></div>`}
+          ${results.skipped > 0 && html`<div class="card-row" style="background:var(--slate-50);padding:8px 12px;border-radius:6px;margin-bottom:6px"><span class="label">— Skipped (empty)</span><span class="value">${results.skipped}</span></div>`}
+          ${results.failed > 0 && html`
+            <div style="margin-top:14px">
+              <div style="font-size:11px;font-weight:700;color:var(--rose-700);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Failures</div>
+              ${results.details.filter(d => d.status === 'failed').map(d => {
+                const m = machines.find(mm => mm.id === d.machine_id);
+                return html`<div key=${d.idx} style="font-size:12px;color:var(--slate-700);padding:6px 10px;background:var(--rose-50);border-radius:4px;margin-bottom:4px">
+                  <b>${m?.code || '?'}</b>: ${d.error}
+                </div>`;
+              })}
+            </div>
+          `}
+          <button class="btn" onClick=${onSaved} style="margin-top:14px">Done</button>
+        </div>
+      </div>
+    `;
+  }
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:720px">
+        <div class="modal-header">
+          <div class="modal-title">📋 Bulk Log Production</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Date *</label><input type="date" required value=${logDate} onChange=${e => setLogDate(e.target.value)} /></div>
+            <div class="field"><label>Shift *</label>
+              <select required value=${shiftId} onChange=${e => setShiftId(e.target.value)}>
+                ${shifts.map(s => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
+              </select>
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Category *</label>
+              <select required value=${category} onChange=${e => setCategory(e.target.value)}>
+                <option value="">— Pick category —</option>
+                ${categories.map(c => html`<option key=${c} value=${c}>${CAT_LABELS[c] || c} (${machines.filter(m => (m.category || 'pdc') === c).length})</option>`)}
+              </select>
+            </div>
+            <div class="field"><label>Unit</label>
+              <select value=${unitId} onChange=${e => setUnitId(e.target.value)}>
+                ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
+              </select>
+            </div>
+          </div>
+
+          ${rows.length > 0 && html`
+            <div class="field" style="background:var(--teal-50);padding:10px 12px;border-radius:8px;border-left:3px solid var(--teal-500);margin-bottom:10px">
+              <label style="font-size:12px">Set all rows to same part (optional shortcut)</label>
+              <select value=${bulkPartId} onChange=${e => applyBulkPart(e.target.value)}>
+                <option value="">— Leave individual —</option>
+                ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number} · ${p.name}</option>`)}
+              </select>
+            </div>
+
+            <div style="overflow-x:auto;margin:0 -16px">
+              <table style="width:100%;font-size:12px;border-collapse:collapse">
+                <thead>
+                  <tr style="background:var(--slate-100);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:var(--slate-600)">
+                    <th style="padding:8px 6px;text-align:left;font-weight:700">Machine</th>
+                    <th style="padding:8px 6px;text-align:left;font-weight:700;min-width:140px">Part</th>
+                    <th style="padding:8px 6px;text-align:right;font-weight:700;width:80px">Good</th>
+                    <th style="padding:8px 6px;text-align:right;font-weight:700;width:70px">Reject</th>
+                    <th style="padding:8px 6px;text-align:left;font-weight:700;min-width:120px">Operator</th>
+                    <th style="padding:8px 6px;text-align:center;font-weight:700;width:50px">Setup</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${rows.map((r, idx) => html`
+                    <tr key=${r.machine_id} style="border-bottom:1px solid var(--slate-100)">
+                      <td style="padding:6px;font-weight:600;color:var(--slate-800)">${r.machine_code}</td>
+                      <td style="padding:6px">
+                        <select value=${r.part_id} onChange=${e => updateRow(idx, 'part_id', e.target.value)} style="width:100%;font-size:12px;padding:4px 6px">
+                          <option value="">— Pick —</option>
+                          ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number}</option>`)}
+                        </select>
+                      </td>
+                      <td style="padding:6px">
+                        <input type="number" min="0" step="0.01" value=${r.qty_good} onChange=${e => updateRow(idx, 'qty_good', e.target.value)} placeholder="0" style="width:100%;text-align:right;font-size:12px;padding:4px 6px" />
+                      </td>
+                      <td style="padding:6px">
+                        <input type="number" min="0" step="0.01" value=${r.qty_rejected} onChange=${e => updateRow(idx, 'qty_rejected', e.target.value)} placeholder="0" style="width:100%;text-align:right;font-size:12px;padding:4px 6px" />
+                      </td>
+                      <td style="padding:6px">
+                        <select value=${r.operator_user_id} onChange=${e => updateRow(idx, 'operator_user_id', e.target.value)} style="width:100%;font-size:12px;padding:4px 6px">
+                          <option value="">— Pick —</option>
+                          ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+                        </select>
+                      </td>
+                      <td style="padding:6px;text-align:center">
+                        <input type="checkbox" checked=${r.setup_change} onChange=${e => updateRow(idx, 'setup_change', e.target.checked)} />
+                      </td>
+                    </tr>
+                  `)}
+                </tbody>
+              </table>
+            </div>
+            <div style="font-size:11px;color:var(--slate-500);margin:10px 0">
+              💡 Leave Good and Reject blank for machines that didn't run · ${rows.filter(r => parseFloat(r.qty_good || 0) > 0 || parseFloat(r.qty_rejected || 0) > 0).length} of ${rows.length} rows will be logged
+            </div>
+          `}
+
+          ${rows.length === 0 && category && html`<div class="card"><div class="empty">No machines in this category</div></div>`}
+
+          <button class="btn" disabled=${loading || rows.length === 0}>${loading ? 'Saving…' : `Log ${rows.filter(r => parseFloat(r.qty_good || 0) > 0 || parseFloat(r.qty_rejected || 0) > 0).length} entries`}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= STAGE LOG MODAL (single-entry) =============
 // Each stage defines:
 //   commonFieldsOverride: rename "Good"/"Rejected" labels per stage context
 //   showMachine: whether to show Machine dropdown
