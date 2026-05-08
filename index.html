@@ -6899,13 +6899,14 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
   const [shiftId, setShiftId] = useState(shifts[0]?.id || '');
   const [unitId, setUnitId] = useState(units[0]?.id || '');
   const [category, setCategory] = useState('');
-  const [bulkPartId, setBulkPartId] = useState('');     // "set all to same part" shortcut
-  const [rows, setRows] = useState([]);                 // one row per machine in this category
+  const [tools, setTools] = useState([]);
+  // segments: array of { _localId, machine_id, machine_code, supervisor_id, part_id, op_number, op_name, qty_good, qty_rejected, reject_reason, operator_user_id, operator_2_user_id, setup_change, setup_time_min, previous_part_id, notes, tool_changes:[] }
+  const [segments, setSegments] = useState([]);
+  const [toolChangeFor, setToolChangeFor] = useState(null); // segment _localId being edited
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [results, setResults] = useState(null);
 
-  // Categories present in this plant's machines
   const categories = [...new Set(machines.map(m => m.category || 'pdc'))].sort();
   const CAT_LABELS = {
     pdc:'Pressure Die Casting', cnc:'CNC', vmc:'VMC', lathe:'Lathe',
@@ -6916,84 +6917,143 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
     plating:'Plating', testing:'Testing', other:'Other',
   };
 
-  // When category changes, populate rows
+  // Load tools master once (filtered to applicable when category changes)
   useEffect(() => {
-    if (!category) { setRows([]); return; }
+    (async () => {
+      const { data } = await sb.from('tools_master').select('*').eq('is_active', true).order('code');
+      setTools(data || []);
+    })();
+  }, []);
+
+  let _idCounter = useMemo(() => ({n:0}), []);
+  const newLocalId = () => `seg-${++_idCounter.n}-${Date.now()}`;
+
+  // When category changes, populate one row per machine in that category
+  useEffect(() => {
+    if (!category) { setSegments([]); return; }
     const catMachines = machines.filter(m => (m.category || 'pdc') === category);
-    setRows(catMachines.map(m => ({
+    setSegments(catMachines.map(m => ({
+      _localId: newLocalId(),
       machine_id: m.id,
       machine_code: m.code,
-      part_id: bulkPartId || '',
+      machine_display: m.display_name ? `${m.code} (${m.display_name})` : m.code,
+      supervisor_id: m.default_supervisor_id || null,
+      part_id: '',
+      op_number: '',
+      op_name: '',
       qty_good: '',
       qty_rejected: '',
       reject_reason: '',
       operator_user_id: m.default_supervisor_id || me.id,
+      operator_2_user_id: '',
       setup_change: false,
+      setup_time_min: '',
+      previous_part_id: '',
+      notes: '',
+      tool_changes: [],
     })));
   }, [category, machines.length]);
 
-  const updateRow = (idx, field, value) => {
-    setRows(rs => rs.map((r, i) => i === idx ? { ...r, [field]: value } : r));
+  const updateSeg = (localId, patch) => {
+    setSegments(segs => segs.map(s => s._localId === localId ? { ...s, ...patch } : s));
   };
 
-  const applyBulkPart = (partId) => {
-    setBulkPartId(partId);
-    if (partId) setRows(rs => rs.map(r => ({ ...r, part_id: partId })));
+  const addRunForMachine = (machineId) => {
+    const lastForMachine = [...segments].reverse().find(s => s.machine_id === machineId);
+    if (!lastForMachine) return;
+    const newSeg = {
+      ...lastForMachine,
+      _localId: newLocalId(),
+      part_id: '',
+      op_number: '',
+      op_name: '',
+      qty_good: '',
+      qty_rejected: '',
+      reject_reason: '',
+      setup_change: true,                              // new run usually means setup change
+      setup_time_min: '',
+      previous_part_id: lastForMachine.part_id || '',  // pre-fill prev part
+      notes: '',
+      tool_changes: [],
+    };
+    // Insert after the last segment for this machine
+    setSegments(segs => {
+      const out = [];
+      let inserted = false;
+      for (let i = 0; i < segs.length; i++) {
+        out.push(segs[i]);
+        const next = segs[i+1];
+        if (segs[i].machine_id === machineId && (!next || next.machine_id !== machineId) && !inserted) {
+          out.push(newSeg);
+          inserted = true;
+        }
+      }
+      if (!inserted) out.push(newSeg);
+      return out;
+    });
   };
 
-  // Stage = same as category for stage_log (pdc, cnc, etc.)
-  // For categories not in production_stage enum, we map to 'other'
-  const stageFor = (cat) => {
-    const validStages = ['pdc','trimming','cnc','vmc','lathe','press','drilling','tapping','deflashing','shot_blast','plating','painting','heat_treat','inspection','packing','dispatch','outsource','other'];
-    if (cat === 'heat_treatment') return 'heat_treat';
-    if (validStages.includes(cat)) return cat;
-    return 'other';
+  const removeRun = (localId) => {
+    setSegments(segs => segs.filter(s => s._localId !== localId));
   };
+
+  // Tool changes for a specific segment
+  const segBeingEdited = segments.find(s => s._localId === toolChangeFor);
 
   const submit = async (e) => {
     e.preventDefault();
     setError(''); setLoading(true); setResults(null);
     try {
-      // Validate: for any row with qty > 0, part must be selected
-      const filledRows = rows.filter(r => parseFloat(r.qty_good || 0) > 0 || parseFloat(r.qty_rejected || 0) > 0);
-      if (filledRows.length === 0) throw new Error('No quantities entered');
-      const missingPart = filledRows.filter(r => !r.part_id);
-      if (missingPart.length > 0) throw new Error(`Part required for: ${missingPart.map(r => r.machine_code).join(', ')}`);
-      const missingOp = filledRows.filter(r => !r.operator_user_id);
-      if (missingOp.length > 0) throw new Error(`Operator required for: ${missingOp.map(r => r.machine_code).join(', ')}`);
+      const filled = segments.filter(s => parseFloat(s.qty_good || 0) > 0 || parseFloat(s.qty_rejected || 0) > 0);
+      if (filled.length === 0) throw new Error('No quantities entered');
+      const missingPart = filled.filter(s => !s.part_id);
+      if (missingPart.length > 0) throw new Error(`Part required for: ${missingPart.map(s => s.machine_code + (s.op_number ? ' Op' + s.op_number : '')).join(', ')}`);
+      const missingOp = filled.filter(s => !s.operator_user_id);
+      if (missingOp.length > 0) throw new Error(`Operator required for: ${missingOp.map(s => s.machine_code).join(', ')}`);
 
-      const stage = stageFor(category);
-      const payload = filledRows.map(r => ({
-        log_date: logDate,
-        shift_id: shiftId,
-        unit_id: unitId,
-        part_id: r.part_id,
-        stage,
-        qty_good: parseFloat(r.qty_good || 0),
-        qty_rejected: parseFloat(r.qty_rejected || 0),
-        reject_reason: r.reject_reason || null,
-        machine_id: r.machine_id,
-        die_id: null,
-        operator_user_id: r.operator_user_id,
-        notes: null,
-        category_attrs: r.setup_change ? { setup_change: true } : {},
+      // Build payload — strip _localId and machine_code (server doesn't need them)
+      const payload = filled.map(s => ({
+        machine_id: s.machine_id,
+        part_id: s.part_id,
+        op_number: s.op_number || null,
+        op_name: s.op_name || null,
+        qty_good: parseFloat(s.qty_good || 0),
+        qty_rejected: parseFloat(s.qty_rejected || 0),
+        reject_reason: s.reject_reason || null,
+        setup_change: !!s.setup_change,
+        setup_time_min: s.setup_time_min ? parseInt(s.setup_time_min) : null,
+        previous_part_id: s.previous_part_id || null,
+        operator_user_id: s.operator_user_id,
+        operator_2_user_id: s.operator_2_user_id || null,
+        category_attrs: {},
+        notes: s.notes || null,
+        tool_changes: (s.tool_changes || []).map(tc => ({
+          tool_id: tc.tool_id,
+          change_reason: tc.change_reason || 'life_expired',
+          corner_to: tc.corner_to || null,
+          pieces_done: tc.pieces_done ? parseFloat(tc.pieces_done) : null,
+          minutes_used: tc.minutes_used ? parseFloat(tc.minutes_used) : null,
+          consumed_from_stock: !!tc.consumed_from_stock,
+          qty_consumed: tc.qty_consumed ? parseFloat(tc.qty_consumed) : 1,
+          notes: tc.notes || null,
+        })),
       }));
 
-      const { data, error: err } = await sb.rpc('log_stage_entries_bulk', { p_entries: payload });
+      const { data, error: err } = await sb.rpc('submit_shift_segments', {
+        p_log_date: logDate,
+        p_shift_id: shiftId,
+        p_unit_id: unitId,
+        p_category: category,
+        p_segments: payload,
+      });
       if (err) throw err;
-      if (!data?.success) throw new Error(data?.error || 'Bulk log failed');
+      if (!data?.success) throw new Error(data?.error || 'Submit failed');
 
       const successCount = (data.results || []).filter(r => r.status === 'success').length;
       const failedCount = (data.results || []).filter(r => r.status === 'failed').length;
       const skippedCount = (data.results || []).filter(r => r.status === 'skipped').length;
-
-      setResults({
-        success: successCount,
-        failed: failedCount,
-        skipped: skippedCount,
-        details: data.results || [],
-      });
-      showToast(`✓ ${successCount} logged${failedCount > 0 ? ` · ${failedCount} failed` : ''}`);
+      setResults({ success: successCount, failed: failedCount, skipped: skippedCount, details: data.results || [] });
+      showToast(`✓ ${successCount} segments logged${failedCount > 0 ? ` · ${failedCount} failed` : ''}`);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -7001,7 +7061,7 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
     }
   };
 
-  // Results view
+  // === Results view ===
   if (results) {
     return html`
       <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onSaved(); }}>
@@ -7019,7 +7079,7 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
               ${results.details.filter(d => d.status === 'failed').map(d => {
                 const m = machines.find(mm => mm.id === d.machine_id);
                 return html`<div key=${d.idx} style="font-size:12px;color:var(--slate-700);padding:6px 10px;background:var(--rose-50);border-radius:4px;margin-bottom:4px">
-                  <b>${m?.code || '?'}</b>: ${d.error}
+                  <b>${m?.code || '?'}${d.op_number ? ' Op' + d.op_number : ''}</b>: ${d.error}
                 </div>`;
               })}
             </div>
@@ -7030,9 +7090,38 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
     `;
   }
 
+  // === Tool change modal (overlay on top of bulk log) ===
+  if (toolChangeFor && segBeingEdited) {
+    return html`
+      <${ToolChangeModal}
+        segment=${segBeingEdited}
+        tools=${tools}
+        machines=${machines}
+        onSave=${(updatedChanges) => {
+          updateSeg(toolChangeFor, { tool_changes: updatedChanges });
+          setToolChangeFor(null);
+        }}
+        onClose=${() => setToolChangeFor(null)}
+      />
+    `;
+  }
+
+  // === Group rendering by machine ===
+  // Group segments by machine_id, preserving order
+  const segsByMachine = (() => {
+    const map = new Map();
+    for (const s of segments) {
+      if (!map.has(s.machine_id)) map.set(s.machine_id, []);
+      map.get(s.machine_id).push(s);
+    }
+    return map;
+  })();
+
+  const filledCount = segments.filter(s => parseFloat(s.qty_good || 0) > 0 || parseFloat(s.qty_rejected || 0) > 0).length;
+
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div class="modal" style="max-width:720px">
+      <div class="modal" style="max-width:880px">
         <div class="modal-header">
           <div class="modal-title">📋 Bulk Log Production</div>
           <button class="close-btn" onClick=${onClose}>×</button>
@@ -7061,70 +7150,245 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
             </div>
           </div>
 
-          ${rows.length > 0 && html`
-            <div class="field" style="background:var(--teal-50);padding:10px 12px;border-radius:8px;border-left:3px solid var(--teal-500);margin-bottom:10px">
-              <label style="font-size:12px">Set all rows to same part (optional shortcut)</label>
-              <select value=${bulkPartId} onChange=${e => applyBulkPart(e.target.value)}>
-                <option value="">— Leave individual —</option>
-                ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number} · ${p.name}</option>`)}
-              </select>
+          ${segments.length > 0 && html`
+            <div style="font-size:11px;color:var(--slate-500);margin:8px 0;padding:8px 10px;background:var(--teal-50);border-radius:6px;border-left:3px solid var(--teal-500)">
+              💡 One row per (machine × operation). Tap <b>+ Add another run</b> below a machine if you ran a different part / operation on it later in the shift. Leave Good/Reject blank for machines that didn't run.
             </div>
 
-            <div style="overflow-x:auto;margin:0 -16px">
-              <table style="width:100%;font-size:12px;border-collapse:collapse">
-                <thead>
-                  <tr style="background:var(--slate-100);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:var(--slate-600)">
-                    <th style="padding:8px 6px;text-align:left;font-weight:700">Machine</th>
-                    <th style="padding:8px 6px;text-align:left;font-weight:700;min-width:140px">Part</th>
-                    <th style="padding:8px 6px;text-align:right;font-weight:700;width:80px">Good</th>
-                    <th style="padding:8px 6px;text-align:right;font-weight:700;width:70px">Reject</th>
-                    <th style="padding:8px 6px;text-align:left;font-weight:700;min-width:120px">Operator</th>
-                    <th style="padding:8px 6px;text-align:center;font-weight:700;width:50px">Setup</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${rows.map((r, idx) => html`
-                    <tr key=${r.machine_id} style="border-bottom:1px solid var(--slate-100)">
-                      <td style="padding:6px;font-weight:600;color:var(--slate-800)">${r.machine_code}</td>
-                      <td style="padding:6px">
-                        <select value=${r.part_id} onChange=${e => updateRow(idx, 'part_id', e.target.value)} style="width:100%;font-size:12px;padding:4px 6px">
-                          <option value="">— Pick —</option>
-                          ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number}</option>`)}
-                        </select>
-                      </td>
-                      <td style="padding:6px">
-                        <input type="number" min="0" step="0.01" value=${r.qty_good} onChange=${e => updateRow(idx, 'qty_good', e.target.value)} placeholder="0" style="width:100%;text-align:right;font-size:12px;padding:4px 6px" />
-                      </td>
-                      <td style="padding:6px">
-                        <input type="number" min="0" step="0.01" value=${r.qty_rejected} onChange=${e => updateRow(idx, 'qty_rejected', e.target.value)} placeholder="0" style="width:100%;text-align:right;font-size:12px;padding:4px 6px" />
-                      </td>
-                      <td style="padding:6px">
-                        <select value=${r.operator_user_id} onChange=${e => updateRow(idx, 'operator_user_id', e.target.value)} style="width:100%;font-size:12px;padding:4px 6px">
-                          <option value="">— Pick —</option>
-                          ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
-                        </select>
-                      </td>
-                      <td style="padding:6px;text-align:center">
-                        <input type="checkbox" checked=${r.setup_change} onChange=${e => updateRow(idx, 'setup_change', e.target.checked)} />
-                      </td>
-                    </tr>
-                  `)}
-                </tbody>
-              </table>
+            <div style="display:flex;flex-direction:column;gap:14px">
+              ${[...segsByMachine.entries()].map(([machineId, segs]) => {
+                const m = machines.find(mm => mm.id === machineId);
+                const machineLabel = m?.display_name ? `${m.code} (${m.display_name})` : m?.code;
+                return html`
+                  <div key=${machineId} style="border:1px solid var(--slate-200);border-radius:10px;padding:10px;background:white">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                      <div style="font-weight:700;color:var(--slate-800);font-size:13px">⚙️ ${machineLabel}</div>
+                      <button type="button" class="btn small ghost" style="padding:3px 8px;font-size:11px" onClick=${() => addRunForMachine(machineId)}>+ Add another run</button>
+                    </div>
+                    ${segs.map((s, i) => html`
+                      <div key=${s._localId} style="border-left:3px solid ${s.setup_change ? 'var(--amber-400)' : 'var(--slate-200)'};padding:8px 10px;margin-top:6px;background:${i > 0 ? 'var(--slate-50)' : 'transparent'};border-radius:6px">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                          <div style="font-size:11px;color:var(--slate-500);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">
+                            Run ${i + 1}${s.setup_change ? ' · ⚙️ setup change' : ''}
+                          </div>
+                          ${segs.length > 1 && html`<button type="button" class="btn small ghost" style="padding:2px 6px;font-size:10px;color:var(--rose-600)" onClick=${() => removeRun(s._localId)}>✕ Remove</button>`}
+                        </div>
+                        <div class="field-row" style="margin-bottom:6px">
+                          <div class="field" style="margin:0;flex:2"><label style="font-size:11px">Part *</label>
+                            <select value=${s.part_id} onChange=${e => updateSeg(s._localId, { part_id: e.target.value })} style="font-size:12px;padding:5px 8px">
+                              <option value="">— Pick part —</option>
+                              ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number}${p.name ? ' · ' + p.name : ''}</option>`)}
+                            </select>
+                          </div>
+                          <div class="field" style="margin:0;flex:1"><label style="font-size:11px">Op #</label>
+                            <input type="text" value=${s.op_number} onChange=${e => updateSeg(s._localId, { op_number: e.target.value })} placeholder="10" style="font-size:12px;padding:5px 8px" />
+                          </div>
+                          <div class="field" style="margin:0;flex:2"><label style="font-size:11px">Op name</label>
+                            <input type="text" value=${s.op_name} onChange=${e => updateSeg(s._localId, { op_name: e.target.value })} placeholder="Turning OD" style="font-size:12px;padding:5px 8px" />
+                          </div>
+                        </div>
+                        <div class="field-row" style="margin-bottom:6px">
+                          <div class="field" style="margin:0"><label style="font-size:11px">Good</label>
+                            <input type="number" min="0" step="0.01" value=${s.qty_good} onChange=${e => updateSeg(s._localId, { qty_good: e.target.value })} placeholder="0" style="text-align:right;font-size:12px;padding:5px 8px" />
+                          </div>
+                          <div class="field" style="margin:0"><label style="font-size:11px">Reject</label>
+                            <input type="number" min="0" step="0.01" value=${s.qty_rejected} onChange=${e => updateSeg(s._localId, { qty_rejected: e.target.value })} placeholder="0" style="text-align:right;font-size:12px;padding:5px 8px" />
+                          </div>
+                          <div class="field" style="margin:0;flex:2"><label style="font-size:11px">Operator *</label>
+                            <select value=${s.operator_user_id} onChange=${e => updateSeg(s._localId, { operator_user_id: e.target.value })} style="font-size:12px;padding:5px 8px">
+                              <option value="">— Pick —</option>
+                              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+                            </select>
+                          </div>
+                        </div>
+                        ${parseFloat(s.qty_rejected || 0) > 0 && html`
+                          <div class="field" style="margin:0 0 6px"><label style="font-size:11px">Reject reason</label>
+                            <select value=${s.reject_reason} onChange=${e => updateSeg(s._localId, { reject_reason: e.target.value })} style="font-size:12px;padding:5px 8px">
+                              <option value="">— Select —</option>
+                              <option>Dimension</option><option>Surface</option><option>Tool wear</option>
+                              <option>Setup</option><option>Programming</option><option>Crash</option><option>Other</option>
+                            </select>
+                          </div>
+                        `}
+                        <div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">
+                          <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--slate-700);cursor:pointer;margin:0">
+                            <input type="checkbox" checked=${!!s.setup_change} onChange=${e => updateSeg(s._localId, { setup_change: e.target.checked })} style="width:auto" />
+                            Setup change
+                          </label>
+                          ${s.setup_change && html`
+                            <input type="number" placeholder="Setup mins" value=${s.setup_time_min} onChange=${e => updateSeg(s._localId, { setup_time_min: e.target.value })} style="font-size:11px;padding:3px 6px;width:90px" />
+                          `}
+                          <button type="button" class="btn small ghost" style="padding:3px 8px;font-size:11px;margin-left:auto" onClick=${() => setToolChangeFor(s._localId)}>
+                            🔧 ${s.tool_changes?.length > 0 ? `${s.tool_changes.length} tool change${s.tool_changes.length > 1 ? 's' : ''}` : 'Record tool change'}
+                          </button>
+                        </div>
+                      </div>
+                    `)}
+                  </div>
+                `;
+              })}
             </div>
-            <div style="font-size:11px;color:var(--slate-500);margin:10px 0">
-              💡 Leave Good and Reject blank for machines that didn't run · ${rows.filter(r => parseFloat(r.qty_good || 0) > 0 || parseFloat(r.qty_rejected || 0) > 0).length} of ${rows.length} rows will be logged
+
+            <div style="font-size:11px;color:var(--slate-500);margin:14px 0 6px;text-align:center">
+              ${filledCount} of ${segments.length} runs will be logged
             </div>
           `}
 
-          ${rows.length === 0 && category && html`<div class="card"><div class="empty">No machines in this category</div></div>`}
+          ${segments.length === 0 && category && html`<div class="card"><div class="empty">No machines in this category</div></div>`}
 
-          <button class="btn" disabled=${loading || rows.length === 0}>${loading ? 'Saving…' : `Log ${rows.filter(r => parseFloat(r.qty_good || 0) > 0 || parseFloat(r.qty_rejected || 0) > 0).length} entries`}</button>
+          <button class="btn" disabled=${loading || filledCount === 0} style="margin-top:8px">${loading ? 'Saving…' : `Log ${filledCount} run${filledCount === 1 ? '' : 's'}`}</button>
         </form>
       </div>
     </div>
   `;
 }
+
+// ============= TOOL CHANGE MODAL (overlay inside bulk log) =============
+function ToolChangeModal({ segment, tools, machines, onSave, onClose }) {
+  const [changes, setChanges] = useState(segment.tool_changes || []);
+  const [error, setError] = useState('');
+
+  // Filter tools applicable to this machine (or no machine restriction)
+  const machine = machines.find(m => m.id === segment.machine_id);
+  const machineCat = machine?.category || 'pdc';
+  const applicableTools = tools.filter(t => {
+    const okMachine = !t.applicable_machines?.length || t.applicable_machines.includes(segment.machine_id);
+    const okCat = !t.applicable_categories?.length || t.applicable_categories.includes(machineCat);
+    return okMachine && okCat;
+  });
+
+  const addChange = () => {
+    setChanges(c => [...c, {
+      _localId: `tc-${Date.now()}-${Math.random().toString(36).slice(2,7)}`,
+      tool_id: '',
+      change_reason: 'life_expired',
+      corner_to: '',
+      pieces_done: '',
+      minutes_used: '',
+      consumed_from_stock: false,
+      qty_consumed: 1,
+      notes: '',
+    }]);
+  };
+
+  const updateChange = (idx, patch) => {
+    setChanges(c => c.map((x, i) => i === idx ? { ...x, ...patch } : x));
+  };
+
+  const removeChange = (idx) => {
+    setChanges(c => c.filter((_, i) => i !== idx));
+  };
+
+  const save = () => {
+    setError('');
+    const valid = changes.filter(c => c.tool_id);
+    if (valid.length !== changes.length) {
+      setError('Each change must have a tool selected');
+      return;
+    }
+    onSave(valid);
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:600px">
+        <div class="modal-header">
+          <div class="modal-title">🔧 Tool changes for ${machine?.code} ${segment.op_number ? '· Op ' + segment.op_number : ''}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+
+        ${applicableTools.length === 0 && html`
+          <div class="alert" style="background:var(--amber-50);color:var(--amber-700);padding:10px 14px;border-radius:8px;margin-bottom:10px">
+            ⚠️ No tools yet. Add tools in Production → 🔧 Tools tab first.
+          </div>
+        `}
+
+        ${changes.length === 0 ? html`
+          <div class="empty" style="padding:20px;text-align:center;color:var(--slate-500);font-size:13px">No tool changes recorded for this run yet.</div>
+        ` : html`
+          <div style="display:flex;flex-direction:column;gap:10px">
+            ${changes.map((c, idx) => {
+              const tool = tools.find(t => t.id === c.tool_id);
+              const isInsert = tool?.kind === 'insert';
+              return html`
+                <div key=${c._localId || idx} style="border:1px solid var(--slate-200);border-radius:8px;padding:10px;background:var(--slate-50)">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                    <div style="font-size:11px;font-weight:700;color:var(--slate-700);text-transform:uppercase;letter-spacing:0.05em">Change ${idx + 1}</div>
+                    <button type="button" class="btn small ghost" style="padding:2px 6px;font-size:10px;color:var(--rose-600)" onClick=${() => removeChange(idx)}>✕ Remove</button>
+                  </div>
+                  <div class="field" style="margin-bottom:6px"><label style="font-size:11px">Tool *</label>
+                    <select value=${c.tool_id} onChange=${e => updateChange(idx, { tool_id: e.target.value })} style="font-size:12px">
+                      <option value="">— Pick tool —</option>
+                      ${applicableTools.map(t => html`<option key=${t.id} value=${t.id}>${t.code} · ${t.name}${t.kind === 'insert' && t.corners_per_insert > 1 ? ` (${t.corners_per_insert} corners)` : ''}</option>`)}
+                    </select>
+                  </div>
+                  <div class="field-row" style="margin-bottom:6px">
+                    <div class="field" style="margin:0"><label style="font-size:11px">Reason</label>
+                      <select value=${c.change_reason} onChange=${e => updateChange(idx, { change_reason: e.target.value })} style="font-size:12px">
+                        <option value="life_expired">Life expired (normal)</option>
+                        <option value="corner_rotated">Corner rotated (no new insert)</option>
+                        <option value="tool_broken">Tool broken</option>
+                        <option value="wear_excessive">Excessive wear</option>
+                        <option value="changeover">Part changeover</option>
+                        <option value="setup">New setup</option>
+                        <option value="other">Other</option>
+                      </select>
+                    </div>
+                    ${isInsert && html`
+                      <div class="field" style="margin:0"><label style="font-size:11px">Corner now in use</label>
+                        <select value=${c.corner_to} onChange=${e => updateChange(idx, { corner_to: e.target.value })} style="font-size:12px">
+                          <option value="">—</option>
+                          ${Array.from({length: tool?.corners_per_insert || 1}, (_, i) => html`<option key=${i+1} value=${i+1}>Corner ${i+1}</option>`)}
+                        </select>
+                      </div>
+                    `}
+                  </div>
+                  <div class="field-row" style="margin-bottom:6px">
+                    <div class="field" style="margin:0"><label style="font-size:11px">Pieces produced before change</label>
+                      <input type="number" min="0" step="0.01" value=${c.pieces_done} onChange=${e => updateChange(idx, { pieces_done: e.target.value })} placeholder=${tool?.life_value || ''} style="font-size:12px;padding:5px 8px" />
+                    </div>
+                    ${tool?.life_unit === 'minutes' && html`
+                      <div class="field" style="margin:0"><label style="font-size:11px">Runtime (min)</label>
+                        <input type="number" min="0" step="0.1" value=${c.minutes_used} onChange=${e => updateChange(idx, { minutes_used: e.target.value })} style="font-size:12px;padding:5px 8px" />
+                      </div>
+                    `}
+                  </div>
+                  ${c.change_reason !== 'corner_rotated' && tool?.stock_item_id && html`
+                    <div style="background:var(--teal-50);padding:6px 10px;border-radius:6px;margin-top:6px">
+                      <label style="display:flex;align-items:center;gap:6px;font-size:11px;cursor:pointer;margin:0">
+                        <input type="checkbox" checked=${c.consumed_from_stock} onChange=${e => updateChange(idx, { consumed_from_stock: e.target.checked })} style="width:auto" />
+                        📦 Take from stock (auto-decrements)
+                      </label>
+                      ${c.consumed_from_stock && html`
+                        <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
+                          <span style="font-size:11px;color:var(--slate-600)">Qty consumed:</span>
+                          <input type="number" min="0" step="0.01" value=${c.qty_consumed} onChange=${e => updateChange(idx, { qty_consumed: e.target.value })} style="font-size:11px;padding:2px 6px;width:60px" />
+                        </div>
+                      `}
+                    </div>
+                  `}
+                  ${c.change_reason !== 'corner_rotated' && !tool?.stock_item_id && tool && html`
+                    <div style="font-size:10px;color:var(--slate-500);margin-top:4px">No stock item linked — event recorded only.</div>
+                  `}
+                  <div class="field" style="margin:6px 0 0"><label style="font-size:11px">Notes (optional)</label>
+                    <input type="text" value=${c.notes} onChange=${e => updateChange(idx, { notes: e.target.value })} placeholder="Worn earlier than expected" style="font-size:12px;padding:5px 8px" />
+                  </div>
+                </div>
+              `;
+            })}
+          </div>
+        `}
+
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <button type="button" class="btn ghost" onClick=${addChange} style="flex:1" disabled=${applicableTools.length === 0}>+ Add tool change</button>
+          <button type="button" class="btn" onClick=${save} style="flex:1">Save</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 
 // ============= STAGE LOG MODAL (single-entry) =============
 // Each stage defines:
