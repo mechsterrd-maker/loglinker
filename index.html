@@ -6900,7 +6900,7 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
   const [unitId, setUnitId] = useState(units[0]?.id || '');
   const [category, setCategory] = useState('');
   const [tools, setTools] = useState([]);
-  // segments: array of { _localId, machine_id, machine_code, supervisor_id, part_id, op_number, op_name, qty_good, qty_rejected, reject_reason, operator_user_id, operator_2_user_id, setup_change, setup_time_min, previous_part_id, notes, tool_changes:[] }
+  const [routeSteps, setRouteSteps] = useState([]);
   const [segments, setSegments] = useState([]);
   const [toolChangeFor, setToolChangeFor] = useState(null); // segment _localId being edited
   const [loading, setLoading] = useState(false);
@@ -6917,11 +6917,15 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
     plating:'Plating', testing:'Testing', other:'Other',
   };
 
-  // Load tools master once (filtered to applicable when category changes)
+  // Load tools master + route steps once
   useEffect(() => {
     (async () => {
-      const { data } = await sb.from('tools_master').select('*').eq('is_active', true).order('code');
-      setTools(data || []);
+      const [tRes, rsRes] = await Promise.all([
+        sb.from('tools_master').select('*').eq('is_active', true).order('code'),
+        sb.from('v_part_route_steps').select('*').order('part_id').order('op_seq'),
+      ]);
+      setTools(tRes.data || []);
+      setRouteSteps(rsRes.data || []);
     })();
   }, []);
 
@@ -6939,6 +6943,7 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
       machine_display: m.display_name ? `${m.code} (${m.display_name})` : m.code,
       supervisor_id: m.default_supervisor_id || null,
       part_id: '',
+      route_step_id: '',
       op_number: '',
       op_name: '',
       qty_good: '',
@@ -6965,6 +6970,7 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
       ...lastForMachine,
       _localId: newLocalId(),
       part_id: '',
+      route_step_id: '',
       op_number: '',
       op_name: '',
       qty_good: '',
@@ -7007,14 +7013,17 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
       const filled = segments.filter(s => parseFloat(s.qty_good || 0) > 0 || parseFloat(s.qty_rejected || 0) > 0);
       if (filled.length === 0) throw new Error('No quantities entered');
       const missingPart = filled.filter(s => !s.part_id);
-      if (missingPart.length > 0) throw new Error(`Part required for: ${missingPart.map(s => s.machine_code + (s.op_number ? ' Op' + s.op_number : '')).join(', ')}`);
-      const missingOp = filled.filter(s => !s.operator_user_id);
-      if (missingOp.length > 0) throw new Error(`Operator required for: ${missingOp.map(s => s.machine_code).join(', ')}`);
+      if (missingPart.length > 0) throw new Error(`Part required for: ${missingPart.map(s => s.machine_code).join(', ')}`);
+      const missingOp = filled.filter(s => !s.route_step_id);
+      if (missingOp.length > 0) throw new Error(`Operation must be picked from route for: ${missingOp.map(s => s.machine_code).join(', ')}. Add a route step in the part's routing if it's missing.`);
+      const missingOperator = filled.filter(s => !s.operator_user_id);
+      if (missingOperator.length > 0) throw new Error(`Operator required for: ${missingOperator.map(s => s.machine_code).join(', ')}`);
 
       // Build payload — strip _localId and machine_code (server doesn't need them)
       const payload = filled.map(s => ({
         machine_id: s.machine_id,
         part_id: s.part_id,
+        route_step_id: s.route_step_id || null,
         op_number: s.op_number || null,
         op_name: s.op_name || null,
         qty_good: parseFloat(s.qty_good || 0),
@@ -7175,16 +7184,45 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
                         </div>
                         <div class="field-row" style="margin-bottom:6px">
                           <div class="field" style="margin:0;flex:2"><label style="font-size:11px">Part *</label>
-                            <select value=${s.part_id} onChange=${e => updateSeg(s._localId, { part_id: e.target.value })} style="font-size:12px;padding:5px 8px">
+                            <select value=${s.part_id} onChange=${e => updateSeg(s._localId, { part_id: e.target.value, route_step_id: '', op_number: '', op_name: '' })} style="font-size:12px;padding:5px 8px">
                               <option value="">— Pick part —</option>
                               ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number}${p.name ? ' · ' + p.name : ''}</option>`)}
                             </select>
                           </div>
-                          <div class="field" style="margin:0;flex:1"><label style="font-size:11px">Op #</label>
-                            <input type="text" value=${s.op_number} onChange=${e => updateSeg(s._localId, { op_number: e.target.value })} placeholder="10" style="font-size:12px;padding:5px 8px" />
-                          </div>
-                          <div class="field" style="margin:0;flex:2"><label style="font-size:11px">Op name</label>
-                            <input type="text" value=${s.op_name} onChange=${e => updateSeg(s._localId, { op_name: e.target.value })} placeholder="Turning OD" style="font-size:12px;padding:5px 8px" />
+                          <div class="field" style="margin:0;flex:3"><label style="font-size:11px">Operation *</label>
+                            ${(() => {
+                              if (!s.part_id) {
+                                return html`<select disabled style="font-size:12px;padding:5px 8px;color:var(--slate-400)"><option>— Pick part first —</option></select>`;
+                              }
+                              // Filter route steps for this part, matching the selected category
+                              const partSteps = routeSteps.filter(rs => rs.part_id === s.part_id);
+                              const matchingSteps = partSteps.filter(rs => {
+                                // Map heat_treatment ↔ heat_treat
+                                const cat = category === 'heat_treatment' ? 'heat_treat' : category;
+                                return rs.op_type === cat;
+                              });
+                              if (matchingSteps.length === 0) {
+                                return html`
+                                  <select value="" disabled style="font-size:12px;padding:5px 8px;color:var(--slate-400)">
+                                    <option>${partSteps.length === 0 ? '— No route defined for this part —' : '— No ' + (CAT_LABELS[category] || category) + ' op in this part\\'s route —'}</option>
+                                  </select>
+                                `;
+                              }
+                              return html`
+                                <select value=${s.route_step_id || ''} onChange=${e => {
+                                  const stepId = e.target.value;
+                                  const step = matchingSteps.find(x => x.route_step_id === stepId);
+                                  updateSeg(s._localId, {
+                                    route_step_id: stepId,
+                                    op_number: step ? String(step.op_seq) : '',
+                                    op_name: step ? step.op_name : '',
+                                  });
+                                }} style="font-size:12px;padding:5px 8px">
+                                  <option value="">— Pick operation —</option>
+                                  ${matchingSteps.map(rs => html`<option key=${rs.route_step_id} value=${rs.route_step_id}>Op ${rs.op_seq} · ${rs.op_name}${rs.cycle_time_sec ? ' (' + rs.cycle_time_sec + 's)' : ''}</option>`)}
+                                </select>
+                              `;
+                            })()}
                           </div>
                         </div>
                         <div class="field-row" style="margin-bottom:6px">
