@@ -691,56 +691,22 @@ function Wizard({ user, pendingInvite, onDone }) {
     e.preventDefault();
     setError(''); setLoading(true);
     try {
-      // Direct inserts (RLS is disabled for now, will re-enable in Block 1.5)
-
-      // 1. Create plant
-      const { data: plant, error: plantErr } = await sb.from('plants').insert({
-        name: form.name,
-        legal_name: form.legal_name || null,
-        gstin: form.gstin || null,
-        iatf_certified: form.iatf,
-        address: form.address,
-        city: form.city,
-        state: form.state,
-        pincode: form.pincode,
-        subscription_tier: 'lite',
-        installed_mcps: ['production_pdc_v1']
-      }).select().single();
-      if (plantErr) throw plantErr;
-
-      // 2. Delete any existing user row first (in case of retry)
-      await sb.from('users').delete().eq('id', user.id);
-
-      // 3. Create user row linked to plant
-      const { error: userErr } = await sb.from('users').insert({
-        id: user.id,
-        plant_id: plant.id,
-        full_name: form.your_name,
-        phone: '+91' + form.your_phone,
-        email: user.email,
-        role: 'plant_head',
-        status: 'active',
-        can_install_mcps: true
+      const { data, error: rpcErr } = await sb.rpc('create_plant_and_signup', {
+        p_plant_name: form.name,
+        p_legal_name: form.legal_name || null,
+        p_gstin: form.gstin || null,
+        p_address: form.address,
+        p_city: form.city,
+        p_pincode: form.pincode,
+        p_state: form.state,
+        p_full_name: form.your_name,
+        p_phone: '+91' + form.your_phone,
+        p_iatf_certified: form.iatf,
       });
-      if (userErr) throw userErr;
+      if (rpcErr) throw rpcErr;
+      if (!data?.success) throw new Error(data?.error || 'Could not create plant');
 
-      // 4. Set primary contact
-      await sb.from('plants').update({ primary_contact_user_id: user.id }).eq('id', plant.id);
-
-      // 5. Default chat groups
-      await sb.from('chat_groups').insert([
-        { plant_id: plant.id, name: '# All Hands', type: 'all_hands', members: [user.id] },
-        { plant_id: plant.id, name: '# Quality', type: 'department', members: [user.id] },
-        { plant_id: plant.id, name: '# Maintenance', type: 'department', members: [user.id] },
-      ]);
-
-      // 6. Default shifts
-      await sb.from('shifts').insert([
-        { plant_id: plant.id, name: 'Day Shift', start_time: '06:00', end_time: '14:00' },
-        { plant_id: plant.id, name: 'Evening Shift', start_time: '14:00', end_time: '22:00' },
-        { plant_id: plant.id, name: 'Night Shift', start_time: '22:00', end_time: '06:00' },
-      ]);
-
+      const { data: plant } = await sb.from('plants').select('*').eq('id', data.plant_id).single();
       showToast('Plant created!');
       onDone(plant);
     } catch (err) {
@@ -2474,7 +2440,6 @@ function MachineModal({ plant, units, users, editTarget, onClose, onSaved }) {
         make: form.make || null,
         model: form.model || null,
         tonnage: form.tonnage ? parseInt(form.tonnage) : null,
-        unit_id: form.unit_id,
         status: form.status,
         category: form.category || 'pdc',
         attributes: form.attributes || {},
@@ -2605,17 +2570,11 @@ function MachineModal({ plant, units, users, editTarget, onClose, onSaved }) {
               </div>
             </div>
           `}
-          <div class="field-row">
-            <div class="field"><label>Unit *</label>
-              <select required value=${form.unit_id} onChange=${e => setForm({...form, unit_id: e.target.value})}>
-                ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
-              </select>
-            </div>
-            <div class="field"><label>Status</label>
-              <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
-                <option value="running">Running</option><option value="idle">Idle</option><option value="breakdown">Breakdown</option><option value="maintenance">Maintenance</option>
-              </select>
-            </div>
+          <div class="field">
+            <label>Status</label>
+            <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
+              <option value="running">Running</option><option value="idle">Idle</option><option value="breakdown">Breakdown</option><option value="maintenance">Maintenance</option>
+            </select>
           </div>
           <div class="field"><label>Default Supervisor <span style="font-size:11px;color:var(--slate-500);font-weight:400">(auto-fills as operator on bulk entry)</span></label>
             <select value=${form.default_supervisor_id || ''} onChange=${e => setForm({...form, default_supervisor_id: e.target.value})}>
@@ -2723,24 +2682,17 @@ function MachineBulkAddModal({ plant, units, users, onClose, onSaved }) {
               <option value="other">Other</option>
             </select>
           </div>
-          <div class="field-row">
-            <div class="field"><label>Unit *</label>
-              <select required value=${unitId} onChange=${e => setUnitId(e.target.value)}>
-                ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
-              </select>
-            </div>
-            <div class="field"><label>Default Supervisor</label>
-              <select value=${supervisorId} onChange=${e => setSupervisorId(e.target.value)}>
-                <option value="">— None —</option>
-                ${(users || []).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
-              </select>
-            </div>
+          <div class="field"><label>Default Supervisor</label>
+            <select value=${supervisorId} onChange=${e => setSupervisorId(e.target.value)}>
+              <option value="">— None —</option>
+              ${(users || []).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+            </select>
           </div>
           <div class="field"><label>Machine codes <span style="font-size:11px;color:var(--slate-500);font-weight:400">(one per line, or comma-separated)</span></label>
             <textarea rows=${8} value=${codes} onChange=${e => setCodes(e.target.value)} placeholder=${'CNC-01\nCNC-02\nCNC-03'} style="font-family:monospace;font-size:13px"></textarea>
           </div>
           <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">
-            ${previewCount} machine${previewCount === 1 ? '' : 's'} will be added · all in <b>${category}</b> category · same unit + supervisor
+            ${previewCount} machine${previewCount === 1 ? '' : 's'} will be added · all in <b>${category}</b> category · same supervisor · current unit
           </div>
           <button class="btn" disabled=${loading || previewCount === 0}>${loading ? 'Adding…' : `Add ${previewCount} machine${previewCount === 1 ? '' : 's'}`}</button>
         </form>
@@ -3060,7 +3012,6 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
     try {
       const payload = {
         plant_id: plant.id,
-        unit_id: form.unit_id,
         shift_id: form.shift_id,
         machine_id: form.machine_id,
         die_id: form.die_id,
@@ -3096,17 +3047,10 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
         <form onSubmit=${submit}>
-          <div class="field-row">
-            <div class="field"><label>Unit *</label>
-              <select required value=${form.unit_id} onChange=${e => setForm({...form, unit_id: e.target.value})}>
-                ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
-              </select>
-            </div>
-            <div class="field"><label>Shift *</label>
-              <select required value=${form.shift_id} onChange=${e => setForm({...form, shift_id: e.target.value})}>
-                ${shifts.map(s => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
-              </select>
-            </div>
+          <div class="field"><label>Shift *</label>
+            <select required value=${form.shift_id} onChange=${e => setForm({...form, shift_id: e.target.value})}>
+              ${shifts.map(s => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
+            </select>
           </div>
           <div class="field"><label>Machine *</label>
             <select required value=${form.machine_id} onChange=${e => setForm({...form, machine_id: e.target.value})}>
@@ -7832,18 +7776,11 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
               </select>
             </div>
           </div>
-          <div class="field-row">
-            <div class="field"><label>Category *</label>
-              <select required value=${category} onChange=${e => setCategory(e.target.value)}>
-                <option value="">— Pick category —</option>
-                ${categories.map(c => html`<option key=${c} value=${c}>${CAT_LABELS[c] || c} (${machines.filter(m => (m.category || 'pdc') === c).length})</option>`)}
-              </select>
-            </div>
-            <div class="field"><label>Unit</label>
-              <select value=${unitId} onChange=${e => setUnitId(e.target.value)}>
-                ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
-              </select>
-            </div>
+          <div class="field"><label>Category *</label>
+            <select required value=${category} onChange=${e => setCategory(e.target.value)}>
+              <option value="">— Pick category —</option>
+              ${categories.map(c => html`<option key=${c} value=${c}>${CAT_LABELS[c] || c} (${machines.filter(m => (m.category || 'pdc') === c).length})</option>`)}
+            </select>
           </div>
 
           ${segments.length > 0 && html`
@@ -8377,7 +8314,7 @@ function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, 
       const { data, error } = await sb.rpc('log_stage_entry', {
         p_log_date: form.log_date,
         p_shift_id: form.shift_id,
-        p_unit_id: form.unit_id || null,
+        p_unit_id: null,
         p_part_id: form.part_id,
         p_stage: form.stage,
         p_qty_good: parseFloat(form.qty_good) || 0,
@@ -8431,12 +8368,6 @@ function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, 
           <div class="field"><label>Stage *</label>
             <select required value=${form.stage} disabled=${isReconcile} onChange=${e => setForm({...form, stage: e.target.value, category_attrs: {}, reject_reason: ''})}>
               ${STAGE_OPTIONS.map(s => html`<option key=${s.v} value=${s.v}>${s.l}</option>`)}
-            </select>
-          </div>
-          <div class="field"><label>Unit</label>
-            <select value=${form.unit_id} onChange=${e => setForm({...form, unit_id: e.target.value})}>
-              <option value="">— None —</option>
-              ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
             </select>
           </div>
           ${(tpl.showMachine || tpl.showDie) && html`
