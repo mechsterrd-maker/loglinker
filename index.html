@@ -9171,13 +9171,17 @@ function PlanVsSupplyView({ plant, me }) {
   const [statusFilter, setStatusFilter] = useState('all'); // all | overdue | at_risk | due_today | on_track | completed
   const [customerFilter, setCustomerFilter] = useState('all');
   const [search, setSearch] = useState('');
+  const [selectedRow, setSelectedRow] = useState(null);
+  const [machineCount, setMachineCount] = useState(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const { data, error } = await sb.from('v_plan_vs_supply')
-      .select('*')
-      .order('effective_due_date', { ascending: true, nullsFirst: false });
-    if (!error) setRows(data || []);
+    const [pvsRes, mRes] = await Promise.all([
+      sb.from('v_plan_vs_supply').select('*').order('effective_due_date', { ascending: true, nullsFirst: false }),
+      sb.from('machines').select('id, code, category, status', { count: 'exact', head: false }),
+    ]);
+    if (!pvsRes.error) setRows(pvsRes.data || []);
+    setMachineCount(mRes.data || []);
     setLoading(false);
   }, []);
 
@@ -9307,7 +9311,7 @@ function PlanVsSupplyView({ plant, me }) {
                 const partLabel = r.part_number || r.part_name_raw || '—';
                 const isOverdueOrRisk = r.status === 'overdue' || r.status === 'at_risk' || r.status === 'due_today';
                 return html`
-                  <tr key=${r.line_id} style="border-bottom:1px solid var(--slate-100);${isOverdueOrRisk ? 'background:' + sty.bg + '40' : ''}">
+                  <tr key=${r.line_id} onClick=${() => setSelectedRow(r)} style="border-bottom:1px solid var(--slate-100);cursor:pointer;${isOverdueOrRisk ? 'background:' + sty.bg + '40' : ''}">
                     <td style="padding:8px;color:var(--slate-800)">
                       <div style="font-weight:600;font-size:12px">${r.customer_code || r.customer_name}</div>
                       <div style="font-size:11px;color:var(--slate-500);margin-top:1px">${partLabel}${r.part_name ? ' · ' + r.part_name : ''}</div>
@@ -9347,8 +9351,153 @@ function PlanVsSupplyView({ plant, me }) {
     }
 
     <div style="font-size:11px;color:var(--slate-500);margin-top:14px;padding:10px 12px;background:var(--slate-50);border-radius:6px;line-height:1.6">
-      💡 <b>Layer 1 of 3.</b> This view shows the comparison only.<br/>
-      <b>Coming next:</b> Layer 2 = per-row recovery math (required vs current rate, action suggestions). Layer 3 = full project plan / Gantt.
+      💡 <b>Tap any row</b> to see recovery math + suggested action.<br/>
+      Layer 3 (full project plan / Gantt) coming in a future session.
+    </div>
+
+    ${selectedRow && html`<${RecoveryDrawer} row=${selectedRow} machines=${machineCount || []} onClose=${() => setSelectedRow(null)} />`}
+  `;
+}
+
+// =================================================================
+// RECOVERY DRAWER — Layer 2: math-based recovery analysis per schedule line
+// Reads required_rate vs current_rate, gives plain-language verdict + action.
+// =================================================================
+function RecoveryDrawer({ row, machines, onClose }) {
+  const r = row;
+  const sty = STATUS_STYLES[r.status] || STATUS_STYLES.unknown;
+  const partLabel = r.part_number || r.part_name_raw || '—';
+  const required = parseFloat(r.required_daily_rate || 0);
+  const current = parseFloat(r.current_daily_rate || 0);
+  const gap = parseFloat(r.gap_qty || 0);
+  const daysLeft = r.days_remaining;
+
+  // Verdict logic
+  let verdict, verdictColor, verdictIcon, suggestion;
+
+  if (r.status === 'completed') {
+    verdict = 'Completed';
+    verdictColor = 'var(--emerald-700)';
+    verdictIcon = '✓';
+    suggestion = 'This schedule line is fulfilled. No action needed.';
+  } else if (r.status === 'overdue') {
+    verdict = 'Already overdue — escalate to customer';
+    verdictColor = 'var(--rose-700)';
+    verdictIcon = '🚨';
+    suggestion = `Past due date by ${Math.abs(daysLeft || 0)} day${Math.abs(daysLeft || 0) === 1 ? '' : 's'}. ${gap.toFixed(0)} pcs short. ` +
+                 `Inform customer of revised delivery commitment. ` +
+                 (current > 0 ? `At your current rate (${current.toFixed(0)}/day), recovery will take ~${Math.ceil(gap / current)} days.` : 'No production logged in last 7 days — investigate why.');
+  } else if (current === 0) {
+    verdict = 'No recent production';
+    verdictColor = 'var(--rose-700)';
+    verdictIcon = '⚠️';
+    suggestion = `Required rate is ${required.toFixed(0)}/day but no production logged in last 7 days. ` +
+                 `Investigate: is the part actually being produced? Are stage logs being entered?`;
+  } else if (current >= required) {
+    verdict = 'On track — current rate covers gap';
+    verdictColor = 'var(--emerald-700)';
+    verdictIcon = '✓';
+    suggestion = `Producing ${current.toFixed(0)}/day, only need ${required.toFixed(0)}/day. ${(current/required*100 - 100).toFixed(0)}% buffer. ` +
+                 `No action needed if rate continues.`;
+  } else if (current >= required * 0.85) {
+    verdict = 'Tight — push slightly harder';
+    verdictColor = 'var(--amber-700)';
+    verdictIcon = '⚠️';
+    const shortPerDay = required - current;
+    suggestion = `Need ${required.toFixed(0)}/day but doing ${current.toFixed(0)}/day. ` +
+                 `Short by ${shortPerDay.toFixed(0)}/day (${((shortPerDay/required)*100).toFixed(0)}%). ` +
+                 `Add overtime or 1 extra shift to close gap.`;
+  } else {
+    verdict = "Won't make it without action";
+    verdictColor = 'var(--rose-700)';
+    verdictIcon = '🚨';
+    const shortPerDay = required - current;
+    const shortPct = (shortPerDay / required) * 100;
+    // Estimate machines needed: assume current rate is from N machines
+    const ratio = required / current;
+    const extraMachines = Math.ceil(ratio) - 1;
+    suggestion = `Need ${required.toFixed(0)}/day but doing only ${current.toFixed(0)}/day. ` +
+                 `Short by ${shortPct.toFixed(0)}%. Options to recover:\n` +
+                 `• Add ${extraMachines} more machine${extraMachines === 1 ? '' : 's'} on this part\n` +
+                 `• Run additional shift (${(shortPerDay * 24 / 8).toFixed(0)} pcs/8hr extra)\n` +
+                 `• Work weekend (catch up ~${(current * 2).toFixed(0)} pcs)\n` +
+                 `• Negotiate later delivery date with customer`;
+  }
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">📊 Recovery Analysis</div>
+            <div style="font-size:12px;color:var(--slate-500);font-weight:400;margin-top:2px">${r.customer_name} · ${partLabel}${r.part_name ? ' · ' + r.part_name : ''}</div>
+          </div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+
+        <!-- Top stats -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px">
+          <div style="padding:10px 12px;background:var(--slate-50);border-radius:8px">
+            <div style="font-size:10px;color:var(--slate-500);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">PLANNED</div>
+            <div style="font-size:18px;font-weight:700;color:var(--slate-800);margin-top:2px">${fmtNum(r.planned_qty)}</div>
+            <div style="font-size:11px;color:var(--slate-500)">required by ${r.effective_due_date || '—'}</div>
+          </div>
+          <div style="padding:10px 12px;background:var(--emerald-50);border-radius:8px">
+            <div style="font-size:10px;color:var(--emerald-700);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">SUPPLIED</div>
+            <div style="font-size:18px;font-weight:700;color:var(--emerald-700);margin-top:2px">${fmtNum(r.supplied_qty)}</div>
+            <div style="font-size:11px;color:var(--slate-500)">${r.pct_supplied}% of plan</div>
+          </div>
+          <div style="padding:10px 12px;background:${gap > 0 ? 'var(--rose-50)' : 'var(--emerald-50)'};border-radius:8px">
+            <div style="font-size:10px;color:${gap > 0 ? 'var(--rose-700)' : 'var(--emerald-700)'};font-weight:600;text-transform:uppercase;letter-spacing:0.05em">GAP</div>
+            <div style="font-size:18px;font-weight:700;color:${gap > 0 ? 'var(--rose-700)' : 'var(--emerald-700)'};margin-top:2px">${fmtNum(gap)}</div>
+            <div style="font-size:11px;color:var(--slate-500)">pcs short</div>
+          </div>
+          <div style="padding:10px 12px;background:${daysLeft != null && daysLeft < 3 ? 'var(--amber-50)' : 'var(--slate-50)'};border-radius:8px">
+            <div style="font-size:10px;color:var(--slate-500);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">TIME</div>
+            <div style="font-size:18px;font-weight:700;color:${daysLeft != null && daysLeft < 0 ? 'var(--rose-700)' : 'var(--slate-800)'};margin-top:2px">${daysLeft == null ? '—' : daysLeft < 0 ? Math.abs(daysLeft) + 'd late' : daysLeft + 'd'}</div>
+            <div style="font-size:11px;color:var(--slate-500)">${daysLeft != null && daysLeft < 0 ? 'past due' : 'remaining'}</div>
+          </div>
+        </div>
+
+        <!-- Rate comparison -->
+        ${(required > 0 || current > 0) && r.status !== 'completed' && html`
+          <div style="margin-bottom:14px">
+            <div style="font-size:11px;font-weight:700;color:var(--slate-700);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">RATE COMPARISON (per day)</div>
+            <div style="display:flex;flex-direction:column;gap:6px;background:var(--slate-50);padding:10px 12px;border-radius:8px">
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <span style="font-size:12px;color:var(--slate-700)">Required to recover gap</span>
+                <span style="font-size:14px;font-weight:700;color:var(--slate-900);font-variant-numeric:tabular-nums">${required.toFixed(0)}/day</span>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <span style="font-size:12px;color:var(--slate-700)">Your current rate (last 7d)</span>
+                <span style="font-size:14px;font-weight:700;color:${current >= required ? 'var(--emerald-700)' : current >= required * 0.85 ? 'var(--amber-700)' : 'var(--rose-700)'};font-variant-numeric:tabular-nums">${current.toFixed(0)}/day</span>
+              </div>
+              ${required > 0 && html`
+                <div style="margin-top:4px;height:8px;background:var(--slate-200);border-radius:4px;overflow:hidden;position:relative">
+                  <div style="height:100%;background:${current >= required ? 'var(--emerald-500)' : current >= required * 0.85 ? 'var(--amber-500)' : 'var(--rose-500)'};width:${Math.min(100, (current/required)*100)}%"></div>
+                </div>
+                <div style="font-size:10px;color:var(--slate-500);text-align:right">${((current/required)*100).toFixed(0)}% of required rate</div>
+              `}
+            </div>
+          </div>
+        `}
+
+        <!-- Verdict -->
+        <div style="padding:12px 14px;background:${verdictColor === 'var(--emerald-700)' ? 'var(--emerald-50)' : verdictColor === 'var(--amber-700)' ? 'var(--amber-50)' : 'var(--rose-50)'};border-left:3px solid ${verdictColor};border-radius:6px;margin-bottom:10px">
+          <div style="font-size:13px;font-weight:700;color:${verdictColor};margin-bottom:6px">${verdictIcon} ${verdict}</div>
+          <div style="font-size:12px;color:var(--slate-700);line-height:1.6;white-space:pre-line">${suggestion}</div>
+        </div>
+
+        <!-- Plant context (if relevant) -->
+        ${r.status !== 'completed' && machines && machines.length > 0 && html`
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:14px;padding:8px 10px;background:var(--slate-50);border-radius:6px;line-height:1.5">
+            <b>Plant context:</b> ${machines.length} machines total · ${machines.filter(m => m.status === 'running').length} running · ${machines.filter(m => m.status === 'idle').length} idle · ${machines.filter(m => m.status === 'breakdown').length} breakdown.
+            ${machines.filter(m => m.status === 'idle').length > 0 ? ' Idle machines could be considered for capacity.' : ''}
+          </div>
+        `}
+
+        <button class="btn" onClick=${onClose} style="width:100%">Close</button>
+      </div>
     </div>
   `;
 }
