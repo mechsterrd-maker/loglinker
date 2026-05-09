@@ -2060,6 +2060,174 @@ function PartModal({ plant, me, dies, editTarget, onClose, onSaved }) {
 }
 
 // ============= PART DETAIL (Route + BOM) =============
+// ============= PART CUSTOMER ALIASES MODAL =============
+function PartAliasesModal({ plant, me, part, onClose, onSaved }) {
+  const [rows, setRows] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const load = async () => {
+    setLoading(true);
+    const [aliasRes, custRes] = await Promise.all([
+      sb.from('customer_part_aliases').select('*, mcp_sched_customers(name, code)').eq('internal_part_id', part.id).order('created_at'),
+      sb.from('mcp_sched_customers').select('id, name, code').order('name'),
+    ]);
+    setRows((aliasRes.data || []).map(a => ({
+      id: a.id,
+      customer_id: a.customer_id,
+      external_name: a.external_name || '',
+      internal_part_number: a.internal_part_number || part.part_number || '',
+      isNew: false,
+      isDirty: false,
+      isDeleted: false,
+    })));
+    setCustomers(custRes.data || []);
+    setLoading(false);
+  };
+  useEffect(() => { load(); }, []);
+
+  const addRow = () => {
+    setRows(prev => [...prev, {
+      id: 'new-' + Date.now() + '-' + Math.random(),
+      customer_id: '',
+      external_name: '',
+      internal_part_number: part.part_number || '',
+      isNew: true,
+      isDirty: true,
+      isDeleted: false,
+    }]);
+  };
+
+  const updateRow = (idx, patch) => {
+    setRows(prev => prev.map((r, i) => i === idx ? { ...r, ...patch, isDirty: true } : r));
+  };
+
+  const deleteRow = (idx) => {
+    setRows(prev => prev.map((r, i) => i === idx ? { ...r, isDeleted: true, isDirty: true } : r));
+  };
+
+  const save = async () => {
+    setError(''); setBusy(true);
+    try {
+      // Validate non-deleted rows
+      for (const r of rows) {
+        if (r.isDeleted) continue;
+        if (!r.customer_id) throw new Error('Pick a customer for every row');
+        if (!r.external_name?.trim()) throw new Error('Customer\\'s name for the part cannot be empty');
+      }
+
+      // Check duplicate (customer_id + external_name) combos in non-deleted rows
+      const seen = new Set();
+      for (const r of rows) {
+        if (r.isDeleted) continue;
+        const k = r.customer_id + '|' + r.external_name.trim().toLowerCase();
+        if (seen.has(k)) throw new Error('Duplicate row: same customer + same alias');
+        seen.add(k);
+      }
+
+      // Apply changes
+      for (const r of rows) {
+        if (r.isDeleted && !r.isNew) {
+          await sb.from('customer_part_aliases').delete().eq('id', r.id);
+        } else if (r.isNew && !r.isDeleted) {
+          await sb.from('customer_part_aliases').insert({
+            plant_id: plant.id,
+            customer_id: r.customer_id,
+            external_name: r.external_name.trim(),
+            external_name_normalized: r.external_name.trim().toLowerCase(),
+            internal_part_id: part.id,
+            internal_part_number: r.internal_part_number?.trim() || part.part_number,
+            confidence: 'manual',
+            created_by: me.id,
+          });
+        } else if (r.isDirty && !r.isDeleted) {
+          await sb.from('customer_part_aliases').update({
+            customer_id: r.customer_id,
+            external_name: r.external_name.trim(),
+            external_name_normalized: r.external_name.trim().toLowerCase(),
+            internal_part_number: r.internal_part_number?.trim() || part.part_number,
+          }).eq('id', r.id);
+        }
+      }
+
+      showToast('Aliases saved');
+      onSaved();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (loading) return html`<div class="modal-backdrop active"><div class="modal"><div class="loader"><div class="spinner"></div></div></div></div>`;
+
+  const visibleRows = rows.filter(r => !r.isDeleted);
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:640px">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">🏷️ Customer Part Aliases</div>
+            <div style="font-size:12px;color:var(--slate-500);font-weight:400;margin-top:2px">${part.part_number} · ${part.name}</div>
+          </div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+
+        <div style="font-size:12px;color:var(--slate-600);margin-bottom:12px;line-height:1.5;background:var(--teal-50);padding:10px 12px;border-radius:8px">
+          <b>Why aliases?</b> Each customer calls this part something different. When schedules or DCs come in, Loglinkr matches their name → your master part automatically.
+        </div>
+
+        ${customers.length === 0 ? html`
+          <div class="empty"><div style="font-size:13px">No customers yet. Add customers in Schedules tab first.</div></div>
+        ` : visibleRows.length === 0 ? html`
+          <div class="empty" style="padding:20px"><div style="font-size:13px;margin-bottom:10px">No aliases yet for this part.</div></div>
+        ` : html`
+          <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">
+            ${rows.map((r, idx) => {
+              if (r.isDeleted) return null;
+              return html`
+                <div key=${r.id} style="border:1px solid var(--slate-200);border-radius:8px;padding:10px 12px;background:${r.isNew ? 'var(--teal-50)' : 'white'}">
+                  <div style="display:grid;grid-template-columns:1fr 1.5fr 1fr auto;gap:8px;align-items:end">
+                    <div class="field" style="margin:0">
+                      <label style="font-size:10px">Customer</label>
+                      <select value=${r.customer_id} onChange=${e => updateRow(idx, { customer_id: e.target.value })} style="font-size:12px;padding:5px 6px">
+                        <option value="">— Pick —</option>
+                        ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.code ? c.code + ' · ' : ''}${c.name}</option>`)}
+                      </select>
+                    </div>
+                    <div class="field" style="margin:0">
+                      <label style="font-size:10px">Customer's name for this part *</label>
+                      <input type="text" value=${r.external_name} onChange=${e => updateRow(idx, { external_name: e.target.value })} placeholder="e.g. FH-251-A" style="font-size:12px;padding:5px 8px" />
+                    </div>
+                    <div class="field" style="margin:0">
+                      <label style="font-size:10px">Customer's part #</label>
+                      <input type="text" value=${r.internal_part_number} onChange=${e => updateRow(idx, { internal_part_number: e.target.value })} placeholder="optional" style="font-size:12px;padding:5px 8px" />
+                    </div>
+                    <button class="btn small ghost" onClick=${() => deleteRow(idx)} style="padding:4px 8px;color:var(--rose-600);font-size:14px">×</button>
+                  </div>
+                </div>
+              `;
+            })}
+          </div>
+        `}
+
+        <div style="display:flex;gap:8px;justify-content:space-between;align-items:center">
+          <button class="btn small ghost" onClick=${addRow} disabled=${busy || customers.length === 0}>+ Add alias</button>
+          <div style="display:flex;gap:8px">
+            <button class="btn small ghost" onClick=${onClose} disabled=${busy}>Cancel</button>
+            <button class="btn small" onClick=${save} disabled=${busy}>${busy ? 'Saving...' : 'Save all'}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ============= PART DETAIL =============
 function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
   const [tab, setTab] = useState('route');
   const [route, setRoute] = useState(null);
@@ -2067,17 +2235,20 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
   const [bom, setBom] = useState([]);
   const [whereUsed, setWhereUsed] = useState([]);
   const [stockItems, setStockItems] = useState([]);
+  const [aliases, setAliases] = useState([]);
+  const [aliasModalOpen, setAliasModalOpen] = useState(false);
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [r, b, w, s] = await Promise.all([
+    const [r, b, w, s, a] = await Promise.all([
       sb.from('mcp_pdc_routes').select('*').eq('part_id', part.id).eq('is_active', true).maybeSingle(),
       sb.from('mcp_pdc_bom').select('*, child_part:child_part_id(part_number,name,revision), child_item:child_item_id(code,name,uom)').eq('parent_part_id', part.id),
       sb.from('v_bom_where_used').select('*').eq('part_id', part.id),
       sb.from('mcp_stocks_items').select('*').order('name'),
+      sb.from('customer_part_aliases').select('*, mcp_sched_customers(name, code)').eq('internal_part_id', part.id),
     ]);
     setRoute(r.data);
     if (r.data) {
@@ -2089,6 +2260,7 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
     setBom(b.data || []);
     setWhereUsed(w.data || []);
     setStockItems(s.data || []);
+    setAliases(a.data || []);
     setLoading(false);
   }, [part.id]);
 
@@ -2132,6 +2304,14 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
       <div class="card-row"><span class="label">Status</span><span class="value"><span class=${'badge ' + (part.status === 'active' ? 'emerald' : 'amber')}>${part.status}</span></span></div>
       ${part.customer && html`<div class="card-row"><span class="label">Customer</span><span class="value">${part.customer}</span></div>`}
       ${part.weight_kg && html`<div class="card-row"><span class="label">Weight</span><span class="value">${part.weight_kg} kg</span></div>`}
+      <div class="card-row" style="cursor:pointer;border-top:1px solid var(--slate-100);padding-top:8px;margin-top:4px" onClick=${() => setAliasModalOpen(true)}>
+        <span class="label">🏷️ Customer Aliases</span>
+        <span class="value">
+          ${aliases.length === 0 ? html`<span style="color:var(--slate-400);font-size:12px">none — tap to add</span>` :
+            html`<span style="color:var(--slate-700);font-size:12px;font-weight:500">${aliases.length} alias${aliases.length === 1 ? '' : 'es'}</span>`}
+          <span style="color:var(--slate-400);margin-left:6px">›</span>
+        </span>
+      </div>
     </div>
 
     <div class="auth-tabs" style="margin-bottom:14px">
@@ -2221,6 +2401,7 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
     ${modal === 'step' && html`<${RouteStepModal} plant=${plant} route=${route} machines=${machines} editTarget=${editTarget} nextSeq=${steps.length > 0 ? Math.max(...steps.map(s => s.seq)) + 10 : 10} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'bom' && html`<${BomModal} plant=${plant} parentPart=${part} parts=${parts} stockItems=${stockItems} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'part' && html`<${PartModal} plant=${plant} me=${me} dies=${dies} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); onClose(); }} />`}
+    ${aliasModalOpen && html`<${PartAliasesModal} plant=${plant} me=${me} part=${part} onClose=${() => setAliasModalOpen(false)} onSaved=${() => { setAliasModalOpen(false); refresh(); }} />`}
   `;
 }
 
@@ -10013,8 +10194,175 @@ function ScheduleAddModal({ plant, me, customers, parts, onClose, onSaved }) {
   const [file, setFile] = useState(null);
   const [extracting, setExtracting] = useState(false);
   const [extracted, setExtracted] = useState(null);
+  const [pasteText, setPasteText] = useState('');
+  const [pastePreview, setPastePreview] = useState(null);
+  const [pasteError, setPasteError] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // === PASTE-FROM-EXCEL parser ===
+  // Accepts tab-separated (Google Sheets / Excel copy) OR CSV
+  // Detects header row, then maps columns to: part_number, part_name, total, then date/week columns
+  const parsePastedTable = () => {
+    setPasteError('');
+    setPastePreview(null);
+    const text = pasteText.trim();
+    if (!text) { setPasteError('Paste table content first'); return; }
+
+    // Split rows
+    const rawRows = text.split(/\r?\n/).filter(r => r.trim());
+    if (rawRows.length < 2) { setPasteError('Need at least 1 header row + 1 data row'); return; }
+
+    // Detect separator: tab if any row has tab, else comma
+    const sep = rawRows[0].includes('\t') ? '\t' : (rawRows[0].includes(',') ? ',' : '\t');
+    const splitRow = (r) => sep === '\t' ? r.split('\t').map(c => c.trim()) : r.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/).map(c => c.trim().replace(/^"|"$/g, ''));
+
+    const rows = rawRows.map(splitRow);
+
+    // Find header row — first row where most cells are non-numeric text
+    let headerIdx = 0;
+    for (let i = 0; i < Math.min(3, rows.length); i++) {
+      const nonNumeric = rows[i].filter(c => c && isNaN(parseFloat(c.replace(/,/g, '')))).length;
+      if (nonNumeric >= rows[i].length / 2) { headerIdx = i; break; }
+    }
+
+    const header = rows[headerIdx].map(h => h.toLowerCase().trim());
+    const dataRows = rows.slice(headerIdx + 1).filter(r => r.some(c => c && c.trim()));
+
+    if (dataRows.length === 0) { setPasteError('No data rows found below header'); return; }
+
+    // Identify columns
+    let partNumCol = -1, partNameCol = -1, totalCol = -1, snoCol = -1;
+    const dateCols = []; // [{idx, label, parsedDate}]
+
+    header.forEach((h, idx) => {
+      const lh = h.toLowerCase();
+      if (!partNumCol && /(^|\W)(part\s*(no|num|#)|item\s*(no|code)|sku|p\/n|partno|part_number)(\W|$)/.test(lh)) partNumCol = idx;
+      else if (partNumCol === -1 && /(part|item|code)/.test(lh) && !/(name|desc|description)/.test(lh)) partNumCol = idx;
+      if (partNameCol === -1 && /(description|desc|name|details|product)/.test(lh)) partNameCol = idx;
+      if (totalCol === -1 && /(total|firm|requirement|qty\s*total|monthly|month\s*total)/.test(lh)) totalCol = idx;
+      if (snoCol === -1 && /(s\.?\s*no|sl\.?\s*no|serial|^#$|sno)/.test(lh)) snoCol = idx;
+
+      // Date / Week columns
+      // Match: W1, Wk1, Week 1, dates like 5/5, 5-5, 05/05, 1st-7th, etc.
+      const weekMatch = lh.match(/^w\s*(eek)?\s*\.?\s*(\d{1,2})$/i);
+      const dateMatch = lh.match(/^(\d{1,2})[\/\-\.](\d{1,2})([\/\-\.](\d{2,4}))?$/);
+      const rangeMatch = lh.match(/^(\d{1,2})\s*(st|nd|rd|th)?\s*[-–to]+\s*(\d{1,2})/i);
+      if (weekMatch || dateMatch || rangeMatch || /^[a-z]+\s*\d{1,2}/i.test(lh)) {
+        dateCols.push({ idx, label: header[idx] || ('col' + idx), weekMatch: !!weekMatch, dateMatch: !!dateMatch, rangeMatch: !!rangeMatch });
+      }
+    });
+
+    if (partNumCol === -1 && partNameCol === -1) {
+      setPasteError('Could not find a Part column. Header should contain "Part No", "Item", "SKU", or "Description".');
+      return;
+    }
+    if (dateCols.length === 0 && totalCol === -1) {
+      setPasteError('Could not find date/week columns or Total column. Need at least one quantity column.');
+      return;
+    }
+
+    // Compute target dates for each detected date column based on schedule month
+    const monthDate = scheduleMonth ? new Date(scheduleMonth + '-01') : new Date();
+    const monthStart = new Date(monthDate.getFullYear(), monthDate.getMonth(), 1);
+    const dateColMap = dateCols.map(dc => {
+      let targetDate = null;
+      if (dc.weekMatch) {
+        const wn = parseInt(dc.label.match(/\d+/)[0]);
+        // Week 1 = days 1-7, Week 2 = 8-14, etc. Use last day of week as required_date
+        const day = Math.min(wn * 7, new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 0).getDate());
+        targetDate = new Date(monthStart.getFullYear(), monthStart.getMonth(), day);
+      } else if (dc.dateMatch) {
+        const m = dc.label.match(/^(\d{1,2})[\/\-\.](\d{1,2})/);
+        if (m) {
+          const d = parseInt(m[1]), mo = parseInt(m[2]);
+          targetDate = new Date(monthStart.getFullYear(), mo - 1, d);
+        }
+      } else if (dc.rangeMatch) {
+        const m = dc.label.match(/^(\d{1,2})/);
+        if (m) targetDate = new Date(monthStart.getFullYear(), monthStart.getMonth(), parseInt(m[1]));
+      }
+      return { ...dc, targetDate: targetDate ? targetDate.toISOString().slice(0, 10) : null };
+    });
+
+    // Build line items
+    const previewLines = [];
+    let parsedRows = 0;
+    let skippedRows = 0;
+    for (const row of dataRows) {
+      const pn = (partNumCol >= 0 ? row[partNumCol] : '') || '';
+      const pname = (partNameCol >= 0 ? row[partNameCol] : '') || '';
+
+      if (!pn && !pname) { skippedRows++; continue; }
+
+      // For each date col, if there's a qty, create a line
+      let anyQty = false;
+      for (const dc of dateColMap) {
+        const cell = (row[dc.idx] || '').replace(/,/g, '').trim();
+        const qty = parseFloat(cell);
+        if (!isNaN(qty) && qty > 0) {
+          previewLines.push({
+            part_name_raw: pn || pname,
+            customer_part_number: pn || '',
+            part_description: pname,
+            delivery_date: dc.targetDate || '',
+            week_label: dc.label,
+            planned_qty: qty,
+            uom: 'nos',
+          });
+          anyQty = true;
+        }
+      }
+      if (!anyQty && totalCol >= 0) {
+        const tot = parseFloat((row[totalCol] || '').replace(/,/g, ''));
+        if (!isNaN(tot) && tot > 0) {
+          // No date breakdown, just total → require_date = end of month
+          const eom = new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 0).toISOString().slice(0, 10);
+          previewLines.push({
+            part_name_raw: pn || pname,
+            customer_part_number: pn || '',
+            part_description: pname,
+            delivery_date: eom,
+            week_label: 'Month total',
+            planned_qty: tot,
+            uom: 'nos',
+          });
+          anyQty = true;
+        }
+      }
+      if (anyQty) parsedRows++;
+      else skippedRows++;
+    }
+
+    if (previewLines.length === 0) {
+      setPasteError('No quantity values found in any row. Check that quantity columns contain numbers.');
+      return;
+    }
+
+    setPastePreview({
+      lines: previewLines,
+      header,
+      partNumCol, partNameCol, totalCol,
+      dateColumns: dateColMap.map(d => ({ label: d.label, targetDate: d.targetDate })),
+      parsedRows,
+      skippedRows,
+      totalLines: previewLines.length,
+      totalQty: previewLines.reduce((s, l) => s + (l.planned_qty || 0), 0),
+    });
+  };
+
+  const applyPastePreview = () => {
+    if (!pastePreview) return;
+    setLines(pastePreview.lines.map(l => ({
+      part_name_raw: l.part_name_raw,
+      customer_part_number: l.customer_part_number,
+      delivery_date: l.delivery_date,
+      planned_qty: String(l.planned_qty),
+      uom: l.uom || 'nos',
+    })));
+    setMode('manual');
+    showToast(pastePreview.totalLines + ' lines loaded · review and save');
+  };
 
   const onPickFile = (e) => {
     const f = e.target.files?.[0];
@@ -10136,8 +10484,61 @@ function ScheduleAddModal({ plant, me, customers, parts, onClose, onSaved }) {
 
         <div class="auth-tabs" style="margin-bottom:14px">
           <button class=${'auth-tab' + (mode === 'upload' ? ' active' : '')} onClick=${() => setMode('upload')}>📎 Upload + AI</button>
+          <button class=${'auth-tab' + (mode === 'paste' ? ' active' : '')} onClick=${() => setMode('paste')}>📋 Paste from Excel</button>
           <button class=${'auth-tab' + (mode === 'manual' ? ' active' : '')} onClick=${() => setMode('manual')}>✏️ Manual</button>
         </div>
+
+        ${mode === 'paste' && html`
+          <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:14px;padding:14px">
+            <div style="font-size:13px;color:var(--slate-700);margin-bottom:10px">
+              Copy the schedule table from Excel/Google Sheets (including header row) and paste below. Loglinkr will detect Part column + week/date columns automatically.
+            </div>
+            <div class="field-row" style="margin-bottom:10px">
+              <div class="field" style="margin:0;flex:1"><label style="font-size:11px">Customer *</label>
+                <select required value=${customerId} onChange=${e => setCustomerId(e.target.value)} style="font-size:13px">
+                  <option value="">— Pick customer —</option>
+                  ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.short_code ? ' · ' + c.short_code : ''}</option>`)}
+                </select>
+              </div>
+              <div class="field" style="margin:0"><label style="font-size:11px">Month *</label>
+                <input type="month" required value=${scheduleMonth} onChange=${e => setScheduleMonth(e.target.value)} style="font-size:13px" />
+              </div>
+            </div>
+            <textarea
+              value=${pasteText}
+              onChange=${e => setPasteText(e.target.value)}
+              placeholder=${'Paste here. Example:\n\nS.No\tPart No\tDescription\tTotal\tW1\tW2\tW3\tW4\n1\t24S30161\tVDC\t100\t50\t50\t-\t-\n2\t24S30119\tVDC\t1300\t400\t400\t400\t100\n...'}
+              rows=${10}
+              style="width:100%;font-family:monospace;font-size:11px;padding:10px;border-radius:8px;border:1px solid var(--slate-200);resize:vertical"
+            ></textarea>
+            ${pasteError && html`<div class="alert error" style="margin-top:8px;margin-bottom:0">${pasteError}</div>`}
+            <div style="display:flex;gap:8px;margin-top:10px">
+              <button class="btn small" onClick=${parsePastedTable} disabled=${!pasteText.trim()}>🔍 Parse table</button>
+              ${pastePreview && html`<button class="btn small" onClick=${applyPastePreview} style="background:var(--emerald-600)">✓ Use these ${pastePreview.totalLines} lines</button>`}
+            </div>
+
+            ${pastePreview && html`
+              <div style="margin-top:12px;padding:12px;background:white;border-radius:8px;border:1px solid var(--emerald-200);font-size:12px">
+                <div style="font-weight:600;color:var(--emerald-700);margin-bottom:6px">✓ Parsed</div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;color:var(--slate-700)">
+                  <div><b>${pastePreview.totalLines}</b> lines from <b>${pastePreview.parsedRows}</b> parts</div>
+                  <div>Total qty: <b>${fmtNum(pastePreview.totalQty)}</b></div>
+                  <div>Part column: <b>${pastePreview.partNumCol >= 0 ? pastePreview.header[pastePreview.partNumCol] : '—'}</b></div>
+                  <div>Description: <b>${pastePreview.partNameCol >= 0 ? pastePreview.header[pastePreview.partNameCol] : '—'}</b></div>
+                  ${pastePreview.skippedRows > 0 && html`<div style="color:var(--amber-700);grid-column:1/-1">${pastePreview.skippedRows} row${pastePreview.skippedRows > 1 ? 's' : ''} skipped (no qty/part)</div>`}
+                </div>
+                <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--slate-100);font-size:11px;color:var(--slate-600)">
+                  <b>Date columns mapped:</b><br/>
+                  ${pastePreview.dateColumns.map(d => html`
+                    <span style="display:inline-block;background:var(--slate-100);padding:2px 8px;border-radius:999px;margin:2px 4px 0 0">
+                      ${d.label} → ${d.targetDate || '?'}
+                    </span>
+                  `)}
+                </div>
+              </div>
+            `}
+          </div>
+        `}
 
         ${mode === 'upload' && html`
           <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:14px">
