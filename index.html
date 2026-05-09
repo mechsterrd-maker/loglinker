@@ -3461,10 +3461,8 @@ function Chat({ plant, me, user }) {
     // Replace optimistic with real (so realtime won't double-add)
     setMessages(prev => prev.map(m => m.id === localId ? {...inserted, users: { full_name: me.full_name }} : m));
 
-    // Auto-extract documents — ONLY in groups marked for logistics (saves API cost on casual chat)
-    const groupName = (activeGroup?.name || '').toLowerCase();
-    const isLogisticsGroup = groupName.includes('logistic') || groupName.includes('bill') || groupName.includes('invoice') || groupName.includes('document') || groupName.includes('vendor') || groupName.includes('supplier') || groupName.includes('grn') || groupName.includes('purchase') || groupName.includes('dc') || groupName.includes('inward');
-    if (inserted && attachments.length > 0 && attachments[0].isImage && isLogisticsGroup) {
+    // Auto-extract documents — ONLY in groups with AI flag enabled (saves API cost)
+    if (inserted && attachments.length > 0 && attachments[0].isImage && activeGroup?.ai_logistics_enabled) {
       try {
         const { data: queueId, error: enqErr } = await sb.rpc('enqueue_chat_image_for_extraction', {
           p_message_id: inserted.id,
@@ -3633,7 +3631,7 @@ function Chat({ plant, me, user }) {
               <div class="chat-avatar">${g.name[0] === '#' ? '#' : g.name[0]}</div>
               <div class="chat-info">
                 <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-                  <div class="chat-name" style=${g.unread > 0 ? 'font-weight:700' : ''}>${g.name}</div>
+                  <div class="chat-name" style=${g.unread > 0 ? 'font-weight:700' : ''}>${g.name}${g.ai_logistics_enabled ? html` <span style="font-size:10px;background:var(--teal-100);color:var(--teal-700);padding:1px 6px;border-radius:999px;font-weight:600;vertical-align:middle">🤖 AI</span>` : ''}</div>
                   ${last && html`<div style="font-size:11px;color:var(--slate-400);flex-shrink:0">${fmtDate(last.created_at)}</div>`}
                 </div>
                 <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:2px">
@@ -8986,6 +8984,31 @@ function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
     } catch (err) { setError(err.message); } finally { setBusy(false); }
   };
 
+  const isAdmin = me.role === 'plant_head' || me.role === 'admin';
+  const aiEnabled = !!group.ai_logistics_enabled;
+  const [aiBusy, setAiBusy] = useState(false);
+
+  const toggleAi = async () => {
+    setAiBusy(true); setError('');
+    try {
+      const { data, error: err } = await sb.rpc('toggle_chat_group_ai', {
+        p_group_id: group.id,
+        p_enabled: !aiEnabled,
+      });
+      if (err || !data?.success) {
+        setError(err?.message || data?.error || 'Failed to toggle AI');
+        return;
+      }
+      const { data: g } = await sb.from('chat_groups').select('*').eq('id', group.id).maybeSingle();
+      if (g) onChanged(g);
+      showToast(!aiEnabled ? '🤖 AI extraction enabled' : 'AI extraction disabled');
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
   const memberIds = members.map(m => m.id);
   const addable = allUsers.filter(u => !memberIds.includes(u.id));
 
@@ -8997,6 +9020,26 @@ function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
+
+        ${isAdmin && html`
+          <div style="border:1px solid ${aiEnabled ? 'var(--teal-200)' : 'var(--slate-200)'};background:${aiEnabled ? 'var(--teal-50)' : 'var(--slate-50)'};border-radius:10px;padding:12px 14px;margin-bottom:14px">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px">
+              <div style="flex:1">
+                <div style="font-size:13px;font-weight:600;color:var(--slate-800);margin-bottom:3px">
+                  🤖 AI Document Extraction ${aiEnabled ? html`<span style="background:var(--teal-600);color:white;font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;margin-left:6px">ACTIVE</span>` : ''}
+                </div>
+                <div style="font-size:11px;color:var(--slate-600);line-height:1.5">
+                  ${aiEnabled
+                    ? 'Images posted in this group are auto-extracted into Logistics → Documents. AI cost applies per image.'
+                    : 'Enable to auto-extract DCs, invoices, and bills posted as images into Logistics. Only one group per unit can have AI enabled.'}
+                </div>
+              </div>
+              <button class="btn small ${aiEnabled ? 'danger' : ''}" disabled=${aiBusy} onClick=${toggleAi} style="white-space:nowrap;flex-shrink:0">
+                ${aiBusy ? '...' : aiEnabled ? 'Disable' : 'Enable AI'}
+              </button>
+            </div>
+          </div>
+        `}
 
         <div class="section-h">Members · ${members.length}${canManage ? html`<button class="btn small ghost" onClick=${() => setAdding(!adding)} disabled=${busy || addable.length === 0}>${adding ? '× Cancel' : '+ Add'}</button>` : ''}</div>
 
