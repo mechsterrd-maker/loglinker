@@ -9480,12 +9480,285 @@ function Schedules({ plant, me }) {
     <div class="auth-tabs" style="margin-bottom:16px">
       <button class=${'auth-tab' + (view === 'schedules' ? ' active' : '')} onClick=${() => setView('schedules')}>Schedules</button>
       <button class=${'auth-tab' + (view === 'plan_vs_supply' ? ' active' : '')} onClick=${() => setView('plan_vs_supply')}>📊 Plan vs Supply</button>
+      <button class=${'auth-tab' + (view === 'movements' ? ' active' : '')} onClick=${() => setView('movements')}>🔀 Movements</button>
       <button class=${'auth-tab' + (view === 'customers' ? ' active' : '')} onClick=${() => setView('customers')}>Customers</button>
     </div>
 
     ${view === 'schedules' ? html`<${SchedulesList} plant=${plant} me=${me} onOpen=${setActiveSchedule} />` :
       view === 'plan_vs_supply' ? html`<${PlanVsSupplyView} plant=${plant} me=${me} />` :
+      view === 'movements' ? html`<${MovementsView} plant=${plant} me=${me} />` :
       html`<${CustomersList} plant=${plant} me=${me} onOpen=${setActiveCustomer} />`}
+  `;
+}
+
+// =================================================================
+// MOVEMENTS VIEW — outward + inward, with filters
+// =================================================================
+function MovementsView({ plant, me }) {
+  const [direction, setDirection] = useState('both');
+  const [dateFrom, setDateFrom] = useState(() => { const d = new Date(); d.setDate(d.getDate() - 30); return d.toISOString().slice(0,10); });
+  const [dateTo, setDateTo] = useState(() => new Date().toISOString().slice(0,10));
+  const [counterpartyFilter, setCounterpartyFilter] = useState('');
+  const [itemFilter, setItemFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [rows, setRows] = useState([]);
+  const [pendingGrns, setPendingGrns] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [verifyTarget, setVerifyTarget] = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    let q = sb.from('v_movements').select('*').eq('plant_id', plant.id);
+    if (direction !== 'both') q = q.eq('direction', direction);
+    if (dateFrom) q = q.gte('movement_date', dateFrom);
+    if (dateTo) q = q.lte('movement_date', dateTo);
+    if (statusFilter !== 'all') q = q.eq('status', statusFilter);
+    const { data } = await q.order('movement_date', { ascending: false }).limit(500);
+
+    let filtered = data || [];
+    if (counterpartyFilter) {
+      const cf = counterpartyFilter.toLowerCase();
+      filtered = filtered.filter(r => (r.counterparty_name || '').toLowerCase().includes(cf));
+    }
+    if (itemFilter) {
+      const itf = itemFilter.toLowerCase();
+      filtered = filtered.filter(r => (r.item_label || '').toLowerCase().includes(itf));
+    }
+    setRows(filtered);
+
+    const { data: pendings } = await sb.from('mcp_logistics_grn_receptions')
+      .select('*, mcp_logistics_grn_lines(id, doc_qty, item_name_raw, uom)')
+      .eq('plant_id', plant.id)
+      .eq('status', 'pending_verification')
+      .order('created_at', { ascending: false });
+    setPendingGrns(pendings || []);
+
+    setLoading(false);
+  }, [plant.id, direction, dateFrom, dateTo, counterpartyFilter, itemFilter, statusFilter]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const totalQty = rows.reduce((s, r) => s + (parseFloat(r.qty) || 0), 0);
+  const outwardCount = rows.filter(r => r.direction === 'outward').length;
+  const inwardCount = rows.filter(r => r.direction === 'inward').length;
+
+  return html`
+    <div>
+      ${pendingGrns.length > 0 && html`
+        <div class="card" style="background:var(--amber-50);border-color:var(--amber-300);margin-bottom:16px;padding:14px 16px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <div>
+              <div style="font-size:14px;font-weight:600;color:var(--amber-900)">⚠ ${pendingGrns.length} inward receipt${pendingGrns.length === 1 ? '' : 's'} awaiting verification</div>
+              <div style="font-size:12px;color:var(--amber-800);margin-top:2px">AI extracted but stock NOT updated yet — verify physically before commit.</div>
+            </div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            ${pendingGrns.slice(0, 5).map(g => html`
+              <div key=${g.id} style="background:white;border:1px solid var(--amber-200);border-radius:6px;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:12px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:13px;font-weight:600">${esc(g.vendor_name || 'Unknown vendor')} · ${esc(g.reference_no || '—')}</div>
+                  <div style="font-size:11px;color:var(--slate-600);margin-top:2px">${g.reception_date} · ${(g.mcp_logistics_grn_lines || []).length} line${(g.mcp_logistics_grn_lines || []).length === 1 ? '' : 's'}</div>
+                </div>
+                <button class="btn small" onClick=${() => setVerifyTarget(g)}>Verify & receive</button>
+              </div>
+            `)}
+            ${pendingGrns.length > 5 && html`<div style="font-size:11px;color:var(--amber-800);text-align:center">+ ${pendingGrns.length - 5} more</div>`}
+          </div>
+        </div>
+      `}
+
+      <div class="card" style="margin-bottom:14px;padding:14px">
+        <div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap">
+          <button class=${'btn small ' + (direction === 'both' ? '' : 'ghost')} onClick=${() => setDirection('both')}>All ${rows.length > 0 ? '· ' + rows.length : ''}</button>
+          <button class=${'btn small ' + (direction === 'outward' ? '' : 'ghost')} onClick=${() => setDirection('outward')}>📤 Outward ${direction !== 'inward' && outwardCount > 0 ? '· ' + outwardCount : ''}</button>
+          <button class=${'btn small ' + (direction === 'inward' ? '' : 'ghost')} onClick=${() => setDirection('inward')}>📥 Inward ${direction !== 'outward' && inwardCount > 0 ? '· ' + inwardCount : ''}</button>
+        </div>
+        <div class="field-row" style="margin:0">
+          <div class="field" style="margin:0;flex:1"><label style="font-size:11px">From</label><input type="date" value=${dateFrom} onChange=${e => setDateFrom(e.target.value)} style="font-size:12px;padding:5px 8px" /></div>
+          <div class="field" style="margin:0;flex:1"><label style="font-size:11px">To</label><input type="date" value=${dateTo} onChange=${e => setDateTo(e.target.value)} style="font-size:12px;padding:5px 8px" /></div>
+          <div class="field" style="margin:0;flex:1.5"><label style="font-size:11px">Customer / Vendor</label><input type="text" value=${counterpartyFilter} onChange=${e => setCounterpartyFilter(e.target.value)} placeholder="filter…" style="font-size:12px;padding:5px 8px" /></div>
+          <div class="field" style="margin:0;flex:1.5"><label style="font-size:11px">Part / Item</label><input type="text" value=${itemFilter} onChange=${e => setItemFilter(e.target.value)} placeholder="filter…" style="font-size:12px;padding:5px 8px" /></div>
+          ${direction === 'inward' && html`
+            <div class="field" style="margin:0;flex:1"><label style="font-size:11px">Status</label>
+              <select value=${statusFilter} onChange=${e => setStatusFilter(e.target.value)} style="font-size:12px;padding:5px 8px">
+                <option value="all">All</option>
+                <option value="pending_verification">Pending</option>
+                <option value="received">Received</option>
+                <option value="rejected">Rejected</option>
+              </select>
+            </div>
+          `}
+        </div>
+      </div>
+
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        rows.length === 0 ? html`<div class="empty"><div style="font-size:14px;font-weight:600">No movements in this range</div><div style="font-size:12px;color:var(--slate-500);margin-top:4px">Adjust filters or dates above.</div></div>` :
+        html`
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px;font-family:'JetBrains Mono',monospace;letter-spacing:.05em">
+            ${rows.length} MOVEMENTS · TOTAL QTY ${fmtNum(totalQty)}
+          </div>
+          <div class="card" style="padding:0;overflow-x:auto">
+            <table class="data" style="width:100%;border-collapse:collapse">
+              <thead style="background:var(--slate-50);border-bottom:1px solid var(--slate-200)">
+                <tr>
+                  <th style="text-align:left;padding:10px;font-size:11px;font-weight:600">Date</th>
+                  <th style="text-align:left;padding:10px;font-size:11px;font-weight:600">Dir</th>
+                  <th style="text-align:left;padding:10px;font-size:11px;font-weight:600">Customer / Vendor</th>
+                  <th style="text-align:left;padding:10px;font-size:11px;font-weight:600">Item / Part</th>
+                  <th style="text-align:right;padding:10px;font-size:11px;font-weight:600">Qty</th>
+                  <th style="text-align:left;padding:10px;font-size:11px;font-weight:600">Reference</th>
+                  <th style="text-align:left;padding:10px;font-size:11px;font-weight:600">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${rows.map(r => html`
+                  <tr key=${r.id} style="border-bottom:1px solid var(--slate-100)">
+                    <td style="padding:10px;font-size:12px">${r.movement_date}</td>
+                    <td style="padding:10px;font-size:12px">
+                      <span style="background:${r.direction === 'outward' ? 'var(--teal-100)' : 'var(--amber-100)'};color:${r.direction === 'outward' ? 'var(--teal-800)' : 'var(--amber-900)'};padding:2px 8px;border-radius:4px;font-weight:600;font-size:10px">
+                        ${r.direction === 'outward' ? '📤 OUT' : '📥 IN'}
+                      </span>
+                    </td>
+                    <td style="padding:10px;font-size:12px;font-weight:500">${esc(r.counterparty_name || '—')}</td>
+                    <td style="padding:10px;font-size:12px">${esc(r.item_label || '—')}</td>
+                    <td style="padding:10px;font-size:12px;text-align:right;font-weight:600">${fmtNum(parseFloat(r.qty) || 0)} <span style="color:var(--slate-500);font-weight:400">${esc(r.uom || '')}</span></td>
+                    <td style="padding:10px;font-size:12px;font-family:monospace">${esc(r.reference_no || '—')}</td>
+                    <td style="padding:10px;font-size:11px"><span class=${'badge ' + (r.status === 'received' || r.status === 'completed' ? 'emerald' : r.status === 'pending_verification' ? 'amber' : r.status === 'rejected' ? 'rose' : '')}>${esc(r.status)}</span></td>
+                  </tr>
+                `)}
+              </tbody>
+            </table>
+          </div>
+        `
+      }
+
+      ${verifyTarget && html`<${GrnVerifyModal} plant=${plant} me=${me} grn=${verifyTarget} onClose=${() => setVerifyTarget(null)} onSaved=${() => { setVerifyTarget(null); load(); }} />`}
+    </div>
+  `;
+}
+
+// =================================================================
+// GRN VERIFY MODAL — physically verify and commit to stock
+// =================================================================
+function GrnVerifyModal({ plant, me, grn, onClose, onSaved }) {
+  const [lines, setLines] = useState([]);
+  const [items, setItems] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      const [linesRes, itemsRes] = await Promise.all([
+        sb.from('mcp_logistics_grn_lines').select('*, mcp_stocks_items(name, uom)').eq('grn_id', grn.id),
+        sb.from('mcp_stocks_items').select('id, name, uom').eq('plant_id', plant.id).order('name'),
+      ]);
+      setLines((linesRes.data || []).map(l => ({
+        ...l,
+        received_qty_input: l.doc_qty != null ? String(l.doc_qty) : '',
+        item_id_input: l.item_id || '',
+      })));
+      setItems(itemsRes.data || []);
+      setLoading(false);
+    })();
+  }, [grn.id]);
+
+  const updateLine = (idx, patch) => {
+    setLines(prev => prev.map((l, i) => i === idx ? { ...l, ...patch } : l));
+  };
+
+  const verify = async () => {
+    setBusy(true); setError('');
+    try {
+      const lineReceipts = lines.map(l => ({
+        line_id: l.id,
+        received_qty: parseFloat(l.received_qty_input) || 0,
+        item_id: l.item_id_input || null,
+      }));
+      const { data, error: err } = await sb.rpc('verify_and_receive_grn', {
+        p_grn_id: grn.id,
+        p_line_receipts: lineReceipts,
+      });
+      if (err || !data?.success) throw new Error(err?.message || data?.error || 'Verify failed');
+      showToast('GRN received · stock updated for ' + (data.lines_processed || 0) + ' line(s)');
+      onSaved();
+    } catch (e) {
+      setError(e.message);
+    } finally { setBusy(false); }
+  };
+
+  const reject = async () => {
+    if (!confirm('Reject this GRN? Stock will NOT be updated. Cannot be undone.')) return;
+    setBusy(true);
+    try {
+      const reason = prompt('Reason for rejection (optional):') || null;
+      await sb.rpc('reject_grn', { p_grn_id: grn.id, p_reason: reason });
+      showToast('GRN rejected');
+      onSaved();
+    } catch (e) {
+      setError(e.message);
+    } finally { setBusy(false); }
+  };
+
+  if (loading) return html`<div class="modal-backdrop active"><div class="modal"><div class="loader"><div class="spinner"></div></div></div></div>`;
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:760px">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">📥 Verify & Receive GRN</div>
+            <div style="font-size:12px;color:var(--slate-500);font-weight:400;margin-top:2px">${esc(grn.vendor_name || '—')} · ${esc(grn.reference_no || '—')} · ${grn.reception_date}</div>
+          </div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+
+        <div style="font-size:12px;color:var(--slate-700);background:var(--teal-50);padding:10px 12px;border-radius:8px;margin-bottom:14px;line-height:1.5">
+          <b>Physically count the received goods first.</b> If qty differs from doc, enter actual received. If item not in stocks master yet, leave item blank — qty stored but no stock txn created.
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">
+          ${lines.map((l, idx) => html`
+            <div key=${l.id} style="border:1px solid var(--slate-200);border-radius:8px;padding:10px 12px;background:white">
+              <div style="display:grid;grid-template-columns:1.6fr 1fr 0.7fr 0.7fr;gap:8px;align-items:end">
+                <div class="field" style="margin:0">
+                  <label style="font-size:10px">Match to stock item</label>
+                  <select value=${l.item_id_input} onChange=${e => updateLine(idx, { item_id_input: e.target.value })} style="font-size:12px;padding:5px 6px">
+                    <option value="">— Skip (no stock update) —</option>
+                    ${items.map(i => html`<option key=${i.id} value=${i.id}>${esc(i.name)}</option>`)}
+                  </select>
+                  <div style="font-size:10px;color:var(--slate-500);margin-top:3px">From doc: ${esc(l.item_name_raw || '—')}</div>
+                </div>
+                <div class="field" style="margin:0">
+                  <label style="font-size:10px">Doc qty</label>
+                  <input type="text" value=${l.doc_qty != null ? l.doc_qty : '—'} disabled style="font-size:12px;padding:5px 8px;background:var(--slate-50);color:var(--slate-600)" />
+                </div>
+                <div class="field" style="margin:0">
+                  <label style="font-size:10px">Received *</label>
+                  <input type="number" step="0.01" value=${l.received_qty_input} onChange=${e => updateLine(idx, { received_qty_input: e.target.value })} placeholder="actual" style="font-size:12px;padding:5px 8px;font-weight:600" />
+                </div>
+                <div class="field" style="margin:0">
+                  <label style="font-size:10px">UOM</label>
+                  <input type="text" value=${l.uom || 'nos'} disabled style="font-size:12px;padding:5px 8px;background:var(--slate-50);color:var(--slate-600)" />
+                </div>
+              </div>
+              ${parseFloat(l.received_qty_input) > 0 && parseFloat(l.received_qty_input) !== parseFloat(l.doc_qty) && html`
+                <div style="font-size:11px;color:var(--amber-700);margin-top:6px">⚠ Short / over: ${(parseFloat(l.received_qty_input) - parseFloat(l.doc_qty)).toFixed(2)} ${l.uom || ''}</div>
+              `}
+            </div>
+          `)}
+        </div>
+
+        <div style="display:flex;gap:8px;justify-content:space-between">
+          <button class="btn small ghost" onClick=${reject} disabled=${busy} style="color:var(--rose-600)">✕ Reject GRN</button>
+          <div style="display:flex;gap:8px">
+            <button class="btn small ghost" onClick=${onClose} disabled=${busy}>Cancel</button>
+            <button class="btn small" onClick=${verify} disabled=${busy} style="background:var(--emerald-600)">${busy ? 'Saving...' : '✓ Verify & receive'}</button>
+          </div>
+        </div>
+      </div>
+    </div>
   `;
 }
 
