@@ -3410,7 +3410,20 @@ function Chat({ plant, me, user }) {
         loadMessages(activeGroup.id);
       })
       .subscribe();
-    return () => { sb.removeChannel(channel); };
+
+    // Polling fallback: every 5s, if any message is showing "Reading…", refresh
+    const pollInterval = setInterval(async () => {
+      const { data } = await sb.from('mcp_logistics_extraction_queue')
+        .select('id')
+        .eq('group_id', activeGroup.id)
+        .in('status', ['pending', 'processing'])
+        .limit(1);
+      if (data && data.length > 0) {
+        loadMessages(activeGroup.id);
+      }
+    }, 5000);
+
+    return () => { sb.removeChannel(channel); clearInterval(pollInterval); };
   }, [plant?.id, activeGroup?.id]);
 
   const lastReadKey = (groupId) => 'loglinkr_lastread_' + user.id + '_' + groupId;
