@@ -20,7 +20,7 @@ const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-sonnet-4-20250514";
-const WORKER_VERSION = "v19";
+const WORKER_VERSION = "v20";
 
 // Tunables
 const VENDOR_CONTEXT_LIMIT = 60;   // top-N vendors fed to the model
@@ -38,16 +38,23 @@ interface QueueRow {
 interface ExtractionPayload {
   is_document: boolean;
   classification: "document" | "non_document";
+  // The model MUST identify both parties as raw OCR text — server then deduces
+  // direction by matching these against plant identity. We do NOT trust the
+  // model's own "direction" answer alone any more.
+  seller_name?: string | null;       // exact OCR text of the consignor / "From" / letterhead
+  seller_gstin?: string | null;
+  buyer_name?: string | null;        // exact OCR text of the consignee / "To" / "Bill to"
+  buyer_gstin?: string | null;
+  seller_is_us?: boolean | null;     // model's read on whether seller matches our plant
+  buyer_is_us?: boolean | null;      // model's read on whether buyer matches our plant
   direction?: "in" | "out" | "interunit_in" | "interunit_out" | "jobwork_out" | "jobwork_in" | "unknown";
   doc_type?: string;
   doc_number?: string | null;
   doc_date?: string | null;
   due_date?: string | null;
-  vendor_name?: string | null;       // raw OCR string
+  vendor_name?: string | null;       // raw OCR string of the COUNTERPARTY (other side, not us)
   vendor_gstin?: string | null;
   vendor_match_id?: string | null;   // resolved against known vendors (uuid) or null
-  buyer_name?: string | null;
-  buyer_gstin?: string | null;
   from_unit_name?: string | null;    // for interunit
   to_unit_name?: string | null;      // for interunit
   is_returnable?: boolean;
@@ -122,54 +129,76 @@ KNOWN STOCK ITEMS (use these spellings if a line item visibly matches one)
 ${itemLines}
 
 ═══════════════════════════════════════════════════════════
-DIRECTION RULES (most important)
+DIRECTION — MANDATORY TWO-STEP PROCESS
 ═══════════════════════════════════════════════════════════
-Determine which side of the document our plant is on:
+Don't jump to direction. Follow these steps in order. The server will
+double-check your work; if your seller/buyer identification contradicts your
+direction, the server will OVERRIDE the direction. So get the names right.
 
-• If the SELLER / CONSIGNOR / "From" is us (matches plant GSTIN, plant name, or one of our units) AND the BUYER / CONSIGNEE / "To" is one of our OTHER units →
-    direction = "interunit_out"
-    doc_type = "interunit_dc_out"
-    Set from_unit_name and to_unit_name to the matching unit names.
+STEP 1 — Identify both parties as raw text from the doc
+  seller_name  = the SELLER / CONSIGNOR / "From" / letterhead party
+                 (the entity whose name is at the very top of the document,
+                  whose address is the "From" address, who issued the doc)
+  seller_gstin = their GSTIN if printed
+  buyer_name   = the BUYER / CONSIGNEE / "To" / "Bill to" / "Ship to" party
+                 (the entity receiving the goods, often labeled "Details of
+                  Consignee" or "Bill To" or "M/s. ..." mid-doc)
+  buyer_gstin  = their GSTIN if printed
 
-• If the SELLER is one of our units AND the BUYER is us at a different unit →
-    direction = "interunit_in"
-    doc_type = "interunit_dc_in"
+STEP 2 — Decide who is "us" by comparing against plant identity
+  Match against the plant identity block at top of this prompt:
+    • Plant name "${ctx.plantName}"
+    • Plant legal name "${ctx.plantLegalName ?? ""}" (if different)
+    • Plant GSTIN "${ctx.plantGstin ?? ""}"
+    • Any of our UNITS (listed at top)
+  Use case-insensitive fuzzy matching. GSTIN is most reliable.
+  Set:
+    seller_is_us = true | false   (does seller_name / seller_gstin match us?)
+    buyer_is_us  = true | false   (does buyer_name / buyer_gstin match us?)
 
-• If the SELLER is us AND the BUYER is a real external vendor/customer →
-    direction = "out"
-    doc_type = "invoice_out" if it's a tax invoice with rates/amounts
-    doc_type = "dc_out" if it's a plain delivery challan (no rate/amount)
+STEP 3 — Derive direction MECHANICALLY from those two booleans
+  buyer_is_us = true,  seller_is_us = false           → direction = "in"
+  seller_is_us = true, buyer_is_us = false            → direction = "out"
+  Both true (different units of ours)                 → direction = "interunit_out"
+                                                        (the issuing unit's perspective)
+  Both false                                          → direction = "unknown"
+  Both null / can't decide                            → direction = "unknown"
 
-• If the BUYER is us AND the SELLER is an external vendor →
-    direction = "in"
-    doc_type = "invoice_in" or "dc_in" by the same rule
-    BUT: if the document mentions "Job Work", "Sub-contract", "Process", "For Plating",
-         "Heat Treatment", "Annealing", "Polishing", "Coating", "Grinding", "Machining",
-         "Returnable", "Returnable basis", "Returnable for processing" → this is a return
-         coming back from a job-work vendor (we sent material out, they processed it,
-         now it's back). Set:
-            direction = "jobwork_in"
-            doc_type = "job_work_dc_in"
-            jobwork_process = the named process
+  REFINEMENTS on top of step 3:
+  • If direction = "in" AND doc mentions any of:
+      "Job Work", "Sub-contract", "Process", "For Plating", "Heat Treatment",
+      "Annealing", "Polishing", "Coating", "Grinding", "Machining",
+      "Returnable", "Returnable basis", "Returnable for processing"
+    → upgrade direction to "jobwork_in", doc_type = "job_work_dc_in", set
+      jobwork_process to the named process.
+  • Same keyword check for direction = "out" → upgrade to "jobwork_out",
+      doc_type = "job_work_dc_out", is_returnable = true.
 
-• If the SELLER is us AND the doc mentions any of the job-work / processing keywords above
-  AND the BUYER is a vendor (not a final customer) →
-    direction = "jobwork_out"
-    doc_type = "job_work_dc_out"
-    is_returnable = true
-    jobwork_process = the named process
+STEP 4 — counterparty fields
+  vendor_name = whichever of seller_name / buyer_name is NOT us.
+                (vendor_name is the COUNTERPARTY, never our own plant name.)
+  vendor_gstin = the counterparty's GSTIN.
+  vendor_match_id = if vendor_name fuzzy-matches a row in KNOWN VENDORS by
+                    name OR GSTIN, return that row's id. Else null.
 
-• If you can't tell with confidence → direction = "unknown", doc_type = "other".
+DOC_TYPE table (after direction is fixed):
+  in              → invoice_in if rates/amounts present, else dc_in
+  out             → invoice_out if rates/amounts present, else dc_out
+  interunit_in    → interunit_dc_in
+  interunit_out   → interunit_dc_out
+  jobwork_in      → job_work_dc_in
+  jobwork_out     → job_work_dc_out
+  unknown         → "other"
 
-═══════════════════════════════════════════════════════════
-COUNTERPARTY MATCHING
-═══════════════════════════════════════════════════════════
-After picking direction, identify the counterparty (the OTHER side, not us):
-  vendor_name      = exact OCR'd name as printed
-  vendor_gstin     = OCR'd GSTIN of the counterparty
-  vendor_match_id  = if the counterparty matches a row in KNOWN VENDORS by name OR
-                     GSTIN (case-insensitive, fuzzy on name), return that row's id.
-                     Else null. Do not guess. Match GSTIN > legal_name > name.
+CRITICAL NEGATIVE RULES
+  ✗ vendor_name MUST NOT equal our plant name. If you find yourself writing
+    the plant name into vendor_name, you've identified the wrong party as
+    counterparty — re-read the doc.
+  ✗ If buyer is "Details of Consignee: KRISHNAS FITTINGS" and we ARE Krishnas
+    Fittings, then buyer_is_us = true. Do not flip this.
+  ✗ Do not let document orientation, photo angle, or rotation change which
+    party is the seller. The letterhead at the natural "top" of the document
+    is always the seller, regardless of how the photo is rotated.
 
 ═══════════════════════════════════════════════════════════
 IMAGE ORIENTATION & QUALITY
@@ -309,16 +338,30 @@ OUTPUT FORMAT — RETURN ONLY THIS JSON, NO PROSE, NO MARKDOWN FENCES
 {
   "is_document": boolean,
   "classification": "document" | "non_document",
+
+  // STEP 1 fields — REQUIRED. Identify both parties as raw OCR text.
+  "seller_name": string | null,
+  "seller_gstin": string | null,
+  "buyer_name": string | null,
+  "buyer_gstin": string | null,
+
+  // STEP 2 fields — REQUIRED. Decide who is "us".
+  "seller_is_us": boolean,
+  "buyer_is_us": boolean,
+
+  // STEP 3 — direction follows from the booleans above.
   "direction": "in" | "out" | "interunit_in" | "interunit_out" | "jobwork_out" | "jobwork_in" | "unknown",
   "doc_type": "<one of: invoice_in, invoice_out, dc_in, dc_out, job_work_dc_out, job_work_dc_in, interunit_dc_out, interunit_dc_in, bill, quote, po, other>",
+
+  // STEP 4 — counterparty
+  "vendor_name": string | null,        // the OTHER side, never us
+  "vendor_gstin": string | null,
+  "vendor_match_id": string | null,    // uuid from KNOWN VENDORS list, or null
+
+  // Extract-from-doc fields
   "doc_number": string | null,
   "doc_date": "YYYY-MM-DD" | null,
   "due_date": "YYYY-MM-DD" | null,
-  "vendor_name": string | null,
-  "vendor_gstin": string | null,
-  "vendor_match_id": string | null,
-  "buyer_name": string | null,
-  "buyer_gstin": string | null,
   "from_unit_name": string | null,
   "to_unit_name": string | null,
   "is_returnable": boolean,
@@ -329,9 +372,9 @@ OUTPUT FORMAT — RETURN ONLY THIS JSON, NO PROSE, NO MARKDOWN FENCES
   "items": [
     {"name": "...", "hsn": null, "qty": 0, "uom": null, "rate": null, "amount": null, "process": ""}
   ],
-  "validation_note": "what you cross-checked, any concerns",
+  "validation_note": "show your work: who is seller, who is buyer, why you concluded direction",
   "confidence": "high" | "medium" | "low",
-  "flags": ["arithmetic_mismatch", "date_inferred", "low_quality_image", "vendor_unrecognized", "junk_filtered"]
+  "flags": ["arithmetic_mismatch", "date_inferred", "low_quality_image", "vendor_unrecognized", "junk_filtered", "seller_buyer_unclear"]
 }
 
 If the image is not a logistics document at all (selfie, screenshot, random photo):
@@ -473,6 +516,122 @@ function safeJsonParse(raw: string): unknown {
   const end = Math.max(lastBrace, lastBracket);
   if (end > 0 && end < cleaned.length - 1) cleaned = cleaned.slice(0, end + 1);
   return JSON.parse(cleaned);
+}
+
+// =============================================================================
+// SERVER-SIDE DIRECTION CHECK
+// =============================================================================
+// The model has been observed to contradict itself: it correctly identifies
+// seller as Vendor X and buyer as our plant, but then writes direction = "out".
+// We treat the seller/buyer identification as ground truth (it's just OCR'd
+// names) and override direction whenever it disagrees with what the names imply.
+// This is the "basic common sense" the model sometimes drops on rotated/
+// low-quality images.
+
+function normalizeName(s: string | null | undefined): string {
+  return (s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function nameMatchesPlant(
+  candidate: string | null | undefined,
+  ctx: { plantName: string; plantLegalName: string | null; units: Array<{ name: string }> },
+): boolean {
+  const c = normalizeName(candidate);
+  if (!c) return false;
+  const targets = [
+    normalizeName(ctx.plantName),
+    normalizeName(ctx.plantLegalName ?? ""),
+    ...ctx.units.map(u => normalizeName(u.name)),
+  ].filter(Boolean);
+  for (const t of targets) {
+    if (!t) continue;
+    if (c === t) return true;
+    // Substring match in either direction (handles "krishnas fittings unit iii"
+    // matching "krishnas fittings", or "krishnas" matching "krishnas fittings")
+    if (c.length >= 6 && t.length >= 6 && (c.includes(t) || t.includes(c))) return true;
+  }
+  return false;
+}
+
+function gstinMatchesPlant(
+  candidate: string | null | undefined,
+  ctx: { plantGstin: string | null },
+): boolean {
+  if (!candidate || !ctx.plantGstin) return false;
+  return candidate.replace(/\s+/g, "").toUpperCase() ===
+         ctx.plantGstin.replace(/\s+/g, "").toUpperCase();
+}
+
+interface DirectionOverride {
+  direction: ExtractionPayload["direction"];
+  reason: string;
+  overridden: boolean;
+  computed_seller_is_us: boolean;
+  computed_buyer_is_us: boolean;
+}
+
+function deriveDirection(
+  parsed: ExtractionPayload,
+  ctx: { plantName: string; plantLegalName: string | null; plantGstin: string | null; units: Array<{ name: string }> },
+): DirectionOverride {
+  // Server-side computation: trust the names (raw OCR), distrust the model's
+  // direction call. GSTIN match wins over name match.
+  const sellerByGstin = gstinMatchesPlant(parsed.seller_gstin, ctx);
+  const buyerByGstin  = gstinMatchesPlant(parsed.buyer_gstin, ctx);
+  const sellerByName  = nameMatchesPlant(parsed.seller_name, ctx);
+  const buyerByName   = nameMatchesPlant(parsed.buyer_name, ctx);
+
+  // GSTIN trumps name. If GSTINs are both present and conflict, use them; if
+  // only one side has a GSTIN, name covers the other side.
+  let sellerIsUs: boolean | null = null;
+  let buyerIsUs: boolean | null = null;
+  if (parsed.seller_gstin) sellerIsUs = sellerByGstin;
+  else if (parsed.seller_name) sellerIsUs = sellerByName;
+  if (parsed.buyer_gstin) buyerIsUs = buyerByGstin;
+  else if (parsed.buyer_name) buyerIsUs = buyerByName;
+
+  // If we still couldn't identify either side, fall back to whatever the
+  // model said (it might have used context we don't expose to this code).
+  if (sellerIsUs === null && buyerIsUs === null) {
+    return {
+      direction: parsed.direction ?? "unknown",
+      reason: "names insufficient — kept model's direction",
+      overridden: false,
+      computed_seller_is_us: false,
+      computed_buyer_is_us: false,
+    };
+  }
+
+  let computedDirection: ExtractionPayload["direction"];
+  if (buyerIsUs === true && sellerIsUs !== true) {
+    computedDirection = "in";
+  } else if (sellerIsUs === true && buyerIsUs !== true) {
+    computedDirection = "out";
+  } else if (sellerIsUs === true && buyerIsUs === true) {
+    computedDirection = "interunit_out"; // doc-issuer-perspective default
+  } else {
+    computedDirection = "unknown";
+  }
+
+  // Apply jobwork upgrade if model already saw jobwork keywords.
+  if (parsed.direction === "jobwork_in" && computedDirection === "in") {
+    computedDirection = "jobwork_in";
+  } else if (parsed.direction === "jobwork_out" && computedDirection === "out") {
+    computedDirection = "jobwork_out";
+  }
+  // Or if model says jobwork but our names say in/out, trust our names + the jobwork flag
+  // (jobwork stays as long as the doc semantics agree).
+
+  const overridden = parsed.direction !== computedDirection;
+  return {
+    direction: computedDirection,
+    reason: overridden
+      ? `server override: seller_is_us=${sellerIsUs} buyer_is_us=${buyerIsUs} → ${computedDirection} (model said ${parsed.direction})`
+      : `server confirms model: seller_is_us=${sellerIsUs} buyer_is_us=${buyerIsUs} → ${computedDirection}`,
+    overridden,
+    computed_seller_is_us: !!sellerIsUs,
+    computed_buyer_is_us: !!buyerIsUs,
+  };
 }
 
 // Resolve doc_type from the model's direction + doc_type, with fallbacks.
@@ -693,6 +852,30 @@ async function processQueueRow(
     const rotationLog = attempt.rotationLog;
     const totalRotationDeg = attempt.totalRotationDeg;
 
+    // Server-side direction override: trust the seller/buyer names the model
+    // OCR'd, recompute direction from those by comparing to plant identity,
+    // override the model's "direction" if it contradicts its own evidence.
+    // This is the "common sense" gate — keeps the model from flipping in/out
+    // on rotated photos when the names clearly say which side we're on.
+    const directionCheck = deriveDirection(parsed, ctx);
+    if (directionCheck.overridden) {
+      parsed.direction = directionCheck.direction;
+    }
+    // Vendor name guardrail: vendor must be the COUNTERPARTY, never us.
+    // If the model wrote our plant name into vendor_name, swap with whichever
+    // raw party-name the model identified as not-us.
+    if (nameMatchesPlant(parsed.vendor_name, ctx) || gstinMatchesPlant(parsed.vendor_gstin, ctx)) {
+      const sellerIsUs = nameMatchesPlant(parsed.seller_name, ctx) || gstinMatchesPlant(parsed.seller_gstin, ctx);
+      const buyerIsUs  = nameMatchesPlant(parsed.buyer_name, ctx) || gstinMatchesPlant(parsed.buyer_gstin, ctx);
+      if (sellerIsUs && !buyerIsUs && parsed.buyer_name) {
+        parsed.vendor_name  = parsed.buyer_name;
+        parsed.vendor_gstin = parsed.buyer_gstin ?? null;
+      } else if (buyerIsUs && !sellerIsUs && parsed.seller_name) {
+        parsed.vendor_name  = parsed.seller_name;
+        parsed.vendor_gstin = parsed.seller_gstin ?? null;
+      }
+    }
+
     if (!parsed.is_document) {
       await supabase
         .from("mcp_logistics_extraction_queue")
@@ -789,6 +972,10 @@ async function processQueueRow(
           escalated_to_hires: escalated,
           image_source: escalated ? "hires" : "compressed",
           image_url_used: attempt.imageUrl,
+          direction_override: directionCheck.overridden,
+          direction_reason: directionCheck.reason,
+          server_seller_is_us: directionCheck.computed_seller_is_us,
+          server_buyer_is_us: directionCheck.computed_buyer_is_us,
         },
       })
       .eq("id", row.id);
