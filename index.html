@@ -9753,11 +9753,12 @@ function MovementsView({ plant, me }) {
   const [counterpartyFilter, setCounterpartyFilter] = useState('');
   const [itemFilter, setItemFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
-  const [rows, setRows] = useState([]);
+  const [rawRows, setRawRows] = useState([]); // unfiltered, for dropdown options
   const [pendingGrns, setPendingGrns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [verifyTarget, setVerifyTarget] = useState(null);
 
+  // Load (date+direction+status only — counterparty/item filtered client-side)
   const load = useCallback(async () => {
     setLoading(true);
     let q = sb.from('v_movements').select('*').eq('plant_id', plant.id);
@@ -9765,18 +9766,9 @@ function MovementsView({ plant, me }) {
     if (dateFrom) q = q.gte('movement_date', dateFrom);
     if (dateTo) q = q.lte('movement_date', dateTo);
     if (statusFilter !== 'all') q = q.eq('status', statusFilter);
-    const { data } = await q.order('movement_date', { ascending: false }).limit(500);
-
-    let filtered = data || [];
-    if (counterpartyFilter) {
-      const cf = counterpartyFilter.toLowerCase();
-      filtered = filtered.filter(r => (r.counterparty_name || '').toLowerCase().includes(cf));
-    }
-    if (itemFilter) {
-      const itf = itemFilter.toLowerCase();
-      filtered = filtered.filter(r => (r.item_label || '').toLowerCase().includes(itf));
-    }
-    setRows(filtered);
+    const { data, error } = await q.order('movement_date', { ascending: false }).limit(500);
+    if (error) console.error('v_movements query error:', error);
+    setRawRows(data || []);
 
     const { data: pendings } = await sb.from('mcp_logistics_grn_receptions')
       .select('*, mcp_logistics_grn_lines(id, doc_qty, item_name_raw, uom)')
@@ -9786,9 +9778,31 @@ function MovementsView({ plant, me }) {
     setPendingGrns(pendings || []);
 
     setLoading(false);
-  }, [plant.id, direction, dateFrom, dateTo, counterpartyFilter, itemFilter, statusFilter]);
+  }, [plant.id, direction, dateFrom, dateTo, statusFilter]);
 
   useEffect(() => { load(); }, [load]);
+
+  // Dropdowns populated from rawRows (unfiltered)
+  const counterpartyOptions = useMemo(() => {
+    const set = new Set();
+    rawRows.forEach(r => r.counterparty_name && set.add(r.counterparty_name));
+    return [...set].sort();
+  }, [rawRows]);
+
+  const itemOptions = useMemo(() => {
+    const set = new Set();
+    rawRows.forEach(r => r.item_label && set.add(r.item_label));
+    return [...set].sort();
+  }, [rawRows]);
+
+  // Apply client-side filters
+  const rows = useMemo(() => {
+    return rawRows.filter(r => {
+      if (counterpartyFilter && r.counterparty_name !== counterpartyFilter) return false;
+      if (itemFilter && r.item_label !== itemFilter) return false;
+      return true;
+    });
+  }, [rawRows, counterpartyFilter, itemFilter]);
 
   const totalQty = rows.reduce((s, r) => s + (parseFloat(r.qty) || 0), 0);
   const outwardCount = rows.filter(r => r.direction === 'outward').length;
@@ -9828,8 +9842,18 @@ function MovementsView({ plant, me }) {
         <div class="field-row" style="margin:0">
           <div class="field" style="margin:0;flex:1"><label style="font-size:11px">From</label><input type="date" value=${dateFrom} onChange=${e => setDateFrom(e.target.value)} style="font-size:12px;padding:5px 8px" /></div>
           <div class="field" style="margin:0;flex:1"><label style="font-size:11px">To</label><input type="date" value=${dateTo} onChange=${e => setDateTo(e.target.value)} style="font-size:12px;padding:5px 8px" /></div>
-          <div class="field" style="margin:0;flex:1.5"><label style="font-size:11px">Customer / Vendor</label><input type="text" value=${counterpartyFilter} onChange=${e => setCounterpartyFilter(e.target.value)} placeholder="filter…" style="font-size:12px;padding:5px 8px" /></div>
-          <div class="field" style="margin:0;flex:1.5"><label style="font-size:11px">Part / Item</label><input type="text" value=${itemFilter} onChange=${e => setItemFilter(e.target.value)} placeholder="filter…" style="font-size:12px;padding:5px 8px" /></div>
+          <div class="field" style="margin:0;flex:1.5"><label style="font-size:11px">Customer / Vendor</label>
+            <select value=${counterpartyFilter} onChange=${e => setCounterpartyFilter(e.target.value)} style="font-size:12px;padding:5px 8px">
+              <option value="">All (${counterpartyOptions.length})</option>
+              ${counterpartyOptions.map(c => html`<option key=${c} value=${c}>${esc(c)}</option>`)}
+            </select>
+          </div>
+          <div class="field" style="margin:0;flex:1.5"><label style="font-size:11px">Part / Item</label>
+            <select value=${itemFilter} onChange=${e => setItemFilter(e.target.value)} style="font-size:12px;padding:5px 8px">
+              <option value="">All (${itemOptions.length})</option>
+              ${itemOptions.map(i => html`<option key=${i} value=${i}>${esc(i)}</option>`)}
+            </select>
+          </div>
           ${direction === 'inward' && html`
             <div class="field" style="margin:0;flex:1"><label style="font-size:11px">Status</label>
               <select value=${statusFilter} onChange=${e => setStatusFilter(e.target.value)} style="font-size:12px;padding:5px 8px">
