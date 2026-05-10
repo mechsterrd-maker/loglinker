@@ -1045,6 +1045,8 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'actions'}><${ActionHub} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'documents'}><${Documents} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'schedules'}><${Schedules} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'movements'}><${MovementsPage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'trace'}><${TracePage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
@@ -1055,7 +1057,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
     </div>
   `;
@@ -1072,7 +1074,9 @@ function TopNavDesktop({ plant, me, initials, tab, setTab, logout, unreadCount, 
     { key:'actions', label:'Tasks', icon:'actions' },
     { key:'documents', label:'Documents', icon:'documents' },
     { key:'schedules', label:'Schedules', icon:'schedules' },
+    { key:'movements', label:'Movements', icon:'stocks' },
     { key:'reports', label:'Reports', icon:'documents' },
+    { key:'trace', label:'Trace', icon:'documents' },
     { key:'chat', label:'Chat', icon:'chat' },
     { key:'people', label:'People', icon:'people' },
   ];
@@ -5114,6 +5118,8 @@ function More({ plant, me, user, logout, setTab, activeUnit, accessibleUnits }) 
   const [unitAccessOpen, setUnitAccessOpen] = useState(false);
   const navItems = [
     { key:'schedules', icon:'📅', label:'Customer Schedules', sub:'Plan vs actual, weekly buckets, AI extract' },
+    { key:'movements', icon:'🔀', label:'Movements', sub:'In/out material flow, GRN verification' },
+    { key:'trace', icon:'🔍', label:'Trace · Audit Investigation', sub:'Linked timeline by date/part/machine' },
     { key:'reports', icon:'📑', label:'Reports & IATF Documents', sub:'Generate audit-ready reports from live data' },
     { key:'people', icon:'👥', label:'People · Units, Team, Shifts', sub:'Manage team, units, shifts' },
     { key:'maintenance', icon:'🔧', label:'Maintenance', sub:'Breakdowns, machine status' },
@@ -9480,14 +9486,258 @@ function Schedules({ plant, me }) {
     <div class="auth-tabs" style="margin-bottom:16px">
       <button class=${'auth-tab' + (view === 'schedules' ? ' active' : '')} onClick=${() => setView('schedules')}>Schedules</button>
       <button class=${'auth-tab' + (view === 'plan_vs_supply' ? ' active' : '')} onClick=${() => setView('plan_vs_supply')}>📊 Plan vs Supply</button>
-      <button class=${'auth-tab' + (view === 'movements' ? ' active' : '')} onClick=${() => setView('movements')}>🔀 Movements</button>
       <button class=${'auth-tab' + (view === 'customers' ? ' active' : '')} onClick=${() => setView('customers')}>Customers</button>
     </div>
 
     ${view === 'schedules' ? html`<${SchedulesList} plant=${plant} me=${me} onOpen=${setActiveSchedule} />` :
       view === 'plan_vs_supply' ? html`<${PlanVsSupplyView} plant=${plant} me=${me} />` :
-      view === 'movements' ? html`<${MovementsView} plant=${plant} me=${me} />` :
       html`<${CustomersList} plant=${plant} me=${me} onOpen=${setActiveCustomer} />`}
+  `;
+}
+
+// =================================================================
+// TRACE PAGE — IATF audit investigation by date/part/machine anchor
+// Shows chronological timeline with anomaly clustering
+// =================================================================
+function TracePage({ plant, me, activeUnit }) {
+  const [anchor, setAnchor] = useState('date'); // 'date' | 'part' | 'machine'
+  const [date, setDate] = useState(() => new Date().toISOString().slice(0,10));
+  const [partId, setPartId] = useState('');
+  const [machineId, setMachineId] = useState('');
+  const [windowDays, setWindowDays] = useState(3);
+  const [parts, setParts] = useState([]);
+  const [machines, setMachines] = useState([]);
+  const [events, setEvents] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const [partsRes, machinesRes] = await Promise.all([
+        sb.from('mcp_pdc_parts').select('id, part_number, name').eq('plant_id', plant.id).order('part_number'),
+        sb.from('machines').select('id, code, name').eq('plant_id', plant.id).order('code'),
+      ]);
+      setParts(partsRes.data || []);
+      setMachines(machinesRes.data || []);
+    })();
+  }, [plant.id]);
+
+  const runTrace = async () => {
+    setLoading(true);
+    let q = sb.from('v_trace_events').select('*').eq('plant_id', plant.id);
+
+    if (anchor === 'date') {
+      const d = new Date(date);
+      const from = new Date(d); from.setDate(d.getDate() - windowDays);
+      const to = new Date(d); to.setDate(d.getDate() + windowDays);
+      q = q.gte('event_date', from.toISOString().slice(0,10)).lte('event_date', to.toISOString().slice(0,10));
+    } else if (anchor === 'part') {
+      if (!partId) { setLoading(false); return; }
+      q = q.eq('part_id', partId);
+      const d = new Date(date);
+      const from = new Date(d); from.setDate(d.getDate() - 30);
+      const to = new Date(d); to.setDate(d.getDate() + 7);
+      q = q.gte('event_date', from.toISOString().slice(0,10)).lte('event_date', to.toISOString().slice(0,10));
+    } else if (anchor === 'machine') {
+      if (!machineId) { setLoading(false); return; }
+      q = q.eq('machine_id', machineId);
+      const d = new Date(date);
+      const from = new Date(d); from.setDate(d.getDate() - windowDays);
+      const to = new Date(d); to.setDate(d.getDate() + windowDays);
+      q = q.gte('event_date', from.toISOString().slice(0,10)).lte('event_date', to.toISOString().slice(0,10));
+    }
+
+    const { data } = await q.order('event_at', { ascending: true }).limit(500);
+    setEvents(data || []);
+    setLoading(false);
+  };
+
+  // Compute time gaps + anomaly clusters
+  const enriched = useMemo(() => {
+    if (events.length === 0) return [];
+    const out = [];
+    for (let i = 0; i < events.length; i++) {
+      const e = events[i];
+      const prev = i > 0 ? events[i - 1] : null;
+      const gapMs = prev ? new Date(e.event_at) - new Date(prev.event_at) : 0;
+      const gapMinutes = Math.round(gapMs / 60000);
+
+      // Cluster detection: 3+ events within 60min window
+      let inCluster = false;
+      const window60 = events.filter(ev => Math.abs(new Date(ev.event_at) - new Date(e.event_at)) < 60 * 60 * 1000);
+      if (window60.length >= 3 && window60.some(ev => ev.severity === 'critical' || ev.severity === 'warning')) {
+        inCluster = true;
+      }
+
+      out.push({ ...e, gapMinutes, inCluster, isFirst: i === 0 });
+    }
+    return out;
+  }, [events]);
+
+  const exportPdf = () => {
+    // Build a self-contained printable HTML evidence pack
+    const anchorLabel = anchor === 'date' ? `Date: ${date} · ±${windowDays} days` :
+      anchor === 'part' ? `Part: ${parts.find(p => p.id === partId)?.part_number || ''}` :
+      `Machine: ${machines.find(m => m.id === machineId)?.code || ''}`;
+
+    let html_str = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Trace Evidence Pack · ${anchorLabel}</title><style>
+      body{font-family:Inter,sans-serif;padding:30px;color:#0a0e0a;line-height:1.5;max-width:900px;margin:0 auto}
+      h1{font-size:22px;margin:0 0 6px;letter-spacing:-0.02em}
+      .meta{font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.1em;margin-bottom:24px;border-bottom:1px solid #ddd;padding-bottom:12px}
+      .ev{padding:10px 14px;border-left:3px solid #0d9488;margin-bottom:8px;background:#f9fafb;page-break-inside:avoid}
+      .ev.critical{border-color:#dc2626;background:#fef2f2}
+      .ev.warning{border-color:#d97706;background:#fffbeb}
+      .ev-time{font-family:'JetBrains Mono',monospace;font-size:11px;color:#666;font-weight:600}
+      .ev-title{font-weight:600;margin:3px 0;font-size:14px}
+      .ev-detail{font-size:12px;color:#444}
+      .ev-meta{font-size:10px;color:#888;margin-top:4px;font-family:monospace}
+      .gap{font-size:10px;color:#999;text-align:center;padding:4px;font-family:monospace}
+      .gap.big{color:#dc2626;font-weight:700}
+    </style></head><body>
+      <h1>🔍 Trace Evidence Pack</h1>
+      <div class="meta">Plant: ${esc(plant.name)} · ${anchorLabel} · Generated ${new Date().toLocaleString('en-IN')} · ${enriched.length} events</div>`;
+
+    enriched.forEach(e => {
+      if (e.gapMinutes > 60 && !e.isFirst) {
+        const big = e.gapMinutes > 240;
+        html_str += `<div class="gap${big ? ' big' : ''}">↕ ${e.gapMinutes < 1440 ? Math.floor(e.gapMinutes/60) + 'h ' + (e.gapMinutes%60) + 'm' : Math.floor(e.gapMinutes/1440) + 'd'} gap</div>`;
+      }
+      html_str += `<div class="ev ${e.severity || ''}">
+        <div class="ev-time">${e.event_icon} ${new Date(e.event_at).toLocaleString('en-IN')}</div>
+        <div class="ev-title">${esc(e.event_title)}</div>
+        ${e.event_detail ? `<div class="ev-detail">${esc(e.event_detail)}</div>` : ''}
+        <div class="ev-meta">${e.event_type} · ${e.event_id}</div>
+      </div>`;
+    });
+
+    html_str += '</body></html>';
+    const blob = new Blob([html_str], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const w = window.open(url, '_blank');
+    setTimeout(() => { try { w.print(); } catch(e){} }, 800);
+  };
+
+  const formatGap = (mins) => {
+    if (mins < 60) return mins + 'm';
+    if (mins < 1440) return Math.floor(mins/60) + 'h ' + (mins%60) + 'm';
+    return Math.floor(mins/1440) + 'd';
+  };
+
+  return html`
+    <div class="page">
+      <div class="page-header">
+        <div>
+          <h1>🔍 Trace</h1>
+          <div class="sub">IATF investigation · linked timeline by date, part, or machine</div>
+        </div>
+        ${enriched.length > 0 && html`<button class="btn small" onClick=${exportPdf}>📄 Export PDF</button>`}
+      </div>
+
+      <div class="card" style="margin-bottom:14px;padding:14px">
+        <div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap">
+          <button class=${'btn small ' + (anchor === 'date' ? '' : 'ghost')} onClick=${() => setAnchor('date')}>📅 By Date</button>
+          <button class=${'btn small ' + (anchor === 'part' ? '' : 'ghost')} onClick=${() => setAnchor('part')}>🏷️ By Part</button>
+          <button class=${'btn small ' + (anchor === 'machine' ? '' : 'ghost')} onClick=${() => setAnchor('machine')}>⚙️ By Machine</button>
+        </div>
+
+        <div class="field-row" style="margin:0;align-items:flex-end">
+          ${anchor === 'date' && html`
+            <div class="field" style="margin:0;flex:1"><label style="font-size:11px">Anchor date</label><input type="date" value=${date} onChange=${e => setDate(e.target.value)} style="font-size:13px;padding:6px 8px" /></div>
+            <div class="field" style="margin:0;width:140px"><label style="font-size:11px">Window (± days)</label>
+              <select value=${windowDays} onChange=${e => setWindowDays(parseInt(e.target.value))} style="font-size:13px;padding:6px 8px">
+                <option value=${0}>Same day only</option>
+                <option value=${1}>± 1 day</option>
+                <option value=${3}>± 3 days</option>
+                <option value=${7}>± 7 days</option>
+                <option value=${30}>± 30 days</option>
+              </select>
+            </div>
+          `}
+          ${anchor === 'part' && html`
+            <div class="field" style="margin:0;flex:1.5"><label style="font-size:11px">Part</label>
+              <select value=${partId} onChange=${e => setPartId(e.target.value)} style="font-size:13px;padding:6px 8px">
+                <option value="">— Pick part —</option>
+                ${parts.map(p => html`<option key=${p.id} value=${p.id}>${esc(p.part_number)}${p.name ? ' · ' + esc(p.name) : ''}</option>`)}
+              </select>
+            </div>
+            <div class="field" style="margin:0;width:140px"><label style="font-size:11px">Center on</label><input type="date" value=${date} onChange=${e => setDate(e.target.value)} style="font-size:13px;padding:6px 8px" /></div>
+          `}
+          ${anchor === 'machine' && html`
+            <div class="field" style="margin:0;flex:1.5"><label style="font-size:11px">Machine</label>
+              <select value=${machineId} onChange=${e => setMachineId(e.target.value)} style="font-size:13px;padding:6px 8px">
+                <option value="">— Pick machine —</option>
+                ${machines.map(m => html`<option key=${m.id} value=${m.id}>${esc(m.code)}${m.name ? ' · ' + esc(m.name) : ''}</option>`)}
+              </select>
+            </div>
+            <div class="field" style="margin:0;width:140px"><label style="font-size:11px">Center on</label><input type="date" value=${date} onChange=${e => setDate(e.target.value)} style="font-size:13px;padding:6px 8px" /></div>
+            <div class="field" style="margin:0;width:140px"><label style="font-size:11px">Window (± days)</label>
+              <select value=${windowDays} onChange=${e => setWindowDays(parseInt(e.target.value))} style="font-size:13px;padding:6px 8px">
+                <option value=${1}>± 1 day</option>
+                <option value=${3}>± 3 days</option>
+                <option value=${7}>± 7 days</option>
+              </select>
+            </div>
+          `}
+          <button class="btn small" onClick=${runTrace} disabled=${loading} style="margin-bottom:1px">${loading ? 'Loading...' : 'Trace →'}</button>
+        </div>
+      </div>
+
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        events.length === 0 ? html`
+          <div class="empty" style="padding:40px 20px">
+            <div style="font-size:14px;font-weight:600">No trace yet</div>
+            <div style="font-size:12px;color:var(--slate-500);margin-top:6px;line-height:1.5">Pick an anchor (date / part / machine) above and tap Trace.<br/>Loglinkr will pull every linked event into a chronological timeline.</div>
+          </div>
+        ` : html`
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px;font-family:'JetBrains Mono',monospace;letter-spacing:.05em">
+            ${enriched.length} EVENTS · ${enriched.filter(e => e.severity === 'critical').length} CRITICAL · ${enriched.filter(e => e.severity === 'warning').length} WARNING
+          </div>
+
+          <div style="border-left:2px solid var(--slate-200);margin-left:14px;padding-left:0">
+            ${enriched.map((e, idx) => html`
+              <div key=${e.event_id}>
+                ${e.gapMinutes > 60 && !e.isFirst && html`
+                  <div style="margin:8px 0 8px -16px;display:flex;align-items:center;gap:8px;color:${e.gapMinutes > 240 ? 'var(--rose-600)' : 'var(--slate-400)'};font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:${e.gapMinutes > 240 ? '700' : '500'}">
+                    <div style="width:14px;height:1px;background:currentColor"></div>
+                    <span>↕ ${formatGap(e.gapMinutes)} gap</span>
+                  </div>
+                `}
+                <div style="position:relative;padding:10px 14px;margin-left:-14px;padding-left:32px;background:${e.severity === 'critical' ? 'var(--rose-50)' : e.severity === 'warning' ? 'var(--amber-50)' : 'var(--paper)'};border-left:3px solid ${e.severity === 'critical' ? 'var(--rose-600)' : e.severity === 'warning' ? 'var(--amber-600)' : 'var(--teal-600)'};border-radius:0 6px 6px 0;margin-bottom:6px">
+                  <div style="position:absolute;left:-7px;top:14px;width:12px;height:12px;border-radius:50%;background:${e.severity === 'critical' ? 'var(--rose-600)' : e.severity === 'warning' ? 'var(--amber-600)' : 'var(--teal-600)'};border:2px solid var(--paper)"></div>
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+                    <div style="flex:1;min-width:0">
+                      <div style="font-size:11px;color:var(--slate-500);font-family:'JetBrains Mono',monospace;font-weight:600;margin-bottom:3px">
+                        ${e.event_icon} ${new Date(e.event_at).toLocaleString('en-IN', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: 'short' })}
+                        ${e.inCluster ? html`<span style="background:var(--rose-100);color:var(--rose-700);padding:1px 6px;border-radius:3px;margin-left:6px;font-size:9px">CLUSTER</span>` : ''}
+                      </div>
+                      <div style="font-size:13px;font-weight:600;color:var(--slate-800);line-height:1.3">${esc(e.event_title)}</div>
+                      ${e.event_detail && html`<div style="font-size:12px;color:var(--slate-600);margin-top:3px;line-height:1.4">${esc(e.event_detail)}</div>`}
+                    </div>
+                    <div style="font-size:10px;color:var(--slate-400);font-family:monospace;text-transform:uppercase;letter-spacing:.05em">${e.event_type}</div>
+                  </div>
+                </div>
+              </div>
+            `)}
+          </div>
+        `
+      }
+    </div>
+  `;
+}
+
+// =================================================================
+// MOVEMENTS PAGE — top-level page wrapper
+// =================================================================
+function MovementsPage({ plant, me, activeUnit }) {
+  return html`
+    <div class="page">
+      <div class="page-header">
+        <div>
+          <h1>🔀 Movements</h1>
+          <div class="sub">All material in/out · auto from AI extraction</div>
+        </div>
+      </div>
+      <${MovementsView} plant=${plant} me=${me} />
+    </div>
   `;
 }
 
