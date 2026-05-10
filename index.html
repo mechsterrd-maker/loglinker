@@ -6926,27 +6926,40 @@ function Documents({ plant, me }) {
   const [docs, setDocs] = useState([]);
   const [vendors, setVendors] = useState([]);
   const [jobworkStock, setJobworkStock] = useState([]);
-  const [view, setView] = useState('dashboard'); // dashboard | vendors | jobwork
+  const [returnables, setReturnables] = useState([]);
+  const [interunits, setInterunits] = useState([]);
+  const [view, setView] = useState('dashboard'); // dashboard | vendors | jobwork | returnables | interunit
   const [typeFilter, setTypeFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState('open');
   const [search, setSearch] = useState('');
+  // Returnables-tab-only filters
+  const [retSearch, setRetSearch] = useState('');
+  const [retVendorFilter, setRetVendorFilter] = useState('all');
+  const [retStatusFilter, setRetStatusFilter] = useState('all'); // all | open | partial | overdue | no_sla
+  const [retSlaModal, setRetSlaModal] = useState(null); // jobwork_line row to set SLA on
+  // Interunit-tab-only filter
+  const [iuStatusFilter, setIuStatusFilter] = useState('in_transit');
   const [activeDoc, setActiveDoc] = useState(null);
   const [activeVendor, setActiveVendor] = useState(null);
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [d, v, jw] = await Promise.all([
+    const [d, v, jw, r, iu] = await Promise.all([
       sb.from('mcp_logistics_documents')
         .select('*, mcp_logistics_vendors(name, gstin, payment_terms_days)')
         .order('doc_date', { ascending: false, nullsFirst: false })
         .limit(500),
       sb.from('mcp_logistics_vendors').select('*').order('name'),
       sb.from('v_vendor_jobwork_stock').select('*').order('vendor_name'),
+      sb.from('v_returnables_open').select('*').limit(500),
+      sb.from('interunit_transfers').select('*, from_unit:from_unit_id(name), to_unit:to_unit_id(name), out_doc:out_doc_id(doc_number, doc_date), in_doc:in_doc_id(doc_number, doc_date)').order('created_at', { ascending: false }).limit(200),
     ]);
     setDocs(d.data || []);
     setVendors(v.data || []);
     setJobworkStock(jw.data || []);
+    setReturnables(r.data || []);
+    setInterunits(iu.data || []);
     setLoading(false);
   }, []);
 
@@ -6958,6 +6971,8 @@ function Documents({ plant, me }) {
     const channel = sb.channel('docs-' + plant.id)
       .on('postgres_changes', { event:'*', schema:'public', table:'mcp_logistics_documents', filter:'plant_id=eq.' + plant.id }, () => refresh())
       .on('postgres_changes', { event:'*', schema:'public', table:'mcp_logistics_payments', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_logistics_jobwork_lines', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .on('postgres_changes', { event:'*', schema:'public', table:'interunit_transfers', filter:'plant_id=eq.' + plant.id }, () => refresh())
       .subscribe();
     return () => { sb.removeChannel(channel); };
   }, [plant?.id, refresh]);
@@ -7001,10 +7016,17 @@ function Documents({ plant, me }) {
   return html`
     <div class="page-header"><div><h1>Documents</h1><div class="sub">Bills, DCs, payments · auto-extracted from chat</div></div></div>
 
-    <div class="auth-tabs" style="margin-bottom:14px">
+    <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
       <button class=${'auth-tab' + (view === 'dashboard' ? ' active' : '')} onClick=${() => setView('dashboard')}>Documents</button>
       <button class=${'auth-tab' + (view === 'vendors' ? ' active' : '')} onClick=${() => setView('vendors')}>Vendors · ${vendors.length}</button>
-      <button class=${'auth-tab' + (view === 'jobwork' ? ' active' : '')} onClick=${() => setView('jobwork')}>Job-work</button>
+      <button class=${'auth-tab' + (view === 'returnables' ? ' active' : '')} onClick=${() => setView('returnables')}>
+        Returnables${returnables.length > 0 ? ' · ' + returnables.length : ''}
+        ${returnables.filter(r => r.sla_breached).length > 0 ? html`<span style="background:var(--rose-500);color:white;font-size:9px;font-weight:700;padding:1px 6px;border-radius:999px;margin-left:4px">${returnables.filter(r => r.sla_breached).length} ⚠</span>` : ''}
+      </button>
+      <button class=${'auth-tab' + (view === 'interunit' ? ' active' : '')} onClick=${() => setView('interunit')}>
+        Inter-unit${interunits.filter(t => t.status === 'in_transit').length > 0 ? ' · ' + interunits.filter(t => t.status === 'in_transit').length : ''}
+      </button>
+      <button class=${'auth-tab' + (view === 'jobwork' ? ' active' : '')} onClick=${() => setView('jobwork')}>Summary</button>
     </div>
 
     ${view === 'dashboard' && html`
@@ -7126,6 +7148,198 @@ function Documents({ plant, me }) {
         `)
       }
     `}
+
+    ${view === 'returnables' && (() => {
+      // Apply filters
+      let rows = returnables;
+      if (retSearch.trim()) {
+        const q = retSearch.toLowerCase();
+        rows = rows.filter(r =>
+          (r.vendor_name || '').toLowerCase().includes(q) ||
+          (r.item_name || '').toLowerCase().includes(q) ||
+          (r.doc_number || '').toLowerCase().includes(q) ||
+          (r.process || '').toLowerCase().includes(q)
+        );
+      }
+      if (retVendorFilter !== 'all') rows = rows.filter(r => r.vendor_id === retVendorFilter);
+      if (retStatusFilter === 'open')     rows = rows.filter(r => r.status === 'open');
+      if (retStatusFilter === 'partial')  rows = rows.filter(r => r.status === 'partial');
+      if (retStatusFilter === 'overdue')  rows = rows.filter(r => r.sla_breached);
+      if (retStatusFilter === 'no_sla')   rows = rows.filter(r => !r.sla_days);
+
+      const totalQty   = rows.reduce((s, r) => s + parseFloat(r.qty_pending || 0), 0);
+      const breached   = returnables.filter(r => r.sla_breached).length;
+      const noSlaSet   = returnables.filter(r => !r.sla_days).length;
+      const vendorOpts = [...new Map(returnables.map(r => [r.vendor_id, { id: r.vendor_id, name: r.vendor_name || '(unknown)' }])).values()];
+
+      return html`
+        <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+          <div class="stat ${returnables.length > 0 ? 'amber' : 'teal'}"><div class="stat-num">${returnables.length}</div><div class="stat-label">Open lines</div></div>
+          <div class="stat ${breached > 0 ? 'rose' : 'teal'}"><div class="stat-num">${breached}</div><div class="stat-label">SLA breached</div></div>
+          <div class="stat ${noSlaSet > 0 ? 'amber' : 'teal'}"><div class="stat-num">${noSlaSet}</div><div class="stat-label">No SLA set</div></div>
+        </div>
+
+        <div style="margin-bottom:10px">
+          <input type="search" value=${retSearch} onChange=${e => setRetSearch(e.target.value)} placeholder="Search vendor, item, DC no…" style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+        </div>
+
+        <div class="auth-tabs" style="margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
+          <button class=${'auth-tab' + (retStatusFilter === 'all' ? ' active' : '')} onClick=${() => setRetStatusFilter('all')}>All</button>
+          <button class=${'auth-tab' + (retStatusFilter === 'open' ? ' active' : '')} onClick=${() => setRetStatusFilter('open')}>Open</button>
+          <button class=${'auth-tab' + (retStatusFilter === 'partial' ? ' active' : '')} onClick=${() => setRetStatusFilter('partial')}>Partial</button>
+          <button class=${'auth-tab' + (retStatusFilter === 'overdue' ? ' active' : '')} onClick=${() => setRetStatusFilter('overdue')} style=${breached > 0 ? 'color:var(--rose-600)' : ''}>SLA breached${breached > 0 ? ' · ' + breached : ''}</button>
+          <button class=${'auth-tab' + (retStatusFilter === 'no_sla' ? ' active' : '')} onClick=${() => setRetStatusFilter('no_sla')}>No SLA${noSlaSet > 0 ? ' · ' + noSlaSet : ''}</button>
+        </div>
+
+        ${vendorOpts.length > 1 && html`
+          <div style="margin-bottom:14px">
+            <select value=${retVendorFilter} onChange=${e => setRetVendorFilter(e.target.value)} style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px;background:white">
+              <option value="all">All vendors (${vendorOpts.length})</option>
+              ${vendorOpts.map(v => html`<option key=${v.id} value=${v.id}>${v.name}</option>`)}
+            </select>
+          </div>
+        `}
+
+        <div class="section-h">${rows.length} pending line${rows.length !== 1 ? 's' : ''} · ${fmtNum(totalQty)} units total</div>
+
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+          rows.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🔁</div>${returnables.length === 0 ? 'No open returnables. As job-work DCs go out, lines appear here for tracking.' : 'No lines match this filter.'}</div></div>` :
+          rows.map(r => html`
+            <div class="list-item" key=${r.id} onClick=${() => { if (r.doc_id) setActiveDoc(docs.find(d => d.id === r.doc_id) || { id: r.doc_id }); }}>
+              <div class="list-item-row" style="align-items:flex-start">
+                <div class="list-item-main">
+                  <div class="list-item-title">${r.item_name}${r.process ? ' · ' + r.process : ''}</div>
+                  <div class="list-item-sub">
+                    🏢 ${r.vendor_name || '(unknown vendor)'} · DC ${r.doc_number || '?'}
+                    ${r.sent_on ? ' · sent ' + r.sent_on : ''}
+                  </div>
+                  <div class="list-item-sub" style="margin-top:3px">
+                    Sent ${fmtNum(r.qty_sent)} ${r.uom || ''} · Back ${fmtNum(r.qty_received_back)} · <strong>Pending ${fmtNum(r.qty_pending)} ${r.uom || ''}</strong>
+                  </div>
+                  <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                    <span class=${'badge ' + (r.status === 'partial' ? 'amber' : '')}>${r.status}</span>
+                    <span class=${'badge ' + (r.sla_breached ? 'rose' : 'teal')} style="font-size:10px">${r.days_pending}d at vendor</span>
+                    ${r.sla_days ? html`<span class="badge" style="font-size:10px;background:var(--slate-200);color:var(--slate-700)">SLA ${r.sla_days}d → ${r.expected_return_date}</span>` : html`<span class="badge amber" style="font-size:10px">no SLA</span>`}
+                    ${r.sla_breached && html`<span class="badge rose" style="font-size:10px">⚠️ ${r.days_overdue}d overdue</span>`}
+                    <button class="btn small ghost" style="padding:2px 8px;font-size:11px;margin-left:auto" onClick=${(e) => { e.stopPropagation(); setRetSlaModal(r); }}>${r.sla_days ? 'Edit SLA' : 'Set SLA'}</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          `)
+        }
+      `;
+    })()}
+
+    ${view === 'interunit' && (() => {
+      let rows = interunits;
+      if (iuStatusFilter === 'in_transit') rows = rows.filter(t => t.status === 'in_transit');
+      else if (iuStatusFilter === 'received') rows = rows.filter(t => t.status === 'received');
+      const inTransit = interunits.filter(t => t.status === 'in_transit').length;
+
+      return html`
+        <div class="auth-tabs" style="margin-bottom:14px">
+          <button class=${'auth-tab' + (iuStatusFilter === 'in_transit' ? ' active' : '')} onClick=${() => setIuStatusFilter('in_transit')}>In transit · ${inTransit}</button>
+          <button class=${'auth-tab' + (iuStatusFilter === 'received' ? ' active' : '')} onClick=${() => setIuStatusFilter('received')}>Received</button>
+          <button class=${'auth-tab' + (iuStatusFilter === 'all' ? ' active' : '')} onClick=${() => setIuStatusFilter('all')}>All</button>
+        </div>
+
+        <div class="section-h">${rows.length} transfer${rows.length !== 1 ? 's' : ''}</div>
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+          rows.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🚚</div>${interunits.length === 0 ? 'No inter-unit transfers yet. They auto-create when an interunit DC is extracted from chat.' : 'No transfers match this filter.'}</div></div>` :
+          rows.map(t => html`
+            <div class="list-item" key=${t.id} onClick=${() => { const d = docs.find(d => d.id === (t.out_doc_id || t.in_doc_id)); if (d) setActiveDoc(d); }}>
+              <div class="list-item-row" style="align-items:flex-start">
+                <div class="list-item-main">
+                  <div class="list-item-title">${t.from_unit?.name || '?'} → ${t.to_unit?.name || '?'}</div>
+                  <div class="list-item-sub">
+                    DC ${t.dc_number || (t.out_doc?.doc_number) || '?'} · ${t.transfer_date}
+                    ${t.received_at ? ' · received ' + fmtDate(t.received_at) : ''}
+                  </div>
+                  ${t.notes && html`<div class="list-item-sub" style="font-style:italic;margin-top:3px">${t.notes}</div>`}
+                </div>
+                <span class=${'badge ' + (t.status === 'received' ? 'emerald' : t.status === 'in_transit' ? 'amber' : '')}>${t.status?.replace('_',' ')}</span>
+              </div>
+            </div>
+          `)
+        }
+      `;
+    })()}
+
+    ${retSlaModal && html`<${ReturnableSlaModal}
+      line=${retSlaModal}
+      onClose=${() => setRetSlaModal(null)}
+      onSaved=${() => { setRetSlaModal(null); refresh(); }} />`}
+  `;
+}
+
+// ============= RETURNABLE SLA MODAL =============
+// Lets user set or change the expected-return SLA on a job-work line.
+// Stores both sla_days and computes expected_return_date from sent_at.
+function ReturnableSlaModal({ line, onClose, onSaved }) {
+  const [days, setDays] = useState(line.sla_days || 30);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const presets = [7, 15, 30, 45, 60, 90];
+
+  const sentAt = line.sent_at ? new Date(line.sent_at) : null;
+  const expectedDate = sentAt ? new Date(sentAt.getTime() + days * 86400000).toISOString().slice(0,10) : null;
+
+  const save = async () => {
+    setSaving(true); setError('');
+    try {
+      const updates = {
+        sla_days: days,
+        expected_return_date: expectedDate,
+      };
+      const { error } = await sb.from('mcp_logistics_jobwork_lines').update(updates).eq('id', line.id);
+      if (error) throw error;
+      showToast('SLA set · expected back ' + expectedDate);
+      onSaved();
+    } catch (e) { setError(e.message); } finally { setSaving(false); }
+  };
+
+  const clear = async () => {
+    if (!line.sla_days) return;
+    setSaving(true); setError('');
+    try {
+      const { error } = await sb.from('mcp_logistics_jobwork_lines').update({
+        sla_days: null, expected_return_date: null
+      }).eq('id', line.id);
+      if (error) throw error;
+      showToast('SLA cleared');
+      onSaved();
+    } catch (e) { setError(e.message); } finally { setSaving(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Set return SLA</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card" style="background:var(--slate-50);margin-bottom:14px">
+          <div class="card-row"><span class="label">Item</span><span class="value">${line.item_name}</span></div>
+          <div class="card-row"><span class="label">Vendor</span><span class="value">${line.vendor_name || '?'}</span></div>
+          <div class="card-row"><span class="label">Sent</span><span class="value">${line.sent_on || fmtDate(line.sent_at)}</span></div>
+          <div class="card-row"><span class="label">Pending</span><span class="value">${fmtNum(line.qty_pending)} ${line.uom || ''}</span></div>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <div class="field"><label>Days from dispatch *</label>
+          <input type="number" min="1" value=${days} onChange=${e => setDays(parseInt(e.target.value || '0'))} />
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">
+          ${presets.map(p => html`<button key=${p} class=${'btn small ghost' + (days === p ? ' active' : '')} onClick=${() => setDays(p)}>${p}d</button>`)}
+        </div>
+        ${expectedDate && html`<div class="alert info" style="margin-bottom:14px">Expected back by <strong>${expectedDate}</strong></div>`}
+        <div style="display:flex;gap:8px">
+          ${line.sla_days && html`<button class="btn ghost" disabled=${saving} onClick=${clear}>Clear SLA</button>`}
+          <button class="btn" disabled=${saving || !days || days < 1} onClick=${save} style="flex:1">${saving ? 'Saving…' : 'Save SLA'}</button>
+        </div>
+      </div>
+    </div>
   `;
 }
 
@@ -7167,11 +7381,38 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
   const items = Array.isArray(doc.items) ? doc.items : [];
 
   return html`
-    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+    <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
-      <div style="flex:1"><h1 style="font-size:18px">${doc.mcp_logistics_vendors?.name || doc.vendor_name_raw || 'Document'}</h1>
-        <div class="sub">${doc.doc_type?.replace('_',' ')} · ${doc.doc_number || ''}</div>
+      <div style="flex:1;min-width:160px"><h1 style="font-size:18px">${doc.mcp_logistics_vendors?.name || doc.vendor_name_raw || 'Document'}</h1>
+        <div class="sub">${doc.doc_type?.replace(/_/g,' ')} · ${doc.doc_number || ''}
+          ${doc.raw_extraction?.confidence && html`<span class=${'badge ' + (doc.raw_extraction.confidence === 'high' ? 'emerald' : doc.raw_extraction.confidence === 'medium' ? 'amber' : 'rose')} style="margin-left:6px">${doc.raw_extraction.confidence}</span>`}
+          ${Array.isArray(doc.raw_extraction?.flags) && doc.raw_extraction.flags.length > 0 && doc.raw_extraction.flags.map(f => html`<span class="badge amber" style="margin-left:4px;font-size:10px">⚑ ${f.replace(/_/g,' ')}</span>`)}
+        </div>
       </div>
+      ${doc.source_image_url && html`
+        <button class="btn small ghost" title="Re-run extraction with the latest plant context" onClick=${async () => {
+          if (!confirm('Re-extract this document?\n\n• A NEW document row will be created from the same image.\n• The current row (and any GRN/payments) is left untouched.\n• Useful when classification was wrong or vendor wasn\\'t in master at the time.')) return;
+          showToast('Re-extracting…');
+          try {
+            const { data: { session } } = await sb.auth.getSession();
+            const r = await fetch(SUPABASE_URL + '/functions/v1/extract-document', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                ...(session ? { 'Authorization': 'Bearer ' + session.access_token, 'apikey': SUPABASE_ANON_KEY } : {}),
+              },
+              body: JSON.stringify({ reextract_doc_id: doc.id }),
+            });
+            const j = await r.json();
+            if (j.success && j.results?.[0]?.doc_id) {
+              showToast('✓ New doc created · ' + (j.results[0].doc_type || 'extracted'));
+              onClose();
+            } else {
+              alert('Re-extract failed: ' + (j.error || j.results?.[0]?.error || 'unknown'));
+            }
+          } catch (e) { alert('Re-extract error: ' + e.message); }
+        }}>🔁 Re-extract</button>
+      `}
       <button class="btn small ghost" onClick=${() => setEditing(true)}>Edit</button>
       <button class="btn small ghost" style="color:var(--rose-600)" onClick=${async () => {
         if (!confirm('Delete this document permanently?\n\nThis will also delete:\n• Pending GRN receipt (if any)\n• Auto-created supply lines (if any)\n\nThe original photo in chat is NOT affected.')) return;
