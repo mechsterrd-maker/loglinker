@@ -4485,10 +4485,10 @@ function StageLagCard({ plant, me, setTab }) {
 
   const refresh = async () => {
     const [sumRes, detRes] = await Promise.all([
-      sb.from('v_stage_lag_summary').select('*').single(),
+      sb.from('v_stage_lag_summary').select('*').maybeSingle(),
       sb.from('mcp_pdc_stage_log')
-        .select('id, log_date, stage, status, mcp_pdc_parts(part_number, name), shifts(name)')
-        .in('status', ['pending','provisional'])
+        .select('id, log_date, stage, status, is_provisional, mcp_pdc_parts(part_number, name), shifts(name)')
+        .eq('is_provisional', true)
         .gte('log_date', new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10))
         .order('log_date', { ascending: false })
         .limit(50),
@@ -9512,12 +9512,17 @@ function TracePage({ plant, me, activeUnit }) {
 
   useEffect(() => {
     (async () => {
-      const [partsRes, machinesRes] = await Promise.all([
-        sb.from('mcp_pdc_parts').select('id, part_number, name').eq('plant_id', plant.id).order('part_number'),
-        sb.from('machines').select('id, code, name').eq('plant_id', plant.id).order('code'),
-      ]);
-      setParts(partsRes.data || []);
-      setMachines(machinesRes.data || []);
+      try {
+        const [partsRes, machinesRes] = await Promise.all([
+          sb.from('mcp_pdc_parts').select('id, part_number, name').eq('plant_id', plant.id).order('part_number'),
+          sb.from('machines').select('*').eq('plant_id', plant.id).order('code'),
+        ]);
+        setParts(partsRes.data || []);
+        setMachines(machinesRes.data || []);
+      } catch (e) {
+        console.error('TracePage data load failed:', e);
+        setParts([]); setMachines([]);
+      }
     })();
   }, [plant.id]);
 
