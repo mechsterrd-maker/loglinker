@@ -3559,6 +3559,9 @@ function Chat({ plant, me, user }) {
       const { data: { session } } = await sb.auth.getSession();
       if (session) {
         showToast('Extracting…');
+        // 90s client-side timeout (function timeout is 150s but we abort earlier for UX)
+        const ctrl = new AbortController();
+        const timeoutId = setTimeout(() => ctrl.abort(), 90000);
         fetch(SUPABASE_URL + '/functions/v1/extract-document', {
           method: 'POST',
           headers: {
@@ -3571,7 +3574,15 @@ function Chat({ plant, me, user }) {
             image_url: imageUrl,
             plant_name: plant.name,
           }),
-        }).catch(e => console.warn('Extract failed:', e));
+          signal: ctrl.signal,
+        })
+        .then(r => { clearTimeout(timeoutId); if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(d => { showToast(d?.success ? 'Extracted ✓' : 'Extraction returned no data'); })
+        .catch(e => {
+          clearTimeout(timeoutId);
+          if (e.name === 'AbortError') showToast('Extraction timed out — image too large?');
+          else console.warn('Extract failed:', e);
+        });
       }
     } catch (e) { alert(e.message); }
   };
