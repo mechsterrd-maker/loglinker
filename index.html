@@ -3550,10 +3550,15 @@ function Chat({ plant, me, user }) {
     }
     e.target.value = '';
     const isImage = original.type.startsWith('image/');
-    // Resize images to cut API + upload cost
+    // Compressed copy for chat preview + default extraction (cheap path).
+    // We also keep the user's original blob for the AI fallback path: when
+    // extraction comes back low-confidence, the edge function re-fetches the
+    // .orig sibling at full resolution and retries — fixes faded thermal-print
+    // DCs and tiny doc-numbers that get lost in the 1600px / q82 downscale.
     const file = isImage ? await resizeImageFile(original, 1600, 0.82) : original;
     setAttachment({
       file,
+      hiresFile: isImage ? original : null,  // null for non-images / unchanged for PDFs
       previewUrl: isImage ? URL.createObjectURL(file) : null,
       type: file.type,
       name: file.name
@@ -3612,7 +3617,8 @@ function Chat({ plant, me, user }) {
       setUploading(true);
       try {
         const ext = attachment.name.split('.').pop().toLowerCase();
-        const path = plant.id + '/' + activeGroup.id + '/' + user.id + '-' + Date.now() + '.' + ext;
+        const ts = Date.now();
+        const path = plant.id + '/' + activeGroup.id + '/' + user.id + '-' + ts + '.' + ext;
         const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, attachment.file, {
           cacheControl: '3600',
           upsert: false
@@ -3623,9 +3629,30 @@ function Chat({ plant, me, user }) {
           return;
         }
         const { data: { publicUrl } } = sb.storage.from('chat-attachments').getPublicUrl(path);
+
+        // Hi-res sibling (only for images) — uploaded under <basepath>.orig.<ext>
+        // so the edge function can derive the URL by simple string substitution.
+        // We don't block the chat send on this — failure here just means no
+        // hi-res fallback later, not a broken send.
+        let hiresUrl = null;
+        if (attachment.hiresFile) {
+          const origExt = (attachment.hiresFile.name?.split('.').pop().toLowerCase()) || ext;
+          const hiresPath = plant.id + '/' + activeGroup.id + '/' + user.id + '-' + ts + '.orig.' + origExt;
+          const { error: hUpErr } = await sb.storage.from('chat-attachments').upload(hiresPath, attachment.hiresFile, {
+            cacheControl: '3600',
+            upsert: false
+          });
+          if (!hUpErr) {
+            hiresUrl = sb.storage.from('chat-attachments').getPublicUrl(hiresPath).data.publicUrl;
+          } else {
+            console.warn('[Loglinkr] hi-res upload failed (extraction will fall back to compressed only):', hUpErr.message);
+          }
+        }
+
         attachments = [{
           url: publicUrl,
           path: path,
+          hiresUrl: hiresUrl,   // edge function reads this for fallback re-extraction
           type: attachment.type,
           name: attachment.name,
           isImage: attachment.type.startsWith('image/')
@@ -7390,9 +7417,9 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
         </div>
       </div>
       ${doc.source_image_url && html`
-        <button class="btn small ghost" title="Re-run extraction with the latest plant context" onClick=${async () => {
-          if (!confirm('Re-extract this document?\n\n• A NEW document row will be created from the same image.\n• The current row (and any GRN/payments) is left untouched.\n• Useful when classification was wrong or vendor wasn\\'t in master at the time.')) return;
-          showToast('Re-extracting…');
+        <button class="btn small ghost" title="Re-run extraction at full resolution with the latest plant context" onClick=${async () => {
+          if (!confirm('Re-extract this document at FULL resolution?\n\n• Uses the original (un-compressed) photo for max accuracy.\n• A NEW document row will be created — the current row is untouched.\n• Costs slightly more API budget than the default cheap path.\n• Best move when classification or item details came out wrong.')) return;
+          showToast('Re-extracting (hi-res)…');
           try {
             const { data: { session } } = await sb.auth.getSession();
             const r = await fetch(SUPABASE_URL + '/functions/v1/extract-document', {
@@ -7401,17 +7428,19 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
                 'Content-Type': 'application/json',
                 ...(session ? { 'Authorization': 'Bearer ' + session.access_token, 'apikey': SUPABASE_ANON_KEY } : {}),
               },
-              body: JSON.stringify({ reextract_doc_id: doc.id }),
+              body: JSON.stringify({ reextract_doc_id: doc.id, force_hires: true }),
             });
             const j = await r.json();
             if (j.success && j.results?.[0]?.doc_id) {
-              showToast('✓ New doc created · ' + (j.results[0].doc_type || 'extracted'));
+              const r0 = j.results[0];
+              const note = r0.escalated_to_hires ? ' (hi-res)' : ' (compressed only — no hi-res available)';
+              showToast('✓ New doc created' + note + ' · ' + (r0.doc_type || 'extracted'));
               onClose();
             } else {
               alert('Re-extract failed: ' + (j.error || j.results?.[0]?.error || 'unknown'));
             }
           } catch (e) { alert('Re-extract error: ' + e.message); }
-        }}>🔁 Re-extract</button>
+        }}>🔁 Re-extract (hi-res)</button>
       `}
       <button class="btn small ghost" onClick=${() => setEditing(true)}>Edit</button>
       <button class="btn small ghost" style="color:var(--rose-600)" onClick=${async () => {

@@ -14,12 +14,13 @@
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { Image } from "https://deno.land/x/imagescript@1.2.17/mod.ts";
 
 const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-sonnet-4-20250514";
-const WORKER_VERSION = "v15.1";
+const WORKER_VERSION = "v19";
 
 // Tunables
 const VENDOR_CONTEXT_LIMIT = 60;   // top-N vendors fed to the model
@@ -171,18 +172,71 @@ After picking direction, identify the counterparty (the OTHER side, not us):
                      Else null. Do not guess. Match GSTIN > legal_name > name.
 
 ═══════════════════════════════════════════════════════════
+IMAGE ORIENTATION & QUALITY
+═══════════════════════════════════════════════════════════
+If the image is rotated, tilted, or upside-down (text reads sideways relative
+to the document's natural top), mentally rotate to upright before extracting.
+The document is always upright in real life; the photo captured it at an angle.
+Never use a rotated reading as an excuse to guess.
+
+═══════════════════════════════════════════════════════════
+ZERO-GUESS DISCIPLINE — the most important rule
+═══════════════════════════════════════════════════════════
+NEVER fabricate a value to fill a field. If a field is illegible, missing,
+or you can't read it with confidence, the value is NULL. Period.
+  ✗ Do not concatenate adjacent text into a doc_number
+  ✗ Do not interpret a quantity as a monetary value
+  ✗ Do not guess a vendor name from a partial reading
+  ✗ Do not infer a date from context if no date is printed
+  ✗ Do not fill items[] with column headers, footers, signature labels, or guesses
+A confident NULL is far more valuable than a confident guess.
+
+═══════════════════════════════════════════════════════════
+DOC NUMBER — strict label-driven extraction
+═══════════════════════════════════════════════════════════
+doc_number is the value next to a clearly-LABELED header field:
+  ✓ "DC No.", "DC Number", "Challan No.", "Invoice No.", "Bill No."
+  ✓ "Doc #", "Document No.", "Reference No.", "Quote No.", "PO No."
+NEVER take doc_number from:
+  ✗ "SL no", "S.No", "Sr. No.", "Sl. No." — those are item-row indices
+  ✗ Item descriptions, HSN codes, item names
+  ✗ Adjacent unlabeled text
+  ✗ Concatenations of multiple fields
+If no clearly labeled doc-number field exists or the value is illegible, set
+doc_number = null and add "doc_number_unreadable" to flags[].
+
+═══════════════════════════════════════════════════════════
+VENDOR NAME — printed business name only
+═══════════════════════════════════════════════════════════
+vendor_name MUST be the printed business name on the seller's letterhead /
+header banner / topmost prominent line of the document.
+NEVER use:
+  ✗ Names from "Authorised Signatory" or signature blocks
+  ✗ Names from "Customer Signature" zones
+  ✗ Witness names, contact-person names, salesperson names
+  ✗ Email-address local-parts (the part before @) as a name
+If the printed business name is illegible or absent, set vendor_name = null AND
+add "vendor_name_illegible" to flags[].
+
+═══════════════════════════════════════════════════════════
 LINE ITEMS — STRICT
 ═══════════════════════════════════════════════════════════
-items[] must contain ONLY real product/material rows from the line-item table.
-DO NOT include any of these as items (they look like rows but are not):
+items[] must contain ONLY real product/material data ROWS from the line-item
+table. The header row (column titles) is never a line item.
+
+DO NOT include any of these as items:
+  ✗ Column headers themselves: "Description of Goods", "Item Description",
+    "Particulars", "Material", "Description", "Qty", "Rate", "Amount"
   ✗ "Total", "Sub-total", "Grand Total", "Amount in Words"
   ✗ "Received the above goods in good condition" / signature blocks
-  ✗ Tax summary rows (CGST, SGST, IGST, Round-off)
-  ✗ Footer disclaimers, terms & conditions
+  ✗ Tax summary rows (CGST, SGST, IGST, Round-off, GST)
+  ✗ Footer disclaimers, terms & conditions, bank details
   ✗ Empty rows, "—", or ditto-mark continuations
 
-For each real line, populate:
-  name      — item description as printed
+If the line-item table contains only headers and no data rows, items = [] (empty).
+
+For each real DATA line, populate:
+  name      — item description as printed (the data row, not the header above)
   hsn       — HSN/SAC code if visible, else null
   qty       — number, never null on a real line
   uom       — unit of measure (NOS, KGS, MT, PCS, SET…), null if absent
@@ -191,28 +245,63 @@ For each real line, populate:
   process   — for jobwork rows: which operation (plating, heat-treat…); else ""
 
 ═══════════════════════════════════════════════════════════
-ARITHMETIC SELF-CHECK
+QUANTITY ≠ MONETARY VALUE — never confuse these
+═══════════════════════════════════════════════════════════
+A "Quantity" / "Qty" / "Pcs" / "Nos" column holds COUNTS, not money.
+A "Rate" / "Unit Price" column holds per-unit money.
+A "Amount" / "Value" / "Total" column holds line-totals (qty × rate).
+A "Invoice Value" or "Grand Total" or "Net Total" column holds doc-level money.
+
+NEVER:
+  ✗ Treat 270 NOS as ₹270 or ₹27,000
+  ✗ Multiply quantity by 10/100/1000 to "estimate" an amount
+  ✗ Copy a quantity into total_value or taxable_value
+  ✗ Read a missing rate as zero and produce amount = 0
+
+═══════════════════════════════════════════════════════════
+DC vs INVOICE — when there are no prices
+═══════════════════════════════════════════════════════════
+If the document is a pure Delivery Challan / DC / Material Issue Slip with
+NO rate column, NO amount column, NO tax row, NO grand total in rupees:
+   total_value = null
+   taxable_value = null
+   tax_amount = null
+   each item.rate = null, item.amount = null
+A DC moves goods without invoicing money — that is the whole purpose of having
+DC and Invoice as separate documents. Never invent monetary values for a DC.
+
+═══════════════════════════════════════════════════════════
+ARITHMETIC SELF-CHECK (when there ARE prices)
 ═══════════════════════════════════════════════════════════
 After listing items, verify:
   sum(items[].amount) ≈ taxable_value   (tolerate ±1 for round-off)
   total_value ≈ taxable_value + tax_amount
-If either check fails, add "arithmetic_mismatch" to flags[] and explain in validation_note.
+If either check fails, add "arithmetic_mismatch" to flags[] and explain in
+validation_note. If the mismatch is large, prefer NULLING the less certain
+field over publishing inconsistent numbers.
 
 ═══════════════════════════════════════════════════════════
 DATES
 ═══════════════════════════════════════════════════════════
 Always return ISO YYYY-MM-DD. Indian docs often use DD/MM/YY or DD-MMM-YY:
   "8-May-26"  → 2026-05-08
+  "10-May-26" → 2026-05-10
   "05/05/24"  → 2024-05-05  (DD/MM/YY assumed unless context proves otherwise)
-If the year is two digits and ambiguous (>= today + 1 year), prefer the past century only if a 4-digit year appears elsewhere on the doc indicating earlier years. Otherwise default to current decade.
-If the date is illegible / handwritten / inferred → add "date_inferred" to flags[].
+If the year is two digits and ambiguous, default to the current decade.
+If the date is illegible / unreadable → set doc_date = null AND add
+"date_unreadable" to flags[]. NEVER guess a date from surrounding context.
 
 ═══════════════════════════════════════════════════════════
 CONFIDENCE
 ═══════════════════════════════════════════════════════════
-confidence = "high"   if image is sharp, all key fields visible, arithmetic balances
-confidence = "medium" if minor ambiguity (one field unclear, arithmetic off by <2%)
-confidence = "low"    if image is blurry / handwritten / multiple fields missing
+confidence = "high"   sharp image, every field visible & legible, arithmetic balances
+confidence = "medium" minor ambiguity (one field unclear, arithmetic off by <2%)
+confidence = "low"    blurry / rotated / faded / handwritten / multiple fields missing
+
+When confidence = "low", be MORE willing to null fields rather than guess.
+A low-confidence extraction with 5 nulls is more useful than a low-confidence
+extraction with 5 fabrications — humans can fill nulls; they can't easily
+detect fabrications buried in plausible-looking output.
 
 ═══════════════════════════════════════════════════════════
 OUTPUT FORMAT — RETURN ONLY THIS JSON, NO PROSE, NO MARKDOWN FENCES
@@ -247,6 +336,126 @@ OUTPUT FORMAT — RETURN ONLY THIS JSON, NO PROSE, NO MARKDOWN FENCES
 
 If the image is not a logistics document at all (selfie, screenshot, random photo):
   is_document = false, classification = "non_document", leave other fields null/[].`;
+}
+
+// =============================================================================
+// IMAGE PRE-PROCESSING — auto-rotate before extraction
+// =============================================================================
+// Phone photos of paper docs are often rotated 90°/180°/270°. The vision model
+// can read rotated text but mangles it more often (digits, similar letters,
+// proper nouns). One cheap "what rotation?" pre-call + a server-side rotate
+// dramatically improves extraction quality on real-world inputs.
+
+const ROTATION_PROMPT = `A document was photographed and the photo may be rotated. To make the document text read upright (left-to-right, top-to-bottom), how many degrees CLOCKWISE should the photo be rotated?
+
+Answer with EXACTLY one number from this list:
+0   — already upright, no rotation needed
+90  — rotate 90 degrees clockwise (current text reads bottom-to-top)
+180 — rotate 180 degrees (current text is upside down)
+270 — rotate 270 degrees clockwise (current text reads top-to-bottom)
+
+Output: a single number. No words, no explanation, no punctuation.`;
+
+async function detectRotationDeg(imgB64: string, mediaType: string): Promise<number> {
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 16,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: mediaType, data: imgB64 } },
+            { type: "text", text: ROTATION_PROMPT },
+          ],
+        }],
+      }),
+    });
+    if (!res.ok) return 0;
+    const data = await res.json();
+    const text = (data.content
+      ?.filter((b: { type: string }) => b.type === "text")
+      ?.map((b: { text: string }) => b.text)
+      ?.join("") ?? "").trim();
+    const m = text.match(/\b(0|90|180|270)\b/);
+    const deg = m ? parseInt(m[1], 10) : 0;
+    return [0, 90, 180, 270].includes(deg) ? deg : 0;
+  } catch (_e) {
+    return 0; // Never let rotation detection break extraction
+  }
+}
+
+async function rotateImageBytes(
+  bytes: Uint8Array,
+  deg: number,
+): Promise<{ bytes: Uint8Array; mediaType: string } | null> {
+  if (deg === 0) return null;
+  try {
+    const img = await Image.decode(bytes);
+    // ImageScript's rotate() takes degrees clockwise. Our detectRotationDeg
+    // returns "how many degrees CW to apply to make upright" — pass through.
+    img.rotate(deg);
+    // High JPEG quality (95) — small text on logistics docs (doc number, date,
+    // GSTIN) needs every bit of fidelity; quality 85 was nulling those fields.
+    const out = await img.encodeJPEG(95);
+    return { bytes: out, mediaType: "image/jpeg" };
+  } catch (_e) {
+    return null; // Rotation failure → fall back to original bytes
+  }
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 32768;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+// =============================================================================
+// HI-RES FALLBACK
+// =============================================================================
+// Chat upload writes both:  <id>.<ext>  (compressed, used by default)
+//                           <id>.orig.<ext>  (full-resolution original)
+// When the first extraction comes back low-confidence (faded thermal print,
+// tiny doc-numbers, etc.) we re-fetch the .orig sibling and retry. Cheap
+// fallback that recovers ~80% of bad-photo failures without paying hi-res
+// cost on every doc.
+
+function deriveHiresUrl(url: string): string {
+  // Insert ".orig" before the final extension.
+  const m = url.match(/^(.+)(\.[a-zA-Z0-9]+)(\?.*)?$/);
+  if (!m) return url + ".orig";
+  return m[1] + ".orig" + m[2] + (m[3] ?? "");
+}
+
+function shouldEscalateToHires(parsed: ExtractionPayload): boolean {
+  if (parsed.confidence === "low") return true;
+  const flags = parsed.flags ?? [];
+  const recoverableFlags = new Set([
+    "doc_number_unreadable",
+    "date_unreadable",
+    "vendor_name_illegible",
+    "low_quality_image",
+  ]);
+  if (flags.some(f => recoverableFlags.has(f))) return true;
+  // Many critical fields nulled → likely worth a retry
+  if (parsed.is_document) {
+    let nullCount = 0;
+    if (!parsed.doc_number) nullCount++;
+    if (!parsed.doc_date) nullCount++;
+    if (!parsed.vendor_name) nullCount++;
+    if (!parsed.items || parsed.items.length === 0) nullCount++;
+    if (nullCount >= 3) return true;
+  }
+  return false;
 }
 
 function safeJsonParse(raw: string): unknown {
@@ -328,9 +537,107 @@ async function fetchPlantContext(
   };
 }
 
+interface AttemptResult {
+  parsed: ExtractionPayload;
+  rawResponse: string;
+  rotationLog: number[];
+  totalRotationDeg: number;
+  imageUrl: string;
+  bytesLen: number;
+}
+
+// One end-to-end pass: fetch the image, auto-rotate, call vision, parse JSON.
+// Throws on any pipeline failure (caller catches and decides whether to retry).
+async function attemptExtraction(
+  url: string,
+  prompt: string,
+): Promise<AttemptResult> {
+  const imgRes = await fetch(url);
+  if (!imgRes.ok) throw new Error(`Image fetch ${imgRes.status} on ${url}`);
+  const imgBuf = await imgRes.arrayBuffer();
+  let bytes = new Uint8Array(imgBuf);
+  let imgB64 = bytesToBase64(bytes);
+  let mediaType = imgRes.headers.get("content-type") || "image/jpeg";
+  if (mediaType.includes(";")) mediaType = mediaType.split(";")[0].trim();
+  if (!["image/jpeg", "image/png", "image/webp", "image/gif"].includes(mediaType)) {
+    mediaType = "image/jpeg";
+  }
+
+  // Single-pass auto-rotate.
+  const rotationLog: number[] = [];
+  {
+    const deg = await detectRotationDeg(imgB64, mediaType);
+    if (deg !== 0) {
+      const rotated = await rotateImageBytes(bytes, deg);
+      if (rotated) {
+        bytes = rotated.bytes;
+        mediaType = rotated.mediaType;
+        imgB64 = bytesToBase64(bytes);
+        rotationLog.push(deg);
+      }
+    }
+  }
+  const totalRotationDeg = rotationLog.reduce((s, d) => s + d, 0) % 360;
+
+  const visionRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 3072,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: mediaType, data: imgB64 } },
+          { type: "text", text: prompt },
+        ],
+      }],
+    }),
+  });
+
+  if (!visionRes.ok) {
+    throw new Error(`Vision API ${visionRes.status}: ${(await visionRes.text()).slice(0, 500)}`);
+  }
+
+  const visionData = await visionRes.json();
+  const rawResponse = visionData.content
+    ?.filter((b: { type: string }) => b.type === "text")
+    ?.map((b: { text: string }) => b.text)
+    ?.join("\n") ?? "";
+
+  const parsed = safeJsonParse(rawResponse) as ExtractionPayload;
+  if (typeof parsed.is_document !== "boolean") {
+    throw new Error("Missing is_document boolean in extraction");
+  }
+
+  return {
+    parsed,
+    rawResponse,
+    rotationLog,
+    totalRotationDeg,
+    imageUrl: url,
+    bytesLen: bytes.length,
+  };
+}
+
+// Probe whether the hi-res sibling exists (HEAD request, fast).
+async function hiresAvailable(hiresUrl: string): Promise<boolean> {
+  try {
+    const r = await fetch(hiresUrl, { method: "HEAD" });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
 async function processQueueRow(
   supabase: ReturnType<typeof createClient>,
   row: QueueRow,
+  forceHires = false,
 ) {
   const startedAt = Date.now();
   const newAttempts = row.attempts + 1;
@@ -344,69 +651,47 @@ async function processQueueRow(
     })
     .eq("id", row.id);
 
-  let rawResponse: string | null = null;
   let stage = "init";
+  let lastRawResponse: string | null = null;
 
   try {
     stage = "fetch_context";
     const ctx = await fetchPlantContext(supabase, row.plant_id);
     const prompt = buildPrompt(ctx);
 
-    stage = "fetch_image";
-    const imgRes = await fetch(row.image_url);
-    if (!imgRes.ok) throw new Error(`Image fetch ${imgRes.status}`);
-    const imgBuf = await imgRes.arrayBuffer();
-    const bytes = new Uint8Array(imgBuf);
-    let binary = "";
-    const chunkSize = 32768;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-    }
-    const imgB64 = btoa(binary);
-    let mediaType = imgRes.headers.get("content-type") || "image/jpeg";
-    if (mediaType.includes(";")) mediaType = mediaType.split(";")[0].trim();
-    if (!["image/jpeg", "image/png", "image/webp", "image/gif"].includes(mediaType)) {
-      mediaType = "image/jpeg";
-    }
+    // ─── First pass: compressed image ───────────────────────────────────────
+    stage = "extract_compressed";
+    let attempt = await attemptExtraction(row.image_url, prompt);
+    lastRawResponse = attempt.rawResponse;
+    let escalated = false;
 
-    stage = "vision_call";
-    const visionRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 3072,
-        messages: [{
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: mediaType, data: imgB64 } },
-            { type: "text", text: prompt },
-          ],
-        }],
-      }),
-    });
-
-    if (!visionRes.ok) {
-      throw new Error(`Vision API ${visionRes.status}: ${(await visionRes.text()).slice(0, 500)}`);
+    if (attempt.parsed.is_document) {
+      // ─── Hi-res escalation ────────────────────────────────────────────────
+      // If the compressed pass struggled (low confidence / unreadable flags /
+      // many nulls), fetch the .orig sibling and try again. Only one extra
+      // call per low-confidence doc; happy-path docs pay nothing extra.
+      const hiresUrl = deriveHiresUrl(row.image_url);
+      const wantsRetry = forceHires || shouldEscalateToHires(attempt.parsed);
+      if (wantsRetry && hiresUrl !== row.image_url && await hiresAvailable(hiresUrl)) {
+        stage = "extract_hires";
+        try {
+          const hiresAttempt = await attemptExtraction(hiresUrl, prompt);
+          if (hiresAttempt.parsed.is_document) {
+            // Hi-res result wins as long as it actually classified the doc.
+            attempt = hiresAttempt;
+            lastRawResponse = hiresAttempt.rawResponse;
+            escalated = true;
+          }
+        } catch (hErr) {
+          console.warn(`hires retry failed: ${(hErr as Error).message}`);
+          // Keep the compressed result — better than nothing.
+        }
+      }
     }
 
-    const visionData = await visionRes.json();
-    rawResponse = visionData.content
-      ?.filter((b: { type: string }) => b.type === "text")
-      ?.map((b: { text: string }) => b.text)
-      ?.join("\n") ?? "";
-
-    stage = "json_parse";
-    const parsed = safeJsonParse(rawResponse) as ExtractionPayload;
-
-    stage = "validate";
-    if (typeof parsed.is_document !== "boolean") {
-      throw new Error("Missing is_document boolean in extraction");
-    }
+    const parsed = attempt.parsed;
+    const rotationLog = attempt.rotationLog;
+    const totalRotationDeg = attempt.totalRotationDeg;
 
     if (!parsed.is_document) {
       await supabase
@@ -418,7 +703,7 @@ async function processQueueRow(
           extraction_ms: Date.now() - startedAt,
           error_message: null,
           raw_response: null,
-          debug_payload: { worker_version: WORKER_VERSION },
+          debug_payload: { worker_version: WORKER_VERSION, escalated_to_hires: escalated },
         })
         .eq("id", row.id);
       return { ok: true, queue_id: row.id, skipped: true };
@@ -489,7 +774,7 @@ async function processQueueRow(
         processed_at: new Date().toISOString(),
         extraction_ms: Date.now() - startedAt,
         error_message: null,
-        raw_response: keepRawForDebug ? rawResponse?.slice(0, 8192) ?? null : null,
+        raw_response: keepRawForDebug ? lastRawResponse?.slice(0, 8192) ?? null : null,
         debug_payload: {
           worker_version: WORKER_VERSION,
           model: MODEL,
@@ -498,6 +783,12 @@ async function processQueueRow(
           direction: parsed.direction ?? null,
           resolved_doc_type: docType,
           vendor_match_id: resolvedVendorId,
+          auto_rotated_deg: totalRotationDeg,
+          auto_rotated_iterations: rotationLog.length,
+          auto_rotated_log: rotationLog,
+          escalated_to_hires: escalated,
+          image_source: escalated ? "hires" : "compressed",
+          image_url_used: attempt.imageUrl,
         },
       })
       .eq("id", row.id);
@@ -510,6 +801,9 @@ async function processQueueRow(
       direction: parsed.direction,
       confidence: parsed.confidence,
       flags: parsed.flags,
+      auto_rotated_deg: totalRotationDeg,
+      auto_rotated_log: rotationLog,
+      escalated_to_hires: escalated,
     };
 
   } catch (err) {
@@ -519,7 +813,7 @@ async function processQueueRow(
       .from("mcp_logistics_extraction_queue")
       .update({
         status: "failed",
-        raw_response: rawResponse?.slice(0, 8192) ?? null,
+        raw_response: lastRawResponse?.slice(0, 8192) ?? null,
         error_message: `${stage}: ${e.message}`.slice(0, 500),
         debug_payload: {
           stage,
@@ -553,8 +847,15 @@ Deno.serve(async (req: Request) => {
   const supabase = createClient(SUPABASE_URL, SERVICE_KEY);
 
   try {
-    let body: { queue_id?: string; batch_size?: number; reextract_doc_id?: string } = {};
+    let body: {
+      queue_id?: string;
+      batch_size?: number;
+      reextract_doc_id?: string;
+      force_hires?: boolean;  // skip the "should I escalate?" check, always retry on .orig
+    } = {};
     try { body = await req.json(); } catch { /* empty body ok */ }
+
+    const forceHires = body.force_hires === true;
 
     let rows: QueueRow[];
 
@@ -609,7 +910,7 @@ Deno.serve(async (req: Request) => {
 
     const results = [];
     for (const row of rows) {
-      results.push(await processQueueRow(supabase, row));
+      results.push(await processQueueRow(supabase, row, forceHires));
     }
 
     const success = results.length > 0 && results.every(r => r.ok);
