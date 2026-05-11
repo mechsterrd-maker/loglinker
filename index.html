@@ -1050,6 +1050,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
+      <${Page} active=${tab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
 
       <div class="tabbar">
@@ -1057,7 +1058,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
     </div>
   `;
@@ -5171,6 +5172,7 @@ function UnitAccessModal({ plant, me, onClose }) {
 function More({ plant, me, user, logout, setTab, activeUnit, accessibleUnits }) {
   const [unitAccessOpen, setUnitAccessOpen] = useState(false);
   const navItems = [
+    { key:'iatf', icon:'🛡', label:'IATF 16949 · Audit Readiness', sub:'All required documents, status, owners, review cadences' },
     { key:'schedules', icon:'📅', label:'Customer Schedules', sub:'Plan vs actual, weekly buckets, AI extract' },
     { key:'movements', icon:'🔀', label:'Movements', sub:'In/out material flow, GRN verification' },
     { key:'trace', icon:'🔍', label:'Trace · Audit Investigation', sub:'Linked timeline by date/part/machine' },
@@ -12891,6 +12893,444 @@ function DocNumberHistoryModal({ plant, record, onClose }) {
           </div>
         `}
       </div>
+    </div>
+  `;
+}
+
+// =============================================================================
+// IATF 16949 — Audit Readiness Dashboard
+// =============================================================================
+// Reads `v_iatf_audit_readiness` (plants × document registry × latest version)
+// and renders a status grid: missing / draft / approved / stale. Filter by
+// clause / category / status. Each row links to the operational module that
+// produces its evidence (NCR Log → Quality, Calibration → Tools, etc.).
+function IatfDashboard({ plant, me, setTab }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [statusFilter, setStatusFilter] = useState('all');     // all | missing | draft | approved | stale
+  const [categoryFilter, setCategoryFilter] = useState('all');
+  const [search, setSearch] = useState('');
+  const [activeRow, setActiveRow] = useState(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data, error } = await sb.from('v_iatf_audit_readiness')
+      .select('*')
+      .eq('plant_id', plant.id)
+      .order('sort_order');
+    if (error) console.warn('iatf load:', error.message);
+    setRows(data || []);
+    setLoading(false);
+  }, [plant.id]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  // Live updates: refresh when a version is added/edited
+  useEffect(() => {
+    if (!plant?.id) return;
+    const ch = sb.channel('iatf-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'iatf_document_versions', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(ch); };
+  }, [plant?.id, refresh]);
+
+  if (activeRow) {
+    return html`<${IatfDocDetail} plant=${plant} me=${me} row=${activeRow} setTab=${setTab}
+      onClose=${() => { setActiveRow(null); refresh(); }} />`;
+  }
+
+  // Counts for stat cards
+  const counts = rows.reduce((acc, r) => { acc[r.doc_status] = (acc[r.doc_status] || 0) + 1; return acc; }, {});
+  const total = rows.length;
+  const ready = counts.approved || 0;
+  const missing = counts.missing || 0;
+  const stale = counts.stale || 0;
+  const draft = counts.draft || 0;
+  const readinessPct = total > 0 ? Math.round((ready / total) * 100) : 0;
+
+  // Categories present in current data
+  const categories = [...new Set(rows.map(r => r.category))].sort();
+
+  // Apply filters
+  let view = rows;
+  if (statusFilter !== 'all') view = view.filter(r => r.doc_status === statusFilter);
+  if (categoryFilter !== 'all') view = view.filter(r => r.category === categoryFilter);
+  if (search.trim()) {
+    const q = search.toLowerCase();
+    view = view.filter(r =>
+      (r.doc_code || '').toLowerCase().includes(q) ||
+      (r.title || '').toLowerCase().includes(q) ||
+      (r.clause_codes || []).some(c => c.toLowerCase().includes(q))
+    );
+  }
+
+  // Group filtered docs by category for the cards layout
+  const byCategory = view.reduce((acc, r) => {
+    (acc[r.category] = acc[r.category] || []).push(r);
+    return acc;
+  }, {});
+
+  const CATEGORY_LABELS = {
+    policy:'Quality Policy & Context',
+    risk:'Risk Management',
+    design:'Design & FMEA / Control Plan',
+    production:'Production & Operations',
+    qc:'Quality Control & Inspection',
+    customer:'Customer Focus',
+    supplier:'Supplier Management',
+    hr:'HR & Training',
+    audit:'Audits & Management Review',
+    tooling:'Tooling',
+    improvement:'Improvement',
+  };
+
+  return html`
+    <div class="page-header">
+      <div><h1>IATF 16949 · Audit Readiness</h1>
+        <div class="sub">Every required document, live status, owner, review cadence.</div>
+      </div>
+    </div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr)">
+      <div class=${'stat ' + (readinessPct >= 80 ? 'emerald' : readinessPct >= 50 ? 'amber' : 'rose')}>
+        <div class="stat-num">${readinessPct}%</div><div class="stat-label">Ready</div>
+      </div>
+      <div class=${'stat ' + (missing > 0 ? 'rose' : 'teal')}>
+        <div class="stat-num">${missing}</div><div class="stat-label">Missing</div>
+      </div>
+      <div class=${'stat ' + (stale > 0 ? 'amber' : 'teal')}>
+        <div class="stat-num">${stale}</div><div class="stat-label">Stale</div>
+      </div>
+      <div class="stat teal">
+        <div class="stat-num">${ready}<span style="font-size:11px;color:var(--slate-500);font-weight:500"> / ${total}</span></div>
+        <div class="stat-label">Approved</div>
+      </div>
+    </div>
+
+    <div style="margin-bottom:10px">
+      <input type="search" value=${search} onChange=${e => setSearch(e.target.value)}
+        placeholder="Search by code, title, clause (e.g., 8.5.1.1)…"
+        style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
+      <button class=${'auth-tab' + (statusFilter === 'all' ? ' active' : '')} onClick=${() => setStatusFilter('all')}>All · ${total}</button>
+      <button class=${'auth-tab' + (statusFilter === 'missing' ? ' active' : '')} onClick=${() => setStatusFilter('missing')} style=${missing > 0 ? 'color:var(--rose-600)' : ''}>Missing · ${missing}</button>
+      <button class=${'auth-tab' + (statusFilter === 'stale' ? ' active' : '')} onClick=${() => setStatusFilter('stale')} style=${stale > 0 ? 'color:var(--amber-600)' : ''}>Stale · ${stale}</button>
+      <button class=${'auth-tab' + (statusFilter === 'draft' ? ' active' : '')} onClick=${() => setStatusFilter('draft')}>Draft · ${draft}</button>
+      <button class=${'auth-tab' + (statusFilter === 'approved' ? ' active' : '')} onClick=${() => setStatusFilter('approved')}>Approved · ${ready}</button>
+    </div>
+
+    ${categories.length > 1 && html`
+      <div style="margin-bottom:14px">
+        <select value=${categoryFilter} onChange=${e => setCategoryFilter(e.target.value)}
+          style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px;background:white">
+          <option value="all">All categories (${categories.length})</option>
+          ${categories.map(c => html`<option key=${c} value=${c}>${CATEGORY_LABELS[c] || c}</option>`)}
+        </select>
+      </div>
+    `}
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      view.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📋</div>No documents match this filter.</div></div>` :
+      Object.entries(byCategory).map(([cat, list]) => html`
+        <div key=${cat} style="margin-bottom:18px">
+          <div class="section-h">${CATEGORY_LABELS[cat] || cat} · ${list.length}</div>
+          ${list.map(r => {
+            const statusColor =
+              r.doc_status === 'approved' ? 'emerald' :
+              r.doc_status === 'stale' ? 'amber' :
+              r.doc_status === 'draft' ? '' :
+              r.doc_status === 'missing' ? 'rose' : '';
+            return html`
+              <div class="list-item" key=${r.registry_id} onClick=${() => setActiveRow(r)}>
+                <div class="list-item-row" style="align-items:flex-start">
+                  <div class="list-item-main">
+                    <div class="list-item-title">
+                      <span class="mono" style="font-size:11px;color:var(--slate-500);font-weight:500">${r.doc_code}</span>
+                      &nbsp;&nbsp;${r.title}
+                    </div>
+                    <div class="list-item-sub">
+                      ${(r.clause_codes || []).map(c => html`<span class="badge" style="background:var(--slate-100);color:var(--slate-700);font-size:10px;margin-right:4px">§${c}</span>`)}
+                      ${r.owner_role ? html`<span style="color:var(--slate-500);margin-left:4px">· owner: ${r.owner_role}</span>` : ''}
+                    </div>
+                    ${r.populated_by === 'auto' && html`<div class="list-item-sub" style="margin-top:3px"><span class="badge teal" style="font-size:10px">🔄 AUTO-POPULATED from live data</span></div>`}
+                    ${r.populated_by === 'hybrid' && html`<div class="list-item-sub" style="margin-top:3px"><span class="badge amber" style="font-size:10px">⚙️ HYBRID · partly live, partly manual</span></div>`}
+                  </div>
+                  <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                    <span class=${'badge ' + statusColor}>${r.doc_status}</span>
+                    ${r.days_to_review != null && r.doc_status === 'approved' && html`
+                      <span style="font-size:10px;color:${r.days_to_review < 0 ? 'var(--rose-500)' : r.days_to_review < 30 ? 'var(--amber-600)' : 'var(--slate-500)'}">
+                        ${r.days_to_review < 0 ? Math.abs(r.days_to_review) + 'd overdue' : 'review in ' + r.days_to_review + 'd'}
+                      </span>
+                    `}
+                  </div>
+                </div>
+              </div>
+            `;
+          })}
+        </div>
+      `)
+    }
+  `;
+}
+
+// IATF doc detail — opened when user clicks any row in the dashboard.
+// Shows: full description, clauses satisfied, owner, review cadence, version
+// history. If auto-populated, embeds the live data via module_link. If manual,
+// offers upload + approve flow.
+function IatfDocDetail({ plant, me, row, setTab, onClose }) {
+  const [versions, setVersions] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showApprove, setShowApprove] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('iatf_document_versions')
+      .select('*, approver:approved_by(full_name), creator:created_by(full_name)')
+      .eq('plant_id', plant.id)
+      .eq('registry_id', row.registry_id)
+      .order('version_no', { ascending: false });
+    setVersions(data || []);
+    setLoading(false);
+  }, [plant.id, row.registry_id]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const canApprove = me.role === 'plant_head' || me.role === 'admin' || me.role === 'qa';
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:200px">
+        <h1 style="font-size:18px">${row.title}</h1>
+        <div class="sub">
+          <span class="mono">${row.doc_code}</span>
+          ${(row.clause_codes || []).map(c => html`<span class="badge" style="background:var(--slate-100);color:var(--slate-700);font-size:10px;margin-left:6px">§${c}</span>`)}
+        </div>
+      </div>
+      <span class=${'badge ' + (row.doc_status === 'approved' ? 'emerald' : row.doc_status === 'stale' ? 'amber' : row.doc_status === 'missing' ? 'rose' : '')}>${row.doc_status}</span>
+    </div>
+
+    <div class="card">
+      <div class="card-row"><span class="label">Owner role</span><span class="value">${row.owner_role || '—'}</span></div>
+      <div class="card-row"><span class="label">Populated by</span><span class="value">${row.populated_by === 'auto' ? '🔄 Auto (live data)' : row.populated_by === 'hybrid' ? '⚙️ Hybrid' : '📝 Manual upload'}</span></div>
+      ${row.review_cadence_days && html`<div class="card-row"><span class="label">Review cadence</span><span class="value">every ${row.review_cadence_days} days</span></div>`}
+      ${row.module_link && html`
+        <div class="card-row"><span class="label">Source module</span>
+          <button class="btn small ghost" onClick=${() => {
+            // Best-effort: parse module_link like '/quality/ncrs' → tab='quality'
+            const seg = (row.module_link || '').replace(/^\//,'').split('/')[0];
+            if (seg) setTab(seg);
+          }}>Open ${row.module_link} →</button>
+        </div>
+      `}
+    </div>
+
+    ${row.populated_by === 'auto' && row.doc_code === 'NCR-LOG' && html`<${IatfNcrRegisterLive} plant=${plant} />`}
+    ${row.populated_by === 'auto' && row.doc_code === 'CC-LOG' && html`<${IatfCustomerComplaintLive} plant=${plant} />`}
+    ${row.populated_by === 'auto' && row.doc_code === 'AF-LOG' && html`<${IatfAuditFindingsLive} plant=${plant} />`}
+
+    <div class="section-h">Versions
+      ${canApprove && html`<button class="btn small" onClick=${() => setShowApprove(true)}>+ Add version</button>`}
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      versions.length === 0 ? html`
+        <div class="card"><div class="empty">
+          <div class="icon">📄</div>
+          <div style="font-size:13px">No versions on file yet.</div>
+          ${row.populated_by === 'auto' ? html`<div style="font-size:11px;color:var(--slate-500);margin-top:4px">Live data above represents the current version — approve to lock in.</div>` : ''}
+        </div></div>
+      ` :
+      versions.map(v => html`
+        <div class="list-item" key=${v.id}>
+          <div class="list-item-row">
+            <div class="list-item-main">
+              <div class="list-item-title">Version ${v.version_no} <span class=${'badge ' + (v.status === 'approved' ? 'emerald' : v.status === 'obsolete' ? '' : 'amber')}>${v.status}</span></div>
+              <div class="list-item-sub">
+                ${v.effective_from ? 'effective ' + v.effective_from : ''}
+                ${v.next_review_at ? ' · review by ' + v.next_review_at : ''}
+                ${v.approver?.full_name ? ' · approved by ' + v.approver.full_name : ''}
+              </div>
+              ${v.notes && html`<div class="list-item-sub" style="margin-top:3px;font-style:italic">${v.notes}</div>`}
+            </div>
+            ${v.file_url && html`<a href=${v.file_url} target="_blank" rel="noopener" class="btn small ghost" style="padding:4px 10px">Open</a>`}
+          </div>
+        </div>
+      `)
+    }
+
+    ${showApprove && html`<${IatfVersionModal} plant=${plant} me=${me} row=${row}
+      currentVersion=${versions[0]?.version_no || 0}
+      onClose=${() => setShowApprove(false)}
+      onSaved=${() => { setShowApprove(false); refresh(); }} />`}
+  `;
+}
+
+// Modal to add a new version (manual or marking the auto doc as approved).
+function IatfVersionModal({ plant, me, row, currentVersion, onClose, onSaved }) {
+  const [fileUrl, setFileUrl] = useState('');
+  const [notes, setNotes] = useState('');
+  const [status, setStatus] = useState('approved');
+  const [effectiveFrom, setEffectiveFrom] = useState(new Date().toISOString().slice(0,10));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const reviewDate = (() => {
+    if (!row.review_cadence_days) return null;
+    const d = new Date(effectiveFrom);
+    d.setDate(d.getDate() + row.review_cadence_days);
+    return d.toISOString().slice(0,10);
+  })();
+
+  const save = async () => {
+    setSaving(true); setError('');
+    try {
+      const { error } = await sb.from('iatf_document_versions').insert({
+        plant_id: plant.id,
+        registry_id: row.registry_id,
+        version_no: currentVersion + 1,
+        status,
+        file_url: fileUrl || null,
+        notes: notes || null,
+        effective_from: effectiveFrom,
+        next_review_at: reviewDate,
+        approved_by: status === 'approved' ? me.id : null,
+        approved_at: status === 'approved' ? new Date().toISOString() : null,
+        created_by: me.id,
+      });
+      if (error) throw error;
+      showToast('Version saved');
+      onSaved();
+    } catch (e) { setError(e.message); } finally { setSaving(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Add version · ${row.doc_code}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <div class="field"><label>Status</label>
+          <select value=${status} onChange=${e => setStatus(e.target.value)}>
+            <option value="draft">Draft (not yet approved)</option>
+            <option value="approved">Approved (signs off official version)</option>
+          </select>
+        </div>
+        <div class="field"><label>Effective from</label>
+          <input type="date" value=${effectiveFrom} onChange=${e => setEffectiveFrom(e.target.value)} />
+        </div>
+        ${reviewDate && html`<div class="alert info" style="margin-bottom:14px">Next review auto-scheduled for <strong>${reviewDate}</strong> (cadence ${row.review_cadence_days}d)</div>`}
+        <div class="field"><label>File URL (optional)</label>
+          <input type="url" value=${fileUrl} onChange=${e => setFileUrl(e.target.value)} placeholder="https://… or leave blank if this is the live auto-doc" />
+        </div>
+        <div class="field"><label>Notes</label>
+          <textarea value=${notes} onChange=${e => setNotes(e.target.value)} placeholder="What changed in this version?" rows="3"></textarea>
+        </div>
+        <button class="btn" disabled=${saving} onClick=${save} style="width:100%">${saving ? 'Saving…' : 'Save version'}</button>
+      </div>
+    </div>
+  `;
+}
+
+// ── Auto-populated doc renderers (PoC: NCR / Customer Complaints / Audit Findings)
+function IatfNcrRegisterLive({ plant }) {
+  const [ncrs, setNcrs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    sb.from('mcp_quality_ncrs')
+      .select('id, ncr_number, source, title, severity, status, raised_by, created_at, qty_affected, root_cause, corrective_action, closed_at')
+      .eq('plant_id', plant.id)
+      .order('created_at', { ascending: false })
+      .then(({ data }) => { setNcrs(data || []); setLoading(false); });
+  }, [plant.id]);
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+  return html`
+    <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-top:14px">
+      <div style="font-weight:700;color:var(--teal-700);margin-bottom:8px">📊 Live data · ${ncrs.length} NCR${ncrs.length === 1 ? '' : 's'}</div>
+      <div style="font-size:11px;color:var(--slate-600);margin-bottom:10px">This document auto-populates from <code>mcp_quality_ncrs</code>. Every NCR raised in the Quality module appears here in real time. To freeze a version for audit (e.g., quarterly), click "Add version" below.</div>
+      ${ncrs.length === 0 ? html`<div class="empty" style="padding:14px;color:var(--slate-500)">No NCRs raised yet</div>` :
+        html`<div style="display:flex;flex-direction:column;gap:6px">
+          ${ncrs.slice(0, 50).map(n => html`
+            <div key=${n.id} style="background:white;border-radius:6px;padding:8px 10px;border:1px solid var(--slate-200)">
+              <div style="display:flex;justify-content:space-between;font-size:12px">
+                <span class="mono" style="font-weight:600">${n.ncr_number}</span>
+                <span class=${'badge ' + (n.severity === 'critical' ? 'rose' : n.severity === 'major' ? 'amber' : '')} style="font-size:10px">${n.severity}</span>
+              </div>
+              <div style="font-size:12px;color:var(--slate-700);margin-top:2px">${n.title}</div>
+              <div style="font-size:10px;color:var(--slate-500);margin-top:3px">${n.source} · ${n.status} · ${n.created_at?.slice(0,10)}${n.closed_at ? ' · closed ' + n.closed_at.slice(0,10) : ''}</div>
+            </div>
+          `)}
+          ${ncrs.length > 50 && html`<div style="font-size:11px;color:var(--slate-500);text-align:center;padding:6px">…and ${ncrs.length - 50} more</div>`}
+        </div>`
+      }
+    </div>
+  `;
+}
+
+function IatfCustomerComplaintLive({ plant }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    sb.from('mcp_quality_ncrs')
+      .select('id, ncr_number, title, severity, status, created_at, closed_at')
+      .eq('plant_id', plant.id)
+      .eq('source', 'customer_complaint')
+      .order('created_at', { ascending: false })
+      .then(({ data }) => { setRows(data || []); setLoading(false); });
+  }, [plant.id]);
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+  return html`
+    <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-top:14px">
+      <div style="font-weight:700;color:var(--teal-700);margin-bottom:8px">📊 Live · ${rows.length} customer complaint${rows.length === 1 ? '' : 's'}</div>
+      <div style="font-size:11px;color:var(--slate-600);margin-bottom:10px">Subset of NCRs with source = customer_complaint. Satisfies IATF §10.2.6.</div>
+      ${rows.length === 0 ? html`<div class="empty" style="padding:14px;color:var(--slate-500)">No customer complaints — good!</div>` :
+        rows.map(n => html`
+          <div key=${n.id} style="background:white;border-radius:6px;padding:8px 10px;border:1px solid var(--slate-200);margin-bottom:6px">
+            <div style="display:flex;justify-content:space-between;font-size:12px">
+              <span class="mono" style="font-weight:600">${n.ncr_number}</span>
+              <span class=${'badge ' + (n.severity === 'critical' ? 'rose' : n.severity === 'major' ? 'amber' : '')} style="font-size:10px">${n.severity}</span>
+            </div>
+            <div style="font-size:12px;color:var(--slate-700);margin-top:2px">${n.title}</div>
+            <div style="font-size:10px;color:var(--slate-500);margin-top:3px">${n.status} · ${n.created_at?.slice(0,10)}${n.closed_at ? ' · closed ' + n.closed_at.slice(0,10) : ''}</div>
+          </div>
+        `)
+      }
+    </div>
+  `;
+}
+
+function IatfAuditFindingsLive({ plant }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    sb.from('actions')
+      .select('id, title, description, status, created_at, completed_at, owner_id, source_label')
+      .eq('plant_id', plant.id)
+      .eq('source_type', 'audit_finding')
+      .order('created_at', { ascending: false })
+      .then(({ data }) => { setRows(data || []); setLoading(false); });
+  }, [plant.id]);
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+  return html`
+    <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-top:14px">
+      <div style="font-weight:700;color:var(--teal-700);margin-bottom:8px">📊 Live · ${rows.length} audit finding${rows.length === 1 ? '' : 's'}</div>
+      <div style="font-size:11px;color:var(--slate-600);margin-bottom:10px">Subset of actions with source_type = audit_finding. Satisfies IATF §9.2 + §10.2.</div>
+      ${rows.length === 0 ? html`<div class="empty" style="padding:14px;color:var(--slate-500)">No audit findings logged yet. Findings auto-flow here as auditors raise them.</div>` :
+        rows.map(a => html`
+          <div key=${a.id} style="background:white;border-radius:6px;padding:8px 10px;border:1px solid var(--slate-200);margin-bottom:6px">
+            <div style="display:flex;justify-content:space-between;font-size:12px">
+              <span style="font-weight:600">${a.title}</span>
+              <span class=${'badge ' + (a.status === 'completed' ? 'emerald' : a.status === 'in_progress' ? 'amber' : '')} style="font-size:10px">${a.status}</span>
+            </div>
+            ${a.source_label && html`<div style="font-size:10px;color:var(--slate-500);margin-top:2px">${a.source_label}</div>`}
+            <div style="font-size:10px;color:var(--slate-500);margin-top:3px">opened ${a.created_at?.slice(0,10)}${a.completed_at ? ' · closed ' + a.completed_at.slice(0,10) : ''}</div>
+          </div>
+        `)
+      }
     </div>
   `;
 }
