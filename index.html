@@ -1051,6 +1051,8 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
       <${Page} active=${tab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
+      <${Page} active=${tab === 'calibration'}><${CalibrationModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'training'}><${TrainingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
 
       <div class="tabbar">
@@ -1058,7 +1060,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
     </div>
   `;
@@ -5173,6 +5175,8 @@ function More({ plant, me, user, logout, setTab, activeUnit, accessibleUnits }) 
   const [unitAccessOpen, setUnitAccessOpen] = useState(false);
   const navItems = [
     { key:'iatf', icon:'🛡', label:'IATF 16949 · Audit Readiness', sub:'All required documents, status, owners, review cadences' },
+    { key:'calibration', icon:'📏', label:'Calibration Register', sub:'Instruments, calibration history, due/overdue alerts (IATF 7.1.5.2)' },
+    { key:'training', icon:'🎓', label:'Training Matrix', sub:'Skills, training records, validity per employee (IATF 7.2)' },
     { key:'schedules', icon:'📅', label:'Customer Schedules', sub:'Plan vs actual, weekly buckets, AI extract' },
     { key:'movements', icon:'🔀', label:'Movements', sub:'In/out material flow, GRN verification' },
     { key:'trace', icon:'🔍', label:'Trace · Audit Investigation', sub:'Linked timeline by date/part/machine' },
@@ -5244,6 +5248,620 @@ function More({ plant, me, user, logout, setTab, activeUnit, accessibleUnits }) 
     <${InstallAppCard} />
 
     <button class="btn danger" style="margin-top:14px" onClick=${logout}>Log out</button>
+  `;
+}
+
+// =================================================================
+// CALIBRATION MODULE (IATF 7.1.5.2 — Monitoring & Measuring Resources)
+// =================================================================
+function CalibrationModule({ plant, me }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState('all');  // all | overdue | due_soon | current
+  const [editTarget, setEditTarget] = useState(null);     // instrument row for edit
+  const [calTarget, setCalTarget] = useState(null);       // instrument to log cal against
+  const [historyTarget, setHistoryTarget] = useState(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('v_iatf_calibration_register').select('*');
+    setRows(data || []);
+    setLoading(false);
+  }, []);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  // Stats
+  const stats = useMemo(() => {
+    const inService = rows.filter(r => r.status === 'in_service');
+    return {
+      total: rows.length,
+      inService: inService.length,
+      overdue: inService.filter(r => r.due_status === 'overdue').length,
+      dueSoon: inService.filter(r => r.due_status === 'due_soon').length,
+    };
+  }, [rows]);
+
+  let filtered = rows;
+  if (filter === 'overdue')   filtered = filtered.filter(r => r.due_status === 'overdue');
+  if (filter === 'due_soon')  filtered = filtered.filter(r => r.due_status === 'due_soon');
+  if (filter === 'current')   filtered = filtered.filter(r => r.due_status === 'current');
+  if (search.trim()) {
+    const q = search.toLowerCase();
+    filtered = filtered.filter(r =>
+      (r.instrument_code || '').toLowerCase().includes(q) ||
+      (r.name || '').toLowerCase().includes(q) ||
+      (r.instrument_type || '').toLowerCase().includes(q) ||
+      (r.location || '').toLowerCase().includes(q)
+    );
+  }
+
+  const dueColor = (s) => s === 'overdue' ? 'rose' : s === 'due_soon' ? 'amber' : s === 'current' ? 'emerald' : '';
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:center">
+      <div><h1>Calibration Register</h1><div class="sub">IATF 7.1.5.2 · Instruments + history + due alerts</div></div>
+      <button class="btn" onClick=${() => setEditTarget({ _new: true })}>+ Add Instrument</button>
+    </div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr)">
+      <div class="stat"><div class="stat-num">${stats.total}</div><div class="stat-label">Total</div></div>
+      <div class="stat ${stats.inService > 0 ? 'emerald' : ''}"><div class="stat-num">${stats.inService}</div><div class="stat-label">In service</div></div>
+      <div class="stat ${stats.dueSoon > 0 ? 'amber' : 'teal'}"><div class="stat-num">${stats.dueSoon}</div><div class="stat-label">Due ≤30d</div></div>
+      <div class="stat ${stats.overdue > 0 ? 'rose' : 'teal'}"><div class="stat-num">${stats.overdue}</div><div class="stat-label">Overdue</div></div>
+    </div>
+
+    <div style="margin-bottom:10px">
+      <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search code, name, type, location…" style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap">
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All ${rows.length}</button>
+      <button class=${'auth-tab' + (filter === 'overdue' ? ' active' : '')} onClick=${() => setFilter('overdue')} style=${stats.overdue > 0 ? 'color:var(--rose-600)' : ''}>Overdue${stats.overdue > 0 ? ' · ' + stats.overdue : ''}</button>
+      <button class=${'auth-tab' + (filter === 'due_soon' ? ' active' : '')} onClick=${() => setFilter('due_soon')} style=${stats.dueSoon > 0 ? 'color:var(--amber-700)' : ''}>Due ≤30d${stats.dueSoon > 0 ? ' · ' + stats.dueSoon : ''}</button>
+      <button class=${'auth-tab' + (filter === 'current' ? ' active' : '')} onClick=${() => setFilter('current')}>Current</button>
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      filtered.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📏</div>No instruments match. Add the first one to start tracking.</div></div>` :
+      filtered.map(r => html`
+        <div class="list-item" key=${r.record_id}>
+          <div class="list-item-row" style="align-items:flex-start">
+            <div class="list-item-main">
+              <div class="list-item-title">${r.instrument_code} · ${r.name}</div>
+              <div class="list-item-sub">${r.instrument_type}${r.range_spec ? ' · ' + r.range_spec : ''}${r.location ? ' · 📍 ' + r.location : ''}</div>
+              <div class="list-item-sub" style="margin-top:3px">
+                Last cal: ${r.last_calibration_date || '—'} · Next due: <strong>${r.next_calibration_date || '—'}</strong>
+                ${r.traceable_to ? html` · 🔗 ${r.traceable_to}` : ''}
+              </div>
+              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                <span class=${'badge ' + (r.status === 'in_service' ? 'emerald' : r.status === 'out_of_service' ? 'rose' : '')}>${r.status?.replace('_',' ')}</span>
+                ${r.due_status && r.due_status !== 'no_schedule' && html`<span class=${'badge ' + dueColor(r.due_status)} style="font-size:10px">${r.due_status === 'overdue' ? '⚠ ' + Math.abs(r.days_to_due) + 'd overdue' : r.due_status === 'due_soon' ? r.days_to_due + 'd to due' : 'on schedule'}</span>`}
+                ${r.last_result && r.last_result !== 'pass' && html`<span class="badge rose" style="font-size:10px">${r.last_result.replace('_',' ')}</span>`}
+                <button class="btn small ghost" style="padding:2px 8px;font-size:11px;margin-left:auto" onClick=${() => setHistoryTarget(r)}>History</button>
+                <button class="btn small" style="padding:2px 10px;font-size:11px" onClick=${() => setCalTarget(r)}>+ Log Cal</button>
+                <button class="btn small ghost" style="padding:2px 8px;font-size:11px" onClick=${() => setEditTarget(r)}>Edit</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      `)
+    }
+
+    ${editTarget && html`<${InstrumentEditModal} plant=${plant} me=${me} row=${editTarget} onClose=${() => setEditTarget(null)} onSaved=${() => { setEditTarget(null); refresh(); }} />`}
+    ${calTarget && html`<${CalibrationRecordModal} plant=${plant} me=${me} instrument=${calTarget} onClose=${() => setCalTarget(null)} onSaved=${() => { setCalTarget(null); refresh(); }} />`}
+    ${historyTarget && html`<${CalibrationHistoryDrawer} plant=${plant} instrument=${historyTarget} onClose=${() => setHistoryTarget(null)} />`}
+  `;
+}
+
+function InstrumentEditModal({ plant, me, row, onClose, onSaved }) {
+  const isNew = !!row._new;
+  const [f, setF] = useState({
+    code: row.instrument_code || '',
+    name: row.name || '',
+    instrument_type: row.instrument_type || 'vernier',
+    range_spec: row.range_spec || '',
+    location: row.location || '',
+    serial_no: row.serial_no || '',
+    manufacturer: row.manufacturer || '',
+    status: row.status || 'in_service',
+    calibration_frequency_days: row.calibration_frequency_days || 365,
+    last_calibration_date: row.last_calibration_date || '',
+    traceable_to: row.traceable_to || '',
+    notes: row.notes || '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const save = async () => {
+    if (!f.code.trim() || !f.name.trim()) { setError('Code and name are required'); return; }
+    setSaving(true); setError('');
+    const payload = {
+      plant_id: plant.id,
+      code: f.code.trim(),
+      name: f.name.trim(),
+      instrument_type: f.instrument_type,
+      range_spec: f.range_spec || null,
+      location: f.location || null,
+      serial_no: f.serial_no || null,
+      manufacturer: f.manufacturer || null,
+      status: f.status,
+      calibration_frequency_days: parseInt(f.calibration_frequency_days) || 365,
+      last_calibration_date: f.last_calibration_date || null,
+      next_calibration_date: f.last_calibration_date
+        ? new Date(new Date(f.last_calibration_date).getTime() + (parseInt(f.calibration_frequency_days) || 365) * 86400000).toISOString().slice(0,10)
+        : null,
+      traceable_to: f.traceable_to || null,
+      notes: f.notes || null,
+    };
+    let err;
+    if (isNew) ({ error: err } = await sb.from('iatf_instruments').insert(payload));
+    else       ({ error: err } = await sb.from('iatf_instruments').update(payload).eq('id', row.record_id));
+    if (err) { setError(err.message); setSaving(false); return; }
+    showToast(isNew ? '✓ Instrument added' : '✓ Updated');
+    onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:520px">
+        <div class="modal-header">
+          <div class="modal-title">${isNew ? '+ Add Instrument' : 'Edit · ' + row.instrument_code}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <div class="field-row">
+          <div class="field"><label>Code *</label><input value=${f.code} onChange=${e => setF({...f, code: e.target.value})} placeholder="VC-04" /></div>
+          <div class="field"><label>Type *</label>
+            <select value=${f.instrument_type} onChange=${e => setF({...f, instrument_type: e.target.value})}>
+              <option value="vernier">Vernier caliper</option>
+              <option value="micrometer">Micrometer</option>
+              <option value="gauge">Gauge</option>
+              <option value="scale">Weighing scale</option>
+              <option value="thermometer">Thermometer / temp probe</option>
+              <option value="other">Other</option>
+            </select>
+          </div>
+        </div>
+        <div class="field"><label>Name *</label><input value=${f.name} onChange=${e => setF({...f, name: e.target.value})} placeholder="Vernier Caliper 0-150 mm" /></div>
+        <div class="field-row">
+          <div class="field"><label>Range / Resolution</label><input value=${f.range_spec} onChange=${e => setF({...f, range_spec: e.target.value})} placeholder="0-150 mm / 0.02 mm" /></div>
+          <div class="field"><label>Location</label><input value=${f.location} onChange=${e => setF({...f, location: e.target.value})} placeholder="Unit 2 QC bench" /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Serial #</label><input value=${f.serial_no} onChange=${e => setF({...f, serial_no: e.target.value})} /></div>
+          <div class="field"><label>Manufacturer</label><input value=${f.manufacturer} onChange=${e => setF({...f, manufacturer: e.target.value})} /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Cal frequency (days) *</label><input type="number" min="30" value=${f.calibration_frequency_days} onChange=${e => setF({...f, calibration_frequency_days: e.target.value})} /></div>
+          <div class="field"><label>Status</label>
+            <select value=${f.status} onChange=${e => setF({...f, status: e.target.value})}>
+              <option value="in_service">In service</option>
+              <option value="in_calibration">In calibration</option>
+              <option value="out_of_service">Out of service</option>
+              <option value="retired">Retired</option>
+            </select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Last cal date</label><input type="date" value=${f.last_calibration_date} onChange=${e => setF({...f, last_calibration_date: e.target.value})} /></div>
+          <div class="field"><label>Traceable to</label><input value=${f.traceable_to} onChange=${e => setF({...f, traceable_to: e.target.value})} placeholder="NABL Lab X" /></div>
+        </div>
+        <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
+        <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Create instrument' : 'Save')}</button>
+      </div>
+    </div>
+  `;
+}
+
+function CalibrationRecordModal({ plant, me, instrument, onClose, onSaved }) {
+  const [f, setF] = useState({
+    calibration_date: new Date().toISOString().slice(0,10),
+    performed_by_external: '',
+    certificate_no: '',
+    certificate_url: '',
+    result: 'pass',
+    out_of_tolerance_action: '',
+    notes: '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const save = async () => {
+    setSaving(true); setError('');
+    const { error: err } = await sb.from('iatf_calibration_records').insert({
+      plant_id: plant.id,
+      instrument_id: instrument.record_id,
+      calibration_date: f.calibration_date,
+      performed_by_user_id: me.id,
+      performed_by_external: f.performed_by_external || null,
+      certificate_no: f.certificate_no || null,
+      certificate_url: f.certificate_url || null,
+      result: f.result,
+      out_of_tolerance_action: f.result !== 'pass' ? (f.out_of_tolerance_action || null) : null,
+      notes: f.notes || null,
+      created_by: me.id,
+    });
+    if (err) { setError(err.message); setSaving(false); return; }
+    showToast('✓ Calibration logged' + (f.result !== 'pass' ? ' · QA action auto-raised' : ''));
+    onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:520px">
+        <div class="modal-header">
+          <div class="modal-title">+ Log Calibration · ${instrument.instrument_code}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card" style="background:var(--slate-50);margin-bottom:14px">
+          <div class="card-row"><span class="label">Instrument</span><span class="value">${instrument.name}</span></div>
+          <div class="card-row"><span class="label">Frequency</span><span class="value">Every ${instrument.calibration_frequency_days} days</span></div>
+          <div class="card-row"><span class="label">Last cal</span><span class="value">${instrument.last_calibration_date || 'never'}</span></div>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <div class="field-row">
+          <div class="field"><label>Calibration date *</label><input type="date" value=${f.calibration_date} onChange=${e => setF({...f, calibration_date: e.target.value})} /></div>
+          <div class="field"><label>Result *</label>
+            <select value=${f.result} onChange=${e => setF({...f, result: e.target.value})}>
+              <option value="pass">✅ Pass</option>
+              <option value="out_of_tolerance">⚠️ Out of tolerance</option>
+              <option value="fail">❌ Fail</option>
+            </select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>External lab (optional)</label><input value=${f.performed_by_external} onChange=${e => setF({...f, performed_by_external: e.target.value})} placeholder="NABL Lab X" /></div>
+          <div class="field"><label>Certificate #</label><input value=${f.certificate_no} onChange=${e => setF({...f, certificate_no: e.target.value})} /></div>
+        </div>
+        <div class="field"><label>Certificate URL</label><input type="url" value=${f.certificate_url} onChange=${e => setF({...f, certificate_url: e.target.value})} placeholder="https://…" /></div>
+        ${f.result !== 'pass' && html`
+          <div class="alert info" style="background:var(--amber-50);border-color:var(--amber-200);color:var(--amber-800)">
+            ⚠ Action will be auto-raised for QA to quarantine all parts inspected with this instrument since the last good cal.
+          </div>
+          <div class="field"><label>Containment action taken</label><textarea rows="2" value=${f.out_of_tolerance_action} onChange=${e => setF({...f, out_of_tolerance_action: e.target.value})}></textarea></div>
+        `}
+        <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
+        <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : 'Log calibration'}</button>
+      </div>
+    </div>
+  `;
+}
+
+function CalibrationHistoryDrawer({ plant, instrument, onClose }) {
+  const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    sb.from('iatf_calibration_records')
+      .select('*, performed_by:performed_by_user_id(full_name)')
+      .eq('instrument_id', instrument.record_id)
+      .order('calibration_date', { ascending: false })
+      .then(({ data }) => { setHistory(data || []); setLoading(false); });
+  }, [instrument.record_id]);
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header">
+          <div class="modal-title">History · ${instrument.instrument_code}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+          history.length === 0 ? html`<div class="empty">No calibration history yet.</div>` :
+          history.map(r => html`
+            <div class="card" key=${r.id} style="margin-bottom:8px">
+              <div class="card-row"><span class="label">Date</span><span class="value">${r.calibration_date}</span></div>
+              <div class="card-row"><span class="label">Result</span><span class="value"><span class=${'badge ' + (r.result === 'pass' ? 'emerald' : 'rose')}>${r.result.replace('_',' ')}</span></span></div>
+              <div class="card-row"><span class="label">Performed by</span><span class="value">${r.performed_by?.full_name || r.performed_by_external || '—'}</span></div>
+              ${r.certificate_no && html`<div class="card-row"><span class="label">Cert #</span><span class="value mono">${r.certificate_no}</span></div>`}
+              <div class="card-row"><span class="label">Next due</span><span class="value">${r.next_due_date || '—'}</span></div>
+              ${r.notes && html`<div class="card-row"><span class="label">Notes</span><span class="value" style="font-size:11px;color:var(--slate-600)">${r.notes}</span></div>`}
+            </div>
+          `)
+        }
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// TRAINING MODULE (IATF 7.2 — Competence)
+// =================================================================
+function TrainingModule({ plant, me }) {
+  const [view, setView] = useState('records');  // records | skills
+  const [rows, setRows] = useState([]);
+  const [skills, setSkills] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState('all');  // all | valid | expiring_soon | expired
+  const [loading, setLoading] = useState(true);
+  const [skillTarget, setSkillTarget] = useState(null);
+  const [trainTarget, setTrainTarget] = useState(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [r, s, u] = await Promise.all([
+      sb.from('v_iatf_training_matrix').select('*'),
+      sb.from('iatf_skills').select('*').order('category').order('code'),
+      sb.from('users').select('id, full_name, role').eq('status','active').order('full_name'),
+    ]);
+    setRows(r.data || []);
+    setSkills(s.data || []);
+    setUsers(u.data || []);
+    setLoading(false);
+  }, []);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const stats = useMemo(() => ({
+    total: rows.length,
+    valid: rows.filter(r => r.validity_status === 'valid' || r.validity_status === 'lifetime').length,
+    expiring: rows.filter(r => r.validity_status === 'expiring_soon').length,
+    expired: rows.filter(r => r.validity_status === 'expired').length,
+  }), [rows]);
+
+  let filtered = rows;
+  if (filter === 'valid')          filtered = filtered.filter(r => r.validity_status === 'valid' || r.validity_status === 'lifetime');
+  if (filter === 'expiring_soon')  filtered = filtered.filter(r => r.validity_status === 'expiring_soon');
+  if (filter === 'expired')        filtered = filtered.filter(r => r.validity_status === 'expired');
+  if (search.trim()) {
+    const q = search.toLowerCase();
+    filtered = filtered.filter(r =>
+      (r.employee || '').toLowerCase().includes(q) ||
+      (r.skill_code || '').toLowerCase().includes(q) ||
+      (r.skill || '').toLowerCase().includes(q)
+    );
+  }
+
+  const validityBadge = (s) => s === 'expired' ? 'rose' : s === 'expiring_soon' ? 'amber' : s === 'valid' ? 'emerald' : '';
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:center">
+      <div><h1>Training Matrix</h1><div class="sub">IATF 7.2 · Skills, training records, validity</div></div>
+      <div style="display:flex;gap:6px">
+        <button class="btn ghost small" onClick=${() => setSkillTarget({ _new: true })}>+ Skill</button>
+        <button class="btn" onClick=${() => setTrainTarget({ _new: true })}>+ Log Training</button>
+      </div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (view === 'records' ? ' active' : '')} onClick=${() => setView('records')}>Records · ${rows.length}</button>
+      <button class=${'auth-tab' + (view === 'skills' ? ' active' : '')} onClick=${() => setView('skills')}>Skill Master · ${skills.length}</button>
+    </div>
+
+    ${view === 'records' && html`
+      <div class="stat-grid" style="grid-template-columns:repeat(4,1fr)">
+        <div class="stat"><div class="stat-num">${stats.total}</div><div class="stat-label">Records</div></div>
+        <div class="stat emerald"><div class="stat-num">${stats.valid}</div><div class="stat-label">Valid</div></div>
+        <div class="stat ${stats.expiring > 0 ? 'amber' : 'teal'}"><div class="stat-num">${stats.expiring}</div><div class="stat-label">Expiring ≤30d</div></div>
+        <div class="stat ${stats.expired > 0 ? 'rose' : 'teal'}"><div class="stat-num">${stats.expired}</div><div class="stat-label">Expired</div></div>
+      </div>
+
+      <div style="margin-bottom:10px">
+        <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search employee or skill…" style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+      </div>
+
+      <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap">
+        <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
+        <button class=${'auth-tab' + (filter === 'valid' ? ' active' : '')} onClick=${() => setFilter('valid')}>Valid</button>
+        <button class=${'auth-tab' + (filter === 'expiring_soon' ? ' active' : '')} onClick=${() => setFilter('expiring_soon')} style=${stats.expiring > 0 ? 'color:var(--amber-700)' : ''}>Expiring${stats.expiring > 0 ? ' · ' + stats.expiring : ''}</button>
+        <button class=${'auth-tab' + (filter === 'expired' ? ' active' : '')} onClick=${() => setFilter('expired')} style=${stats.expired > 0 ? 'color:var(--rose-600)' : ''}>Expired${stats.expired > 0 ? ' · ' + stats.expired : ''}</button>
+      </div>
+
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        filtered.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🎓</div>No training records match. Click "+ Log Training" to capture the first one.</div></div>` :
+        filtered.map(r => html`
+          <div class="list-item" key=${r.record_id}>
+            <div class="list-item-row" style="align-items:flex-start">
+              <div class="list-item-main">
+                <div class="list-item-title">${r.employee} · ${r.skill}</div>
+                <div class="list-item-sub">
+                  Skill code ${r.skill_code} · ${r.skill_category} · Trained ${r.trained_on}
+                  ${r.trainer ? ' · by ' + r.trainer : ''}
+                </div>
+                <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                  <span class=${'badge ' + validityBadge(r.validity_status)} style="font-size:10px">${r.validity_status === 'lifetime' ? '∞ lifetime' : r.validity_status?.replace('_',' ')}</span>
+                  ${r.days_to_expiry !== null && r.days_to_expiry !== undefined && html`<span style="font-size:11px;color:var(--slate-600)">${r.days_to_expiry < 0 ? Math.abs(r.days_to_expiry) + 'd overdue' : r.days_to_expiry + 'd to expiry'}</span>`}
+                  ${r.evaluation_score && html`<span style="font-size:11px;color:var(--slate-700)">Eval: ${r.evaluation_score}</span>`}
+                </div>
+              </div>
+            </div>
+          </div>
+        `)
+      }
+    `}
+
+    ${view === 'skills' && html`
+      ${skills.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🧠</div>No skills defined. Add one to start.</div></div>` :
+        skills.map(s => html`
+          <div class="list-item" key=${s.id} onClick=${() => setSkillTarget(s)}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${s.code} · ${s.name}</div>
+                <div class="list-item-sub">
+                  <span class="badge ${s.category === 'safety' ? 'rose' : s.category === 'quality' ? 'amber' : 'teal'}" style="font-size:9px">${s.category}</span>
+                  · ${s.validity_days ? 'Validity ' + s.validity_days + ' days' : 'Lifetime'}
+                  ${s.required_for_roles?.length > 0 ? ' · Required for: ' + s.required_for_roles.join(', ') : ''}
+                </div>
+                ${s.description && html`<div class="list-item-sub" style="margin-top:3px;font-style:italic">${s.description}</div>`}
+              </div>
+              <span style="color:var(--slate-400)">›</span>
+            </div>
+          </div>
+        `)
+      }
+    `}
+
+    ${skillTarget && html`<${SkillEditModal} plant=${plant} me=${me} row=${skillTarget} onClose=${() => setSkillTarget(null)} onSaved=${() => { setSkillTarget(null); refresh(); }} />`}
+    ${trainTarget && html`<${TrainingRecordModal} plant=${plant} me=${me} users=${users} skills=${skills} onClose=${() => setTrainTarget(null)} onSaved=${() => { setTrainTarget(null); refresh(); }} />`}
+  `;
+}
+
+function SkillEditModal({ plant, me, row, onClose, onSaved }) {
+  const isNew = !!row._new;
+  const [f, setF] = useState({
+    code: row.code || '',
+    name: row.name || '',
+    category: row.category || 'production',
+    description: row.description || '',
+    validity_days: row.validity_days ?? '',
+    required_for_roles: row.required_for_roles || [],
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const toggleRole = (r) => {
+    setF(prev => ({
+      ...prev,
+      required_for_roles: prev.required_for_roles.includes(r)
+        ? prev.required_for_roles.filter(x => x !== r)
+        : [...prev.required_for_roles, r],
+    }));
+  };
+
+  const save = async () => {
+    if (!f.code.trim() || !f.name.trim()) { setError('Code and name required'); return; }
+    setSaving(true); setError('');
+    const payload = {
+      plant_id: plant.id,
+      code: f.code.trim(),
+      name: f.name.trim(),
+      category: f.category,
+      description: f.description || null,
+      validity_days: f.validity_days ? parseInt(f.validity_days) : null,
+      required_for_roles: f.required_for_roles,
+    };
+    let err;
+    if (isNew) ({ error: err } = await sb.from('iatf_skills').insert(payload));
+    else       ({ error: err } = await sb.from('iatf_skills').update(payload).eq('id', row.id));
+    if (err) { setError(err.message); setSaving(false); return; }
+    showToast(isNew ? '✓ Skill added' : '✓ Updated');
+    onSaved();
+  };
+
+  const ALL_ROLES = ['plant_head','admin','supervisor','qa','operator','store','driver','toolroom'];
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:520px">
+        <div class="modal-header">
+          <div class="modal-title">${isNew ? '+ Add Skill' : 'Edit Skill · ' + row.code}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <div class="field-row">
+          <div class="field"><label>Code *</label><input value=${f.code} onChange=${e => setF({...f, code: e.target.value})} placeholder="PDC-OP-L2" /></div>
+          <div class="field"><label>Category *</label>
+            <select value=${f.category} onChange=${e => setF({...f, category: e.target.value})}>
+              <option value="production">Production</option>
+              <option value="quality">Quality</option>
+              <option value="maintenance">Maintenance</option>
+              <option value="safety">Safety</option>
+              <option value="admin">Admin</option>
+              <option value="other">Other</option>
+            </select>
+          </div>
+        </div>
+        <div class="field"><label>Name *</label><input value=${f.name} onChange=${e => setF({...f, name: e.target.value})} placeholder="PDC Operator — Level 2" /></div>
+        <div class="field"><label>Description</label><textarea rows="2" value=${f.description} onChange=${e => setF({...f, description: e.target.value})}></textarea></div>
+        <div class="field"><label>Validity (days) <span style="font-weight:400;color:var(--slate-500);font-size:11px">— leave blank for lifetime</span></label>
+          <input type="number" min="30" value=${f.validity_days} onChange=${e => setF({...f, validity_days: e.target.value})} placeholder="365 (annual)" />
+        </div>
+        <div class="field"><label>Required for roles</label>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+            ${ALL_ROLES.map(r => html`
+              <button key=${r} type="button" class=${'btn small ' + (f.required_for_roles.includes(r) ? '' : 'ghost')} style="padding:4px 10px;font-size:11px" onClick=${() => toggleRole(r)}>${r}</button>
+            `)}
+          </div>
+        </div>
+        <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Create skill' : 'Save')}</button>
+      </div>
+    </div>
+  `;
+}
+
+function TrainingRecordModal({ plant, me, users, skills, onClose, onSaved }) {
+  const [f, setF] = useState({
+    user_id: '',
+    skill_id: '',
+    trained_on: new Date().toISOString().slice(0,10),
+    trainer_user_id: '',
+    trainer_external: '',
+    evaluation_method: 'Practical demo',
+    evaluation_score: '',
+    certificate_url: '',
+    notes: '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const save = async () => {
+    if (!f.user_id || !f.skill_id) { setError('Employee and skill required'); return; }
+    setSaving(true); setError('');
+    const { error: err } = await sb.from('iatf_training_records').insert({
+      plant_id: plant.id,
+      user_id: f.user_id,
+      skill_id: f.skill_id,
+      trained_on: f.trained_on,
+      trainer_user_id: f.trainer_user_id || null,
+      trainer_external: f.trainer_external || null,
+      evaluation_method: f.evaluation_method || null,
+      evaluation_score: f.evaluation_score || null,
+      certificate_url: f.certificate_url || null,
+      notes: f.notes || null,
+      created_by: me.id,
+    });
+    if (err) { setError(err.message); setSaving(false); return; }
+    showToast('✓ Training record added');
+    onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:520px">
+        <div class="modal-header">
+          <div class="modal-title">+ Log Training Record</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <div class="field"><label>Employee *</label>
+          <select value=${f.user_id} onChange=${e => setF({...f, user_id: e.target.value})}>
+            <option value="">— select —</option>
+            ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${u.role})</option>`)}
+          </select>
+        </div>
+        <div class="field"><label>Skill *</label>
+          <select value=${f.skill_id} onChange=${e => setF({...f, skill_id: e.target.value})}>
+            <option value="">— select —</option>
+            ${skills.map(s => html`<option key=${s.id} value=${s.id}>${s.code} · ${s.name}${s.validity_days ? ` (validity ${s.validity_days}d)` : ' (lifetime)'}</option>`)}
+          </select>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Trained on *</label><input type="date" value=${f.trained_on} onChange=${e => setF({...f, trained_on: e.target.value})} /></div>
+          <div class="field"><label>Method</label>
+            <select value=${f.evaluation_method} onChange=${e => setF({...f, evaluation_method: e.target.value})}>
+              <option>Practical demo</option>
+              <option>Written test</option>
+              <option>On-job</option>
+              <option>Workshop</option>
+              <option>Other</option>
+            </select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Trainer (internal)</label>
+            <select value=${f.trainer_user_id} onChange=${e => setF({...f, trainer_user_id: e.target.value})}>
+              <option value="">— select —</option>
+              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Trainer (external)</label><input value=${f.trainer_external} onChange=${e => setF({...f, trainer_external: e.target.value})} placeholder="If outside trainer" /></div>
+        </div>
+        <div class="field"><label>Evaluation score</label><input value=${f.evaluation_score} onChange=${e => setF({...f, evaluation_score: e.target.value})} placeholder="85/100 or Satisfactory" /></div>
+        <div class="field"><label>Certificate URL</label><input type="url" value=${f.certificate_url} onChange=${e => setF({...f, certificate_url: e.target.value})} placeholder="https://…" /></div>
+        <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
+        <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : 'Log training'}</button>
+      </div>
+    </div>
   `;
 }
 
@@ -11945,6 +12563,12 @@ const REPORT_CATALOG = [
   { id:'iatf_preventive_actions', title:'Preventive Action Log', dept:'quality', clauses:['10.3.1'], frequency:'monthly',
     desc:'Open preventive actions across audit/risk/MOM with overdue flags.', icon:'🛡',
     view:'v_iatf_preventive_actions' },
+  { id:'iatf_cal_register', title:'Calibration Register', dept:'maintenance', clauses:['7.1.5.2'], frequency:'monthly',
+    desc:'All measuring instruments with calibration history, due dates, NABL traceability.', icon:'📏',
+    view:'v_iatf_calibration_register' },
+  { id:'iatf_training_matrix', title:'Training Matrix', dept:'people', clauses:['7.2'], frequency:'on_demand',
+    desc:'Every training record per employee per skill with validity status.', icon:'🎓',
+    view:'v_iatf_training_matrix' },
 ];
 
 const DEPT_LABELS = {
@@ -12060,16 +12684,14 @@ const IATF_RECORDS = [
   // ============================================================
   // BLOCK 3 — New modules required (~30 more, planned)
   // ============================================================
-  { name:'Calibration Register', clause:'7.1.5.2', dept:'maintenance', block:3, frequency:'on_demand',
-    note:'Need calibration module — instruments, frequencies, due dates' },
+  { name:'Calibration Register', clause:'7.1.5.2', dept:'maintenance', block:1, reportId:'iatf_cal_register', frequency:'on_demand' },
   { name:'Calibration Due List', clause:'7.1.5.2', dept:'maintenance', block:3, frequency:'monthly',
     note:'Instruments due for calibration in next 30/60 days' },
   { name:'Out-of-Tolerance Log', clause:'7.1.5.2', dept:'quality', block:3, frequency:'on_demand',
     note:'Instruments found out-of-cal + parts produced since last cal' },
   { name:'Calibration Cost Tracker', clause:'7.1.5.2', dept:'maintenance', block:3, frequency:'monthly',
     note:'External vs internal calibration spend' },
-  { name:'Training Matrix', clause:'7.2', dept:'people', block:3, frequency:'on_demand',
-    note:'Need training records module — per person per skill' },
+  { name:'Training Matrix', clause:'7.2', dept:'people', block:1, reportId:'iatf_training_matrix', frequency:'on_demand' },
   { name:'Skill Gap Analysis', clause:'7.2', dept:'people', block:3, frequency:'monthly',
     note:'Required skills vs available skills per shift/line' },
   { name:'Training Schedule', clause:'7.2', dept:'people', block:3, frequency:'monthly',
