@@ -364,7 +364,7 @@ body{
 
 <script type="module">
 import { h, render } from 'https://esm.sh/preact@10.19.3';
-import { useState, useEffect, useCallback, useMemo } from 'https://esm.sh/preact@10.19.3/hooks';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10.19.3/hooks';
 import htm from 'https://esm.sh/htm@3.1.1';
 
 const html = htm.bind(h);
@@ -1062,6 +1062,8 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
         <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
+
+      <${LogiBubble} plant=${plant} me=${me} setTab=${setTab} />
     </div>
   `;
 }
@@ -5860,6 +5862,143 @@ function TrainingRecordModal({ plant, me, users, skills, onClose, onSaved }) {
         <div class="field"><label>Certificate URL</label><input type="url" value=${f.certificate_url} onChange=${e => setF({...f, certificate_url: e.target.value})} placeholder="https://…" /></div>
         <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
         <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : 'Log training'}</button>
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// LOGI — chatbot bubble (plant-scoped AI assistant)
+// =================================================================
+// Floating button bottom-right of every tab. Click opens a side panel.
+// Per-plant conversation is kept in sessionStorage so users get a clean
+// thread per tab open, with persistence across tab switches.
+function LogiBubble({ plant, me, setTab }) {
+  const STORAGE_KEY = 'logi_history_' + plant.id;
+  const [open, setOpen] = useState(false);
+  const [messages, setMessages] = useState(() => {
+    try { return JSON.parse(sessionStorage.getItem(STORAGE_KEY) || '[]'); }
+    catch { return []; }
+  });
+  const [input, setInput] = useState('');
+  const [sending, setSending] = useState(false);
+  const scrollRef = useRef(null);
+
+  // Persist history
+  useEffect(() => {
+    try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(messages.slice(-30))); } catch {}
+  }, [messages, STORAGE_KEY]);
+
+  // Auto-scroll on new message
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages, sending]);
+
+  const ask = async (q) => {
+    const text = (q ?? input).trim();
+    if (!text || sending) return;
+    const userMsg = { role: 'user', content: text };
+    setMessages(prev => [...prev, userMsg]);
+    setInput('');
+    setSending(true);
+    try {
+      const { data: { session } } = await sb.auth.getSession();
+      const r = await fetch(SUPABASE_URL + '/functions/v1/loglinkr-chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(session ? { 'Authorization': 'Bearer ' + session.access_token, 'apikey': SUPABASE_ANON_KEY } : {}),
+        },
+        body: JSON.stringify({
+          message: text,
+          history: messages,
+          plant_id: plant.id,
+        }),
+      });
+      const data = await r.json();
+      if (data.error) throw new Error(data.error);
+      setMessages(prev => [...prev, { role: 'assistant', content: data.response || '(empty)' }]);
+    } catch (e) {
+      setMessages(prev => [...prev, { role: 'assistant', content: '⚠️ ' + e.message }]);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const clear = () => {
+    if (!confirm('Clear conversation? History is local to this tab.')) return;
+    setMessages([]);
+    try { sessionStorage.removeItem(STORAGE_KEY); } catch {}
+  };
+
+  if (!open) {
+    return html`
+      <button
+        title="Ask Logi — Loglinkr AI assistant"
+        onClick=${() => setOpen(true)}
+        style="position:fixed;right:18px;bottom:78px;width:56px;height:56px;border-radius:50%;border:none;cursor:pointer;background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white;font-size:26px;line-height:1;box-shadow:0 6px 20px rgba(13,148,136,0.45);z-index:900;display:flex;align-items:center;justify-content:center">
+        🤖
+      </button>
+    `;
+  }
+
+  // Quick-start prompts shown when conversation is empty
+  const STARTERS = [
+    'How many open NCRs and which is most critical?',
+    'What is our IATF audit readiness right now?',
+    'Any calibrations or training expiring soon?',
+    'What are my biggest overdue actions today?',
+    'Summarize this week\\'s production performance',
+  ];
+
+  return html`
+    <div style="position:fixed;right:18px;bottom:78px;width:min(380px,calc(100vw - 36px));max-height:min(640px,calc(100vh - 130px));background:white;border:1px solid var(--slate-200);border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,0.18);display:flex;flex-direction:column;z-index:900;overflow:hidden">
+      <div style="padding:12px 14px;background:linear-gradient(135deg,var(--teal-700),var(--teal-600));color:white;display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div style="font-weight:700;font-size:14px;display:flex;align-items:center;gap:6px">🤖 Logi <span style="background:rgba(255,255,255,0.18);font-size:9px;padding:2px 6px;border-radius:999px;font-weight:600;letter-spacing:0.05em">BETA</span></div>
+          <div style="font-size:11px;opacity:0.92;margin-top:1px">Knows everything about ${plant.name}</div>
+        </div>
+        <div style="display:flex;gap:6px">
+          ${messages.length > 0 && html`<button onClick=${clear} title="Clear chat" style="background:rgba(255,255,255,0.18);color:white;border:none;font-size:11px;padding:4px 8px;border-radius:6px;cursor:pointer">Clear</button>`}
+          <button onClick=${() => setOpen(false)} title="Close" style="background:transparent;color:white;border:none;font-size:22px;cursor:pointer;line-height:1;padding:0 4px">×</button>
+        </div>
+      </div>
+
+      <div ref=${scrollRef} style="flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px;background:var(--slate-50)">
+        ${messages.length === 0 ? html`
+          <div style="text-align:center;color:var(--slate-600);font-size:12px;padding:8px 4px">
+            <div style="font-size:32px;margin-bottom:8px">👋</div>
+            <div style="font-weight:600;margin-bottom:4px;color:var(--slate-800)">Hi ${me.full_name?.split(' ')[0] || 'there'}!</div>
+            <div style="line-height:1.5;margin-bottom:14px">Ask me anything about <strong>${plant.name}</strong> — NCRs, calibrations, IATF readiness, schedules, who owns what.<br/>I only see this plant's data.</div>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              ${STARTERS.map(s => html`
+                <button key=${s} onClick=${() => ask(s)} style="text-align:left;background:white;border:1px solid var(--slate-200);padding:8px 10px;border-radius:8px;font-size:12px;cursor:pointer;color:var(--slate-700);line-height:1.4">${s}</button>
+              `)}
+            </div>
+          </div>
+        ` : messages.map((m, i) => html`
+          <div key=${i} style="display:flex;${m.role === 'user' ? 'justify-content:flex-end' : 'justify-content:flex-start'}">
+            <div style="max-width:85%;padding:9px 12px;border-radius:14px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word;${m.role === 'user' ? 'background:var(--teal-600);color:white;border-bottom-right-radius:4px' : 'background:white;color:var(--slate-800);border-bottom-left-radius:4px;border:1px solid var(--slate-200)'}">${m.content}</div>
+          </div>
+        `)}
+        ${sending && html`
+          <div style="display:flex;justify-content:flex-start">
+            <div style="padding:9px 12px;border-radius:14px;background:white;border:1px solid var(--slate-200);font-size:13px;color:var(--slate-500);font-style:italic">Logi is thinking…</div>
+          </div>
+        `}
+      </div>
+
+      <div style="padding:10px 12px;border-top:1px solid var(--slate-200);display:flex;gap:8px;background:white">
+        <input
+          type="text"
+          value=${input}
+          onChange=${e => setInput(e.target.value)}
+          onKeyDown=${e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); } }}
+          placeholder="Ask Logi…"
+          disabled=${sending}
+          style="flex:1;padding:9px 12px;border:1px solid var(--slate-200);border-radius:10px;font-size:13px;outline:none"
+        />
+        <button class="btn small" disabled=${sending || !input.trim()} onClick=${() => ask()} style="padding:9px 14px">${sending ? '…' : 'Send'}</button>
       </div>
     </div>
   `;
