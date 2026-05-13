@@ -5868,6 +5868,298 @@ function TrainingRecordModal({ plant, me, users, skills, onClose, onSaved }) {
 }
 
 // =================================================================
+// VOICE ENTRY MODAL — Tamil / Hindi / English voice-driven data entry
+// =================================================================
+// Browser SpeechRecognition does STT (free, on-device, multi-lingual).
+// Edge function `loglinkr-voice-entry` orchestrates the dialog with Claude.
+// When all required fields are collected and operator confirms, this
+// component performs the final DB insert.
+function VoiceEntryModal({ plant, me, moduleKey, onClose, onSaved }) {
+  const [state, setState] = useState({ history: [] });
+  const [currentQuestion, setCurrentQuestion] = useState('');
+  const [language, setLanguage] = useState('en');
+  const [fields, setFields] = useState({});
+  const [machineCodeMatch, setMachineCodeMatch] = useState(null);
+  const [transcript, setTranscript] = useState('');
+  const [partialTranscript, setPartialTranscript] = useState('');
+  const [listening, setListening] = useState(false);
+  const [thinking, setThinking] = useState(false);
+  const [isComplete, setIsComplete] = useState(false);
+  const [readyToSave, setReadyToSave] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState('');
+  const [recLang, setRecLang] = useState('ta-IN'); // default Tamil; user can switch
+  const recognitionRef = useRef(null);
+  const bootstrappedRef = useRef(false);
+
+  // Browser SpeechRecognition feature-detect
+  const SR = typeof window !== 'undefined'
+    ? (window.SpeechRecognition || window.webkitSpeechRecognition)
+    : null;
+  const speechSupported = !!SR;
+
+  // Bootstrap the conversation on first open
+  useEffect(() => {
+    if (bootstrappedRef.current) return;
+    bootstrappedRef.current = true;
+    askAI(null);
+    // Cleanup recognition if user closes mid-listen
+    return () => { try { recognitionRef.current?.stop(); } catch {} };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const speak = (text, lang) => {
+    if (typeof window === 'undefined' || !window.speechSynthesis || !text) return;
+    try {
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      const tag = lang === 'ta' || lang === 'ta-en' ? 'ta-IN'
+                 : lang === 'hi' || lang === 'hi-en' ? 'hi-IN'
+                 : lang === 'te' ? 'te-IN'
+                 : lang === 'kn' ? 'kn-IN'
+                 : lang === 'mr' ? 'mr-IN'
+                 : 'en-IN';
+      u.lang = tag;
+      u.rate = 1.0;
+      window.speechSynthesis.speak(u);
+    } catch {}
+  };
+
+  const askAI = async (text) => {
+    setThinking(true); setError(''); setPartialTranscript('');
+    try {
+      const { data: { session } } = await sb.auth.getSession();
+      const r = await fetch(SUPABASE_URL + '/functions/v1/loglinkr-voice-entry', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(session ? { 'Authorization': 'Bearer ' + session.access_token, 'apikey': SUPABASE_ANON_KEY } : {}),
+        },
+        body: JSON.stringify({
+          plant_id: plant.id,
+          module: moduleKey,
+          transcript: text || null,
+          state,
+        }),
+      });
+      const data = await r.json();
+      if (data.error) throw new Error(data.error);
+
+      setState(data.state || { history: [] });
+      setCurrentQuestion(data.next_question || '');
+      setLanguage(data.language || 'en');
+      setFields(data.fields || {});
+      setMachineCodeMatch(data.machine_code_match || null);
+      setIsComplete(!!data.is_complete);
+      setReadyToSave(!!data.ready_to_save);
+
+      speak(data.next_question, data.language);
+
+      // Update mic language to follow the operator
+      const detected = data.language || 'en';
+      if (detected.startsWith('ta')) setRecLang('ta-IN');
+      else if (detected.startsWith('hi')) setRecLang('hi-IN');
+      else if (detected === 'te') setRecLang('te-IN');
+      else if (detected === 'kn') setRecLang('kn-IN');
+      else if (detected === 'mr') setRecLang('mr-IN');
+
+      // If model says ready_to_save, perform the DB insert
+      if (data.ready_to_save) {
+        await saveToDB(data.fields, data.machine_code_match);
+      }
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setThinking(false);
+    }
+  };
+
+  const startListening = () => {
+    if (!speechSupported) { setError('Voice not supported. Use Chrome on Android, or Safari on iOS.'); return; }
+    try { window.speechSynthesis?.cancel(); } catch {}
+    setTranscript(''); setPartialTranscript(''); setError('');
+    const rec = new SR();
+    rec.continuous = false;
+    rec.interimResults = true;
+    rec.lang = recLang;
+    rec.maxAlternatives = 1;
+    let finalText = '';
+    rec.onresult = (e) => {
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) finalText += e.results[i][0].transcript + ' ';
+        else interim += e.results[i][0].transcript;
+      }
+      setTranscript(finalText.trim());
+      setPartialTranscript(interim);
+    };
+    rec.onerror = (e) => {
+      if (e.error !== 'no-speech' && e.error !== 'aborted') setError('Mic error: ' + e.error);
+      setListening(false);
+    };
+    rec.onend = () => {
+      setListening(false);
+      const t = (finalText || '').trim();
+      if (t) {
+        setTranscript(t);
+        // Auto-send 200ms after stop
+        setTimeout(() => askAI(t), 200);
+      }
+    };
+    recognitionRef.current = rec;
+    try { rec.start(); setListening(true); }
+    catch (e) { setError('Could not start mic: ' + e.message); }
+  };
+
+  const stopListening = () => {
+    try { recognitionRef.current?.stop(); } catch {}
+    setListening(false);
+  };
+
+  // Manual type-and-send fallback (when voice doesn't work / user prefers)
+  const [manualInput, setManualInput] = useState('');
+  const sendManual = () => {
+    const t = manualInput.trim();
+    if (!t || thinking) return;
+    setManualInput('');
+    askAI(t);
+  };
+
+  const saveToDB = async (collected, machineCodeMatched) => {
+    setSaving(true); setError('');
+    try {
+      if (moduleKey === 'maintenance_breakdown') {
+        // Resolve machine_id from code
+        let machineId = null;
+        const code = machineCodeMatched || collected.machine_code;
+        if (code) {
+          const { data: mList } = await sb.from('machines')
+            .select('id, code')
+            .eq('plant_id', plant.id)
+            .ilike('code', code);
+          machineId = mList?.find(m => m.code === code)?.id || mList?.[0]?.id || null;
+        }
+        const tags = [];
+        if (collected.production_stopped === true) tags.push('🛑 production stopped');
+        if (collected.estimated_downtime_minutes) tags.push('~' + collected.estimated_downtime_minutes + ' min ETA');
+        if (collected.severity) tags.push('severity: ' + collected.severity);
+        const description = (collected.description || 'breakdown reported by voice') +
+          (tags.length > 0 ? ' [' + tags.join(' · ') + ']' : '');
+        const { error: err } = await sb.from('mcp_maintenance_breakdowns').insert({
+          plant_id: plant.id,
+          machine_id: machineId,
+          description,
+          status: 'open',
+          reported_by: me.id,
+        });
+        if (err) throw err;
+        setSaved(true);
+        showToast('✓ Breakdown saved by voice');
+        setTimeout(() => onSaved(), 1200);
+      } else {
+        throw new Error('Module not wired for save: ' + moduleKey);
+      }
+    } catch (e) {
+      setError('Save failed: ' + e.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const showSummary = isComplete && !readyToSave && !saved;
+  const showFieldsCollected = Object.keys(fields).length > 0;
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget && !listening && !thinking && !saving) onClose(); }}>
+      <div class="modal" style="max-width:500px">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">🎙️ Voice Entry</div>
+            <div style="font-size:11px;color:var(--slate-500);font-weight:400">Tamil · Hindi · English · Tanglish — speak naturally</div>
+          </div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+
+        ${!speechSupported && html`<div class="alert error" style="font-size:12px">Voice input isn't available on this browser. Try Chrome on Android, Safari on iOS, or use the text field below.</div>`}
+        ${error && html`<div class="alert error" style="font-size:12px">${error}</div>`}
+
+        <!-- Logi's question / response area -->
+        <div style="background:linear-gradient(135deg,var(--teal-50),var(--slate-50));border:1px solid var(--teal-200);border-radius:12px;padding:14px;min-height:64px;margin-bottom:12px;position:relative">
+          ${thinking ? html`<div style="color:var(--slate-500);font-style:italic;font-size:13px">🤖 Thinking…</div>` :
+            currentQuestion ? html`<div style="color:var(--slate-800);font-size:14px;line-height:1.5;white-space:pre-wrap">${currentQuestion}</div>` :
+            html`<div style="color:var(--slate-500);font-size:13px">Starting…</div>`}
+          ${currentQuestion && !thinking && html`<button onClick=${() => speak(currentQuestion, language)} title="Replay" style="position:absolute;top:8px;right:8px;background:transparent;border:none;color:var(--slate-400);cursor:pointer;font-size:14px">🔊</button>`}
+        </div>
+
+        <!-- Live transcript -->
+        ${(transcript || partialTranscript) && html`
+          <div style="padding:10px 14px;background:white;border:1px solid var(--slate-200);border-radius:10px;margin-bottom:12px;font-size:13px;line-height:1.5">
+            <div style="font-size:10px;color:var(--teal-700);font-weight:700;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">You said</div>
+            ${transcript}${partialTranscript && html`<span style="color:var(--slate-400)"> ${partialTranscript}</span>`}
+          </div>
+        `}
+
+        <!-- Fields collected so far -->
+        ${showFieldsCollected && html`
+          <div class="card" style="background:var(--slate-50);margin-bottom:12px;padding:10px 12px">
+            <div style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Collected so far</div>
+            ${Object.entries(fields).map(([k, v]) => html`
+              <div style="display:flex;justify-content:space-between;padding:3px 0;font-size:12px" key=${k}>
+                <span style="color:var(--slate-600)">${k.replace(/_/g, ' ')}</span>
+                <span style="color:var(--slate-800);font-weight:500;text-align:right">${
+                  typeof v === 'boolean' ? (v ? '✓ Yes' : '✗ No') :
+                  v === null || v === undefined ? '—' : String(v)
+                }</span>
+              </div>
+            `)}
+            ${machineCodeMatch && html`<div style="font-size:10px;color:var(--emerald-700);margin-top:4px">✓ matched ${machineCodeMatch} from plant master</div>`}
+          </div>
+        `}
+
+        ${saving && html`<div class="loader"><div class="spinner"></div></div>`}
+        ${saved && html`<div class="alert" style="background:var(--emerald-50);border-color:var(--emerald-200);color:var(--emerald-800);text-align:center;font-weight:600">✓ Saved. Closing…</div>`}
+
+        ${!readyToSave && !saving && !saved && html`
+          <!-- Big mic button -->
+          <div style="display:flex;flex-direction:column;align-items:center;gap:8px;margin:14px 0">
+            <button
+              onClick=${listening ? stopListening : startListening}
+              disabled=${thinking || !speechSupported}
+              title=${listening ? 'Stop' : 'Tap and speak'}
+              style="width:96px;height:96px;border-radius:50%;border:none;cursor:pointer;font-size:36px;background:${listening ? 'linear-gradient(135deg,#ef4444,#dc2626)' : (speechSupported ? 'linear-gradient(135deg,var(--teal-600),var(--teal-500))' : 'var(--slate-300)')};color:white;box-shadow:0 6px 24px ${listening ? 'rgba(220,38,38,0.45)' : 'rgba(13,148,136,0.45)'};${listening ? 'animation:pulse 1.5s ease-in-out infinite' : ''}">
+              ${listening ? '⏹' : '🎙️'}
+            </button>
+            <div style="font-size:12px;color:var(--slate-500);text-align:center">
+              ${listening ? 'Listening… tap to stop' : speechSupported ? 'Tap to speak' : 'Type below'}
+            </div>
+            <div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:center;margin-top:4px">
+              ${['ta-IN','hi-IN','en-IN','te-IN','kn-IN','mr-IN'].map(l => html`
+                <button key=${l} onClick=${() => setRecLang(l)} disabled=${listening} class=${'btn small ' + (recLang === l ? '' : 'ghost')} style="padding:3px 8px;font-size:10px">${l.replace('-IN','').toUpperCase()}</button>
+              `)}
+            </div>
+          </div>
+
+          <!-- Manual type fallback -->
+          <div style="display:flex;gap:6px;margin-top:10px">
+            <input type="text" value=${manualInput} onChange=${e => setManualInput(e.target.value)} onKeyDown=${e => { if (e.key === 'Enter') sendManual(); }} placeholder="Or type your reply…" disabled=${thinking} style="flex:1;padding:8px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:12px" />
+            <button class="btn small ghost" onClick=${sendManual} disabled=${thinking || !manualInput.trim()}>Send</button>
+          </div>
+        `}
+      </div>
+    </div>
+  `;
+}
+
+// CSS for pulse animation — append to head once
+if (typeof document !== 'undefined' && !document.getElementById('voice-pulse-css')) {
+  const s = document.createElement('style');
+  s.id = 'voice-pulse-css';
+  s.textContent = '@keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.06); } }';
+  document.head.appendChild(s);
+}
+
+// =================================================================
 // LOGI — chatbot bubble (plant-scoped AI assistant)
 // =================================================================
 // Floating button bottom-right of every tab. Click opens a side panel.
@@ -6429,6 +6721,7 @@ function Maintenance({ plant, me }) {
   const [editTarget, setEditTarget] = useState(null);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('open');
+  const [voiceOpen, setVoiceOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -6466,7 +6759,10 @@ function Maintenance({ plant, me }) {
       <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
     </div>
 
-    <div class="section-h">Breakdowns · ${breakdowns.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('breakdown'); }} disabled=${machines.length === 0}>+ Report</button></div>
+    <div class="section-h">Breakdowns · ${breakdowns.length}<span style="display:flex;gap:6px">
+      <button class="btn small" style="background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white" onClick=${() => setVoiceOpen(true)} disabled=${machines.length === 0} title="Voice entry — Tamil / Hindi / English">🎙️ Voice</button>
+      <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('breakdown'); }} disabled=${machines.length === 0}>+ Report</button>
+    </span></div>
     ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
       breakdowns.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✓</div>No breakdowns ${machines.length === 0 ? '— add machines first' : ''}</div></div>` :
       breakdowns.map(b => html`
@@ -6498,6 +6794,7 @@ function Maintenance({ plant, me }) {
     `)}
 
     ${modal === 'breakdown' && html`<${BreakdownModal} plant=${plant} me=${me} machines=${machines} users=${users} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="maintenance_breakdown" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
   `;
 }
 
