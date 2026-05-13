@@ -7,8 +7,13 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") || Deno.env.get("ANON_KEY") || "";
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
-const MODEL         = "claude-sonnet-4-20250514";
+// Cost optimisation: Haiku 4.5 for chat (vs Sonnet 4 previously). Same
+// analytical quality for read-and-summarise workload; ~3-4× cheaper.
+const MODEL         = "claude-haiku-4-5";
+const AGENT         = "chat";
+const DAILY_CAP_DEFAULT = 200;
 
 // Static portion of the system prompt — cached by Anthropic to cut input cost.
 const PLATFORM_DOC = `You are "Logi", the AI assistant inside Loglinkr — an audit-ready ERP for SME manufacturers (mainly IATF 16949 certified plants).
@@ -115,29 +120,28 @@ BEHAVIOR RULES
 8. If snapshot is empty for the asked module, say so honestly: "No records yet — add the first one under [path]."
 9. Tone: senior advisor on the phone with a plant head. Direct, opinionated, no fluff.`;
 
-async function buildSystemPrompt(supabase: ReturnType<typeof createClient>, plantId: string) {
+// Returns separate snapshot + insights blocks so each can be cache_control'd.
+// insights is skipped (null) when not needed — saves ~1.5k input tokens.
+async function buildContext(
+  supabase: ReturnType<typeof createClient>,
+  plantId: string,
+  wantsInsights: boolean,
+) {
   const [snapRes, insRes] = await Promise.all([
     supabase.rpc("get_plant_snapshot", { p_plant_id: plantId }),
-    supabase.rpc("get_plant_insights", { p_plant_id: plantId }),
+    wantsInsights
+      ? supabase.rpc("get_plant_insights", { p_plant_id: plantId })
+      : Promise.resolve({ data: null }),
   ]);
   if (snapRes.error) throw new Error("snapshot rpc: " + snapRes.error.message);
 
-  const dynamicBlock = `═══════════════════════════════════════════
-LIVE PLANT SNAPSHOT — counts + recent items, THIS plant only
-═══════════════════════════════════════════
-${JSON.stringify(snapRes.data, null, 2)}
+  // Compact JSON (no pretty-print) — saves ~40% chars vs indented.
+  const snapshotBlock = `LIVE PLANT SNAPSHOT — THIS plant only\n${JSON.stringify(snapRes.data)}`;
+  const insightsBlock = wantsInsights
+    ? `LIVE INSIGHTS — correlations, trends, hotspots\n${JSON.stringify(insRes.data)}\n\nUse INSIGHTS for synthesis. End with one named action.`
+    : "Only SNAPSHOT this turn. Ask 'biggest risks' / 'summary' for full analytical insights.";
 
-═══════════════════════════════════════════
-LIVE INSIGHTS — correlations, patterns, hotspots
-═══════════════════════════════════════════
-${JSON.stringify(insRes.data, null, 2)}
-
-═══════════════════════════════════════════
-RESPOND TO THE USER NOW
-═══════════════════════════════════════════
-Remember: ANALYZE → PRIORITIZE → RECOMMEND. End with one named action + the tab to open it in.`;
-
-  return { staticDoc: PLATFORM_DOC, dynamicBlock, snap: snapRes.data };
+  return { snapshotBlock, insightsBlock, snap: snapRes.data };
 }
 
 interface Msg { role: "user" | "assistant"; content: string }
@@ -164,12 +168,51 @@ Deno.serve(async (req: Request) => {
     if (!body.plant_id) throw new Error("plant_id is required");
     if (!body.message) throw new Error("message is required");
 
-    const { staticDoc, dynamicBlock } = await buildSystemPrompt(supabase, body.plant_id);
+    // ─── Resolve user for usage tracking (auth optional but preferred) ────
+    let userId: string | null = null;
+    let dailyCap = DAILY_CAP_DEFAULT;
+    const auth = req.headers.get("Authorization");
+    if (auth && SUPABASE_ANON_KEY) {
+      const userClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        global: { headers: { Authorization: auth } },
+      });
+      const { data: { user } } = await userClient.auth.getUser();
+      if (user) userId = user.id;
+    }
+    if (userId) {
+      const { data: profile } = await supabase.from("users")
+        .select("ai_daily_cap_per_user, plant_id")
+        .eq("id", userId).maybeSingle();
+      // Cap is set at plant level, not user level — pull from plants table
+      const { data: pl } = await supabase.from("plants")
+        .select("ai_daily_cap_per_user")
+        .eq("id", body.plant_id).maybeSingle();
+      dailyCap = (pl as any)?.ai_daily_cap_per_user ?? DAILY_CAP_DEFAULT;
 
-    // Trim history to last ~10 turns to keep token budget sane
-    const history = (body.history || []).slice(-10);
+      // ─── Pre-check daily cap (cheap; no API burnt) ────────────────────────
+      const { data: usage } = await supabase
+        .from("voice_usage_daily")
+        .select("message_count")
+        .eq("plant_id", body.plant_id).eq("user_id", userId)
+        .eq("agent", AGENT).eq("day", new Date().toISOString().slice(0, 10))
+        .maybeSingle();
+      if (((usage as any)?.message_count ?? 0) >= dailyCap) {
+        return new Response(JSON.stringify({
+          response: `You've hit today's chat limit of ${dailyCap} messages. Plant_head can raise it in Plant settings → AI cap.`,
+        }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+      }
+    }
 
+    // ─── Cost knob: history slice 10 → 4 ──────────────────────────────────
+    const history = (body.history || []).slice(-4);
     const messages: Msg[] = [...history, { role: "user", content: body.message }];
+
+    // ─── Cost knob: only fetch insights when asked (or first turn) ────────
+    const wantsInsights =
+      history.length === 0 ||
+      /\b(summary|summarise|summarize|overview|biggest|top|critical|priorit|important|worry|risk|issue|problem|how are we|how is|what.s wrong|today|this week|month|kya|enna|important|risks?|bottleneck)\b/i.test(body.message);
+
+    const { snapshotBlock, insightsBlock } = await buildContext(supabase, body.plant_id, wantsInsights);
 
     const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -180,12 +223,14 @@ Deno.serve(async (req: Request) => {
       },
       body: JSON.stringify({
         model: MODEL,
-        max_tokens: 1024,
-        // Split system into static (cacheable) + dynamic (per-call). Saves 90%
-        // input cost on the platform docs over a multi-turn chat.
+        // Cost knob: 1024 → 500. Plenty for chat.
+        max_tokens: 500,
+        // Cost knob: 3-block caching so static + snapshot get cache hits on
+        // rapid follow-up turns. Insights changes per turn (or is skipped).
         system: [
-          { type: "text", text: staticDoc, cache_control: { type: "ephemeral" } },
-          { type: "text", text: dynamicBlock },
+          { type: "text", text: PLATFORM_DOC, cache_control: { type: "ephemeral" } },
+          { type: "text", text: snapshotBlock, cache_control: { type: "ephemeral" } },
+          { type: "text", text: insightsBlock },
         ],
         messages,
       }),
@@ -200,6 +245,20 @@ Deno.serve(async (req: Request) => {
       ?.filter((b: { type: string }) => b.type === "text")
       ?.map((b: { text: string }) => b.text)
       ?.join("\n") ?? "";
+
+    // ─── Log usage (best-effort, fire-and-forget) ─────────────────────────
+    if (userId) {
+      const u = data.usage || {};
+      supabase.rpc("track_voice_usage", {
+        p_plant_id: body.plant_id,
+        p_user_id: userId,
+        p_agent: AGENT,
+        p_in: u.input_tokens || 0,
+        p_out: u.output_tokens || 0,
+        p_cache_read: u.cache_read_input_tokens || 0,
+        p_cache_create: u.cache_creation_input_tokens || 0,
+      }).then(() => {}).catch((e: Error) => console.warn("usage log failed:", e.message));
+    }
 
     return new Response(JSON.stringify({
       response: text,

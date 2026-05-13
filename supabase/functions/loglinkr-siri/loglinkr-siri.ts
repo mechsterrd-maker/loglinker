@@ -11,7 +11,12 @@ const SUPABASE_URL      = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") || Deno.env.get("ANON_KEY") || "";
 const SERVICE_KEY       = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY     = Deno.env.get("ANTHROPIC_API_KEY")!;
-const MODEL             = "claude-sonnet-4-20250514";
+// Cost optimisation: Haiku 4.5 is plenty smart for "read snapshot + insights,
+// answer like a consultant" — and ~3-4× cheaper than Sonnet 4. The model
+// quality difference for this workload is negligible.
+const MODEL             = "claude-haiku-4-5";
+const AGENT             = "siri";
+const DAILY_CAP_DEFAULT = 200;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -361,30 +366,60 @@ Deno.serve(async (req: Request) => {
     // ─── Get user message + history ────────────────────────────────────────
     const body = await req.json() as { message: string; history?: any[] };
     if (!body.message) throw new Error("message required");
-    const incoming = (body.history || []).slice(-10);
+    // Cost knob: shorter history. 4 turns is plenty for voice context.
+    const incoming = (body.history || []).slice(-4);
     const messages: any[] = [...incoming, { role: "user", content: body.message }];
 
-    // ─── Fetch fresh snapshot + insights so model has the full picture ─────
+    // ─── Cost knob: pre-check daily cap (fails fast, no API call burnt) ────
+    {
+      const { data: usage } = await supabase
+        .from("voice_usage_daily")
+        .select("message_count")
+        .eq("plant_id", plantId)
+        .eq("user_id", user.id)
+        .eq("agent", AGENT)
+        .eq("day", new Date().toISOString().slice(0, 10))
+        .maybeSingle();
+      const used = (usage as any)?.message_count ?? 0;
+      const cap = (profile as any).ai_daily_cap_per_user ?? DAILY_CAP_DEFAULT;
+      if (used >= cap) {
+        return new Response(JSON.stringify({
+          response_text: `You've hit today's voice limit of ${cap} messages. Plant_head can raise it in Plant settings.`,
+          navigation: null,
+          tools_called: [],
+          state: { history: incoming },
+        }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+    }
+
+    // ─── Conditional insights fetch — only on first turn or "analyze me" Q's
+    // Insights ≈ 1.5k tokens. For "show me X" / "open Y", we don't need them.
+    const wantsInsights =
+      incoming.length === 0 ||
+      /\b(summary|summarise|summarize|overview|biggest|top|critical|priorit|important|worry|risk|issue|problem|how are we|how is|what.s wrong|today|this week|month|kya|enna|important|risks?|bottleneck)\b/i.test(body.message);
+
     const [snapRes, insRes] = await Promise.all([
       supabase.rpc("get_plant_snapshot", { p_plant_id: plantId }),
-      supabase.rpc("get_plant_insights", { p_plant_id: plantId }),
+      wantsInsights
+        ? supabase.rpc("get_plant_insights", { p_plant_id: plantId })
+        : Promise.resolve({ data: null }),
     ]);
-    const liveContext = `Plant: ${(profile as any).plant_id} | Manager: ${(profile as any).full_name || user.email}
 
-═══ LIVE PLANT SNAPSHOT (counts + recent items) ═══
-${JSON.stringify(snapRes.data, null, 2)}
-
-═══ LIVE INSIGHTS (correlations + patterns + hotspots) ═══
-${JSON.stringify(insRes.data, null, 2)}
-
-Use BOTH blobs to ANALYZE. Don't ask for them again — they're already in front of you. End with one named action.`;
+    // Cost knob: compact JSON (no pretty-print → ~40% fewer chars)
+    const snapshotBlock = `Plant: ${(profile as any).full_name || user.email}\n\nSNAPSHOT:\n${JSON.stringify(snapRes.data)}`;
+    const insightsBlock = wantsInsights
+      ? `INSIGHTS (correlations + patterns):\n${JSON.stringify(insRes.data)}\n\nUse INSIGHTS for synthesis. End with one named action.`
+      : "Only SNAPSHOT this turn. Ask 'show me biggest risks' for full analytical insights.";
 
     // ─── Tool-use loop ─────────────────────────────────────────────────────
     const toolsCalled: string[] = [];
     let navigationHint: any = null;
     let finalText = "";
 
-    for (let iter = 0; iter < 5; iter++) {
+    // Cost knob: cap tool-use loop to 3 iterations (was 5) — most queries
+    // finish in 1-2 turns; we were paying for occasional infinite-spiral edge cases.
+    let totalIn = 0, totalOut = 0, totalCacheRead = 0, totalCacheCreate = 0;
+    for (let iter = 0; iter < 3; iter++) {
       const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
@@ -394,10 +429,15 @@ Use BOTH blobs to ANALYZE. Don't ask for them again — they're already in front
         },
         body: JSON.stringify({
           model: MODEL,
-          max_tokens: 1024,
+          // Cost knob: 1024 → 500. Voice answers should be short anyway.
+          max_tokens: 500,
+          // Cost knob: multi-block caching so each chunk gets its own 5-min TTL.
+          // STATIC prompt rarely changes → always cached. SNAPSHOT changes only
+          // when DB changes → cached for rapid follow-ups in same minute.
           system: [
             { type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
-            { type: "text", text: liveContext },
+            { type: "text", text: snapshotBlock, cache_control: { type: "ephemeral" } },
+            { type: "text", text: insightsBlock },
           ],
           tools: TOOLS,
           messages,
@@ -409,6 +449,12 @@ Use BOTH blobs to ANALYZE. Don't ask for them again — they're already in front
       }
       const data = await apiRes.json();
       const content = data.content || [];
+      // Accumulate tokens for usage log
+      const u = data.usage || {};
+      totalIn += u.input_tokens || 0;
+      totalOut += u.output_tokens || 0;
+      totalCacheRead += u.cache_read_input_tokens || 0;
+      totalCacheCreate += u.cache_creation_input_tokens || 0;
 
       // Capture text blocks
       const textBlocks = content.filter((c: any) => c.type === "text");
@@ -456,12 +502,24 @@ Use BOTH blobs to ANALYZE. Don't ask for them again — they're already in front
       { role: "assistant", content: finalText || "(no response)" },
     ];
 
+    // Log usage (best-effort; don't block response if it fails)
+    supabase.rpc("track_voice_usage", {
+      p_plant_id: plantId,
+      p_user_id: user.id,
+      p_agent: AGENT,
+      p_in: totalIn,
+      p_out: totalOut,
+      p_cache_read: totalCacheRead,
+      p_cache_create: totalCacheCreate,
+    }).then(() => {}).catch((e: Error) => console.warn("usage log failed:", e.message));
+
     return new Response(JSON.stringify({
       response_text: finalText || "I couldn't generate a reply, please try again.",
       navigation: navigationHint,
       tools_called: toolsCalled,
       manager_name: (profile as any).full_name,
       state: { history: updatedHistory },
+      tokens: { input: totalIn, output: totalOut, cache_read: totalCacheRead, cache_create: totalCacheCreate },
     }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
