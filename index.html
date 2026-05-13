@@ -1306,6 +1306,7 @@ function Production({ plant, me }) {
   const [editTarget, setEditTarget] = useState(null);
   const [activePart, setActivePart] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [voiceOpen, setVoiceOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -1553,7 +1554,10 @@ function Production({ plant, me }) {
     ${view === 'forecast' && html`<${ToolForecastView} plant=${plant} setModal=${setModal} setEditTarget=${setEditTarget} />`}
 
     ${view === 'shots' && html`
-      <div class="section-h">Shots · ${shots.length}<button class="btn small ghost" onClick=${() => setModal('shot')} disabled=${machines.length === 0 || dies.length === 0}>+ Log</button></div>
+      <div class="section-h">Shots · ${shots.length}<span style="display:flex;gap:6px">
+        <button class="btn small" style="background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white" onClick=${() => setVoiceOpen(true)} disabled=${machines.length === 0 || dies.length === 0} title="Voice entry — Tamil / Hindi / English">🎙️ Voice</button>
+        <button class="btn small ghost" onClick=${() => setModal('shot')} disabled=${machines.length === 0 || dies.length === 0}>+ Log</button>
+      </span></div>
       ${shots.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📊</div>No shots logged yet</div></div>` :
         shots.map(s => html`
           <div class="list-item" key=${s.id}>
@@ -1576,6 +1580,7 @@ function Production({ plant, me }) {
     ${modal === 'tool' && html`<${ToolModal} plant=${plant} me=${me} machines=${machines} stockItems=${stockItems} parts=${parts} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'tool_assign' && html`<${ToolAssignmentModal} plant=${plant} tool=${editTarget} parts=${parts} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'shot' && html`<${ShotModal} plant=${plant} me=${me} units=${units} shifts=${shifts} machines=${machines} dies=${dies} parts=${parts} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
+    ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="shot_log" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
   `;
 }
 
@@ -6029,15 +6034,15 @@ function VoiceEntryModal({ plant, me, moduleKey, onClose, onSaved }) {
   const saveToDB = async (collected, machineCodeMatched) => {
     setSaving(true); setError('');
     try {
+      // -------------------------------------------------------------------
+      // MAINTENANCE BREAKDOWN
+      // -------------------------------------------------------------------
       if (moduleKey === 'maintenance_breakdown') {
-        // Resolve machine_id from code
         let machineId = null;
         const code = machineCodeMatched || collected.machine_code;
         if (code) {
           const { data: mList } = await sb.from('machines')
-            .select('id, code')
-            .eq('plant_id', plant.id)
-            .ilike('code', code);
+            .select('id, code').eq('plant_id', plant.id).ilike('code', code);
           machineId = mList?.find(m => m.code === code)?.id || mList?.[0]?.id || null;
         }
         const tags = [];
@@ -6047,19 +6052,134 @@ function VoiceEntryModal({ plant, me, moduleKey, onClose, onSaved }) {
         const description = (collected.description || 'breakdown reported by voice') +
           (tags.length > 0 ? ' [' + tags.join(' · ') + ']' : '');
         const { error: err } = await sb.from('mcp_maintenance_breakdowns').insert({
-          plant_id: plant.id,
-          machine_id: machineId,
-          description,
-          status: 'open',
-          reported_by: me.id,
+          plant_id: plant.id, machine_id: machineId, description, status: 'open', reported_by: me.id,
         });
         if (err) throw err;
-        setSaved(true);
-        showToast('✓ Breakdown saved by voice');
+        setSaved(true); showToast('✓ Breakdown saved by voice');
         setTimeout(() => onSaved(), 1200);
-      } else {
-        throw new Error('Module not wired for save: ' + moduleKey);
+        return;
       }
+
+      // -------------------------------------------------------------------
+      // SHOT LOG (production)
+      // -------------------------------------------------------------------
+      if (moduleKey === 'shot_log') {
+        const machineCode = machineCodeMatched || collected.machine_code;
+        const dieCode = collected.die_code;
+        if (!machineCode || !dieCode) throw new Error('Missing machine or die code');
+
+        const [machineRes, dieRes, shiftsRes] = await Promise.all([
+          sb.from('machines').select('id, code, unit_id').eq('plant_id', plant.id).ilike('code', machineCode),
+          sb.from('mcp_pdc_dies').select('id, code, default_part_id').eq('plant_id', plant.id).ilike('code', dieCode),
+          sb.from('shifts').select('id, name').eq('plant_id', plant.id).eq('is_active', true),
+        ]);
+        const machine = machineRes.data?.find(m => m.code === machineCode) || machineRes.data?.[0];
+        const die = dieRes.data?.find(d => d.code === dieCode) || dieRes.data?.[0];
+        if (!machine) throw new Error('Machine "' + machineCode + '" not found');
+        if (!die) throw new Error('Die "' + dieCode + '" not found');
+
+        let shift = shiftsRes.data?.find(s => collected.shift_name && s.name.toLowerCase().includes(String(collected.shift_name).toLowerCase()));
+        if (!shift) {
+          // Infer shift from current IST time
+          const now = new Date();
+          const istHour = (now.getUTCHours() + 5 + Math.floor((now.getUTCMinutes() + 30) / 60)) % 24;
+          shift = (shiftsRes.data || [])[0]; // fallback to first active shift
+          // Simple time-bucket: 06-14 = A, 14-22 = B, 22-06 = C
+          const target = istHour >= 6 && istHour < 14 ? 'A' : istHour >= 14 && istHour < 22 ? 'B' : 'C';
+          const found = shiftsRes.data?.find(s => s.name.toUpperCase().startsWith(target));
+          if (found) shift = found;
+        }
+        if (!shift) throw new Error('No active shift configured');
+
+        const good = parseInt(collected.shots_good ?? 0) || 0;
+        const reject = parseInt(collected.shots_rejected ?? 0) || 0;
+        const { error: err } = await sb.from('mcp_pdc_shots').insert({
+          plant_id: plant.id,
+          unit_id: machine.unit_id,
+          shift_id: shift.id,
+          machine_id: machine.id,
+          die_id: die.id,
+          part_id: die.default_part_id || null,
+          operator_user_id: me.id,
+          recorded_by_user_id: me.id,
+          shots_good: good,
+          shots_rejected: reject,
+          reject_reason: reject > 0 ? (collected.reject_reason || 'unspecified') : null,
+          metal_consumed_kg: collected.metal_consumed_kg ? parseFloat(collected.metal_consumed_kg) : null,
+          notes: 'Logged via voice entry',
+        });
+        if (err) throw err;
+        setSaved(true); showToast('✓ Shot logged: ' + good + ' good · ' + reject + ' reject');
+        setTimeout(() => onSaved(), 1200);
+        return;
+      }
+
+      // -------------------------------------------------------------------
+      // NCR RAISE (quality)
+      // -------------------------------------------------------------------
+      if (moduleKey === 'ncr_raise') {
+        // Generate next NCR number for this month
+        const yymm = new Date().toISOString().slice(2, 7).replace('-', '');
+        const { count } = await sb.from('mcp_quality_ncrs')
+          .select('id', { count: 'exact', head: true })
+          .eq('plant_id', plant.id)
+          .ilike('ncr_number', 'NCR-' + yymm + '-%');
+        const ncrNumber = 'NCR-' + yymm + '-VOICE-' + String((count || 0) + 1).padStart(3, '0');
+
+        const { error: err } = await sb.from('mcp_quality_ncrs').insert({
+          plant_id: plant.id,
+          ncr_number: ncrNumber,
+          source: collected.source || 'in_process',
+          title: collected.title || 'NCR raised by voice',
+          description: collected.description || null,
+          severity: collected.severity || 'minor',
+          status: 'open',
+          part_number: collected.part_number || null,
+          qty_affected: collected.qty_affected ? parseInt(collected.qty_affected) : null,
+          raised_by: me.id,
+        });
+        if (err) throw err;
+        setSaved(true); showToast('✓ NCR ' + ncrNumber + ' raised');
+        setTimeout(() => onSaved(), 1200);
+        return;
+      }
+
+      // -------------------------------------------------------------------
+      // STOCK ISSUE
+      // -------------------------------------------------------------------
+      if (moduleKey === 'stock_issue') {
+        const code = collected.item_code;
+        if (!code) throw new Error('Missing item code');
+        const { data: items } = await sb.from('mcp_stocks_items')
+          .select('id, code, name').eq('plant_id', plant.id).ilike('code', code);
+        let item = items?.find(i => i.code === code) || items?.[0];
+        if (!item) {
+          // Try name match
+          const { data: byName } = await sb.from('mcp_stocks_items')
+            .select('id, code, name').eq('plant_id', plant.id).ilike('name', '%' + code + '%').limit(1);
+          item = byName?.[0];
+        }
+        if (!item) throw new Error('Item "' + code + '" not found in stock master');
+
+        const qty = parseFloat(collected.qty);
+        if (!qty || qty <= 0) throw new Error('Invalid qty');
+
+        const { error: err } = await sb.from('mcp_stocks_transactions').insert({
+          plant_id: plant.id,
+          item_id: item.id,
+          txn_type: 'issue',
+          qty,
+          reference: collected.reference || 'Voice issue',
+          notes: collected.notes || 'Issued via voice entry',
+          performed_by: me.id,
+        });
+        if (err) throw err;
+        setSaved(true); showToast('✓ Issued ' + qty + ' × ' + item.code);
+        setTimeout(() => onSaved(), 1200);
+        return;
+      }
+
+      throw new Error('Module not wired for save: ' + moduleKey);
     } catch (e) {
       setError('Save failed: ' + e.message);
     } finally {
@@ -6422,6 +6542,7 @@ function Quality({ plant, me }) {
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [filter, setFilter] = useState('open');
+  const [voiceOpen, setVoiceOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -6453,7 +6574,10 @@ function Quality({ plant, me }) {
       <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
     </div>
 
-    <div class="section-h">NCRs · ${ncrs.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('ncr'); }}>+ Raise NCR</button></div>
+    <div class="section-h">NCRs · ${ncrs.length}<span style="display:flex;gap:6px">
+      <button class="btn small" style="background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white" onClick=${() => setVoiceOpen(true)} title="Voice entry — Tamil / Hindi / English">🎙️ Voice</button>
+      <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('ncr'); }}>+ Raise NCR</button>
+    </span></div>
     ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
       ncrs.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✓</div>No NCRs in this filter</div></div>` :
       ncrs.map(n => html`
@@ -6473,6 +6597,7 @@ function Quality({ plant, me }) {
     }
 
     ${modal === 'ncr' && html`<${NcrModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="ncr_raise" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
   `;
 }
 
@@ -6898,6 +7023,7 @@ function Stocks({ plant, me }) {
   const [editTarget, setEditTarget] = useState(null);
   const [activeItem, setActiveItem] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [voiceOpen, setVoiceOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -7014,7 +7140,10 @@ function Stocks({ plant, me }) {
         </div>
       `}
 
-      <div class="section-h">Items · ${filteredItems.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('item'); }}>+ Add</button></div>
+      <div class="section-h">Items · ${filteredItems.length}<span style="display:flex;gap:6px">
+        <button class="btn small" style="background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white" onClick=${() => setVoiceOpen(true)} disabled=${items.length === 0} title="Voice issue — Tamil / Hindi / English">🎙️ Voice Issue</button>
+        <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('item'); }}>+ Add</button>
+      </span></div>
 
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
         filteredItems.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📦</div>${items.length === 0 ? 'No items yet' : 'No items match this filter'}</div></div>` :
@@ -7135,6 +7264,7 @@ function Stocks({ plant, me }) {
 
     ${modal === 'item' && html`<${ItemModal} plant=${plant} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'txn' && html`<${TxnModal} plant=${plant} me=${me} item=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="stock_issue" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
   `;
 }
 

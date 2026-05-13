@@ -47,7 +47,67 @@ If operator says everything in one sentence (e.g. "PDC-150 oil leak heavily, lin
 fill all fields you can extract — don't re-ask what was already said.`,
   },
 
-  // Future modules will be added here (shot_log, ncr_raise, stock_issue…)
+  shot_log: {
+    title: "Production Shot Log",
+    instructions: `You are helping a production operator log a shot count by voice (typically at shift-end or mid-shift).
+
+FIELDS TO COLLECT (one at a time):
+  • machine_code      (string, REQUIRED)   "Which machine? / Enna machine?"
+  • die_code          (string, REQUIRED)   "Which die? / Enna die?"
+  • shots_good        (number, REQUIRED)   "How many good? / Yetra good?"
+  • shots_rejected    (number, REQUIRED)   "How many rejects? / Yetra reject?"
+  • reject_reason     (string, REQUIRED IF shots_rejected > 0)  "What was the reject reason? / Reject reason yenna?"
+  • shift_name        (string, OPTIONAL — try to infer from time-of-day in context, else ask)
+  • metal_consumed_kg (number, OPTIONAL — only ask if operator volunteered it)
+
+INFERENCE RULES:
+- If operator says "300 nallavum, 12 rejecta poruchchu, flash problem" → shots_good=300, shots_rejected=12, reject_reason="flash"
+- If they say "no rejects" / "all good" / "zero reject" → shots_rejected=0, skip reject_reason
+- Die code patterns: D-XXX-NNN (e.g. D-654-001). Be flexible — operator may say just "654 die".
+- Match die_code against the dies list in plant context; pick the best match.
+
+DON'T ASK about operator name — we use the logged-in user.`,
+  },
+
+  ncr_raise: {
+    title: "NCR (Non-Conformance Report)",
+    instructions: `You are helping a QA / supervisor raise an NCR (non-conformance report) by voice.
+
+FIELDS TO COLLECT (one at a time):
+  • source         (enum, REQUIRED) — one of:
+                     in_process | customer_complaint | audit_finding | supplier | other
+                     Infer from context if obvious (e.g. "Acme customer complained" → customer_complaint).
+                     Else ask: "Yenga irundhu vandhuchu? / Where did this issue come from?"
+  • title          (string, REQUIRED)  short headline (max 80 chars) — "Briefly what is the issue?"
+  • severity       (enum: minor|major|critical, REQUIRED — infer if obvious)
+                     - critical: customer stopped line / safety / huge cost
+                     - major: customer-impacting OR batch-level rejection
+                     - minor: in-process anomaly, contained
+  • description    (string, REQUIRED)  fuller description — "Tell me more detail"
+  • part_number    (string, OPTIONAL) — "Which part? / Enna part?"
+  • qty_affected   (number, OPTIONAL) — "How many affected? / Yetra parts?"
+
+After collecting, summarise: "NCR raise pannava? <source> · <severity> · <title> · qty <X>"`,
+  },
+
+  stock_issue: {
+    title: "Stock Issue (Material Out)",
+    instructions: `You are helping a stores operator issue stock to production by voice.
+
+FIELDS TO COLLECT (one at a time):
+  • item_code       (string, REQUIRED)  match against plant's stock items list — "Which item? / Enna item?"
+                    Operator may speak just the name (e.g. "M8 bolts", "die lubricant").
+                    Match flexibly against the item list provided in plant context.
+  • qty             (number, REQUIRED)  "How many / how much? / Yetra qty?"
+  • reference       (string, OPTIONAL)  "Issued to which line / machine / job? / Yenga ku?"
+  • notes           (string, OPTIONAL)  any extra context
+
+INFERENCE RULES:
+- If operator says "200 M8 bolts assembly line ku" → item="HW-BOLT-M8" (match), qty=200, reference="assembly line".
+- UOM is part of the item master — don't ask UOM separately; just use qty.
+
+After collecting, summarise with stock item's CODE and NAME from the master.`,
+  },
 };
 
 const SYSTEM_PROMPT_COMMON = `You are "Logi", the voice-entry assistant inside Loglinkr — an audit-ready ERP for Indian SME manufacturers.
@@ -94,15 +154,43 @@ async function buildSystemPrompt(
 
   // Module-specific context (e.g. list of available machines for breakdown entry)
   let contextBlock = "";
+  const now = new Date();
+  const localHour = (now.getUTCHours() + 5) % 24; // IST rough
+  contextBlock += `\nCURRENT IST TIME: approx ${localHour}:${String((now.getUTCMinutes() + 30) % 60).padStart(2,"0")} — use this to infer shift if not stated.\n`;
+
   if (moduleKey === "maintenance_breakdown") {
     const { data: machines } = await supabase
-      .from("machines")
-      .select("code, make, model, category, status, unit_id, units(name)")
+      .from("machines").select("code, make, model, category, status, unit_id, units(name)")
       .eq("plant_id", plantId);
     const lines = (machines || []).map((m: any) =>
       `  • ${m.code} — ${m.make || "?"}${m.model ? " " + m.model : ""} (${m.category}, ${m.units?.name || "?"}, ${m.status})`
     );
-    contextBlock = `\nMACHINES AVAILABLE in this plant:\n${lines.join("\n") || "  (none configured — accept whatever code the operator gives)"}\n`;
+    contextBlock += `\nMACHINES AVAILABLE:\n${lines.join("\n") || "  (none configured)"}\n`;
+  }
+
+  if (moduleKey === "shot_log") {
+    const [m, d, sh] = await Promise.all([
+      supabase.from("machines").select("code, make, category, status, units(name)").eq("plant_id", plantId).eq("category", "pdc"),
+      supabase.from("mcp_pdc_dies").select("code, part_number, customer_name, status, current_stroke_count, max_strokes").eq("plant_id", plantId).neq("status", "retired"),
+      supabase.from("shifts").select("name, start_time, end_time").eq("plant_id", plantId).eq("is_active", true),
+    ]);
+    contextBlock += `\nPDC MACHINES:\n${(m.data || []).map((x: any) => `  • ${x.code} — ${x.make || "?"} (${x.units?.name || "?"}, ${x.status})`).join("\n") || "  (none)"}\n`;
+    contextBlock += `\nDIES AVAILABLE:\n${(d.data || []).map((x: any) => `  • ${x.code} (part ${x.part_number}${x.customer_name ? ", " + x.customer_name : ""}, ${x.current_stroke_count?.toLocaleString("en-IN") || 0}/${x.max_strokes?.toLocaleString("en-IN") || 0} strokes)`).join("\n") || "  (none)"}\n`;
+    contextBlock += `\nSHIFTS:\n${(sh.data || []).map((x: any) => `  • "${x.name}" — ${x.start_time}–${x.end_time}`).join("\n") || "  (none)"}\n`;
+  }
+
+  if (moduleKey === "ncr_raise") {
+    const { data: parts } = await supabase
+      .from("mcp_pdc_parts").select("part_number, name").eq("plant_id", plantId).limit(50);
+    const lines = (parts || []).map((p: any) => `  • ${p.part_number} — ${p.name}`);
+    contextBlock += `\nPARTS:\n${lines.join("\n") || "  (none — accept whatever part number operator says)"}\n`;
+  }
+
+  if (moduleKey === "stock_issue") {
+    const { data: items } = await supabase
+      .from("mcp_stocks_items").select("code, name, category, uom, current_qty").eq("plant_id", plantId).order("name");
+    const lines = (items || []).map((i: any) => `  • ${i.code} — ${i.name} (${i.category || "?"}, current: ${i.current_qty} ${i.uom})`);
+    contextBlock += `\nSTOCK ITEMS AVAILABLE:\n${lines.join("\n") || "  (none)"}\n`;
   }
 
   // Static portion (cacheable) + dynamic (per-call) split
