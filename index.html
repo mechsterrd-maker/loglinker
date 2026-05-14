@@ -1053,6 +1053,11 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'calibration'}><${CalibrationModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'training'}><${TrainingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'ppap'}><${PpapModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'pfmea'}><${PfmeaModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'lpa'}><${LpaModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'mgmt_review'}><${MgmtReviewModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'csr'}><${CsrModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
 
       <div class="tabbar">
@@ -1060,7 +1065,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
 
       <${LogiBubble} plant=${plant} me=${me} setTab=${setTab} />
@@ -5185,6 +5190,11 @@ function More({ plant, me, user, logout, setTab, activeUnit, accessibleUnits }) 
     { key:'iatf', icon:'🛡', label:'IATF 16949 · Audit Readiness', sub:'All required documents, status, owners, review cadences' },
     { key:'calibration', icon:'📏', label:'Calibration Register', sub:'Instruments, calibration history, due/overdue alerts (IATF 7.1.5.2)' },
     { key:'training', icon:'🎓', label:'Training Matrix', sub:'Skills, training records, validity per employee (IATF 7.2)' },
+    { key:'ppap', icon:'📑', label:'PPAP Submissions', sub:'Part approval status per customer (IATF 8.3.4.4)' },
+    { key:'pfmea', icon:'⚠️', label:'PFMEA Register', sub:'Process FMEAs with RPN; high-RPN auto-cascades (IATF 8.3)' },
+    { key:'lpa', icon:'📋', label:'Layered Process Audits', sub:'Daily L1 / weekly L2 / monthly L3 walks (IATF 9.2.2.3)' },
+    { key:'mgmt_review', icon:'🏛', label:'Management Reviews', sub:'MR meetings with agenda, decisions, action items (IATF 9.3)' },
+    { key:'csr', icon:'📜', label:'Customer-Specific Requirements', sub:'CSR register per OEM with compliance status (IATF 8.2.2)' },
     { key:'schedules', icon:'📅', label:'Customer Schedules', sub:'Plan vs actual, weekly buckets, AI extract' },
     { key:'movements', icon:'🔀', label:'Movements', sub:'In/out material flow, GRN verification' },
     { key:'trace', icon:'🔍', label:'Trace · Audit Investigation', sub:'Linked timeline by date/part/machine' },
@@ -5868,6 +5878,1209 @@ function TrainingRecordModal({ plant, me, users, skills, onClose, onSaved }) {
         <div class="field"><label>Certificate URL</label><input type="url" value=${f.certificate_url} onChange=${e => setF({...f, certificate_url: e.target.value})} placeholder="https://…" /></div>
         <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
         <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : 'Log training'}</button>
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// PPAP MODULE (IATF 8.3.4.4 — Production Part Approval Process)
+// =================================================================
+function PpapModule({ plant, me }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState('all'); // all | active | expiring | expired | rejected | gap
+  const [editTarget, setEditTarget] = useState(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('v_iatf_ppap_register').select('*').order('created_at', { ascending: false });
+    setRows(data || []);
+    setLoading(false);
+  }, []);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const stats = useMemo(() => ({
+    total: rows.length,
+    approved: rows.filter(r => r.status === 'approved').length,
+    expiring: rows.filter(r => r.audit_flag === 'expiring_soon').length,
+    expired: rows.filter(r => r.audit_flag === 'expired_unflagged').length,
+    interim: rows.filter(r => r.status === 'interim' || r.audit_flag === 'interim_expired').length,
+    rejected: rows.filter(r => r.status === 'rejected').length,
+    inprog: rows.filter(r => r.status === 'in_progress').length,
+  }), [rows]);
+
+  let filtered = rows;
+  if (filter === 'active') filtered = filtered.filter(r => r.status === 'approved' && r.audit_flag !== 'expired_unflagged');
+  if (filter === 'expiring') filtered = filtered.filter(r => r.audit_flag === 'expiring_soon');
+  if (filter === 'expired') filtered = filtered.filter(r => r.audit_flag === 'expired_unflagged' || r.status === 'expired' || r.audit_flag === 'interim_expired');
+  if (filter === 'rejected') filtered = filtered.filter(r => r.status === 'rejected');
+  if (filter === 'inprog') filtered = filtered.filter(r => r.status === 'in_progress');
+  if (search.trim()) {
+    const q = search.toLowerCase();
+    filtered = filtered.filter(r =>
+      (r.part_number || '').toLowerCase().includes(q) ||
+      (r.customer_name || '').toLowerCase().includes(q) ||
+      (r.submission_ref || '').toLowerCase().includes(q));
+  }
+
+  const flagBadge = (r) => {
+    if (r.audit_flag === 'expired_unflagged' || r.status === 'expired') return html`<span class="badge rose">expired</span>`;
+    if (r.audit_flag === 'expiring_soon') return html`<span class="badge amber">expires ≤30d</span>`;
+    if (r.audit_flag === 'interim_expired') return html`<span class="badge rose">interim expired</span>`;
+    if (r.status === 'approved') return html`<span class="badge emerald">approved</span>`;
+    if (r.status === 'rejected') return html`<span class="badge rose">rejected</span>`;
+    if (r.status === 'interim') return html`<span class="badge amber">interim</span>`;
+    if (r.status === 'submitted') return html`<span class="badge">submitted</span>`;
+    return html`<span class="badge slate">${r.status}</span>`;
+  };
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:center">
+      <div><h1>PPAP Submissions</h1><div class="sub">IATF 8.3.4.4 · Production Part Approval Process</div></div>
+      <button class="btn" onClick=${() => setEditTarget({ _new: true })}>+ New Submission</button>
+    </div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr)">
+      <div class="stat"><div class="stat-num">${stats.total}</div><div class="stat-label">Total</div></div>
+      <div class="stat ${stats.approved > 0 ? 'emerald' : ''}"><div class="stat-num">${stats.approved}</div><div class="stat-label">Approved</div></div>
+      <div class="stat ${stats.expiring > 0 ? 'amber' : ''}"><div class="stat-num">${stats.expiring}</div><div class="stat-label">Expiring ≤30d</div></div>
+      <div class="stat ${stats.expired + stats.rejected > 0 ? 'rose' : ''}"><div class="stat-num">${stats.expired + stats.rejected}</div><div class="stat-label">Expired / Rejected</div></div>
+    </div>
+
+    <div style="margin-bottom:10px">
+      <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search part #, customer, submission ref…" style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap">
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All ${rows.length}</button>
+      <button class=${'auth-tab' + (filter === 'active' ? ' active' : '')} onClick=${() => setFilter('active')}>Active ${stats.approved}</button>
+      <button class=${'auth-tab' + (filter === 'expiring' ? ' active' : '')} onClick=${() => setFilter('expiring')} style=${stats.expiring > 0 ? 'color:var(--amber-700)' : ''}>Expiring ${stats.expiring}</button>
+      <button class=${'auth-tab' + (filter === 'expired' ? ' active' : '')} onClick=${() => setFilter('expired')} style=${stats.expired > 0 ? 'color:var(--rose-600)' : ''}>Expired ${stats.expired}</button>
+      <button class=${'auth-tab' + (filter === 'rejected' ? ' active' : '')} onClick=${() => setFilter('rejected')}>Rejected ${stats.rejected}</button>
+      <button class=${'auth-tab' + (filter === 'inprog' ? ' active' : '')} onClick=${() => setFilter('inprog')}>In progress ${stats.inprog}</button>
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      filtered.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📑</div>No PPAP submissions match.</div></div>` :
+      filtered.map(r => html`
+        <div class="list-item" key=${r.id}>
+          <div class="list-item-row" style="align-items:flex-start">
+            <div class="list-item-main">
+              <div class="list-item-title">${r.part_number}${r.part_revision ? ' rev ' + r.part_revision : ''} · ${r.customer_name}</div>
+              <div class="list-item-sub">PPAP L${r.ppap_level} · ${r.reason?.replace(/_/g,' ')} ${r.submission_ref ? ' · ref ' + r.submission_ref : ''}</div>
+              <div class="list-item-sub" style="margin-top:3px">
+                Submitted: ${r.submitted_on || '—'} · Approved: <strong>${r.approved_on || '—'}</strong> · Expires: ${r.expires_on || '—'}
+              </div>
+              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                ${flagBadge(r)}
+                <button class="btn small ghost" style="padding:2px 8px;font-size:11px;margin-left:auto" onClick=${() => setEditTarget(r)}>Edit</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      `)
+    }
+
+    ${editTarget && html`<${PpapEditModal} plant=${plant} me=${me} row=${editTarget} onClose=${() => setEditTarget(null)} onSaved=${() => { setEditTarget(null); refresh(); }} />`}
+  `;
+}
+
+function PpapEditModal({ plant, me, row, onClose, onSaved }) {
+  const isNew = !!row._new;
+  const [f, setF] = useState({
+    part_number: row.part_number || '',
+    part_revision: row.part_revision || '',
+    customer_name: row.customer_name || '',
+    customer_part_number: row.customer_part_number || '',
+    ppap_level: row.ppap_level || 3,
+    reason: row.reason || 'new_part',
+    submission_ref: row.submission_ref || '',
+    status: row.status || 'in_progress',
+    submitted_on: row.submitted_on || '',
+    approved_on: row.approved_on || '',
+    interim_until: row.interim_until || '',
+    expires_on: row.expires_on || '',
+    approver_name: row.approver_name || '',
+    notes: row.notes || '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const save = async () => {
+    if (!f.part_number.trim() || !f.customer_name.trim()) { setError('Part # and customer are required'); return; }
+    setSaving(true); setError('');
+    const payload = {
+      plant_id: plant.id,
+      part_number: f.part_number.trim(),
+      part_revision: f.part_revision || null,
+      customer_name: f.customer_name.trim(),
+      customer_part_number: f.customer_part_number || null,
+      ppap_level: parseInt(f.ppap_level) || 3,
+      reason: f.reason,
+      submission_ref: f.submission_ref || null,
+      status: f.status,
+      submitted_on: f.submitted_on || null,
+      approved_on: f.approved_on || null,
+      interim_until: f.interim_until || null,
+      expires_on: f.expires_on || null,
+      approver_name: f.approver_name || null,
+      notes: f.notes || null,
+    };
+    let err;
+    if (isNew) ({ error: err } = await sb.from('iatf_ppap_submissions').insert({ ...payload, created_by: me.id }));
+    else       ({ error: err } = await sb.from('iatf_ppap_submissions').update(payload).eq('id', row.id));
+    if (err) { setError(err.message); setSaving(false); return; }
+    showToast(isNew ? '✓ PPAP added' : '✓ Updated' + (f.status === 'rejected' ? ' · QA action raised' : ''));
+    onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header">
+          <div class="modal-title">${isNew ? '+ New PPAP Submission' : 'Edit · ' + row.part_number}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <div class="field-row">
+          <div class="field"><label>Part # *</label><input value=${f.part_number} onChange=${e => setF({...f, part_number: e.target.value})} placeholder="ABS-12345" /></div>
+          <div class="field"><label>Revision</label><input value=${f.part_revision} onChange=${e => setF({...f, part_revision: e.target.value})} placeholder="C" /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Customer *</label><input value=${f.customer_name} onChange=${e => setF({...f, customer_name: e.target.value})} placeholder="Bosch India" /></div>
+          <div class="field"><label>Customer Part #</label><input value=${f.customer_part_number} onChange=${e => setF({...f, customer_part_number: e.target.value})} /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>PPAP Level *</label>
+            <select value=${f.ppap_level} onChange=${e => setF({...f, ppap_level: e.target.value})}>
+              <option value="1">Level 1 (Warrant only)</option>
+              <option value="2">Level 2 (Warrant + samples)</option>
+              <option value="3">Level 3 (Default, full)</option>
+              <option value="4">Level 4 (Customer-defined)</option>
+              <option value="5">Level 5 (At supplier, full review)</option>
+            </select>
+          </div>
+          <div class="field"><label>Reason</label>
+            <select value=${f.reason} onChange=${e => setF({...f, reason: e.target.value})}>
+              <option value="new_part">New part</option>
+              <option value="engineering_change">Engineering change</option>
+              <option value="tooling_change">Tooling change</option>
+              <option value="supplier_change">Supplier change</option>
+              <option value="process_change">Process change</option>
+              <option value="annual_revalidation">Annual revalidation</option>
+            </select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Submission ref</label><input value=${f.submission_ref} onChange=${e => setF({...f, submission_ref: e.target.value})} placeholder="PSW-2026-001" /></div>
+          <div class="field"><label>Status *</label>
+            <select value=${f.status} onChange=${e => setF({...f, status: e.target.value})}>
+              <option value="in_progress">In progress</option>
+              <option value="submitted">Submitted</option>
+              <option value="approved">Approved</option>
+              <option value="interim">Interim approval</option>
+              <option value="rejected">Rejected</option>
+              <option value="expired">Expired</option>
+            </select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Submitted on</label><input type="date" value=${f.submitted_on} onChange=${e => setF({...f, submitted_on: e.target.value})} /></div>
+          <div class="field"><label>Approved on</label><input type="date" value=${f.approved_on} onChange=${e => setF({...f, approved_on: e.target.value})} /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Interim until</label><input type="date" value=${f.interim_until} onChange=${e => setF({...f, interim_until: e.target.value})} /></div>
+          <div class="field"><label>Expires on</label><input type="date" value=${f.expires_on} onChange=${e => setF({...f, expires_on: e.target.value})} /></div>
+        </div>
+        <div class="field"><label>Approver name</label><input value=${f.approver_name} onChange=${e => setF({...f, approver_name: e.target.value})} placeholder="QA Manager name at customer" /></div>
+        <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
+        ${(f.status === 'rejected' || f.status === 'expired') && html`
+          <div class="alert info" style="background:var(--amber-50);border-color:var(--amber-200);color:var(--amber-800)">
+            ⚠ A QA action will be auto-raised on save for follow-up.
+          </div>
+        `}
+        <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Create submission' : 'Save')}</button>
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// PFMEA MODULE (IATF 8.3 — Process FMEA with RPN)
+// =================================================================
+function PfmeaModule({ plant, me }) {
+  const [view, setView] = useState('list');   // list | detail
+  const [headers, setHeaders] = useState([]);
+  const [activeFmea, setActiveFmea] = useState(null);
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [editHeader, setEditHeader] = useState(null);
+  const [editItem, setEditItem] = useState(null);
+
+  const refreshHeaders = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('iatf_fmea').select('*').order('fmea_date', { ascending: false });
+    setHeaders(data || []);
+    setLoading(false);
+  }, []);
+  const refreshItems = useCallback(async (fmeaId) => {
+    if (!fmeaId) return;
+    const { data } = await sb.from('iatf_fmea_items').select('*').eq('fmea_id', fmeaId).order('step_no', { ascending: true, nullsFirst: false });
+    setItems(data || []);
+  }, []);
+
+  useEffect(() => { refreshHeaders(); }, [refreshHeaders]);
+  useEffect(() => { if (view === 'detail' && activeFmea) refreshItems(activeFmea.id); }, [view, activeFmea, refreshItems]);
+
+  const rpnBand = (n) => n >= 200 ? 'rose' : n >= 120 ? 'amber' : n >= 60 ? '' : 'emerald';
+
+  if (view === 'detail' && activeFmea) {
+    const high = items.filter(i => !i.closed && (i.rev_rpn || i.rpn) >= 120).length;
+    const max = items.reduce((m, i) => Math.max(m, i.rev_rpn || i.rpn || 0), 0);
+    return html`
+      <div class="page-header" style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <h1>${activeFmea.process_name}</h1>
+          <div class="sub">PFMEA rev ${activeFmea.revision} · ${activeFmea.fmea_date}${activeFmea.part_number ? ' · part ' + activeFmea.part_number : ''}</div>
+        </div>
+        <button class="btn ghost small" onClick=${() => { setActiveFmea(null); setView('list'); }}>← Back</button>
+      </div>
+
+      <div class="stat-grid" style="grid-template-columns:repeat(4,1fr)">
+        <div class="stat"><div class="stat-num">${items.length}</div><div class="stat-label">Total items</div></div>
+        <div class="stat ${high > 0 ? 'rose' : 'emerald'}"><div class="stat-num">${high}</div><div class="stat-label">High RPN (≥120)</div></div>
+        <div class="stat ${max >= 200 ? 'rose' : max >= 120 ? 'amber' : ''}"><div class="stat-num">${max}</div><div class="stat-label">Max RPN</div></div>
+        <div class="stat ${items.filter(i => i.closed).length > 0 ? 'emerald' : ''}"><div class="stat-num">${items.filter(i => i.closed).length}</div><div class="stat-label">Closed</div></div>
+      </div>
+
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <div class="section-h" style="margin:0">Failure modes</div>
+        <button class="btn small" onClick=${() => setEditItem({ _new: true, fmea_id: activeFmea.id })}>+ Add item</button>
+      </div>
+
+      ${items.length === 0 ? html`<div class="card"><div class="empty">No failure modes added yet.</div></div>` :
+        items.map(it => {
+          const effRpn = it.rev_rpn || it.rpn;
+          return html`
+            <div class="list-item" key=${it.id}>
+              <div class="list-item-row" style="align-items:flex-start">
+                <div class="list-item-main">
+                  <div class="list-item-title">${it.step_no ? '[' + it.step_no + '] ' : ''}${it.process_step}: ${it.failure_mode}</div>
+                  <div class="list-item-sub">Effect: ${it.failure_effect}${it.cause ? ' · Cause: ' + it.cause : ''}</div>
+                  ${it.current_controls && html`<div class="list-item-sub" style="margin-top:2px">Controls: ${it.current_controls}</div>`}
+                  <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                    <span class="badge slate" style="font-size:10px">S=${it.severity}</span>
+                    <span class="badge slate" style="font-size:10px">O=${it.occurrence}</span>
+                    <span class="badge slate" style="font-size:10px">D=${it.detection}</span>
+                    <span class=${'badge ' + rpnBand(effRpn)} style="font-size:11px;font-weight:700">RPN ${effRpn}${it.rev_rpn && it.rev_rpn !== it.rpn ? ' (was ' + it.rpn + ')' : ''}</span>
+                    ${it.closed && html`<span class="badge emerald" style="font-size:10px">closed</span>`}
+                    <button class="btn small ghost" style="padding:2px 8px;font-size:11px;margin-left:auto" onClick=${() => setEditItem(it)}>Edit</button>
+                  </div>
+                  ${it.recommended_action && html`<div class="list-item-sub" style="margin-top:6px;color:var(--teal-700)"><strong>Action:</strong> ${it.recommended_action}${it.action_owner ? ' (' + it.action_owner + ')' : ''}${it.target_date ? ' · due ' + it.target_date : ''}</div>`}
+                </div>
+              </div>
+            </div>
+          `;
+        })
+      }
+
+      ${editItem && html`<${PfmeaItemEditModal} plant=${plant} fmea=${activeFmea} row=${editItem} onClose=${() => setEditItem(null)} onSaved=${() => { setEditItem(null); refreshItems(activeFmea.id); }} />`}
+    `;
+  }
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:center">
+      <div><h1>PFMEA Register</h1><div class="sub">IATF 8.3 · Process / Design FMEA with RPN tracking</div></div>
+      <button class="btn" onClick=${() => setEditHeader({ _new: true })}>+ New FMEA</button>
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      headers.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">⚠️</div>No FMEAs created yet. Start with a process FMEA for your top part.</div></div>` :
+      headers.map(h => html`
+        <div class="list-item" key=${h.id} style="cursor:pointer" onClick=${() => { setActiveFmea(h); setView('detail'); }}>
+          <div class="list-item-row" style="align-items:flex-start">
+            <div class="list-item-main">
+              <div class="list-item-title">${h.process_name}${h.part_number ? ' · ' + h.part_number : ''}</div>
+              <div class="list-item-sub">${h.fmea_type === 'design' ? 'DFMEA' : 'PFMEA'} rev ${h.revision} · ${h.fmea_date}${h.team_members ? ' · team: ' + h.team_members : ''}</div>
+              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                <span class=${'badge ' + (h.status === 'active' ? 'emerald' : 'slate')}>${h.status}</span>
+                <span style="color:var(--slate-400);margin-left:auto;font-size:13px">›</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      `)
+    }
+
+    ${editHeader && html`<${PfmeaHeaderEditModal} plant=${plant} me=${me} row=${editHeader} onClose=${() => setEditHeader(null)} onSaved=${(saved) => { setEditHeader(null); refreshHeaders(); if (saved && saved.id) { setActiveFmea(saved); setView('detail'); } }} />`}
+  `;
+}
+
+function PfmeaHeaderEditModal({ plant, me, row, onClose, onSaved }) {
+  const isNew = !!row._new;
+  const [f, setF] = useState({
+    fmea_type: row.fmea_type || 'process',
+    part_number: row.part_number || '',
+    process_name: row.process_name || '',
+    team_members: row.team_members || '',
+    revision: row.revision || '1.0',
+    fmea_date: row.fmea_date || new Date().toISOString().slice(0,10),
+    status: row.status || 'active',
+    notes: row.notes || '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const save = async () => {
+    if (!f.process_name.trim()) { setError('Process name required'); return; }
+    setSaving(true); setError('');
+    const payload = {
+      plant_id: plant.id,
+      fmea_type: f.fmea_type,
+      part_number: f.part_number || null,
+      process_name: f.process_name.trim(),
+      team_members: f.team_members || null,
+      revision: f.revision || '1.0',
+      fmea_date: f.fmea_date,
+      status: f.status,
+      notes: f.notes || null,
+    };
+    let result;
+    if (isNew) result = await sb.from('iatf_fmea').insert({ ...payload, created_by: me.id }).select().single();
+    else       result = await sb.from('iatf_fmea').update(payload).eq('id', row.id).select().single();
+    if (result.error) { setError(result.error.message); setSaving(false); return; }
+    showToast(isNew ? '✓ FMEA created' : '✓ Updated');
+    onSaved(result.data);
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:520px">
+        <div class="modal-header">
+          <div class="modal-title">${isNew ? '+ New FMEA' : 'Edit · ' + row.process_name}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <div class="field-row">
+          <div class="field"><label>Type *</label>
+            <select value=${f.fmea_type} onChange=${e => setF({...f, fmea_type: e.target.value})}>
+              <option value="process">Process FMEA</option>
+              <option value="design">Design FMEA</option>
+            </select>
+          </div>
+          <div class="field"><label>Revision</label><input value=${f.revision} onChange=${e => setF({...f, revision: e.target.value})} /></div>
+        </div>
+        <div class="field"><label>Process / Part name *</label><input value=${f.process_name} onChange=${e => setF({...f, process_name: e.target.value})} placeholder="e.g. CNC machining of yoke" /></div>
+        <div class="field"><label>Part #</label><input value=${f.part_number} onChange=${e => setF({...f, part_number: e.target.value})} placeholder="ABS-12345 (optional)" /></div>
+        <div class="field"><label>Team members</label><input value=${f.team_members} onChange=${e => setF({...f, team_members: e.target.value})} placeholder="QA, Production, Maintenance" /></div>
+        <div class="field-row">
+          <div class="field"><label>FMEA date</label><input type="date" value=${f.fmea_date} onChange=${e => setF({...f, fmea_date: e.target.value})} /></div>
+          <div class="field"><label>Status</label>
+            <select value=${f.status} onChange=${e => setF({...f, status: e.target.value})}>
+              <option value="draft">Draft</option>
+              <option value="active">Active</option>
+              <option value="superseded">Superseded</option>
+            </select>
+          </div>
+        </div>
+        <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
+        <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Create FMEA' : 'Save')}</button>
+      </div>
+    </div>
+  `;
+}
+
+function PfmeaItemEditModal({ plant, fmea, row, onClose, onSaved }) {
+  const isNew = !!row._new;
+  const [f, setF] = useState({
+    step_no: row.step_no || '',
+    process_step: row.process_step || '',
+    function_text: row.function_text || '',
+    failure_mode: row.failure_mode || '',
+    failure_effect: row.failure_effect || '',
+    severity: row.severity || 5,
+    cause: row.cause || '',
+    occurrence: row.occurrence || 5,
+    current_controls: row.current_controls || '',
+    detection: row.detection || 5,
+    recommended_action: row.recommended_action || '',
+    action_owner: row.action_owner || '',
+    target_date: row.target_date || '',
+    action_taken: row.action_taken || '',
+    rev_severity: row.rev_severity || '',
+    rev_occurrence: row.rev_occurrence || '',
+    rev_detection: row.rev_detection || '',
+    closed: row.closed || false,
+    notes: row.notes || '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const liveRpn = (parseInt(f.severity)||0) * (parseInt(f.occurrence)||0) * (parseInt(f.detection)||0);
+  const revRpn = (f.rev_severity || f.rev_occurrence || f.rev_detection)
+    ? (parseInt(f.rev_severity || f.severity)||0) * (parseInt(f.rev_occurrence || f.occurrence)||0) * (parseInt(f.rev_detection || f.detection)||0)
+    : null;
+  const save = async () => {
+    if (!f.process_step.trim() || !f.failure_mode.trim() || !f.failure_effect.trim() || !f.cause.trim()) {
+      setError('Process step, failure mode, effect and cause are required'); return;
+    }
+    setSaving(true); setError('');
+    const payload = {
+      plant_id: plant.id,
+      fmea_id: fmea.id,
+      step_no: f.step_no ? parseInt(f.step_no) : null,
+      process_step: f.process_step.trim(),
+      function_text: f.function_text || null,
+      failure_mode: f.failure_mode.trim(),
+      failure_effect: f.failure_effect.trim(),
+      severity: parseInt(f.severity) || 5,
+      cause: f.cause.trim(),
+      occurrence: parseInt(f.occurrence) || 5,
+      current_controls: f.current_controls || null,
+      detection: parseInt(f.detection) || 5,
+      recommended_action: f.recommended_action || null,
+      action_owner: f.action_owner || null,
+      target_date: f.target_date || null,
+      action_taken: f.action_taken || null,
+      rev_severity: f.rev_severity ? parseInt(f.rev_severity) : null,
+      rev_occurrence: f.rev_occurrence ? parseInt(f.rev_occurrence) : null,
+      rev_detection: f.rev_detection ? parseInt(f.rev_detection) : null,
+      closed: !!f.closed,
+      notes: f.notes || null,
+    };
+    let err;
+    if (isNew) ({ error: err } = await sb.from('iatf_fmea_items').insert(payload));
+    else       ({ error: err } = await sb.from('iatf_fmea_items').update(payload).eq('id', row.id));
+    if (err) { setError(err.message); setSaving(false); return; }
+    showToast(isNew ? '✓ Item added' + (liveRpn >= 120 ? ' · QA action raised' : '') : '✓ Updated');
+    onSaved();
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:600px;max-height:90vh;overflow-y:auto">
+        <div class="modal-header">
+          <div class="modal-title">${isNew ? '+ Add FMEA Item' : 'Edit item'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <div class="field-row">
+          <div class="field"><label>Step #</label><input type="number" min="1" value=${f.step_no} onChange=${e => setF({...f, step_no: e.target.value})} style="max-width:80px" /></div>
+          <div class="field"><label>Process step *</label><input value=${f.process_step} onChange=${e => setF({...f, process_step: e.target.value})} placeholder="OP-20 turning" /></div>
+        </div>
+        <div class="field"><label>Function</label><input value=${f.function_text} onChange=${e => setF({...f, function_text: e.target.value})} placeholder="Achieve dia 25.0 ±0.05" /></div>
+        <div class="field"><label>Failure mode *</label><input value=${f.failure_mode} onChange=${e => setF({...f, failure_mode: e.target.value})} placeholder="Diameter out of tolerance" /></div>
+        <div class="field"><label>Failure effect *</label><textarea rows="2" value=${f.failure_effect} onChange=${e => setF({...f, failure_effect: e.target.value})} placeholder="Part rejected at customer assembly"></textarea></div>
+        <div class="field"><label>Severity (1-10) *</label>
+          <input type="number" min="1" max="10" value=${f.severity} onChange=${e => setF({...f, severity: e.target.value})} />
+        </div>
+        <div class="field"><label>Cause *</label><textarea rows="2" value=${f.cause} onChange=${e => setF({...f, cause: e.target.value})} placeholder="Tool wear beyond limit"></textarea></div>
+        <div class="field"><label>Occurrence (1-10) *</label>
+          <input type="number" min="1" max="10" value=${f.occurrence} onChange=${e => setF({...f, occurrence: e.target.value})} />
+        </div>
+        <div class="field"><label>Current controls</label><textarea rows="2" value=${f.current_controls} onChange=${e => setF({...f, current_controls: e.target.value})} placeholder="100% gauge check, tool life monitor"></textarea></div>
+        <div class="field"><label>Detection (1-10) *</label>
+          <input type="number" min="1" max="10" value=${f.detection} onChange=${e => setF({...f, detection: e.target.value})} />
+        </div>
+        <div class="card" style="background:var(--slate-50);margin:14px 0">
+          <div class="card-row"><span class="label">Current RPN</span><span class="value mono" style="font-size:18px;font-weight:700;color:${liveRpn >= 200 ? 'var(--rose-600)' : liveRpn >= 120 ? 'var(--amber-700)' : 'var(--emerald-700)'}">${liveRpn}</span></div>
+          ${liveRpn >= 120 && html`<div class="card-row"><span class="label" style="color:var(--amber-700)">⚠ Cascade</span><span class="value" style="font-size:11px">Auto QA action will be raised</span></div>`}
+        </div>
+        <div class="field"><label>Recommended action</label><textarea rows="2" value=${f.recommended_action} onChange=${e => setF({...f, recommended_action: e.target.value})} placeholder="Poka-yoke gauge at OP-20 outfeed"></textarea></div>
+        <div class="field-row">
+          <div class="field"><label>Action owner</label><input value=${f.action_owner} onChange=${e => setF({...f, action_owner: e.target.value})} /></div>
+          <div class="field"><label>Target date</label><input type="date" value=${f.target_date} onChange=${e => setF({...f, target_date: e.target.value})} /></div>
+        </div>
+        <div class="field"><label>Action taken</label><textarea rows="2" value=${f.action_taken} onChange=${e => setF({...f, action_taken: e.target.value})}></textarea></div>
+        <div class="section-h" style="margin-top:14px">After action — revised S × O × D (optional)</div>
+        <div class="field-row">
+          <div class="field"><label>Rev S</label><input type="number" min="1" max="10" value=${f.rev_severity} onChange=${e => setF({...f, rev_severity: e.target.value})} /></div>
+          <div class="field"><label>Rev O</label><input type="number" min="1" max="10" value=${f.rev_occurrence} onChange=${e => setF({...f, rev_occurrence: e.target.value})} /></div>
+          <div class="field"><label>Rev D</label><input type="number" min="1" max="10" value=${f.rev_detection} onChange=${e => setF({...f, rev_detection: e.target.value})} /></div>
+        </div>
+        ${revRpn && html`<div class="card" style="background:var(--emerald-50);margin-bottom:14px"><div class="card-row"><span class="label">Revised RPN</span><span class="value mono" style="font-size:16px;font-weight:700">${revRpn}</span></div></div>`}
+        <div class="field"><label><input type="checkbox" checked=${f.closed} onChange=${e => setF({...f, closed: e.target.checked})} style="margin-right:8px" />Close this item</label></div>
+        <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
+        <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Add item' : 'Save')}</button>
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// LPA MODULE (IATF 9.2.2.3 — Layered Process Audit)
+// =================================================================
+function LpaModule({ plant, me }) {
+  const [audits, setAudits] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState('all'); // all | layer1 | layer2 | layer3 | non_compliant
+  const [editTarget, setEditTarget] = useState(null);
+  const [findingsTarget, setFindingsTarget] = useState(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('iatf_lpa_audits').select('*').order('audit_date', { ascending: false }).limit(200);
+    setAudits(data || []);
+    setLoading(false);
+  }, []);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const stats = useMemo(() => {
+    const last30 = audits.filter(a => {
+      const d = new Date(a.audit_date).getTime();
+      return d >= Date.now() - 30 * 86400000;
+    });
+    return {
+      total: audits.length,
+      last30: last30.length,
+      avgCompliance: last30.length > 0
+        ? Math.round(last30.filter(a => a.compliance_pct != null).reduce((s,a)=>s+(+a.compliance_pct||0),0) / last30.filter(a => a.compliance_pct != null).length)
+        : null,
+      withFindings: last30.filter(a => a.non_compliant_count > 0).length,
+    };
+  }, [audits]);
+
+  let filtered = audits;
+  if (filter === 'layer1') filtered = filtered.filter(a => a.layer === 1);
+  if (filter === 'layer2') filtered = filtered.filter(a => a.layer === 2);
+  if (filter === 'layer3') filtered = filtered.filter(a => a.layer === 3);
+  if (filter === 'non_compliant') filtered = filtered.filter(a => a.non_compliant_count > 0);
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:center">
+      <div><h1>Layered Process Audits</h1><div class="sub">IATF 9.2.2.3 · Daily/weekly/monthly walks (L1/L2/L3)</div></div>
+      <button class="btn" onClick=${() => setEditTarget({ _new: true })}>+ New Audit</button>
+    </div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr)">
+      <div class="stat"><div class="stat-num">${stats.total}</div><div class="stat-label">All audits</div></div>
+      <div class="stat"><div class="stat-num">${stats.last30}</div><div class="stat-label">Last 30 days</div></div>
+      <div class="stat ${stats.avgCompliance != null && stats.avgCompliance < 80 ? 'amber' : stats.avgCompliance != null ? 'emerald' : ''}"><div class="stat-num">${stats.avgCompliance != null ? stats.avgCompliance + '%' : '—'}</div><div class="stat-label">Avg compliance</div></div>
+      <div class="stat ${stats.withFindings > 0 ? 'rose' : 'emerald'}"><div class="stat-num">${stats.withFindings}</div><div class="stat-label">With findings (30d)</div></div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap">
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All ${audits.length}</button>
+      <button class=${'auth-tab' + (filter === 'layer1' ? ' active' : '')} onClick=${() => setFilter('layer1')}>L1 supervisor</button>
+      <button class=${'auth-tab' + (filter === 'layer2' ? ' active' : '')} onClick=${() => setFilter('layer2')}>L2 manager</button>
+      <button class=${'auth-tab' + (filter === 'layer3' ? ' active' : '')} onClick=${() => setFilter('layer3')}>L3 plant head</button>
+      <button class=${'auth-tab' + (filter === 'non_compliant' ? ' active' : '')} onClick=${() => setFilter('non_compliant')} style="color:var(--rose-600)">With findings</button>
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      filtered.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📋</div>No audits match.</div></div>` :
+      filtered.map(a => html`
+        <div class="list-item" key=${a.id}>
+          <div class="list-item-row" style="align-items:flex-start">
+            <div class="list-item-main">
+              <div class="list-item-title">Layer ${a.layer} · ${a.area}${a.shift ? ' · ' + a.shift : ''}</div>
+              <div class="list-item-sub">${a.audit_date} · ${a.auditor_name || '—'}</div>
+              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                <span class=${'badge ' + (a.compliance_pct == null ? 'slate' : a.compliance_pct < 70 ? 'rose' : a.compliance_pct < 90 ? 'amber' : 'emerald')}>${a.compliance_pct != null ? a.compliance_pct + '% compliance' : 'no data'}</span>
+                <span class="badge slate" style="font-size:10px">${a.compliant_count}✓ / ${a.non_compliant_count}✗ / ${a.na_count} N/A</span>
+                ${a.non_compliant_count > 0 && html`<span class="badge rose" style="font-size:10px">${a.non_compliant_count} finding${a.non_compliant_count > 1 ? 's' : ''}</span>`}
+                <button class="btn small ghost" style="padding:2px 8px;font-size:11px;margin-left:auto" onClick=${() => setFindingsTarget(a)}>Findings</button>
+                <button class="btn small ghost" style="padding:2px 8px;font-size:11px" onClick=${() => setEditTarget(a)}>Edit</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      `)
+    }
+
+    ${editTarget && html`<${LpaEditModal} plant=${plant} me=${me} row=${editTarget} onClose=${() => setEditTarget(null)} onSaved=${() => { setEditTarget(null); refresh(); }} />`}
+    ${findingsTarget && html`<${LpaFindingsDrawer} plant=${plant} me=${me} audit=${findingsTarget} onClose=${() => setFindingsTarget(null)} onChanged=${refresh} />`}
+  `;
+}
+
+function LpaEditModal({ plant, me, row, onClose, onSaved }) {
+  const isNew = !!row._new;
+  const [f, setF] = useState({
+    audit_date: row.audit_date || new Date().toISOString().slice(0,10),
+    layer: row.layer || 1,
+    area: row.area || '',
+    shift: row.shift || '',
+    auditor_name: row.auditor_name || (me?.full_name || ''),
+    total_questions: row.total_questions || 10,
+    compliant_count: row.compliant_count || 0,
+    non_compliant_count: row.non_compliant_count || 0,
+    na_count: row.na_count || 0,
+    notes: row.notes || '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const save = async () => {
+    if (!f.area.trim()) { setError('Area is required'); return; }
+    const tq = parseInt(f.total_questions) || 0;
+    const cc = parseInt(f.compliant_count) || 0;
+    const nc = parseInt(f.non_compliant_count) || 0;
+    const na = parseInt(f.na_count) || 0;
+    if (cc + nc + na > tq) { setError('Counts exceed total questions'); return; }
+    setSaving(true); setError('');
+    const payload = {
+      plant_id: plant.id,
+      audit_date: f.audit_date,
+      layer: parseInt(f.layer) || 1,
+      area: f.area.trim(),
+      shift: f.shift || null,
+      auditor_user_id: me?.id || null,
+      auditor_name: f.auditor_name || null,
+      total_questions: tq,
+      compliant_count: cc,
+      non_compliant_count: nc,
+      na_count: na,
+      status: 'completed',
+      notes: f.notes || null,
+    };
+    let err;
+    if (isNew) ({ error: err } = await sb.from('iatf_lpa_audits').insert(payload));
+    else       ({ error: err } = await sb.from('iatf_lpa_audits').update(payload).eq('id', row.id));
+    if (err) { setError(err.message); setSaving(false); return; }
+    showToast(isNew ? '✓ LPA logged' : '✓ Updated');
+    onSaved();
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:520px">
+        <div class="modal-header">
+          <div class="modal-title">${isNew ? '+ New LPA Audit' : 'Edit · ' + row.area}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <div class="field-row">
+          <div class="field"><label>Date *</label><input type="date" value=${f.audit_date} onChange=${e => setF({...f, audit_date: e.target.value})} /></div>
+          <div class="field"><label>Layer *</label>
+            <select value=${f.layer} onChange=${e => setF({...f, layer: e.target.value})}>
+              <option value="1">Layer 1 — Supervisor (daily)</option>
+              <option value="2">Layer 2 — Manager (weekly)</option>
+              <option value="3">Layer 3 — Plant Head (monthly)</option>
+            </select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Area *</label><input value=${f.area} onChange=${e => setF({...f, area: e.target.value})} placeholder="CNC line / Heat treat / Assembly" /></div>
+          <div class="field"><label>Shift</label><input value=${f.shift} onChange=${e => setF({...f, shift: e.target.value})} placeholder="A / B / C" /></div>
+        </div>
+        <div class="field"><label>Auditor</label><input value=${f.auditor_name} onChange=${e => setF({...f, auditor_name: e.target.value})} /></div>
+        <div class="section-h">Counts (post-walk)</div>
+        <div class="field-row">
+          <div class="field"><label>Total questions</label><input type="number" min="0" value=${f.total_questions} onChange=${e => setF({...f, total_questions: e.target.value})} /></div>
+          <div class="field"><label>N/A</label><input type="number" min="0" value=${f.na_count} onChange=${e => setF({...f, na_count: e.target.value})} /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Compliant ✓</label><input type="number" min="0" value=${f.compliant_count} onChange=${e => setF({...f, compliant_count: e.target.value})} /></div>
+          <div class="field"><label>Non-compliant ✗</label><input type="number" min="0" value=${f.non_compliant_count} onChange=${e => setF({...f, non_compliant_count: e.target.value})} /></div>
+        </div>
+        <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
+        <div class="alert info">After saving, open <strong>Findings</strong> from the list to log each non-compliance. Critical findings auto-raise QA actions due in 2 days.</div>
+        <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Log audit' : 'Save')}</button>
+      </div>
+    </div>
+  `;
+}
+
+function LpaFindingsDrawer({ plant, me, audit, onClose, onChanged }) {
+  const [findings, setFindings] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [adding, setAdding] = useState(false);
+  const [nf, setNf] = useState({ question: '', observation: '', severity: 'minor' });
+
+  const refresh = async () => {
+    const { data } = await sb.from('iatf_lpa_findings').select('*').eq('audit_id', audit.id).order('created_at', { ascending: true });
+    setFindings(data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [audit.id]);
+
+  const addFinding = async () => {
+    if (!nf.question.trim()) return;
+    const { error } = await sb.from('iatf_lpa_findings').insert({
+      plant_id: plant.id,
+      audit_id: audit.id,
+      question: nf.question.trim(),
+      observation: nf.observation || null,
+      result: 'non_compliant',
+      severity: nf.severity,
+    });
+    if (error) { showToast('✗ ' + error.message); return; }
+    showToast('✓ Finding added · QA action raised');
+    setNf({ question: '', observation: '', severity: 'minor' });
+    setAdding(false);
+    await refresh();
+    onChanged && onChanged();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header">
+          <div class="modal-title">Findings · L${audit.layer} ${audit.area}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card" style="background:var(--slate-50);margin-bottom:14px">
+          <div class="card-row"><span class="label">Date</span><span class="value">${audit.audit_date}</span></div>
+          <div class="card-row"><span class="label">Auditor</span><span class="value">${audit.auditor_name || '—'}</span></div>
+          <div class="card-row"><span class="label">Compliance</span><span class="value">${audit.compliance_pct != null ? audit.compliance_pct + '%' : '—'}</span></div>
+        </div>
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+          findings.length === 0 ? html`<div class="empty">No findings logged. Tap "+ Add finding" to record non-compliances.</div>` :
+          findings.map(fnd => html`
+            <div class="card" key=${fnd.id} style="margin-bottom:8px">
+              <div class="card-row"><span class="label">Question</span><span class="value">${fnd.question}</span></div>
+              ${fnd.observation && html`<div class="card-row"><span class="label">Observation</span><span class="value">${fnd.observation}</span></div>`}
+              <div class="card-row"><span class="label">Severity</span><span class="value"><span class=${'badge ' + (fnd.severity === 'critical' ? 'rose' : fnd.severity === 'major' ? 'amber' : 'slate')}>${fnd.severity}</span></span></div>
+              ${fnd.action_id && html`<div class="card-row"><span class="label">QA action</span><span class="value mono" style="font-size:11px">${fnd.action_id.slice(0,8)}…</span></div>`}
+            </div>
+          `)
+        }
+        ${adding ? html`
+          <div class="card" style="border:2px solid var(--teal-200);margin-bottom:8px">
+            <div class="field"><label>Question / area checked *</label><input value=${nf.question} onChange=${e => setNf({...nf, question: e.target.value})} placeholder="Are operators wearing safety shoes?" /></div>
+            <div class="field"><label>Observation</label><textarea rows="2" value=${nf.observation} onChange=${e => setNf({...nf, observation: e.target.value})} placeholder="2 of 5 operators on grinder without shoes"></textarea></div>
+            <div class="field"><label>Severity</label>
+              <select value=${nf.severity} onChange=${e => setNf({...nf, severity: e.target.value})}>
+                <option value="minor">Minor</option>
+                <option value="major">Major</option>
+                <option value="critical">Critical (action due in 2d)</option>
+              </select>
+            </div>
+            <div style="display:flex;gap:8px">
+              <button class="btn ghost small" onClick=${() => setAdding(false)}>Cancel</button>
+              <button class="btn small" onClick=${addFinding}>Save finding</button>
+            </div>
+          </div>
+        ` : html`<button class="btn small" style="width:100%" onClick=${() => setAdding(true)}>+ Add finding</button>`}
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// MANAGEMENT REVIEW MODULE (IATF 9.3 — Management Review)
+// =================================================================
+function MgmtReviewModule({ plant, me }) {
+  const [reviews, setReviews] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [editTarget, setEditTarget] = useState(null);
+  const [actionsTarget, setActionsTarget] = useState(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('v_iatf_mgmt_review_log').select('*').order('review_date', { ascending: false });
+    setReviews(data || []);
+    setLoading(false);
+  }, []);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:center">
+      <div><h1>Management Reviews</h1><div class="sub">IATF 9.3 · Top-management review of QMS effectiveness</div></div>
+      <button class="btn" onClick=${() => setEditTarget({ _new: true })}>+ New Review</button>
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      reviews.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🏛</div>No reviews yet. Schedule the first MR session.</div></div>` :
+      reviews.map(r => html`
+        <div class="list-item" key=${r.id}>
+          <div class="list-item-row" style="align-items:flex-start">
+            <div class="list-item-main">
+              <div class="list-item-title">${r.review_no || 'MR'} · ${r.review_date}</div>
+              <div class="list-item-sub">Chair: ${r.chairperson_name || '—'}${r.next_review_date ? ' · next due ' + r.next_review_date : ''}</div>
+              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                <span class=${'badge ' + (r.status === 'completed' ? 'emerald' : r.status === 'in_progress' ? 'amber' : 'slate')}>${r.status}</span>
+                <span class="badge slate" style="font-size:10px">${r.action_closed}/${r.action_count} actions closed</span>
+                <button class="btn small ghost" style="padding:2px 8px;font-size:11px;margin-left:auto" onClick=${() => setActionsTarget(r)}>Actions</button>
+                <button class="btn small ghost" style="padding:2px 8px;font-size:11px" onClick=${() => setEditTarget(r)}>Edit</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      `)
+    }
+
+    ${editTarget && html`<${MgmtReviewEditModal} plant=${plant} me=${me} row=${editTarget} onClose=${() => setEditTarget(null)} onSaved=${() => { setEditTarget(null); refresh(); }} />`}
+    ${actionsTarget && html`<${MgmtReviewActionsDrawer} plant=${plant} me=${me} review=${actionsTarget} onClose=${() => setActionsTarget(null)} onChanged=${refresh} />`}
+  `;
+}
+
+function MgmtReviewEditModal({ plant, me, row, onClose, onSaved }) {
+  const isNew = !!row._new;
+  const [f, setF] = useState({
+    review_no: row.review_no || '',
+    review_date: row.review_date || new Date().toISOString().slice(0,10),
+    chairperson_name: row.chairperson_name || '',
+    attendees: row.attendees || '',
+    agenda: row.agenda || '',
+    inputs: row.inputs || {},
+    outputs: row.outputs || {},
+    effectiveness_summary: row.effectiveness_summary || '',
+    status: row.status || 'completed',
+    next_review_date: row.next_review_date || '',
+    notes: row.notes || '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const setInput = (k, v) => setF({ ...f, inputs: { ...f.inputs, [k]: v } });
+  const setOutput = (k, v) => setF({ ...f, outputs: { ...f.outputs, [k]: v } });
+
+  const save = async () => {
+    setSaving(true); setError('');
+    let result;
+    const payload = {
+      plant_id: plant.id,
+      review_no: f.review_no || null,
+      review_date: f.review_date,
+      chairperson_user_id: me?.id || null,
+      chairperson_name: f.chairperson_name || null,
+      attendees: f.attendees || null,
+      agenda: f.agenda || null,
+      inputs: f.inputs,
+      outputs: f.outputs,
+      effectiveness_summary: f.effectiveness_summary || null,
+      status: f.status,
+      next_review_date: f.next_review_date || null,
+      notes: f.notes || null,
+    };
+    if (isNew) result = await sb.from('iatf_mgmt_reviews').insert({ ...payload, created_by: me?.id || null });
+    else       result = await sb.from('iatf_mgmt_reviews').update(payload).eq('id', row.id);
+    if (result.error) { setError(result.error.message); setSaving(false); return; }
+    showToast(isNew ? '✓ Review created' : '✓ Updated');
+    onSaved();
+  };
+
+  const INPUT_FIELDS = [
+    ['customer_satisfaction', 'Customer satisfaction & complaints'],
+    ['audit_results', 'Internal/external audit results'],
+    ['process_performance', 'Process performance & KPIs'],
+    ['ncr_summary', 'NCR & conformance summary'],
+    ['capa_status', 'CAPA effectiveness'],
+    ['supplier_performance', 'Supplier performance'],
+    ['resource_adequacy', 'Resource adequacy'],
+    ['opportunities', 'Opportunities for improvement'],
+    ['risks', 'Risk & opportunity status'],
+    ['csr_compliance', 'CSR compliance status'],
+  ];
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:680px;max-height:90vh;overflow-y:auto">
+        <div class="modal-header">
+          <div class="modal-title">${isNew ? '+ New Management Review' : 'Edit · ' + (row.review_no || row.review_date)}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <div class="field-row">
+          <div class="field"><label>Review #</label><input value=${f.review_no} onChange=${e => setF({...f, review_no: e.target.value})} placeholder="MR-2026-Q2" /></div>
+          <div class="field"><label>Date *</label><input type="date" value=${f.review_date} onChange=${e => setF({...f, review_date: e.target.value})} /></div>
+        </div>
+        <div class="field"><label>Chairperson</label><input value=${f.chairperson_name} onChange=${e => setF({...f, chairperson_name: e.target.value})} placeholder="Plant Head name" /></div>
+        <div class="field"><label>Attendees</label><textarea rows="2" value=${f.attendees} onChange=${e => setF({...f, attendees: e.target.value})} placeholder="QA Manager, Production Head, Maintenance Head…"></textarea></div>
+        <div class="field"><label>Agenda</label><textarea rows="2" value=${f.agenda} onChange=${e => setF({...f, agenda: e.target.value})}></textarea></div>
+
+        <div class="section-h">Inputs (IATF 9.3.2)</div>
+        ${INPUT_FIELDS.map(([k, label]) => html`
+          <div class="field" key=${k}><label>${label}</label><textarea rows="2" value=${f.inputs[k] || ''} onChange=${e => setInput(k, e.target.value)}></textarea></div>
+        `)}
+
+        <div class="section-h">Outputs (IATF 9.3.3)</div>
+        <div class="field"><label>Decisions</label><textarea rows="2" value=${f.outputs.decisions || ''} onChange=${e => setOutput('decisions', e.target.value)}></textarea></div>
+        <div class="field"><label>Resource changes</label><textarea rows="2" value=${f.outputs.resource_changes || ''} onChange=${e => setOutput('resource_changes', e.target.value)}></textarea></div>
+        <div class="field"><label>System / process changes</label><textarea rows="2" value=${f.outputs.system_changes || ''} onChange=${e => setOutput('system_changes', e.target.value)}></textarea></div>
+
+        <div class="field"><label>Effectiveness summary</label><textarea rows="2" value=${f.effectiveness_summary} onChange=${e => setF({...f, effectiveness_summary: e.target.value})}></textarea></div>
+
+        <div class="field-row">
+          <div class="field"><label>Status</label>
+            <select value=${f.status} onChange=${e => setF({...f, status: e.target.value})}>
+              <option value="planned">Planned</option>
+              <option value="in_progress">In progress</option>
+              <option value="completed">Completed</option>
+            </select>
+          </div>
+          <div class="field"><label>Next review due</label><input type="date" value=${f.next_review_date} onChange=${e => setF({...f, next_review_date: e.target.value})} /></div>
+        </div>
+        <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
+        <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Create review' : 'Save')}</button>
+      </div>
+    </div>
+  `;
+}
+
+function MgmtReviewActionsDrawer({ plant, me, review, onClose, onChanged }) {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [adding, setAdding] = useState(false);
+  const [nf, setNf] = useState({ topic: '', decision: '', owner_name: '', target_date: '' });
+
+  const refresh = async () => {
+    const { data } = await sb.from('iatf_mgmt_review_actions').select('*').eq('review_id', review.id).order('created_at', { ascending: true });
+    setItems(data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [review.id]);
+
+  const addAction = async () => {
+    if (!nf.topic.trim() || !nf.decision.trim()) return;
+    const { error } = await sb.from('iatf_mgmt_review_actions').insert({
+      plant_id: plant.id,
+      review_id: review.id,
+      topic: nf.topic.trim(),
+      decision: nf.decision.trim(),
+      owner_name: nf.owner_name || null,
+      target_date: nf.target_date || null,
+      status: 'open',
+    });
+    if (error) { showToast('✗ ' + error.message); return; }
+    showToast('✓ Action added · cascaded to Tasks');
+    setNf({ topic: '', decision: '', owner_name: '', target_date: '' });
+    setAdding(false);
+    await refresh();
+    onChanged && onChanged();
+  };
+
+  const toggleStatus = async (item, newStatus) => {
+    await sb.from('iatf_mgmt_review_actions').update({
+      status: newStatus,
+      completed_on: newStatus === 'completed' ? new Date().toISOString().slice(0,10) : null,
+    }).eq('id', item.id);
+    refresh();
+    onChanged && onChanged();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:600px">
+        <div class="modal-header">
+          <div class="modal-title">MR Actions · ${review.review_no || review.review_date}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+          items.length === 0 ? html`<div class="empty">No actions yet.</div>` :
+          items.map(it => html`
+            <div class="card" key=${it.id} style="margin-bottom:8px">
+              <div class="card-row"><span class="label">Topic</span><span class="value"><strong>${it.topic}</strong></span></div>
+              <div class="card-row"><span class="label">Decision</span><span class="value">${it.decision}</span></div>
+              ${it.owner_name && html`<div class="card-row"><span class="label">Owner</span><span class="value">${it.owner_name}</span></div>`}
+              ${it.target_date && html`<div class="card-row"><span class="label">Target</span><span class="value">${it.target_date}</span></div>`}
+              <div class="card-row"><span class="label">Status</span><span class="value"><span class=${'badge ' + (it.status === 'completed' ? 'emerald' : it.status === 'in_progress' ? 'amber' : 'slate')}>${it.status}</span></span></div>
+              ${it.status !== 'completed' && html`
+                <div style="display:flex;gap:6px;margin-top:8px">
+                  ${it.status === 'open' && html`<button class="btn small ghost" onClick=${() => toggleStatus(it, 'in_progress')}>Mark in progress</button>`}
+                  <button class="btn small" onClick=${() => toggleStatus(it, 'completed')}>Mark done</button>
+                </div>
+              `}
+            </div>
+          `)
+        }
+        ${adding ? html`
+          <div class="card" style="border:2px solid var(--teal-200);margin-bottom:8px">
+            <div class="field"><label>Topic *</label><input value=${nf.topic} onChange=${e => setNf({...nf, topic: e.target.value})} placeholder="Improve OTD for Customer X" /></div>
+            <div class="field"><label>Decision *</label><textarea rows="2" value=${nf.decision} onChange=${e => setNf({...nf, decision: e.target.value})} placeholder="Add 2nd shift on Line 3 for 30 days"></textarea></div>
+            <div class="field-row">
+              <div class="field"><label>Owner</label><input value=${nf.owner_name} onChange=${e => setNf({...nf, owner_name: e.target.value})} /></div>
+              <div class="field"><label>Target</label><input type="date" value=${nf.target_date} onChange=${e => setNf({...nf, target_date: e.target.value})} /></div>
+            </div>
+            <div style="display:flex;gap:8px">
+              <button class="btn ghost small" onClick=${() => setAdding(false)}>Cancel</button>
+              <button class="btn small" onClick=${addAction}>Save action</button>
+            </div>
+          </div>
+        ` : html`<button class="btn small" style="width:100%" onClick=${() => setAdding(true)}>+ Add action</button>`}
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// CSR MODULE (IATF 8.2.2 — Customer-Specific Requirements)
+// =================================================================
+function CsrModule({ plant, me }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState('all'); // all | compliant | gap | in_progress | overdue
+  const [editTarget, setEditTarget] = useState(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('v_iatf_csr_register').select('*').order('customer_name', { ascending: true });
+    setRows(data || []);
+    setLoading(false);
+  }, []);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const stats = useMemo(() => ({
+    total: rows.length,
+    compliant: rows.filter(r => r.compliance_status === 'compliant').length,
+    gap: rows.filter(r => r.compliance_status === 'gap').length,
+    inProg: rows.filter(r => r.compliance_status === 'in_progress').length,
+    overdue: rows.filter(r => r.audit_flag === 'review_overdue').length,
+  }), [rows]);
+
+  let filtered = rows;
+  if (filter === 'compliant') filtered = filtered.filter(r => r.compliance_status === 'compliant');
+  if (filter === 'gap') filtered = filtered.filter(r => r.compliance_status === 'gap');
+  if (filter === 'in_progress') filtered = filtered.filter(r => r.compliance_status === 'in_progress');
+  if (filter === 'overdue') filtered = filtered.filter(r => r.audit_flag === 'review_overdue');
+  if (search.trim()) {
+    const q = search.toLowerCase();
+    filtered = filtered.filter(r =>
+      (r.customer_name || '').toLowerCase().includes(q) ||
+      (r.csr_ref || '').toLowerCase().includes(q) ||
+      (r.requirement || '').toLowerCase().includes(q));
+  }
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:center">
+      <div><h1>Customer-Specific Requirements</h1><div class="sub">IATF 8.2.2 · CSR register per customer/OEM</div></div>
+      <button class="btn" onClick=${() => setEditTarget({ _new: true })}>+ Add CSR</button>
+    </div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr)">
+      <div class="stat"><div class="stat-num">${stats.total}</div><div class="stat-label">Total</div></div>
+      <div class="stat ${stats.compliant > 0 ? 'emerald' : ''}"><div class="stat-num">${stats.compliant}</div><div class="stat-label">Compliant</div></div>
+      <div class="stat ${stats.gap > 0 ? 'rose' : ''}"><div class="stat-num">${stats.gap}</div><div class="stat-label">Gaps</div></div>
+      <div class="stat ${stats.overdue > 0 ? 'amber' : ''}"><div class="stat-num">${stats.overdue}</div><div class="stat-label">Review overdue</div></div>
+    </div>
+
+    <div style="margin-bottom:10px">
+      <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search customer, ref, requirement…" style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap">
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All ${rows.length}</button>
+      <button class=${'auth-tab' + (filter === 'compliant' ? ' active' : '')} onClick=${() => setFilter('compliant')}>Compliant</button>
+      <button class=${'auth-tab' + (filter === 'gap' ? ' active' : '')} onClick=${() => setFilter('gap')} style=${stats.gap > 0 ? 'color:var(--rose-600)' : ''}>Gaps ${stats.gap}</button>
+      <button class=${'auth-tab' + (filter === 'in_progress' ? ' active' : '')} onClick=${() => setFilter('in_progress')}>In progress</button>
+      <button class=${'auth-tab' + (filter === 'overdue' ? ' active' : '')} onClick=${() => setFilter('overdue')} style=${stats.overdue > 0 ? 'color:var(--amber-700)' : ''}>Review overdue</button>
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      filtered.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📜</div>No CSRs match.</div></div>` :
+      filtered.map(r => html`
+        <div class="list-item" key=${r.id}>
+          <div class="list-item-row" style="align-items:flex-start">
+            <div class="list-item-main">
+              <div class="list-item-title">${r.customer_name}${r.csr_ref ? ' · ' + r.csr_ref : ''}</div>
+              <div class="list-item-sub">${r.category || '—'}: ${r.requirement}</div>
+              <div class="list-item-sub" style="margin-top:3px">
+                ${r.responsible_person ? 'Owner: ' + r.responsible_person + ' · ' : ''}Last reviewed: ${r.last_reviewed_on || '—'} · Next: ${r.next_review_on || '—'}
+              </div>
+              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                <span class=${'badge ' + (r.compliance_status === 'compliant' ? 'emerald' : r.compliance_status === 'gap' ? 'rose' : r.compliance_status === 'in_progress' ? 'amber' : 'slate')}>${r.compliance_status}</span>
+                ${r.audit_flag === 'review_overdue' && html`<span class="badge amber" style="font-size:10px">review overdue</span>`}
+                ${r.audit_flag === 'expired' && html`<span class="badge rose" style="font-size:10px">expired</span>`}
+                <button class="btn small ghost" style="padding:2px 8px;font-size:11px;margin-left:auto" onClick=${() => setEditTarget(r)}>Edit</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      `)
+    }
+
+    ${editTarget && html`<${CsrEditModal} plant=${plant} me=${me} row=${editTarget} onClose=${() => setEditTarget(null)} onSaved=${() => { setEditTarget(null); refresh(); }} />`}
+  `;
+}
+
+function CsrEditModal({ plant, me, row, onClose, onSaved }) {
+  const isNew = !!row._new;
+  const [f, setF] = useState({
+    customer_name: row.customer_name || '',
+    customer_code: row.customer_code || '',
+    csr_ref: row.csr_ref || '',
+    category: row.category || 'quality',
+    requirement: row.requirement || '',
+    document_url: row.document_url || '',
+    effective_from: row.effective_from || '',
+    effective_to: row.effective_to || '',
+    compliance_status: row.compliance_status || 'compliant',
+    evidence_url: row.evidence_url || '',
+    responsible_person: row.responsible_person || '',
+    last_reviewed_on: row.last_reviewed_on || '',
+    next_review_on: row.next_review_on || '',
+    notes: row.notes || '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const save = async () => {
+    if (!f.customer_name.trim() || !f.requirement.trim()) { setError('Customer and requirement are required'); return; }
+    setSaving(true); setError('');
+    const payload = {
+      plant_id: plant.id,
+      customer_name: f.customer_name.trim(),
+      customer_code: f.customer_code || null,
+      csr_ref: f.csr_ref || null,
+      category: f.category,
+      requirement: f.requirement.trim(),
+      document_url: f.document_url || null,
+      effective_from: f.effective_from || null,
+      effective_to: f.effective_to || null,
+      compliance_status: f.compliance_status,
+      evidence_url: f.evidence_url || null,
+      responsible_person: f.responsible_person || null,
+      last_reviewed_on: f.last_reviewed_on || null,
+      next_review_on: f.next_review_on || null,
+      notes: f.notes || null,
+    };
+    let err;
+    if (isNew) ({ error: err } = await sb.from('iatf_csrs').insert({ ...payload, created_by: me?.id || null }));
+    else       ({ error: err } = await sb.from('iatf_csrs').update(payload).eq('id', row.id));
+    if (err) { setError(err.message); setSaving(false); return; }
+    showToast(isNew ? '✓ CSR added' : '✓ Updated' + (f.compliance_status === 'gap' ? ' · QA action raised' : ''));
+    onSaved();
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px;max-height:90vh;overflow-y:auto">
+        <div class="modal-header">
+          <div class="modal-title">${isNew ? '+ Add CSR' : 'Edit · ' + row.customer_name}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <div class="field-row">
+          <div class="field"><label>Customer *</label><input value=${f.customer_name} onChange=${e => setF({...f, customer_name: e.target.value})} placeholder="Bosch India / Ford / Stellantis…" /></div>
+          <div class="field"><label>Customer code</label><input value=${f.customer_code} onChange=${e => setF({...f, customer_code: e.target.value})} placeholder="BIN" /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>CSR reference</label><input value=${f.csr_ref} onChange=${e => setF({...f, csr_ref: e.target.value})} placeholder="Q1 / MMOG-LE / CQI-9" /></div>
+          <div class="field"><label>Category</label>
+            <select value=${f.category} onChange=${e => setF({...f, category: e.target.value})}>
+              <option value="quality">Quality</option>
+              <option value="packaging">Packaging</option>
+              <option value="labelling">Labelling</option>
+              <option value="warranty">Warranty</option>
+              <option value="ppap">PPAP</option>
+              <option value="logistics">Logistics</option>
+              <option value="manufacturing">Manufacturing</option>
+              <option value="other">Other</option>
+            </select>
+          </div>
+        </div>
+        <div class="field"><label>Requirement *</label><textarea rows="3" value=${f.requirement} onChange=${e => setF({...f, requirement: e.target.value})} placeholder="Describe the specific customer requirement"></textarea></div>
+        <div class="field-row">
+          <div class="field"><label>CSR document URL</label><input type="url" value=${f.document_url} onChange=${e => setF({...f, document_url: e.target.value})} /></div>
+          <div class="field"><label>Evidence URL</label><input type="url" value=${f.evidence_url} onChange=${e => setF({...f, evidence_url: e.target.value})} /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Effective from</label><input type="date" value=${f.effective_from} onChange=${e => setF({...f, effective_from: e.target.value})} /></div>
+          <div class="field"><label>Effective to</label><input type="date" value=${f.effective_to} onChange=${e => setF({...f, effective_to: e.target.value})} /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Compliance status *</label>
+            <select value=${f.compliance_status} onChange=${e => setF({...f, compliance_status: e.target.value})}>
+              <option value="compliant">Compliant</option>
+              <option value="in_progress">In progress</option>
+              <option value="gap">Gap (auto-raise action)</option>
+              <option value="not_applicable">N/A</option>
+            </select>
+          </div>
+          <div class="field"><label>Responsible person</label><input value=${f.responsible_person} onChange=${e => setF({...f, responsible_person: e.target.value})} /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Last reviewed</label><input type="date" value=${f.last_reviewed_on} onChange=${e => setF({...f, last_reviewed_on: e.target.value})} /></div>
+          <div class="field"><label>Next review</label><input type="date" value=${f.next_review_on} onChange=${e => setF({...f, next_review_on: e.target.value})} /></div>
+        </div>
+        <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
+        <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Add CSR' : 'Save')}</button>
       </div>
     </div>
   `;
@@ -13409,6 +14622,21 @@ const REPORT_CATALOG = [
   { id:'iatf_training_matrix', title:'Training Matrix', dept:'people', clauses:['7.2'], frequency:'on_demand',
     desc:'Every training record per employee per skill with validity status.', icon:'🎓',
     view:'v_iatf_training_matrix' },
+  { id:'iatf_ppap_register', title:'PPAP Submission Status', dept:'quality', clauses:['8.3.4.4'], frequency:'on_demand',
+    desc:'Per part: current PPAP level, submitted/approved date, customer, expiry flags.', icon:'📑',
+    view:'v_iatf_ppap_register' },
+  { id:'iatf_pfmea_register', title:'PFMEA Risk Register (SOD)', dept:'quality', clauses:['8.3'], frequency:'on_demand',
+    desc:'All process FMEA items with Severity × Occurrence × Detection = RPN ranked.', icon:'⚠️',
+    view:'v_iatf_pfmea_register' },
+  { id:'iatf_lpa_register', title:'Layered Process Audit Register', dept:'quality', clauses:['9.2.2.3'], frequency:'monthly',
+    desc:'All L1/L2/L3 audits with compliance % and findings count.', icon:'📋',
+    view:'v_iatf_lpa_register' },
+  { id:'iatf_mgmt_review_log', title:'Management Review Log', dept:'quality', clauses:['9.3'], frequency:'on_demand',
+    desc:'All MR sessions with chairperson, status, action open/closed counts.', icon:'🏛',
+    view:'v_iatf_mgmt_review_log' },
+  { id:'iatf_csr_register', title:'Customer-Specific Requirements Register', dept:'quality', clauses:['8.2.2'], frequency:'on_demand',
+    desc:'CSRs per OEM with compliance status, review cadence, audit flags.', icon:'📜',
+    view:'v_iatf_csr_register' },
 ];
 
 const DEPT_LABELS = {
@@ -13538,12 +14766,9 @@ const IATF_RECORDS = [
     note:'Upcoming sessions, attendees, trainers' },
   { name:'Training Effectiveness Records', clause:'7.2', dept:'people', block:3, frequency:'on_demand',
     note:'Pre/post test scores, on-job evaluation' },
-  { name:'PFMEA (Process FMEA)', clause:'8.3', dept:'quality', block:3, frequency:'on_demand',
-    note:'Need FMEA module — failure modes, effects, controls per process' },
-  { name:'DFMEA (Design FMEA)', clause:'8.3', dept:'quality', block:3, frequency:'on_demand',
-    note:'Failure modes per part design' },
-  { name:'FMEA Severity-Occurrence-Detection (SOD) Register', clause:'8.3', dept:'quality', block:3, frequency:'on_demand',
-    note:'Risk priority numbers ranked' },
+  { name:'PFMEA (Process FMEA)', clause:'8.3', dept:'quality', block:1, reportId:'iatf_pfmea_register', frequency:'on_demand' },
+  { name:'DFMEA (Design FMEA)', clause:'8.3', dept:'quality', block:1, reportId:'iatf_pfmea_register', frequency:'on_demand' },
+  { name:'FMEA Severity-Occurrence-Detection (SOD) Register', clause:'8.3', dept:'quality', block:1, reportId:'iatf_pfmea_register', frequency:'on_demand' },
   { name:'FMEA Review History', clause:'8.3', dept:'quality', block:3, frequency:'on_demand',
     note:'Audit trail of FMEA revisions per part' },
   { name:'Control Plan (per part)', clause:'8.3.4.4', dept:'quality', block:1, reportId:'iatf_control_plan', frequency:'on_demand' },
@@ -13551,8 +14776,7 @@ const IATF_RECORDS = [
     note:'Critical/significant features identified per part' },
   { name:'Reaction Plan Tracker', clause:'8.3.4.4', dept:'quality', block:3, frequency:'on_demand',
     note:'Triggered actions when control plan thresholds breach' },
-  { name:'PPAP Submission Status', clause:'8.3.4.4', dept:'quality', block:3, frequency:'on_demand',
-    note:'Per part: current PPAP level, submitted date, customer approval' },
+  { name:'PPAP Submission Status', clause:'8.3.4.4', dept:'quality', block:1, reportId:'iatf_ppap_register', frequency:'on_demand' },
   { name:'APQP Phase Tracker', clause:'8.3', dept:'quality', block:3, frequency:'on_demand',
     note:'Phase 1-5 tracking for new product introductions' },
   { name:'PPAP Customer Package', clause:'8.3.4.4', dept:'quality', block:3, frequency:'on_demand',
@@ -13562,10 +14786,8 @@ const IATF_RECORDS = [
   { name:'Internal Audit Findings Register', clause:'9.2.2', dept:'quality', block:1, reportId:'iatf_af_log', frequency:'on_demand' },
   { name:'Internal Audit Effectiveness', clause:'9.2.2', dept:'quality', block:3, frequency:'monthly',
     note:'CAPA closure rate, repeat findings tracking' },
-  { name:'Management Review Minutes', clause:'9.3.2', dept:'quality', block:3, frequency:'monthly',
-    note:'Need MR module — agenda, attendees, decisions, action items' },
-  { name:'Management Review Action Items', clause:'9.3.2', dept:'quality', block:3, frequency:'monthly',
-    note:'Tracker for actions assigned in MR meetings' },
+  { name:'Management Review Minutes', clause:'9.3.2', dept:'quality', block:1, reportId:'iatf_mgmt_review_log', frequency:'monthly' },
+  { name:'Management Review Action Items', clause:'9.3.2', dept:'quality', block:1, reportId:'iatf_mgmt_review_log', frequency:'monthly' },
   { name:'Management Review KPI Scorecard', clause:'9.3.2', dept:'quality', block:3, frequency:'monthly',
     note:'Quality, OTD, customer complaint, CAPA effectiveness compiled' },
   { name:'Quality Objectives', clause:'6.2', dept:'quality', block:3, frequency:'on_demand',
@@ -13588,16 +14810,14 @@ const IATF_RECORDS = [
   // ============================================================
   // BLOCK 4 — IATF/OEM specials (~15 more, planned)
   // ============================================================
-  { name:'Customer Specific Requirements (CSR) Tracker', clause:'8.2.2', dept:'quality', block:4, frequency:'on_demand',
-    note:'Per OEM (Bosch, Sundram, etc.): their specific demands beyond IATF' },
+  { name:'Customer Specific Requirements (CSR) Tracker', clause:'8.2.2', dept:'quality', block:1, reportId:'iatf_csr_register', frequency:'on_demand' },
   { name:'OEE Drilldown by Line/Shift', clause:'9.1.1.1', dept:'production', block:4, frequency:'monthly',
     note:'Multi-level OEE rollup with drilldown to root causes' },
   { name:'Cost of Poor Quality (COPQ) Trend', clause:'10.2', dept:'quality', block:4, frequency:'monthly',
     note:'Internal failure + external failure + appraisal + prevention' },
   { name:'Containment Action Records', clause:'8.7', dept:'quality', block:4, frequency:'on_demand',
     note:'When OEM raises alert: 100% sort, traceability, communication log' },
-  { name:'Layered Process Audit (LPA) Records', clause:'9.2.2', dept:'quality', block:4, frequency:'daily',
-    note:'Daily supervisor audits, findings closed-loop' },
+  { name:'Layered Process Audit (LPA) Records', clause:'9.2.2', dept:'quality', block:1, reportId:'iatf_lpa_register', frequency:'daily' },
   { name:'Rework & Concession Deviation Log', clause:'8.7', dept:'quality', block:4, frequency:'monthly',
     note:'All deviations from spec with customer approval refs' },
   { name:'Receiving Inspection Report', clause:'8.4.3', dept:'documents', block:1, reportId:'iatf_iq_inspections', frequency:'on_demand' },
