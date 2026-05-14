@@ -6054,6 +6054,7 @@ function PpapModule({ plant, me }) {
 
 function PpapEditModal({ plant, me, row, onClose, onSaved }) {
   const isNew = !!row._new;
+  const [users, setUsers] = useState([]);
   const [f, setF] = useState({
     part_number: row.part_number || '',
     part_revision: row.part_revision || '',
@@ -6068,10 +6069,12 @@ function PpapEditModal({ plant, me, row, onClose, onSaved }) {
     interim_until: row.interim_until || '',
     expires_on: row.expires_on || '',
     approver_name: row.approver_name || '',
+    owner_user_id: row.owner_user_id || '',
     notes: row.notes || '',
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  useEffect(() => { sb.from('users').select('id, full_name, role').eq('status','active').order('full_name').then(({data}) => setUsers(data || [])); }, []);
 
   const save = async () => {
     if (!f.part_number.trim() || !f.customer_name.trim()) { setError('Part # and customer are required'); return; }
@@ -6091,6 +6094,7 @@ function PpapEditModal({ plant, me, row, onClose, onSaved }) {
       interim_until: f.interim_until || null,
       expires_on: f.expires_on || null,
       approver_name: f.approver_name || null,
+      owner_user_id: f.owner_user_id || null,
       notes: f.notes || null,
     };
     let err;
@@ -6159,7 +6163,13 @@ function PpapEditModal({ plant, me, row, onClose, onSaved }) {
           <div class="field"><label>Interim until</label><input type="date" value=${f.interim_until} onChange=${e => setF({...f, interim_until: e.target.value})} /></div>
           <div class="field"><label>Expires on</label><input type="date" value=${f.expires_on} onChange=${e => setF({...f, expires_on: e.target.value})} /></div>
         </div>
-        <div class="field"><label>Approver name</label><input value=${f.approver_name} onChange=${e => setF({...f, approver_name: e.target.value})} placeholder="QA Manager name at customer" /></div>
+        <div class="field"><label>Approver name (customer side)</label><input value=${f.approver_name} onChange=${e => setF({...f, approver_name: e.target.value})} placeholder="QA Manager name at customer" /></div>
+        <div class="field"><label>👤 Plant owner (auto-assigned tasks land here)</label>
+          <select value=${f.owner_user_id} onChange=${e => setF({...f, owner_user_id: e.target.value})}>
+            <option value="">— Select owner —</option>
+            ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + u.role : ''}</option>`)}
+          </select>
+        </div>
         <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
         ${(f.status === 'rejected' || f.status === 'expired') && html`
           <div class="alert info" style="background:var(--amber-50);border-color:var(--amber-200);color:var(--amber-800)">
@@ -6357,6 +6367,7 @@ function PfmeaHeaderEditModal({ plant, me, row, onClose, onSaved }) {
 
 function PfmeaItemEditModal({ plant, fmea, row, onClose, onSaved }) {
   const isNew = !!row._new;
+  const [users, setUsers] = useState([]);
   const [f, setF] = useState({
     step_no: row.step_no || '',
     process_step: row.process_step || '',
@@ -6370,6 +6381,7 @@ function PfmeaItemEditModal({ plant, fmea, row, onClose, onSaved }) {
     detection: row.detection || 5,
     recommended_action: row.recommended_action || '',
     action_owner: row.action_owner || '',
+    action_owner_user_id: row.action_owner_user_id || '',
     target_date: row.target_date || '',
     action_taken: row.action_taken || '',
     rev_severity: row.rev_severity || '',
@@ -6380,6 +6392,7 @@ function PfmeaItemEditModal({ plant, fmea, row, onClose, onSaved }) {
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  useEffect(() => { sb.from('users').select('id, full_name, role').eq('status','active').order('full_name').then(({data}) => setUsers(data || [])); }, []);
   const liveRpn = (parseInt(f.severity)||0) * (parseInt(f.occurrence)||0) * (parseInt(f.detection)||0);
   const revRpn = (f.rev_severity || f.rev_occurrence || f.rev_detection)
     ? (parseInt(f.rev_severity || f.severity)||0) * (parseInt(f.rev_occurrence || f.occurrence)||0) * (parseInt(f.rev_detection || f.detection)||0)
@@ -6404,6 +6417,7 @@ function PfmeaItemEditModal({ plant, fmea, row, onClose, onSaved }) {
       detection: parseInt(f.detection) || 5,
       recommended_action: f.recommended_action || null,
       action_owner: f.action_owner || null,
+      action_owner_user_id: f.action_owner_user_id || null,
       target_date: f.target_date || null,
       action_taken: f.action_taken || null,
       rev_severity: f.rev_severity ? parseInt(f.rev_severity) : null,
@@ -6451,8 +6465,14 @@ function PfmeaItemEditModal({ plant, fmea, row, onClose, onSaved }) {
         </div>
         <div class="field"><label>Recommended action</label><textarea rows="2" value=${f.recommended_action} onChange=${e => setF({...f, recommended_action: e.target.value})} placeholder="Poka-yoke gauge at OP-20 outfeed"></textarea></div>
         <div class="field-row">
-          <div class="field"><label>Action owner</label><input value=${f.action_owner} onChange=${e => setF({...f, action_owner: e.target.value})} /></div>
+          <div class="field"><label>Action owner (text)</label><input value=${f.action_owner} onChange=${e => setF({...f, action_owner: e.target.value})} placeholder="A. Kumar (QA)" /></div>
           <div class="field"><label>Target date</label><input type="date" value=${f.target_date} onChange=${e => setF({...f, target_date: e.target.value})} /></div>
+        </div>
+        <div class="field"><label>👤 Action owner (auto-assigns Tasks when RPN ≥120)</label>
+          <select value=${f.action_owner_user_id} onChange=${e => setF({...f, action_owner_user_id: e.target.value})}>
+            <option value="">— Select person —</option>
+            ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + u.role : ''}</option>`)}
+          </select>
         </div>
         <div class="field"><label>Action taken</label><textarea rows="2" value=${f.action_taken} onChange=${e => setF({...f, action_taken: e.target.value})}></textarea></div>
         <div class="section-h" style="margin-top:14px">After action — revised S × O × D (optional)</div>
@@ -7048,6 +7068,7 @@ function CsrModule({ plant, me }) {
 
 function CsrEditModal({ plant, me, row, onClose, onSaved }) {
   const isNew = !!row._new;
+  const [users, setUsers] = useState([]);
   const [f, setF] = useState({
     customer_name: row.customer_name || '',
     customer_code: row.customer_code || '',
@@ -7060,12 +7081,14 @@ function CsrEditModal({ plant, me, row, onClose, onSaved }) {
     compliance_status: row.compliance_status || 'compliant',
     evidence_url: row.evidence_url || '',
     responsible_person: row.responsible_person || '',
+    responsible_user_id: row.responsible_user_id || '',
     last_reviewed_on: row.last_reviewed_on || '',
     next_review_on: row.next_review_on || '',
     notes: row.notes || '',
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  useEffect(() => { sb.from('users').select('id, full_name, role').eq('status','active').order('full_name').then(({data}) => setUsers(data || [])); }, []);
   const save = async () => {
     if (!f.customer_name.trim() || !f.requirement.trim()) { setError('Customer and requirement are required'); return; }
     setSaving(true); setError('');
@@ -7082,6 +7105,7 @@ function CsrEditModal({ plant, me, row, onClose, onSaved }) {
       compliance_status: f.compliance_status,
       evidence_url: f.evidence_url || null,
       responsible_person: f.responsible_person || null,
+      responsible_user_id: f.responsible_user_id || null,
       last_reviewed_on: f.last_reviewed_on || null,
       next_review_on: f.next_review_on || null,
       notes: f.notes || null,
@@ -7138,7 +7162,13 @@ function CsrEditModal({ plant, me, row, onClose, onSaved }) {
               <option value="not_applicable">N/A</option>
             </select>
           </div>
-          <div class="field"><label>Responsible person</label><input value=${f.responsible_person} onChange=${e => setF({...f, responsible_person: e.target.value})} /></div>
+          <div class="field"><label>Responsible person (text)</label><input value=${f.responsible_person} onChange=${e => setF({...f, responsible_person: e.target.value})} /></div>
+        </div>
+        <div class="field"><label>👤 Responsible user (auto-assigns Tasks on gap)</label>
+          <select value=${f.responsible_user_id} onChange=${e => setF({...f, responsible_user_id: e.target.value})}>
+            <option value="">— Select person —</option>
+            ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + u.role : ''}</option>`)}
+          </select>
         </div>
         <div class="field-row">
           <div class="field"><label>Last reviewed</label><input type="date" value=${f.last_reviewed_on} onChange=${e => setF({...f, last_reviewed_on: e.target.value})} /></div>
@@ -7448,6 +7478,7 @@ function InternalAuditPlanModule({ plant, me }) {
 
 function IapEditModal({ plant, me, row, onClose, onSaved }) {
   const isNew = !!row._new;
+  const [users, setUsers] = useState([]);
   const [f, setF] = useState({
     audit_no: row.audit_no || '',
     audit_type: row.audit_type || 'process',
@@ -7457,6 +7488,7 @@ function IapEditModal({ plant, me, row, onClose, onSaved }) {
     planned_date: row.planned_date || new Date().toISOString().slice(0,10),
     planned_duration_days: row.planned_duration_days || 1,
     auditor_name: row.auditor_name || '',
+    auditor_user_id: row.auditor_user_id || '',
     auditor_qualification: row.auditor_qualification || '',
     auditee_name: row.auditee_name || '',
     status: row.status || 'planned',
@@ -7470,6 +7502,7 @@ function IapEditModal({ plant, me, row, onClose, onSaved }) {
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  useEffect(() => { sb.from('users').select('id, full_name, role').eq('status','active').order('full_name').then(({data}) => setUsers(data || [])); }, []);
   const save = async () => {
     if (!f.scope.trim() || !f.planned_date) { setError('Scope and planned date required'); return; }
     setSaving(true); setError('');
@@ -7483,6 +7516,7 @@ function IapEditModal({ plant, me, row, onClose, onSaved }) {
       planned_date: f.planned_date,
       planned_duration_days: parseFloat(f.planned_duration_days) || 1,
       auditor_name: f.auditor_name || null,
+      auditor_user_id: f.auditor_user_id || null,
       auditor_qualification: f.auditor_qualification || null,
       auditee_name: f.auditee_name || null,
       status: f.status,
@@ -7529,8 +7563,14 @@ function IapEditModal({ plant, me, row, onClose, onSaved }) {
           <div class="field"><label>Duration (days)</label><input type="number" min="0.25" step="0.25" value=${f.planned_duration_days} onChange=${e => setF({...f, planned_duration_days: e.target.value})} /></div>
         </div>
         <div class="field-row">
-          <div class="field"><label>Auditor</label><input value=${f.auditor_name} onChange=${e => setF({...f, auditor_name: e.target.value})} /></div>
+          <div class="field"><label>Auditor (text — for external auditors)</label><input value=${f.auditor_name} onChange=${e => setF({...f, auditor_name: e.target.value})} placeholder="External: TUV India" /></div>
           <div class="field"><label>Auditor qualification</label><input value=${f.auditor_qualification} onChange=${e => setF({...f, auditor_qualification: e.target.value})} placeholder="IATF Lead Auditor cert #" /></div>
+        </div>
+        <div class="field"><label>👤 Internal auditor user (auto-assigns Tasks if overdue)</label>
+          <select value=${f.auditor_user_id} onChange=${e => setF({...f, auditor_user_id: e.target.value})}>
+            <option value="">— Select internal auditor —</option>
+            ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + u.role : ''}</option>`)}
+          </select>
         </div>
         <div class="field"><label>Auditee</label><input value=${f.auditee_name} onChange=${e => setF({...f, auditee_name: e.target.value})} placeholder="Process owner being audited" /></div>
         <div class="field-row">
@@ -7646,6 +7686,7 @@ function PmScheduleModule({ plant, me }) {
 function PmTaskEditModal({ plant, me, row, onClose, onSaved }) {
   const isNew = !!row._new;
   const [machines, setMachines] = useState([]);
+  const [users, setUsers] = useState([]);
   const [f, setF] = useState({
     machine_id: row.machine_id || '',
     machine_code: row.machine_code || '',
@@ -7659,6 +7700,7 @@ function PmTaskEditModal({ plant, me, row, onClose, onSaved }) {
     instructions: row.instructions || '',
     required_skills: row.required_skills || '',
     next_due_date: row.next_due_date || '',
+    owner_user_id: row.owner_user_id || '',
     active: row.active !== false,
     notes: row.notes || '',
   });
@@ -7666,6 +7708,7 @@ function PmTaskEditModal({ plant, me, row, onClose, onSaved }) {
   const [error, setError] = useState('');
   useEffect(() => {
     sb.from('machines').select('id, code, make, model').then(({ data }) => setMachines(data || []));
+    sb.from('users').select('id, full_name, role').eq('status','active').order('full_name').then(({data}) => setUsers(data || []));
   }, []);
   const save = async () => {
     if (!f.task_code.trim() || !f.task_name.trim()) { setError('Code and name required'); return; }
@@ -7689,6 +7732,7 @@ function PmTaskEditModal({ plant, me, row, onClose, onSaved }) {
       instructions: f.instructions || null,
       required_skills: f.required_skills || null,
       next_due_date: f.next_due_date || null,
+      owner_user_id: f.owner_user_id || null,
       active: !!f.active,
       notes: f.notes || null,
     };
@@ -7749,6 +7793,12 @@ function PmTaskEditModal({ plant, me, row, onClose, onSaved }) {
           <div class="field"><label>Next due</label><input type="date" value=${f.next_due_date} onChange=${e => setF({...f, next_due_date: e.target.value})} /></div>
         </div>
         <div class="field"><label>Required skills</label><input value=${f.required_skills} onChange=${e => setF({...f, required_skills: e.target.value})} placeholder="Cert mechanical fitter L2" /></div>
+        <div class="field"><label>👤 Owner (auto-assigns Tasks if PM is skipped)</label>
+          <select value=${f.owner_user_id} onChange=${e => setF({...f, owner_user_id: e.target.value})}>
+            <option value="">— Select person —</option>
+            ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + u.role : ''}</option>`)}
+          </select>
+        </div>
         <div class="field"><label>Instructions</label><textarea rows="3" value=${f.instructions} onChange=${e => setF({...f, instructions: e.target.value})} placeholder="Step-by-step procedure"></textarea></div>
         <div class="field"><label><input type="checkbox" checked=${f.active} onChange=${e => setF({...f, active: e.target.checked})} style="margin-right:8px" />Active</label></div>
         <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
@@ -7923,12 +7973,14 @@ function QualityObjectivesModule({ plant, me }) {
 
 function QoEditModal({ plant, me, row, onClose, onSaved }) {
   const isNew = !!row._new;
+  const [users, setUsers] = useState([]);
   const [f, setF] = useState({
     objective_code: row.objective_code || '',
     title: row.title || '',
     description: row.description || '',
     department: row.department || 'Quality',
     owner_name: row.owner_name || '',
+    owner_user_id: row.owner_user_id || '',
     target_value: row.target_value ?? '',
     current_value: row.current_value ?? '',
     baseline_value: row.baseline_value ?? '',
@@ -7944,6 +7996,7 @@ function QoEditModal({ plant, me, row, onClose, onSaved }) {
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  useEffect(() => { sb.from('users').select('id, full_name, role').eq('status','active').order('full_name').then(({data}) => setUsers(data || [])); }, []);
   const save = async () => {
     if (!f.objective_code.trim() || !f.title.trim() || f.target_value === '') {
       setError('Code, title and target are required'); return;
@@ -7956,6 +8009,7 @@ function QoEditModal({ plant, me, row, onClose, onSaved }) {
       description: f.description || null,
       department: f.department || null,
       owner_name: f.owner_name || null,
+      owner_user_id: f.owner_user_id || null,
       target_value: parseFloat(f.target_value),
       current_value: f.current_value === '' ? null : parseFloat(f.current_value),
       baseline_value: f.baseline_value === '' ? null : parseFloat(f.baseline_value),
@@ -8002,7 +8056,13 @@ function QoEditModal({ plant, me, row, onClose, onSaved }) {
               <option>Management</option>
             </select>
           </div>
-          <div class="field"><label>Owner</label><input value=${f.owner_name} onChange=${e => setF({...f, owner_name: e.target.value})} /></div>
+          <div class="field"><label>Owner (text)</label><input value=${f.owner_name} onChange=${e => setF({...f, owner_name: e.target.value})} /></div>
+        </div>
+        <div class="field"><label>👤 Owner (auto-assigns Tasks when off-track)</label>
+          <select value=${f.owner_user_id} onChange=${e => setF({...f, owner_user_id: e.target.value})}>
+            <option value="">— Select person —</option>
+            ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + u.role : ''}</option>`)}
+          </select>
         </div>
         <div class="field-row">
           <div class="field"><label>Target value *</label><input type="number" step="0.01" value=${f.target_value} onChange=${e => setF({...f, target_value: e.target.value})} /></div>
@@ -8129,6 +8189,7 @@ function RiskRegisterModule({ plant, me }) {
 
 function RiskEditModal({ plant, me, row, onClose, onSaved }) {
   const isNew = !!row._new;
+  const [users, setUsers] = useState([]);
   const [f, setF] = useState({
     risk_code: row.risk_code || '',
     title: row.title || '',
@@ -8137,6 +8198,7 @@ function RiskEditModal({ plant, me, row, onClose, onSaved }) {
     likelihood: row.likelihood || 3,
     impact: row.impact || 3,
     owner_name: row.owner_name || '',
+    owner_user_id: row.owner_user_id || '',
     current_controls: row.current_controls || '',
     mitigation_plan: row.mitigation_plan || '',
     target_likelihood: row.target_likelihood || '',
@@ -8148,6 +8210,7 @@ function RiskEditModal({ plant, me, row, onClose, onSaved }) {
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  useEffect(() => { sb.from('users').select('id, full_name, role').eq('status','active').order('full_name').then(({data}) => setUsers(data || [])); }, []);
   const liveScore = (parseInt(f.likelihood) || 0) * (parseInt(f.impact) || 0);
   const targetScore = (f.target_likelihood && f.target_impact) ? parseInt(f.target_likelihood) * parseInt(f.target_impact) : null;
   const save = async () => {
@@ -8162,6 +8225,7 @@ function RiskEditModal({ plant, me, row, onClose, onSaved }) {
       likelihood: parseInt(f.likelihood) || 3,
       impact: parseInt(f.impact) || 3,
       owner_name: f.owner_name || null,
+      owner_user_id: f.owner_user_id || null,
       current_controls: f.current_controls || null,
       mitigation_plan: f.mitigation_plan || null,
       target_likelihood: f.target_likelihood ? parseInt(f.target_likelihood) : null,
@@ -8213,7 +8277,13 @@ function RiskEditModal({ plant, me, row, onClose, onSaved }) {
           <div class="card-row"><span class="label">Current score</span><span class="value mono" style="font-size:18px;font-weight:700;color:${liveScore >= 16 ? 'var(--rose-600)' : liveScore >= 9 ? 'var(--amber-700)' : 'var(--emerald-700)'}">${liveScore}</span></div>
           ${liveScore >= 16 && html`<div class="card-row"><span class="label" style="color:var(--rose-600)">⚠</span><span class="value" style="font-size:11px">High risk — action will be raised</span></div>`}
         </div>
-        <div class="field"><label>Owner</label><input value=${f.owner_name} onChange=${e => setF({...f, owner_name: e.target.value})} /></div>
+        <div class="field"><label>Owner (text)</label><input value=${f.owner_name} onChange=${e => setF({...f, owner_name: e.target.value})} /></div>
+        <div class="field"><label>👤 Owner (auto-assigns Tasks when score ≥ 16)</label>
+          <select value=${f.owner_user_id} onChange=${e => setF({...f, owner_user_id: e.target.value})}>
+            <option value="">— Select person —</option>
+            ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + u.role : ''}</option>`)}
+          </select>
+        </div>
         <div class="field"><label>Current controls</label><textarea rows="2" value=${f.current_controls} onChange=${e => setF({...f, current_controls: e.target.value})} placeholder="Existing measures already in place"></textarea></div>
         <div class="field"><label>Mitigation plan</label><textarea rows="2" value=${f.mitigation_plan} onChange=${e => setF({...f, mitigation_plan: e.target.value})} placeholder="Planned actions to reduce score"></textarea></div>
         <div class="field-row">
@@ -8319,6 +8389,7 @@ function ContingencyModule({ plant, me }) {
 
 function ContingencyEditModal({ plant, me, row, onClose, onSaved }) {
   const isNew = !!row._new;
+  const [users, setUsers] = useState([]);
   const [f, setF] = useState({
     scenario_code: row.scenario_code || '',
     scenario_name: row.scenario_name || '',
@@ -8330,6 +8401,7 @@ function ContingencyEditModal({ plant, me, row, onClose, onSaved }) {
     short_term_response: row.short_term_response || '',
     recovery_plan: row.recovery_plan || '',
     responsible_person: row.responsible_person || '',
+    responsible_user_id: row.responsible_user_id || '',
     last_tested_on: row.last_tested_on || '',
     last_test_result: row.last_test_result || '',
     next_test_date: row.next_test_date || '',
@@ -8338,6 +8410,7 @@ function ContingencyEditModal({ plant, me, row, onClose, onSaved }) {
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  useEffect(() => { sb.from('users').select('id, full_name, role').eq('status','active').order('full_name').then(({data}) => setUsers(data || [])); }, []);
   const save = async () => {
     if (!f.scenario_code.trim() || !f.scenario_name.trim()) { setError('Code and name required'); return; }
     setSaving(true); setError('');
@@ -8353,6 +8426,7 @@ function ContingencyEditModal({ plant, me, row, onClose, onSaved }) {
       short_term_response: f.short_term_response || null,
       recovery_plan: f.recovery_plan || null,
       responsible_person: f.responsible_person || null,
+      responsible_user_id: f.responsible_user_id || null,
       last_tested_on: f.last_tested_on || null,
       last_test_result: f.last_test_result || null,
       next_test_date: f.next_test_date || null,
@@ -8398,7 +8472,13 @@ function ContingencyEditModal({ plant, me, row, onClose, onSaved }) {
         <div class="field"><label>Immediate response (first hour)</label><textarea rows="2" value=${f.immediate_response} onChange=${e => setF({...f, immediate_response: e.target.value})} placeholder="Start DG set, safe-state machines, log in-process parts"></textarea></div>
         <div class="field"><label>Short-term response (1-24h)</label><textarea rows="2" value=${f.short_term_response} onChange=${e => setF({...f, short_term_response: e.target.value})} placeholder="Switch to DG for critical lines, defer non-critical, notify customers"></textarea></div>
         <div class="field"><label>Recovery plan (1-7 days)</label><textarea rows="2" value=${f.recovery_plan} onChange=${e => setF({...f, recovery_plan: e.target.value})} placeholder="Catch-up plan, root cause investigation, customer comms"></textarea></div>
-        <div class="field"><label>Responsible person</label><input value=${f.responsible_person} onChange=${e => setF({...f, responsible_person: e.target.value})} /></div>
+        <div class="field"><label>Responsible person (text)</label><input value=${f.responsible_person} onChange=${e => setF({...f, responsible_person: e.target.value})} /></div>
+        <div class="field"><label>👤 Responsible user (auto-assigns Tasks when test overdue)</label>
+          <select value=${f.responsible_user_id} onChange=${e => setF({...f, responsible_user_id: e.target.value})}>
+            <option value="">— Select person —</option>
+            ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + u.role : ''}</option>`)}
+          </select>
+        </div>
         <div class="field-row">
           <div class="field"><label>Last tested</label><input type="date" value=${f.last_tested_on} onChange=${e => setF({...f, last_tested_on: e.target.value})} /></div>
           <div class="field"><label>Next test</label><input type="date" value=${f.next_test_date} onChange=${e => setF({...f, next_test_date: e.target.value})} /></div>
