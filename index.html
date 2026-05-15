@@ -13880,11 +13880,13 @@ function Schedules({ plant, me }) {
       <button class=${'auth-tab' + (view === 'schedules' ? ' active' : '')} onClick=${() => setView('schedules')}>Schedules</button>
       <button class=${'auth-tab' + (view === 'plan_vs_supply' ? ' active' : '')} onClick=${() => setView('plan_vs_supply')}>📊 Plan vs Supply</button>
       <button class=${'auth-tab' + (view === 'customers' ? ' active' : '')} onClick=${() => setView('customers')}>Customers</button>
+      <button class=${'auth-tab' + (view === 'lines' ? ' active' : '')} onClick=${() => setView('lines')}>📋 Lines</button>
       <button class=${'auth-tab' + (view === 'mapping' ? ' active' : '')} onClick=${() => setView('mapping')}>🔗 Bill Mapping</button>
     </div>
 
     ${view === 'schedules' ? html`<${SchedulesList} plant=${plant} me=${me} onOpen=${setActiveSchedule} />` :
       view === 'plan_vs_supply' ? html`<${PlanVsSupplyView} plant=${plant} me=${me} />` :
+      view === 'lines' ? html`<${ScheduleLinesManagerView} plant=${plant} me=${me} />` :
       view === 'mapping' ? html`<${BillMappingView} plant=${plant} me=${me} />` :
       html`<${CustomersList} plant=${plant} me=${me} onOpen=${setActiveCustomer} />`}
   `;
@@ -15323,6 +15325,225 @@ function BillMappingView({ plant, me }) {
         </div>
       </div>
     `)}
+  `;
+}
+
+// ============= SCHEDULE LINES MANAGER (CPN editor) =============
+// Lists every (customer, part_name_raw) combination across the plant's active/open
+// schedules. Surfaces lines whose customer_part_number is missing or a
+// short placeholder ("1", "2", etc.) so the user can fix them inline.
+//
+// Setting a CPN here applies plant-wide for that (customer, part_name_raw)
+// pair, then re-fires the supply trigger on outward docs so past bills
+// retroactively land on the right line.
+function ScheduleLinesManagerView({ plant, me }) {
+  const [lines, setLines] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState('missing');   // missing | all
+  const [customerFilter, setCustomerFilter] = useState('');
+  const [search, setSearch] = useState('');
+  const [editing, setEditing] = useState(null);      // group key
+  const [draftCpn, setDraftCpn] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    setLoading(true);
+    const [l, c] = await Promise.all([
+      // All schedule lines for active/open schedules in this plant
+      sb.from('mcp_sched_lines')
+        .select('id, part_name_raw, customer_part_number, planned_qty, uom, schedule_id, mcp_sched_schedules!inner(customer_id, status, mcp_sched_customers!inner(name, short_code))')
+        .eq('plant_id', plant.id)
+        .in('mcp_sched_schedules.status', ['active','open']),
+      sb.from('mcp_sched_customers').select('id, name, short_code').eq('plant_id', plant.id).order('name'),
+    ]);
+    const lineRows = l.data || [];
+    // Supplied totals — one batch query
+    if (lineRows.length > 0) {
+      const ids = lineRows.map(x => x.id);
+      const { data: sup } = await sb.from('mcp_sched_supplies')
+        .select('schedule_line_id, supplied_qty')
+        .in('schedule_line_id', ids);
+      const sumByLine = new Map();
+      (sup || []).forEach(s => {
+        sumByLine.set(s.schedule_line_id, (sumByLine.get(s.schedule_line_id) || 0) + parseFloat(s.supplied_qty || 0));
+      });
+      lineRows.forEach(x => { x._supplied = sumByLine.get(x.id) || 0; });
+    }
+    setLines(lineRows);
+    setCustomers(c.data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [plant.id]);
+
+  // Classify a CPN value: ok | placeholder | missing
+  const classifyCpn = (cpn) => {
+    if (!cpn || !cpn.trim()) return 'missing';
+    const t = cpn.trim();
+    // pure digits ≤ 3 chars looks like an auto-incrementing placeholder
+    if (/^\d{1,3}$/.test(t)) return 'placeholder';
+    return 'ok';
+  };
+
+  // Group (customer_id, part_name_raw) → one row per part per customer
+  const groups = (() => {
+    const map = new Map();
+    lines.forEach(l => {
+      const cust = l.mcp_sched_schedules?.mcp_sched_customers || {};
+      const customerId = l.mcp_sched_schedules?.customer_id;
+      const key = customerId + '||' + (l.part_name_raw || '');
+      if (!map.has(key)) {
+        map.set(key, {
+          key, customer_id: customerId,
+          customer_name: cust.name || '?',
+          customer_short_code: cust.short_code || '',
+          part_name_raw: l.part_name_raw || '(no name)',
+          cpns: new Set(),
+          lines: [],
+          planned: 0,
+          supplied: 0,
+        });
+      }
+      const g = map.get(key);
+      if (l.customer_part_number && l.customer_part_number.trim() !== '') g.cpns.add(l.customer_part_number.trim());
+      g.lines.push(l);
+      g.planned += parseFloat(l.planned_qty || 0);
+      g.supplied += parseFloat(l._supplied || 0);
+    });
+    return Array.from(map.values()).map(g => {
+      const cpnList = Array.from(g.cpns);
+      const statuses = cpnList.length === 0 ? ['missing'] : cpnList.map(classifyCpn);
+      const status = statuses.includes('ok') ? 'ok' : statuses.includes('placeholder') ? 'placeholder' : 'missing';
+      return { ...g, cpnList, status };
+    });
+  })();
+
+  const visible = groups
+    .filter(g => filter === 'missing' ? g.status !== 'ok' : true)
+    .filter(g => !customerFilter || g.customer_id === customerFilter)
+    .filter(g => {
+      if (!search.trim()) return true;
+      const s = search.toLowerCase();
+      return (g.part_name_raw || '').toLowerCase().includes(s)
+          || (g.customer_name || '').toLowerCase().includes(s)
+          || g.cpnList.some(c => c.toLowerCase().includes(s));
+    })
+    .sort((a, b) => {
+      // missing/placeholder first
+      const rank = { missing: 0, placeholder: 1, ok: 2 };
+      if (rank[a.status] !== rank[b.status]) return rank[a.status] - rank[b.status];
+      return a.customer_name.localeCompare(b.customer_name) || a.part_name_raw.localeCompare(b.part_name_raw);
+    });
+
+  const startEdit = (g) => {
+    setEditing(g.key);
+    setDraftCpn(g.cpnList[0] || '');
+  };
+  const cancelEdit = () => { setEditing(null); setDraftCpn(''); };
+
+  const saveCpn = async (g) => {
+    const newCpn = (draftCpn || '').trim();
+    setBusy(true);
+    try {
+      // Update every line for this (customer, part_name_raw) across this plant's
+      // active/open schedules — so a per-customer fix sticks across weekly lines.
+      const lineIds = lines.filter(l =>
+        l.mcp_sched_schedules?.customer_id === g.customer_id && (l.part_name_raw || '') === g.part_name_raw
+      ).map(l => l.id);
+      if (lineIds.length === 0) throw new Error('No lines to update');
+
+      const { error } = await sb.from('mcp_sched_lines')
+        .update({ customer_part_number: newCpn || null })
+        .in('id', lineIds);
+      if (error) throw error;
+
+      // Re-fire supply trigger on plant's outward docs by touching items.
+      const { data: docs } = await sb.from('mcp_logistics_documents')
+        .select('id, items')
+        .eq('plant_id', plant.id)
+        .in('doc_type', ['dc_out','invoice_out']);
+      let touched = 0;
+      for (const d of (docs || [])) {
+        if (!Array.isArray(d.items) || d.items.length === 0) continue;
+        const { error: uErr } = await sb.from('mcp_logistics_documents').update({ items: d.items }).eq('id', d.id);
+        if (!uErr) touched++;
+      }
+
+      showToast('✓ CPN saved on ' + lineIds.length + ' line' + (lineIds.length === 1 ? '' : 's') + ' · re-applied on ' + touched + ' bill' + (touched === 1 ? '' : 's'));
+      setEditing(null);
+      setDraftCpn('');
+      await refresh();
+    } catch (e) { alert('Save failed: ' + e.message); }
+    finally { setBusy(false); }
+  };
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  const missingCount = groups.filter(g => g.status !== 'ok').length;
+
+  return html`
+    <div class="card" style="background:var(--slate-50);font-size:12px;color:var(--slate-700);margin-bottom:14px;padding:10px 12px">
+      Edit the customer part number (CPN) on each schedule line. Bills match to lines by CPN — adding a real CPN to lines that have placeholder/missing values unlocks auto-supply for past and future bills.
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:10px">
+      <button class=${'auth-tab' + (filter === 'missing' ? ' active' : '')} onClick=${() => setFilter('missing')}>Missing CPN · ${missingCount}</button>
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All · ${groups.length}</button>
+    </div>
+
+    <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+      <select value=${customerFilter} onChange=${e => setCustomerFilter(e.target.value)} style="flex:1;min-width:160px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px">
+        <option value="">— All customers —</option>
+        ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.short_code ? ' · ' + c.short_code : ''}</option>`)}
+      </select>
+      <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search part name or CPN…" style="flex:2;min-width:160px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />
+    </div>
+
+    ${visible.length === 0 ? html`
+      <div class="card"><div class="empty">
+        <div class="icon">✅</div>
+        <div style="font-size:13px">${filter === 'missing' ? 'Every line has a real CPN. Bills will match on part number.' : 'No lines match this filter.'}</div>
+      </div></div>
+    ` : visible.map(g => {
+      const isEditing = editing === g.key;
+      const pct = g.planned > 0 ? Math.min(100, (g.supplied / g.planned) * 100) : 0;
+      const statusBadge = g.status === 'ok'
+        ? html`<span class="badge emerald" style="font-size:10px">CPN ${g.cpnList.join(', ')}</span>`
+        : g.status === 'placeholder'
+        ? html`<span class="badge amber" style="font-size:10px">⚙ placeholder · ${g.cpnList.join(', ')}</span>`
+        : html`<span class="badge rose" style="font-size:10px">⚠ no CPN</span>`;
+      return html`
+        <div class="card" key=${g.key} style="margin-bottom:8px;padding:12px 14px">
+          <div style="display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap">
+            <div style="flex:1;min-width:200px">
+              <div style="font-size:11px;color:var(--slate-500);font-weight:600">${g.customer_name}${g.customer_short_code ? ' · ' + g.customer_short_code : ''}</div>
+              <div style="font-size:14px;font-weight:600;margin-top:2px">${g.part_name_raw}</div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:4px">
+                ${g.lines.length} line${g.lines.length === 1 ? '' : 's'} · ${fmtNum(g.supplied)}/${fmtNum(g.planned)} ${g.lines[0]?.uom || ''} supplied (${pct.toFixed(0)}%)
+              </div>
+              <div style="background:var(--slate-100);height:4px;border-radius:2px;overflow:hidden;margin-top:6px">
+                <div style="background:${pct >= 90 ? 'var(--emerald-500)' : pct >= 60 ? 'var(--teal-500)' : 'var(--amber-500)'};height:100%;width:${pct}%"></div>
+              </div>
+            </div>
+            <div style="text-align:right">${statusBadge}</div>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap">
+            ${isEditing ? html`
+              <input type="text"
+                value=${draftCpn}
+                onChange=${e => setDraftCpn(e.target.value)}
+                placeholder="e.g. 10S30654 or 576041"
+                style="flex:1;min-width:160px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px;font-family:monospace"
+              />
+              <button class="btn small" onClick=${() => saveCpn(g)} disabled=${busy}>${busy ? 'Saving…' : 'Save & re-apply'}</button>
+              <button class="btn small ghost" onClick=${cancelEdit} disabled=${busy}>Cancel</button>
+            ` : html`
+              <button class="btn small ghost" onClick=${() => startEdit(g)} style="font-size:12px">✎ ${g.status === 'ok' ? 'Edit CPN' : 'Set CPN'}</button>
+            `}
+          </div>
+        </div>
+      `;
+    })}
   `;
 }
 
