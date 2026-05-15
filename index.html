@@ -1024,6 +1024,7 @@ const MORE_GROUPS = [
       { key:'quality_objectives',    icon:'🎯', label:'Quality Objectives',           sub:'KPI targets per function (IATF 6.2)' },
       { key:'risk_register',         icon:'⚠️', label:'Risk Register',                sub:'L×I scoring, mitigation owners (IATF 6.1)' },
       { key:'contingency',           icon:'⛑️', label:'Contingency Plans',            sub:'Disruption playbooks + drill log (IATF 6.1.2.3)' },
+      { key:'rejection_types',       icon:'✗',  label:'Rejection Types',              sub:'Per-stage reject reason catalog · drives entry breakdown' },
     ],
   },
   {
@@ -1162,6 +1163,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'contingency'}><${ContingencyModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'npd'}><${NpdModule} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'tpm'}><${TpmModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'rejection_types'}><${RejectionTypesModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
 
       <div class="tabbar">
@@ -1169,7 +1171,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr','scl','iap','pm_schedule','quality_objectives','risk_register','contingency','npd','tpm'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr','scl','iap','pm_schedule','quality_objectives','risk_register','contingency','npd','tpm','rejection_types'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
 
       ${/* Logi chatbot + Siri voice agent hidden per user request. Components
@@ -3395,8 +3397,13 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
     metal_consumed_kg: '',
     notes: '',
   });
+  // Structured rejection breakdown: array of { rejection_type_id, label_snapshot, qty }
+  const [rejBreakdown, setRejBreakdown] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // Total rejected is the SUM of breakdown rows (rollup is also handled by DB trigger)
+  const totalRejected = rejBreakdown.reduce((s, r) => s + (parseInt(r.qty, 10) || 0), 0);
 
   // Auto-update part when die is changed
   const onDieChange = (newDieId) => {
@@ -3416,16 +3423,32 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
         part_id: form.part_id || null,
         operator_user_id: form.operator_user_id || null,
         shots_good: parseInt(form.shots_good) || 0,
-        shots_rejected: parseInt(form.shots_rejected) || 0,
-        reject_reason: form.reject_reason || null,
+        shots_rejected: totalRejected,
+        reject_reason: null,  // legacy single-reason replaced by breakdown rows
         metal_alloy: form.metal_alloy || null,
         metal_consumed_kg: form.metal_consumed_kg ? parseFloat(form.metal_consumed_kg) : null,
         notes: form.notes || null,
         recorded_by_user_id: me.id,
         recorded_at: new Date().toISOString(),
       };
-      const { error } = await sb.from('mcp_pdc_shots').insert(payload);
+      const { data: inserted, error } = await sb.from('mcp_pdc_shots').insert(payload).select('id').single();
       if (error) throw error;
+
+      // Persist the breakdown children
+      const breakdownRows = rejBreakdown
+        .filter(r => parseInt(r.qty, 10) > 0)
+        .map(r => ({
+          plant_id: plant.id,
+          shot_id: inserted.id,
+          rejection_type_id: r.rejection_type_id || null,
+          label_snapshot: r.label_snapshot,
+          qty: parseInt(r.qty, 10),
+        }));
+      if (breakdownRows.length > 0) {
+        const { error: rErr } = await sb.from('mcp_pdc_shot_rejections').insert(breakdownRows);
+        if (rErr) console.warn('shot rejection breakdown insert failed:', rErr);
+      }
+
       const msg = form.part_id ? 'Shot logged · die strokes + BOM stock updated' : 'Shot logged · die strokes updated (no part linked, no BOM consumed)';
       showToast(msg);
       onSaved();
@@ -3473,16 +3496,12 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
           </div>
           <div class="field-row">
             <div class="field"><label>Good *</label><input type="number" required min=${0} value=${form.shots_good} onChange=${e => setForm({...form, shots_good: e.target.value})} /></div>
-            <div class="field"><label>Rejected</label><input type="number" min=${0} value=${form.shots_rejected} onChange=${e => setForm({...form, shots_rejected: e.target.value})} /></div>
+            <div class="field"><label>Rejected (total)</label><input type="number" min=${0} value=${totalRejected} disabled style="background:var(--slate-50);color:var(--slate-700);font-weight:600" /></div>
           </div>
-          ${form.shots_rejected > 0 && html`
-            <div class="field"><label>Reject Reason</label>
-              <select value=${form.reject_reason} onChange=${e => setForm({...form, reject_reason: e.target.value})}>
-                <option value="">— Select —</option>
-                <option>Dimension</option><option>Surface</option><option>Crack</option><option>Cold-shut</option><option>Porosity</option><option>Flash</option><option>Other</option>
-              </select>
-            </div>
-          `}
+          <div class="field">
+            <label style="font-size:11px;color:var(--slate-500)">Reject breakdown · type the count next to each defect (total above auto-fills)</label>
+            <${RejectionBreakdown} plant=${plant} stage="pdc" value=${rejBreakdown} onChange=${setRejBreakdown} />
+          </div>
           <div class="field-row">
             <div class="field"><label>Alloy</label><input type="text" value=${form.metal_alloy} onChange=${e => setForm({...form, metal_alloy: e.target.value})} /></div>
             <div class="field"><label>Metal (kg)</label><input type="number" step="0.01" value=${form.metal_consumed_kg} onChange=${e => setForm({...form, metal_consumed_kg: e.target.value})} placeholder="850" /></div>
@@ -7858,6 +7877,283 @@ function IapEditModal({ plant, me, row, onClose, onSaved }) {
         <div class="field"><label>Audit report URL</label><input type="url" value=${f.audit_report_url} onChange=${e => setF({...f, audit_report_url: e.target.value})} /></div>
         <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
         <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Plan audit' : 'Save')}</button>
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// REJECTION TYPES — master catalog + reusable breakdown grid
+// =================================================================
+// Per-plant, per-stage rejection-reason catalog. When operators record
+// shots / stage logs, they break the rejected qty down by type instead
+// of typing one free-text reason and a single number. Rolls up to the
+// parent row's qty_rejected via DB trigger.
+const PRODUCTION_STAGES = [
+  'pdc','trimming','cnc','vmc','lathe','press','drilling','tapping',
+  'deflashing','shot_blast','plating','painting','heat_treat',
+  'inspection','packing','dispatch','outsource','other',
+];
+
+function RejectionTypesModule({ plant, me }) {
+  const [types, setTypes] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filterStage, setFilterStage] = useState('all');
+  const [search, setSearch] = useState('');
+  const [editing, setEditing] = useState(null);   // row being edited
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    setLoading(true);
+    const { data } = await sb.from('mcp_pdc_rejection_types')
+      .select('*').eq('plant_id', plant.id)
+      .order('stage').order('ord');
+    setTypes(data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [plant.id]);
+
+  const visible = types
+    .filter(t => filterStage === 'all' ? true : t.stage === filterStage)
+    .filter(t => !search.trim() || (t.label + ' ' + (t.code || '') + ' ' + (t.category || '')).toLowerCase().includes(search.toLowerCase()));
+
+  const grouped = {};
+  visible.forEach(t => { (grouped[t.stage] ||= []).push(t); });
+
+  const seedDefaults = async () => {
+    if (!confirm('Add the standard rejection types for each stage? Existing types are unchanged; duplicates are skipped.')) return;
+    setBusy(true);
+    try {
+      const { data, error } = await sb.rpc('seed_default_rejection_types');
+      if (error) throw error;
+      showToast('✓ Seeded · total ' + (data?.total_rejection_types ?? '?'));
+      refresh();
+    } catch (e) { alert(e.message); } finally { setBusy(false); }
+  };
+
+  const startNew = (stage) => setEditing({ id: null, stage: stage || filterStage !== 'all' ? filterStage : 'pdc', code:'', label:'', category:'', ord: 0, active: true });
+
+  const save = async (row) => {
+    if (!row.label.trim()) { alert('Label is required'); return; }
+    setBusy(true);
+    try {
+      const payload = {
+        plant_id: plant.id, stage: row.stage, code: row.code || null,
+        label: row.label.trim(), category: row.category || null,
+        ord: row.ord || 0, active: row.active,
+      };
+      if (row.id) {
+        const { error } = await sb.from('mcp_pdc_rejection_types').update(payload).eq('id', row.id);
+        if (error) throw error;
+      } else {
+        const { error } = await sb.from('mcp_pdc_rejection_types').insert({ ...payload, created_by: me.id });
+        if (error) throw error;
+      }
+      setEditing(null);
+      refresh();
+    } catch (e) { alert(e.message); } finally { setBusy(false); }
+  };
+
+  const remove = async (id) => {
+    if (!confirm('Delete this rejection type? Past entries that referenced it are unaffected (label snapshot is kept on the breakdown rows).')) return;
+    await sb.from('mcp_pdc_rejection_types').delete().eq('id', id);
+    refresh();
+  };
+
+  const toggleActive = async (row) => {
+    await sb.from('mcp_pdc_rejection_types').update({ active: !row.active }).eq('id', row.id);
+    refresh();
+  };
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap">
+      <div><h1>✗ Rejection Types</h1><div class="sub">Per-stage reject reason catalog · drives the breakdown grid in shot &amp; stage entry</div></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${types.length === 0 && html`<button class="btn small" onClick=${seedDefaults} disabled=${busy}>${busy ? '…' : '+ Seed defaults'}</button>`}
+        <button class="btn small ghost" onClick=${() => startNew()}>+ Add</button>
+      </div>
+    </div>
+
+    <div class="card" style="background:var(--slate-50);font-size:12px;color:var(--slate-700);margin-bottom:14px;padding:10px 12px">
+      Operators see the active rejection types for the relevant stage when they log a shot or stage entry. The breakdown per type rolls up to the parent's <code>qty_rejected</code> automatically.
+    </div>
+
+    <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+      <select value=${filterStage} onChange=${e => setFilterStage(e.target.value)} style="flex:1;min-width:140px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px">
+        <option value="all">All stages · ${types.length}</option>
+        ${PRODUCTION_STAGES.map(s => html`<option key=${s} value=${s}>${s.replace(/_/g,' ').toUpperCase()} · ${types.filter(t => t.stage === s).length}</option>`)}
+      </select>
+      <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search label / code / category…" style="flex:2;min-width:160px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      types.length === 0 ? html`
+        <div class="card"><div class="empty">
+          <div class="icon">✗</div>
+          <div style="font-size:13px;margin-bottom:8px">No rejection types yet.</div>
+          <button class="btn small" onClick=${seedDefaults} disabled=${busy}>${busy ? 'Seeding…' : '+ Seed defaults (40+ types across all stages)'}</button>
+        </div></div>
+      ` : Object.entries(grouped).map(([stage, rows]) => html`
+        <div key=${stage} style="margin-bottom:14px">
+          <div style="display:flex;align-items:center;gap:8px;margin:8px 4px 6px">
+            <div style="font-size:11px;font-weight:700;color:var(--slate-700);text-transform:uppercase;letter-spacing:0.5px;flex:1">${stage.replace(/_/g,' ')} · ${rows.length}</div>
+            <button class="btn small ghost" onClick=${() => setEditing({ id: null, stage, code:'', label:'', category:'', ord: (rows[rows.length-1]?.ord || 0) + 1, active: true })} style="padding:4px 10px;font-size:11px">+ Add to ${stage}</button>
+          </div>
+          ${rows.map(r => editing && editing.id === r.id ? html`
+            <${RejectionTypeEditor} key=${r.id} row=${editing} busy=${busy} onChange=${setEditing} onSave=${save} onCancel=${() => setEditing(null)} />
+          ` : html`
+            <div class="card" key=${r.id} style="margin-bottom:6px;padding:10px 12px;${r.active ? '' : 'opacity:0.55'}">
+              <div style="display:flex;align-items:center;gap:8px">
+                <div style="font-size:11px;color:var(--slate-500);font-family:monospace;min-width:60px">${r.code || '—'}</div>
+                <div style="flex:1">
+                  <div style="font-size:13px;font-weight:500">${r.label}</div>
+                  ${r.category && html`<div style="font-size:10px;color:var(--slate-500)">${r.category}</div>`}
+                </div>
+                <label style="font-size:11px;color:var(--slate-600);display:flex;align-items:center;gap:4px">
+                  <input type="checkbox" checked=${r.active} onChange=${() => toggleActive(r)} /> active
+                </label>
+                <button class="btn small ghost" onClick=${() => setEditing(r)} style="padding:3px 8px;font-size:11px">✎</button>
+                <button class="btn small danger" onClick=${() => remove(r.id)} style="padding:3px 8px;font-size:11px">×</button>
+              </div>
+            </div>
+          `)}
+        </div>
+      `)}
+
+    ${editing && !editing.id && html`
+      <${RejectionTypeEditor} row=${editing} busy=${busy} onChange=${setEditing} onSave=${save} onCancel=${() => setEditing(null)} />
+    `}
+  `;
+}
+
+function RejectionTypeEditor({ row, busy, onChange, onSave, onCancel }) {
+  return html`
+    <div class="card" style="margin-bottom:6px;padding:12px;background:var(--teal-50);border-color:var(--teal-200)">
+      <div class="field-row">
+        <div class="field" style="flex:1.2"><label>Stage *</label>
+          <select value=${row.stage} onChange=${e => onChange({ ...row, stage: e.target.value })}>
+            ${PRODUCTION_STAGES.map(s => html`<option key=${s} value=${s}>${s.replace(/_/g,' ')}</option>`)}
+          </select>
+        </div>
+        <div class="field" style="flex:0.8"><label>Code</label><input type="text" value=${row.code} onChange=${e => onChange({ ...row, code: e.target.value })} placeholder="POR" style="font-family:monospace" /></div>
+        <div class="field" style="flex:0.6"><label>Ord</label><input type="number" value=${row.ord} onChange=${e => onChange({ ...row, ord: parseInt(e.target.value || 0) })} /></div>
+      </div>
+      <div class="field"><label>Label *</label><input type="text" value=${row.label} onChange=${e => onChange({ ...row, label: e.target.value })} placeholder="Porosity" /></div>
+      <div class="field"><label>Category (optional)</label><input type="text" value=${row.category} onChange=${e => onChange({ ...row, category: e.target.value })} placeholder="surface · fill · dimension · finish · mechanical" /></div>
+      <div style="display:flex;gap:6px;margin-top:6px">
+        <button class="btn small" onClick=${() => onSave(row)} disabled=${busy || !row.label.trim()}>${busy ? '…' : 'Save'}</button>
+        <button class="btn small ghost" onClick=${onCancel} disabled=${busy}>Cancel</button>
+      </div>
+    </div>
+  `;
+}
+
+// ============= REUSABLE BREAKDOWN GRID =============
+// Drops into any entry form that needs structured rejection counts. Pass
+// the relevant stage and an onChange handler. Returns a list of
+// { rejection_type_id, label_snapshot, qty } rows the parent saves into
+// mcp_pdc_shot_rejections / mcp_pdc_stage_log_rejections.
+function RejectionBreakdown({ plant, stage, value, onChange }) {
+  const [types, setTypes] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showAddCustom, setShowAddCustom] = useState(false);
+  const [customLabel, setCustomLabel] = useState('');
+
+  useEffect(() => { (async () => {
+    setLoading(true);
+    const { data } = await sb.from('mcp_pdc_rejection_types')
+      .select('*').eq('plant_id', plant.id).eq('stage', stage).eq('active', true).order('ord');
+    setTypes(data || []);
+    setLoading(false);
+  })(); }, [plant.id, stage]);
+
+  const byTypeId = {};
+  (value || []).forEach(r => { if (r.rejection_type_id) byTypeId[r.rejection_type_id] = r; });
+  const customs = (value || []).filter(r => !r.rejection_type_id);
+
+  const setRow = (typeId, label, qty) => {
+    const next = (value || []).filter(r => r.rejection_type_id !== typeId);
+    const n = parseInt(qty, 10);
+    if (n > 0) next.push({ rejection_type_id: typeId, label_snapshot: label, qty: n });
+    onChange(next);
+  };
+  const setCustom = (idx, patch) => {
+    const next = [...(value || [])];
+    let count = -1;
+    const realIdx = next.findIndex(r => { if (!r.rejection_type_id) count++; return count === idx && !r.rejection_type_id; });
+    if (realIdx < 0) return;
+    next[realIdx] = { ...next[realIdx], ...patch };
+    onChange(next);
+  };
+  const removeCustom = (idx) => {
+    let count = -1;
+    onChange((value || []).filter(r => { if (!r.rejection_type_id) { count++; return count !== idx; } return true; }));
+  };
+  const addCustom = () => {
+    if (!customLabel.trim()) return;
+    onChange([...(value || []), { rejection_type_id: null, label_snapshot: customLabel.trim(), qty: 0 }]);
+    setCustomLabel(''); setShowAddCustom(false);
+  };
+
+  const total = (value || []).reduce((s, r) => s + (parseInt(r.qty, 10) || 0), 0);
+
+  if (loading) return html`<div style="padding:10px;font-size:12px;color:var(--slate-500)">Loading rejection types…</div>`;
+
+  if (types.length === 0 && customs.length === 0) {
+    return html`
+      <div class="card" style="background:var(--amber-50);border-color:var(--amber-200);padding:10px 12px">
+        <div style="font-size:12px;color:var(--amber-800);margin-bottom:6px">No rejection types configured for stage <b>${stage}</b>.</div>
+        <button class="btn small ghost" onClick=${() => setShowAddCustom(true)} style="padding:3px 10px;font-size:11px">+ Add custom reason for this entry</button>
+        ${showAddCustom && html`
+          <div style="display:flex;gap:6px;margin-top:8px">
+            <input type="text" value=${customLabel} onChange=${e => setCustomLabel(e.target.value)} placeholder="Reason label" style="flex:1;padding:6px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px" autoFocus />
+            <button class="btn small" onClick=${addCustom}>Add</button>
+          </div>
+        `}
+      </div>
+    `;
+  }
+
+  return html`
+    <div class="card" style="padding:10px 12px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.5px;flex:1">Reject by type · ${stage}</div>
+        <div style="font-size:13px;font-weight:700;color:${total > 0 ? 'var(--rose-600)' : 'var(--slate-400)'}">Total: ${total}</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:4px">
+        ${types.map(t => {
+          const cur = byTypeId[t.id];
+          return html`
+            <div key=${t.id} style="display:flex;align-items:center;gap:8px;padding:4px 0">
+              <div style="flex:1;font-size:12px">
+                ${t.code ? html`<span style="font-family:monospace;color:var(--slate-500);font-size:11px;margin-right:6px">${t.code}</span>` : ''}
+                ${t.label}
+                ${t.category && html`<span style="color:var(--slate-400);font-size:10px;margin-left:6px">${t.category}</span>`}
+              </div>
+              <input type="number" min=${0} value=${cur?.qty || ''} placeholder="0"
+                onChange=${e => setRow(t.id, t.label, e.target.value)}
+                style="width:70px;padding:5px 8px;font-size:13px;border:1px solid ${cur ? 'var(--rose-300)' : 'var(--slate-200)'};border-radius:5px;text-align:right;background:${cur ? 'var(--rose-50)' : 'white'}" />
+            </div>
+          `;
+        })}
+        ${customs.map((r, idx) => html`
+          <div key=${'c'+idx} style="display:flex;align-items:center;gap:8px;padding:4px 0;background:var(--amber-50);border-radius:5px;padding-left:6px;padding-right:6px">
+            <input type="text" value=${r.label_snapshot} onChange=${e => setCustom(idx, { label_snapshot: e.target.value })} style="flex:1;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px" placeholder="Custom reason" />
+            <input type="number" min=${0} value=${r.qty || ''} onChange=${e => setCustom(idx, { qty: parseInt(e.target.value || 0) })} style="width:70px;padding:5px 8px;font-size:13px;border:1px solid var(--rose-300);border-radius:5px;text-align:right;background:white" />
+            <button class="btn small danger" onClick=${() => removeCustom(idx)} style="padding:2px 6px;font-size:11px">×</button>
+          </div>
+        `)}
+      </div>
+      <div style="margin-top:8px">
+        ${showAddCustom ? html`
+          <div style="display:flex;gap:6px">
+            <input type="text" value=${customLabel} onChange=${e => setCustomLabel(e.target.value)} placeholder="Custom reason label" style="flex:1;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px" autoFocus />
+            <button class="btn small" onClick=${addCustom}>Add</button>
+            <button class="btn small ghost" onClick=${() => { setShowAddCustom(false); setCustomLabel(''); }}>Cancel</button>
+          </div>
+        ` : html`
+          <button class="btn small ghost" onClick=${() => setShowAddCustom(true)} style="padding:3px 10px;font-size:11px">+ Other reason (one-off)</button>
+        `}
       </div>
     </div>
   `;
