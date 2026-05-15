@@ -1092,6 +1092,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'quality_objectives'}><${QualityObjectivesModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'risk_register'}><${RiskRegisterModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'contingency'}><${ContingencyModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'npd'}><${NpdModule} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
 
       <div class="tabbar">
@@ -1099,7 +1100,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr','scl','iap','pm_schedule','quality_objectives','risk_register','contingency'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr','scl','iap','pm_schedule','quality_objectives','risk_register','contingency','npd'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
 
       ${/* Logi chatbot + Siri voice agent hidden per user request. Components
@@ -1144,6 +1145,7 @@ function TopNavDesktop({ plant, me, initials, tab, setTab, logout, unreadCount, 
     { key:'quality_objectives',  icon:'🎯', label:'Quality Objectives (6.2)' },
     { key:'risk_register',       icon:'⚠️', label:'Risk Register (6.1)' },
     { key:'contingency',         icon:'⛑️', label:'Contingency Plans (6.1.2.3)' },
+    { key:'npd',                 icon:'🧪', label:'NPD Projects (APQP)' },
     { key:'more',                icon:'⚙️', label:'Settings & Account' },
   ];
   const inMore = moreItems.some(it => it.key === tab) && !tabs.some(t => t.key === tab);
@@ -7752,6 +7754,344 @@ function IapEditModal({ plant, me, row, onClose, onSaved }) {
         <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Plan audit' : 'Save')}</button>
       </div>
     </div>
+  `;
+}
+
+// =================================================================
+// =================================================================
+// NPD MODULE (New Product Development · APQP lifecycle)
+// =================================================================
+// Tracks the full new-part journey: RFQ → Quote → Award → Tooling →
+// Prototype → PPAP → SOP. Each phase carries a target_date and an
+// actual_date; the trigger cascades phase changes to All Hands chat
+// and auto-creates a PPAP submission row when phase reaches 'ppap'.
+const NPD_PHASES = [
+  { key:'rfq',       label:'RFQ',       emoji:'📥', target:'quote_target_date',     actual:'quote_sent_date' },
+  { key:'quoted',    label:'Quoted',    emoji:'💬', target:'award_target_date',     actual:'award_actual_date' },
+  { key:'awarded',   label:'Awarded',   emoji:'🏆', target:'tooling_target_date',   actual:'tooling_actual_date' },
+  { key:'tooling',   label:'Tooling',   emoji:'🛠',  target:'prototype_target_date', actual:'prototype_actual_date' },
+  { key:'prototype', label:'Prototype', emoji:'🧪', target:'ppap_target_date',      actual:'ppap_actual_date' },
+  { key:'ppap',      label:'PPAP',      emoji:'📑', target:'sop_target_date',       actual:'sop_actual_date' },
+  { key:'sop',       label:'SOP',       emoji:'🚀', target:null,                    actual:null },
+];
+const NPD_PHASE_BY_KEY = Object.fromEntries(NPD_PHASES.map(p => [p.key, p]));
+
+function NpdModule({ plant, me, setTab }) {
+  const [projects, setProjects] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState('active');   // active | slipping | sop_30 | all
+  const [activeId, setActiveId] = useState(null);
+  const [createOpen, setCreateOpen] = useState(false);
+
+  const refresh = async () => {
+    setLoading(true);
+    const [p, c, u] = await Promise.all([
+      sb.from('mcp_npd_projects').select('*').eq('plant_id', plant.id).order('created_at', { ascending: false }),
+      sb.from('mcp_sched_customers').select('id, name, short_code').eq('plant_id', plant.id).order('name'),
+      sb.from('users').select('id, full_name, role').eq('plant_id', plant.id).order('full_name'),
+    ]);
+    setProjects(p.data || []);
+    setCustomers(c.data || []);
+    setUsers(u.data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [plant.id]);
+
+  useEffect(() => {
+    const ch = sb.channel('npd-projects-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_npd_projects', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(ch); };
+  }, [plant.id]);
+
+  if (activeId) {
+    const proj = projects.find(p => p.id === activeId);
+    if (!proj) { setActiveId(null); return null; }
+    return html`<${NpdDetail} project=${proj} customers=${customers} users=${users} me=${me} onClose=${() => setActiveId(null)} onChanged=${refresh} />`;
+  }
+
+  const today = new Date().toISOString().slice(0,10);
+  const isSlipping = (p) => {
+    if (p.status !== 'active') return false;
+    const ph = NPD_PHASE_BY_KEY[p.phase];
+    if (!ph || !ph.target) return false;
+    const t = p[ph.target]; const a = p[ph.actual];
+    return t && t < today && !a;
+  };
+  const isApproaching30 = (p) => {
+    if (p.status !== 'active' || !p.sop_target_date) return false;
+    const diff = (new Date(p.sop_target_date) - new Date(today)) / 86400000;
+    return diff >= 0 && diff <= 30;
+  };
+
+  const visible = projects
+    .filter(p => filter === 'all' ? true :
+                 filter === 'active' ? p.status === 'active' :
+                 filter === 'slipping' ? isSlipping(p) :
+                 filter === 'sop_30' ? isApproaching30(p) : true)
+    .sort((a, b) => (a.sop_target_date || '9999') < (b.sop_target_date || '9999') ? -1 : 1);
+
+  const counts = {
+    active: projects.filter(p => p.status === 'active').length,
+    slipping: projects.filter(isSlipping).length,
+    sop_30: projects.filter(isApproaching30).length,
+    all: projects.length,
+  };
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap">
+      <div><h1>🧪 NPD Projects</h1><div class="sub">New product development · APQP lifecycle from RFQ to SOP</div></div>
+      <button class="btn small" onClick=${() => setCreateOpen(true)}>+ New Project</button>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px;flex-wrap:wrap">
+      <button class=${'auth-tab' + (filter === 'active' ? ' active' : '')} onClick=${() => setFilter('active')}>Active · ${counts.active}</button>
+      <button class=${'auth-tab' + (filter === 'slipping' ? ' active' : '')} onClick=${() => setFilter('slipping')}>⚠️ Slipping · ${counts.slipping}</button>
+      <button class=${'auth-tab' + (filter === 'sop_30' ? ' active' : '')} onClick=${() => setFilter('sop_30')}>🎯 SOP ≤ 30d · ${counts.sop_30}</button>
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All · ${counts.all}</button>
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      visible.length === 0 ? html`
+        <div class="card"><div class="empty">
+          <div class="icon">🧪</div>
+          <div style="font-size:13px">${filter === 'active' ? 'No active NPD projects. Tap + New Project to begin.' : 'Nothing matches this filter.'}</div>
+        </div></div>
+      ` : visible.map(p => {
+        const cust = customers.find(c => c.id === p.customer_id);
+        const owner = users.find(u => u.id === p.responsible_user_id);
+        const phaseDef = NPD_PHASE_BY_KEY[p.phase];
+        const slipping = isSlipping(p);
+        const days_to_sop = p.sop_target_date ? Math.floor((new Date(p.sop_target_date) - new Date(today)) / 86400000) : null;
+        return html`
+          <div class="card" key=${p.id} onClick=${() => setActiveId(p.id)} style="cursor:pointer;margin-bottom:8px;padding:12px 14px;${slipping ? 'background:var(--rose-50);border-color:var(--rose-200)' : ''}">
+            <div style="display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap">
+              <div style="flex:1;min-width:200px">
+                <div style="font-size:11px;color:var(--slate-500);font-weight:600;margin-bottom:2px">${p.project_code}</div>
+                <div style="font-size:14px;font-weight:600">${p.part_name}${p.customer_part_number ? html` <span style="font-family:monospace;color:var(--slate-500);font-size:12px">· ${p.customer_part_number}</span>` : ''}</div>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:3px">
+                  ${cust ? cust.name : (p.customer_name_raw || '?')}
+                  ${owner ? ' · 👤 ' + owner.full_name : ''}
+                  ${p.annual_volume ? ' · EAU ' + fmtNum(p.annual_volume) : ''}
+                </div>
+              </div>
+              <div style="text-align:right;display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                <span class=${'badge ' + (p.status === 'completed' ? 'emerald' : p.status === 'cancelled' ? '' : slipping ? 'rose' : 'teal')} style="font-size:11px">
+                  ${phaseDef ? phaseDef.emoji + ' ' + phaseDef.label : p.phase}
+                </span>
+                ${p.sop_target_date && p.status === 'active' && html`
+                  <div style="font-size:11px;color:${days_to_sop < 0 ? 'var(--rose-600)' : days_to_sop <= 30 ? 'var(--amber-700)' : 'var(--slate-500)'};font-weight:500">
+                    SOP ${new Date(p.sop_target_date).toLocaleDateString('en-IN', { day:'numeric', month:'short' })}${days_to_sop !== null ? ' · ' + (days_to_sop >= 0 ? days_to_sop + 'd left' : Math.abs(days_to_sop) + 'd overdue') : ''}
+                  </div>
+                `}
+                ${slipping && html`<div style="font-size:10px;color:var(--rose-600);font-weight:600">⚠️ phase overdue</div>`}
+              </div>
+            </div>
+          </div>
+        `;
+      })
+    }
+
+    ${createOpen && html`<${NpdCreateModal} plant=${plant} me=${me} customers=${customers} users=${users} onClose=${() => setCreateOpen(false)} onSaved=${(id) => { setCreateOpen(false); refresh().then(() => setActiveId(id)); }} />`}
+  `;
+}
+
+// ============= NPD CREATE MODAL =============
+function NpdCreateModal({ plant, me, customers, users, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    project_code: '',
+    customer_id: '',
+    customer_name_raw: '',
+    part_name: '',
+    customer_part_number: '',
+    annual_volume: '',
+    responsible_user_id: me.id,
+    phase: 'rfq',
+    rfq_received_date: new Date().toISOString().slice(0,10),
+    quote_target_date: '',
+    sop_target_date: '',
+    notes: '',
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  // Auto-suggest a project code
+  useEffect(() => {
+    if (form.project_code) return;
+    (async () => {
+      const year = new Date().getFullYear().toString().slice(-2);
+      const { data } = await sb.from('mcp_npd_projects')
+        .select('project_code').eq('plant_id', plant.id)
+        .like('project_code', 'NPD-' + year + '-%').order('project_code', { ascending: false }).limit(1);
+      let next = 1;
+      if (data && data[0]) {
+        const m = data[0].project_code.match(/(\d+)$/);
+        if (m) next = parseInt(m[1], 10) + 1;
+      }
+      setForm(f => ({ ...f, project_code: 'NPD-' + year + '-' + String(next).padStart(3, '0') }));
+    })();
+  }, [plant.id]);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setErr(''); setBusy(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        project_code: form.project_code.trim(),
+        customer_id: form.customer_id || null,
+        customer_name_raw: form.customer_id ? null : (form.customer_name_raw || null),
+        part_name: form.part_name.trim(),
+        customer_part_number: form.customer_part_number || null,
+        annual_volume: form.annual_volume ? parseInt(form.annual_volume, 10) : null,
+        responsible_user_id: form.responsible_user_id || null,
+        phase: form.phase,
+        rfq_received_date: form.rfq_received_date || null,
+        quote_target_date: form.quote_target_date || null,
+        sop_target_date: form.sop_target_date || null,
+        notes: form.notes || null,
+        created_by: me.id,
+      };
+      const { data, error } = await sb.from('mcp_npd_projects').insert(payload).select('id').single();
+      if (error) throw error;
+      showToast('🧪 NPD project created');
+      onSaved(data.id);
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">New NPD Project</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Project code *</label><input type="text" required value=${form.project_code} onChange=${e => setForm({...form, project_code: e.target.value})} style="font-family:monospace" /></div>
+            <div class="field"><label>Phase</label>
+              <select value=${form.phase} onChange=${e => setForm({...form, phase: e.target.value})}>
+                ${NPD_PHASES.map(p => html`<option key=${p.key} value=${p.key}>${p.emoji} ${p.label}</option>`)}
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Customer</label>
+            <select value=${form.customer_id} onChange=${e => setForm({...form, customer_id: e.target.value, customer_name_raw: ''})}>
+              <option value="">— Pick customer or enter name —</option>
+              ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.short_code ? ' · ' + c.short_code : ''}</option>`)}
+            </select>
+            ${!form.customer_id && html`<input type="text" value=${form.customer_name_raw} onChange=${e => setForm({...form, customer_name_raw: e.target.value})} placeholder="Or type a new customer name" style="margin-top:6px" />`}
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Part name *</label><input type="text" required value=${form.part_name} onChange=${e => setForm({...form, part_name: e.target.value})} placeholder="e.g. Bracket Nozzle holder" /></div>
+            <div class="field"><label>Customer part #</label><input type="text" value=${form.customer_part_number} onChange=${e => setForm({...form, customer_part_number: e.target.value})} style="font-family:monospace" /></div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Annual volume (EAU)</label><input type="number" min=${0} value=${form.annual_volume} onChange=${e => setForm({...form, annual_volume: e.target.value})} /></div>
+            <div class="field"><label>Responsible</label>
+              <select value=${form.responsible_user_id} onChange=${e => setForm({...form, responsible_user_id: e.target.value})}>
+                <option value="">— Pick owner —</option>
+                ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + u.role : ''}</option>`)}
+              </select>
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>RFQ received</label><input type="date" value=${form.rfq_received_date} onChange=${e => setForm({...form, rfq_received_date: e.target.value})} /></div>
+            <div class="field"><label>Quote target</label><input type="date" value=${form.quote_target_date} onChange=${e => setForm({...form, quote_target_date: e.target.value})} /></div>
+            <div class="field"><label>SOP target</label><input type="date" value=${form.sop_target_date} onChange=${e => setForm({...form, sop_target_date: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${busy || !form.project_code || !form.part_name}>${busy ? 'Saving…' : 'Create project'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= NPD DETAIL =============
+function NpdDetail({ project, customers, users, me, onClose, onChanged }) {
+  const [p, setP] = useState(project);
+  const [busy, setBusy] = useState(false);
+
+  const cust = customers.find(c => c.id === p.customer_id);
+  const owner = users.find(u => u.id === p.responsible_user_id);
+
+  const update = async (patch) => {
+    setBusy(true);
+    try {
+      const { data, error } = await sb.from('mcp_npd_projects').update(patch).eq('id', p.id).select('*').single();
+      if (error) throw error;
+      setP(data);
+      onChanged && onChanged();
+      showToast('Saved');
+    } catch (e) { alert(e.message); } finally { setBusy(false); }
+  };
+
+  const setPhase = (newPhase) => {
+    if (newPhase === p.phase) return;
+    update({ phase: newPhase });
+  };
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:160px">
+        <h1 style="font-size:18px">${p.part_name}</h1>
+        <div class="sub">${p.project_code} · ${cust ? cust.name : (p.customer_name_raw || '?')} ${p.customer_part_number ? ' · ' + p.customer_part_number : ''}</div>
+      </div>
+      <select value=${p.status} onChange=${e => update({ status: e.target.value })} disabled=${busy} style="padding:6px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px">
+        <option value="active">Active</option>
+        <option value="onhold">On Hold</option>
+        <option value="completed">Completed</option>
+        <option value="cancelled">Cancelled</option>
+      </select>
+    </div>
+
+    <div class="card">
+      <div class="card-row"><span class="label">Phase</span><span class="value">
+        <select value=${p.phase} onChange=${e => setPhase(e.target.value)} disabled=${busy} style="padding:4px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px">
+          ${NPD_PHASES.map(ph => html`<option key=${ph.key} value=${ph.key}>${ph.emoji} ${ph.label}</option>`)}
+        </select>
+      </span></div>
+      ${owner && html`<div class="card-row"><span class="label">Owner</span><span class="value">${owner.full_name}${owner.role ? ' · ' + owner.role : ''}</span></div>`}
+      ${p.annual_volume && html`<div class="card-row"><span class="label">EAU</span><span class="value">${fmtNum(p.annual_volume)} / year</span></div>`}
+      ${p.sop_target_date && html`<div class="card-row"><span class="label">SOP target</span><span class="value">${p.sop_target_date}</span></div>`}
+      ${p.sop_actual_date && html`<div class="card-row"><span class="label">SOP actual</span><span class="value" style="color:var(--emerald-700)">${p.sop_actual_date}</span></div>`}
+      ${p.ppap_submission_id && html`<div class="card-row"><span class="label">PPAP</span><span class="value mono" style="font-size:11px">linked · ${p.ppap_submission_id.slice(0,8)}…</span></div>`}
+    </div>
+
+    <div class="section-h">Phase timeline</div>
+    <div class="card" style="padding:0">
+      ${[
+        { label:'RFQ received', target:null, actual:'rfq_received_date' },
+        { label:'Quote', target:'quote_target_date', actual:'quote_sent_date' },
+        { label:'Award', target:'award_target_date', actual:'award_actual_date' },
+        { label:'Tooling start', target:'tooling_target_date', actual:'tooling_actual_date' },
+        { label:'Prototype', target:'prototype_target_date', actual:'prototype_actual_date' },
+        { label:'PPAP submission', target:'ppap_target_date', actual:'ppap_actual_date' },
+        { label:'SOP', target:'sop_target_date', actual:'sop_actual_date' },
+      ].map((row, i, arr) => html`
+        <div key=${row.label} style="padding:10px 12px;border-bottom:${i === arr.length - 1 ? 'none' : '1px solid var(--slate-100)'}">
+          <div style="font-size:13px;font-weight:500;margin-bottom:6px">${row.label}</div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap">
+            ${row.target && html`
+              <label style="flex:1;min-width:120px;font-size:11px;color:var(--slate-500)">
+                Target
+                <input type="date" value=${p[row.target] || ''} onChange=${e => update({ [row.target]: e.target.value || null })} disabled=${busy} style="display:block;margin-top:2px;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px;width:100%" />
+              </label>
+            `}
+            ${row.actual && html`
+              <label style="flex:1;min-width:120px;font-size:11px;color:var(--slate-500)">
+                Actual
+                <input type="date" value=${p[row.actual] || ''} onChange=${e => update({ [row.actual]: e.target.value || null })} disabled=${busy} style="display:block;margin-top:2px;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px;width:100%" />
+              </label>
+            `}
+          </div>
+        </div>
+      `)}
+    </div>
+
+    ${p.notes && html`<div class="alert info" style="margin-top:14px"><strong>Notes:</strong> ${p.notes}</div>`}
   `;
 }
 
