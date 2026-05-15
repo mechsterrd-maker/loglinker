@@ -857,11 +857,39 @@ function Wizard({ user, pendingInvite, onDone }) {
 }
 
 // ============= MAIN APP =============
+// Capture deep-link params ONCE before they're stripped during profile load.
+// Push notifications send the user to /app?tab=chat&group=<uuid>, but older
+// notifications (still on locked phones) point to /chat?group=<uuid> or
+// /tasks?action=<uuid>. The Vercel catch-all rewrite serves index.html for
+// all those paths; this block extracts intent from BOTH pathname and query.
+const PATH_TAB_MAP = {
+  chat: 'chat',
+  tasks: 'actions',
+  actions: 'actions',
+  schedules: 'schedules',
+  documents: 'documents',
+  quality: 'quality',
+  maintenance: 'maintenance',
+  production: 'production',
+};
+const DEEP_LINK = (() => {
+  try {
+    if (typeof window === 'undefined') return null;
+    const sp = new URLSearchParams(window.location.search);
+    const path = window.location.pathname.replace(/^\/+|\/+$/g, '').toLowerCase();
+    const pathTab = PATH_TAB_MAP[path.split('/')[0]] || null;
+    const tab = sp.get('tab') || pathTab;
+    const group = sp.get('group');
+    if (!tab && !group) return null;
+    return { tab, group };
+  } catch (_) { return null; }
+})();
+
 function App() {
   const [user, setUser] = useState(null);
   const [plant, setPlant] = useState(null);
   const [me, setMe] = useState(null);
-  const [tab, setTab] = useState('home');
+  const [tab, setTab] = useState(DEEP_LINK?.tab || 'home');
   const [loading, setLoading] = useState(true);
   const [pendingInvite, setPendingInvite] = useState(null);
   const [accessibleUnits, setAccessibleUnits] = useState([]);
@@ -1048,7 +1076,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'movements'}><${MovementsPage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'trace'}><${TracePage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} /></${Page}>
-      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} /></${Page}>
+      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
       <${Page} active=${tab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'calibration'}><${CalibrationModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -3362,10 +3390,125 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
   `;
 }
 
+// ============= PENDING TASKS PANEL (sticky in chat) =============
+// Plant-wide pending tasks, collapsible header that shows counts. Each row
+// has inline Done / Start / Snooze quick actions; the link icon jumps to the
+// Actions tab. Subscribes to the actions table so updates appear instantly.
+function PendingTasksPanel({ plant, setTab }) {
+  const [open, setOpen] = useState(false);
+  const [tasks, setTasks] = useState([]);
+  const [busy, setBusy] = useState({});
+
+  const refresh = useCallback(async () => {
+    const { data } = await sb.from('actions')
+      .select('id, title, status, due_at, owner_id, department')
+      .eq('plant_id', plant.id)
+      .not('status', 'in', '(completed,cancelled)')
+      .order('due_at', { ascending: true, nullsFirst: false })
+      .limit(50);
+    const list = data || [];
+    const ownerIds = [...new Set(list.map(t => t.owner_id).filter(Boolean))];
+    if (ownerIds.length > 0) {
+      const { data: us } = await sb.from('users').select('id, full_name').in('id', ownerIds);
+      const m = new Map((us || []).map(u => [u.id, u.full_name]));
+      list.forEach(t => { t._owner_name = m.get(t.owner_id) || '?'; });
+    }
+    setTasks(list);
+  }, [plant.id]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  useEffect(() => {
+    const ch = sb.channel('pending-tasks-panel-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'actions', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(ch); };
+  }, [plant.id, refresh]);
+
+  const today = new Date().toISOString().slice(0, 10);
+  const overdue = tasks.filter(t => t.due_at && t.due_at.slice(0,10) < today);
+  const dueToday = tasks.filter(t => t.due_at && t.due_at.slice(0,10) === today);
+
+  const doAction = async (taskId, kind) => {
+    setBusy(prev => ({ ...prev, [taskId]: kind }));
+    try {
+      if (kind === 'done') {
+        await sb.from('actions').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('id', taskId);
+        showToast('✅ Task closed');
+      } else if (kind === 'start') {
+        await sb.from('actions').update({ status: 'in_progress' }).eq('id', taskId);
+        showToast('▶️ Started');
+      } else if (kind === 'snooze') {
+        const t = tasks.find(x => x.id === taskId);
+        const base = t?.due_at ? new Date(t.due_at) : new Date();
+        const next = new Date(base.getTime() + 24 * 60 * 60 * 1000);
+        await sb.from('actions').update({ due_at: next.toISOString() }).eq('id', taskId);
+        showToast('⏰ Snoozed 1 day');
+      }
+    } catch (e) { alert(e.message); }
+    finally { setBusy(prev => { const c = { ...prev }; delete c[taskId]; return c; }); }
+  };
+
+  if (tasks.length === 0) return null;
+
+  const headerBg = overdue.length > 0 ? 'var(--rose-50)' : dueToday.length > 0 ? 'var(--amber-50)' : 'var(--slate-50)';
+
+  return html`
+    <div class="card" style="padding:0;margin-bottom:14px;border-radius:10px;overflow:hidden">
+      <div onClick=${() => setOpen(!open)} style="padding:10px 12px;display:flex;align-items:center;gap:8px;cursor:pointer;background:${headerBg};border-bottom:${open ? '1px solid var(--slate-200)' : 'none'}">
+        <div style="font-size:13px;font-weight:600;flex:1">
+          📋 ${tasks.length} pending plant task${tasks.length === 1 ? '' : 's'}
+          ${overdue.length > 0 ? html` · <span style="color:var(--rose-600)">⚠️ ${overdue.length} overdue</span>` : ''}
+          ${dueToday.length > 0 ? html` · <span style="color:var(--amber-700)">⏰ ${dueToday.length} due today</span>` : ''}
+        </div>
+        <span style="font-size:11px;color:var(--slate-500)">${open ? '▾' : '▸'}</span>
+      </div>
+      ${open && html`
+        <div style="max-height:360px;overflow-y:auto">
+          ${tasks.slice(0, 20).map(t => {
+            const isOverdue = t.due_at && t.due_at.slice(0,10) < today;
+            const isToday = t.due_at && t.due_at.slice(0,10) === today;
+            const dueLabel = !t.due_at ? 'no due' :
+              isOverdue ? '⚠️ ' + Math.abs(Math.floor((new Date(today) - new Date(t.due_at.slice(0,10))) / 86400000)) + 'd overdue' :
+              isToday ? '⏰ due today' :
+              'due ' + new Date(t.due_at).toLocaleDateString('en-IN', { day:'numeric', month:'short' });
+            return html`
+              <div key=${t.id} style="padding:10px 12px;border-bottom:1px solid var(--slate-100);background:${isOverdue ? 'var(--rose-50)' : ''}">
+                <div style="font-size:13px;font-weight:500;line-height:1.3">${t.title}</div>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:3px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+                  ${t.department ? html`<span class="badge teal" style="font-size:10px;padding:1px 6px">${t.department}</span>` : ''}
+                  <span>${t._owner_name || '—'}</span>
+                  <span>·</span>
+                  <span style=${isOverdue ? 'color:var(--rose-600);font-weight:600' : isToday ? 'color:var(--amber-700);font-weight:600' : ''}>${dueLabel}</span>
+                  <span>·</span>
+                  <span style="color:var(--slate-400)">${t.status}</span>
+                </div>
+                <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
+                  <button class="btn small" onClick=${() => doAction(t.id, 'done')} disabled=${!!busy[t.id]} style="padding:4px 10px;font-size:11px">${busy[t.id]==='done' ? '…' : '✅ Done'}</button>
+                  ${t.status !== 'in_progress' && html`<button class="btn small ghost" onClick=${() => doAction(t.id, 'start')} disabled=${!!busy[t.id]} style="padding:4px 10px;font-size:11px">${busy[t.id]==='start' ? '…' : '▶️ Start'}</button>`}
+                  <button class="btn small ghost" onClick=${() => doAction(t.id, 'snooze')} disabled=${!!busy[t.id]} style="padding:4px 10px;font-size:11px">${busy[t.id]==='snooze' ? '…' : '⏰ +1d'}</button>
+                  <button class="btn small ghost" onClick=${() => setTab && setTab('actions')} style="padding:4px 10px;font-size:11px;margin-left:auto" title="Open in Actions">🔗</button>
+                </div>
+              </div>
+            `;
+          })}
+          ${tasks.length > 20 && html`
+            <div style="padding:10px 12px;text-align:center;font-size:12px;color:var(--slate-500)">
+              + ${tasks.length - 20} more ·
+              <button class="btn small ghost" onClick=${() => setTab && setTab('actions')} style="padding:2px 8px;font-size:11px;margin-left:4px">Open Actions tab</button>
+            </div>
+          `}
+        </div>
+      `}
+    </div>
+  `;
+}
+
 // ============= CHAT =============
-function Chat({ plant, me, user }) {
+function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
   const [groups, setGroups] = useState([]);
   const [activeGroup, setActiveGroup] = useState(null);
+  const deepLinkAppliedRef = useRef(false);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
@@ -3551,6 +3694,15 @@ function Chat({ plant, me, user }) {
 
     setGroups(enriched);
     setLoading(false);
+
+    // Deep-link from push notification: auto-open the requested group once.
+    if (deepLinkGroupId && !deepLinkAppliedRef.current) {
+      const target = enriched.find(g => g.id === deepLinkGroupId);
+      if (target) {
+        setActiveGroup(target);
+        deepLinkAppliedRef.current = true;
+      }
+    }
   };
 
   const loadMessages = async (groupId) => {
@@ -3921,6 +4073,7 @@ function Chat({ plant, me, user }) {
 
   return html`
     <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start"><div><h1>Chat</h1><div class="sub">Plant communication</div></div><button class="btn small" onClick=${() => setGroupModal(true)} style="margin-top:6px">+ New Group</button></div>
+    <${PendingTasksPanel} plant=${plant} setTab=${setTab} />
     ${notifPerm === 'default' && html`
       <div class="setup-banner" style="margin-bottom:14px">
         <div class="setup-banner-title">🔔 Enable notifications</div>
@@ -10837,7 +10990,7 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
 
-  const deptOptions = ['Production', 'Quality', 'Maintenance', 'Stores', 'Tool Room', 'Logistics', 'Admin', 'Finance'];
+  const deptOptions = ['Production', 'Quality', 'Maintenance', 'Stores', 'Tool Room', 'Logistics', 'Records', 'Admin', 'Finance'];
 
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
@@ -10929,7 +11082,7 @@ function AssignTaskFromMsgModal({ plant, me, message, group, onClose, onSaved })
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
 
-  const deptOptions = ['Production', 'Quality', 'Maintenance', 'Stores', 'Tool Room', 'Logistics', 'Admin', 'Finance'];
+  const deptOptions = ['Production', 'Quality', 'Maintenance', 'Stores', 'Tool Room', 'Logistics', 'Records', 'Admin', 'Finance'];
 
   return html`
     <div class="modal-backdrop active" style="z-index:200" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
@@ -13810,7 +13963,7 @@ function QuickTaskInGroupModal({ plant, me, group, onClose, onSaved }) {
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
 
-  const deptOptions = ['Production', 'Quality', 'Maintenance', 'Stores', 'Tool Room', 'Logistics', 'Admin', 'Finance'];
+  const deptOptions = ['Production', 'Quality', 'Maintenance', 'Stores', 'Tool Room', 'Logistics', 'Records', 'Admin', 'Finance'];
 
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
@@ -13860,7 +14013,7 @@ function QuickTaskInGroupModal({ plant, me, group, onClose, onSaved }) {
 // SCHEDULES — Customer monthly schedules + plan-vs-actual tracking
 // =================================================================
 function Schedules({ plant, me }) {
-  const [view, setView] = useState('schedules'); // 'schedules' | 'customers'
+  const [view, setView] = useState('schedules'); // 'schedules' | 'plan_vs_supply' | 'customers' | 'mapping'
   const [activeSchedule, setActiveSchedule] = useState(null);
   const [activeCustomer, setActiveCustomer] = useState(null);
 
@@ -13880,10 +14033,14 @@ function Schedules({ plant, me }) {
       <button class=${'auth-tab' + (view === 'schedules' ? ' active' : '')} onClick=${() => setView('schedules')}>Schedules</button>
       <button class=${'auth-tab' + (view === 'plan_vs_supply' ? ' active' : '')} onClick=${() => setView('plan_vs_supply')}>📊 Plan vs Supply</button>
       <button class=${'auth-tab' + (view === 'customers' ? ' active' : '')} onClick=${() => setView('customers')}>Customers</button>
+      <button class=${'auth-tab' + (view === 'lines' ? ' active' : '')} onClick=${() => setView('lines')}>📋 Lines</button>
+      <button class=${'auth-tab' + (view === 'mapping' ? ' active' : '')} onClick=${() => setView('mapping')}>🔗 Bill Mapping</button>
     </div>
 
     ${view === 'schedules' ? html`<${SchedulesList} plant=${plant} me=${me} onOpen=${setActiveSchedule} />` :
       view === 'plan_vs_supply' ? html`<${PlanVsSupplyView} plant=${plant} me=${me} />` :
+      view === 'lines' ? html`<${ScheduleLinesManagerView} plant=${plant} me=${me} />` :
+      view === 'mapping' ? html`<${BillMappingView} plant=${plant} me=${me} />` :
       html`<${CustomersList} plant=${plant} me=${me} onOpen=${setActiveCustomer} />`}
   `;
 }
@@ -14986,17 +15143,76 @@ function CustomerModal({ plant, me, editTarget, onClose, onSaved }) {
   `;
 }
 
-function CustomerDetail({ plant, me, customer, onClose }) {
+function CustomerDetail({ plant, me, customer: initialCustomer, onClose }) {
+  const [customer, setCustomer] = useState(initialCustomer);
   const [schedules, setSchedules] = useState([]);
+  const [aliases, setAliases] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [aliasForm, setAliasForm] = useState({ alias_name: '', alias_gstin: '' });
+  const [aliasBusy, setAliasBusy] = useState(false);
+  const [aliasErr, setAliasErr] = useState('');
+  const [reapplying, setReapplying] = useState(false);
+  const [editModal, setEditModal] = useState(false);
 
   const refresh = async () => {
     setLoading(true);
-    const { data } = await sb.from('mcp_sched_schedules').select('*').eq('customer_id', customer.id).order('schedule_month', { ascending: false });
-    setSchedules(data || []);
+    const [c, s, a] = await Promise.all([
+      sb.from('mcp_sched_customers').select('*').eq('id', customer.id).maybeSingle(),
+      sb.from('mcp_sched_schedules').select('*').eq('customer_id', customer.id).order('schedule_month', { ascending: false }),
+      sb.from('mcp_sched_customer_aliases').select('*').eq('customer_id', customer.id).order('created_at'),
+    ]);
+    if (c.data) setCustomer(c.data);
+    setSchedules(s.data || []);
+    setAliases(a.data || []);
     setLoading(false);
   };
   useEffect(() => { refresh(); }, [customer.id]);
+
+  const addAlias = async () => {
+    setAliasErr('');
+    const name = (aliasForm.alias_name || '').trim();
+    const gstin = (aliasForm.alias_gstin || '').trim().toUpperCase();
+    if (!name && !gstin) { setAliasErr('Enter a billing name or a GSTIN'); return; }
+    setAliasBusy(true);
+    try {
+      const { error } = await sb.from('mcp_sched_customer_aliases').insert({
+        plant_id: plant.id,
+        customer_id: customer.id,
+        alias_name: name || null,
+        alias_gstin: gstin || null,
+        created_by: me.id,
+      });
+      if (error) throw error;
+      setAliasForm({ alias_name: '', alias_gstin: '' });
+      await refresh();
+    } catch (e) { setAliasErr(e.message); } finally { setAliasBusy(false); }
+  };
+
+  const deleteAlias = async (id) => {
+    if (!confirm('Remove this alias?')) return;
+    await sb.from('mcp_sched_customer_aliases').delete().eq('id', id);
+    refresh();
+  };
+
+  // Re-fire the supply trigger on this customer's existing outward docs so a
+  // newly-added alias retroactively links past unmatched bills.
+  const reapplyAliases = async () => {
+    setReapplying(true);
+    try {
+      const { data: docs } = await sb.from('mcp_logistics_documents')
+        .select('id, items')
+        .eq('plant_id', plant.id)
+        .in('doc_type', ['dc_out','invoice_out']);
+      let touched = 0;
+      for (const d of (docs || [])) {
+        if (!Array.isArray(d.items) || d.items.length === 0) continue;
+        const { error } = await sb.from('mcp_logistics_documents').update({ items: d.items }).eq('id', d.id);
+        if (!error) touched++;
+      }
+      showToast('Re-applied aliases on ' + touched + ' outward doc' + (touched === 1 ? '' : 's'));
+      refresh();
+    } catch (e) { alert('Re-apply failed: ' + e.message); } finally { setReapplying(false); }
+  };
 
   return html`
     <div class="page-header" style="display:flex;align-items:center;gap:10px">
@@ -15005,13 +15221,59 @@ function CustomerDetail({ plant, me, customer, onClose }) {
         <h1 style="font-size:18px">${customer.name}</h1>
         <div class="sub">${customer.short_code || customer.city || ''}</div>
       </div>
+      <button class="btn small ghost" onClick=${() => setEditModal(true)}>✎ Edit</button>
     </div>
 
     <div class="card">
-      ${customer.gstin && html`<div class="card-row"><span class="label">GSTIN</span><span class="value mono">${customer.gstin}</span></div>`}
+      <div class="card-row"><span class="label">Name</span><span class="value">${customer.name}</span></div>
+      ${customer.short_code && html`<div class="card-row"><span class="label">Short code</span><span class="value mono">${customer.short_code}</span></div>`}
+      <div class="card-row"><span class="label">GSTIN</span><span class="value mono" style=${customer.gstin ? '' : 'color:var(--slate-400)'}>${customer.gstin || '— tap Edit to add —'}</span></div>
       ${customer.contact_person && html`<div class="card-row"><span class="label">Contact</span><span class="value">${customer.contact_person} · ${customer.contact_phone || ''}</span></div>`}
       ${customer.contact_email && html`<div class="card-row"><span class="label">Email</span><span class="value">${customer.contact_email}</span></div>`}
       <div class="card-row"><span class="label">Payment terms</span><span class="value">${customer.default_payment_terms_days || 45} days</span></div>
+    </div>
+
+    ${editModal && html`<${CustomerModal} plant=${plant} me=${me} editTarget=${customer} onClose=${() => setEditModal(false)} onSaved=${() => { setEditModal(false); refresh(); }} />`}
+
+    <div class="section-h" style="display:flex;align-items:center;gap:8px">
+      <span style="flex:1">Billing-name aliases · ${aliases.length}</span>
+      ${aliases.length > 0 && html`
+        <button class="btn small ghost" onClick=${reapplyAliases} disabled=${reapplying} title="Re-fire the supply matcher on past outward docs so newly-added aliases retroactively attach unmatched bills.">
+          ${reapplying ? '…' : '↻ Re-apply to past bills'}
+        </button>
+      `}
+    </div>
+    <div class="card" style="background:var(--slate-50);font-size:12px;color:var(--slate-700);margin-bottom:8px;padding:10px 12px">
+      Names or GSTINs the OCR'd bills carry that should map to <b>${customer.name}</b>. Use this when the printed bill name differs from this customer's name (e.g. "ROOP POLYMERS LTD" → "ROOP POLYMERS"). Aliases win over fuzzy matching.
+    </div>
+    ${aliases.length > 0 && html`
+      <div class="card" style="padding:0;margin-bottom:8px">
+        ${aliases.map(a => html`
+          <div class="list-item" key=${a.id}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                ${a.alias_name && html`<div class="list-item-title" style="font-size:13px">${a.alias_name}</div>`}
+                ${a.alias_gstin && html`<div class="list-item-sub mono" style="font-size:11px">GSTIN ${a.alias_gstin}</div>`}
+              </div>
+              <button class="btn small danger" onClick=${() => deleteAlias(a.id)} style="padding:4px 8px">×</button>
+            </div>
+          </div>
+        `)}
+      </div>
+    `}
+    <div class="card" style="margin-bottom:14px">
+      ${aliasErr && html`<div class="alert error" style="margin-bottom:8px">${aliasErr}</div>`}
+      <div class="field-row">
+        <div class="field" style="flex:2">
+          <label style="font-size:11px">Billing name (as printed on bill)</label>
+          <input type="text" value=${aliasForm.alias_name} onChange=${e => setAliasForm({...aliasForm, alias_name: e.target.value})} placeholder="ROOP POLYMERS LTD" />
+        </div>
+        <div class="field" style="flex:1">
+          <label style="font-size:11px">or GSTIN</label>
+          <input type="text" maxLength=${15} value=${aliasForm.alias_gstin} onChange=${e => setAliasForm({...aliasForm, alias_gstin: e.target.value.toUpperCase()})} placeholder="33ABCDE…" style="font-family:monospace" />
+        </div>
+      </div>
+      <button class="btn small" onClick=${addAlias} disabled=${aliasBusy}>${aliasBusy ? 'Saving…' : '+ Add alias'}</button>
     </div>
 
     <div class="section-h">Schedules · ${schedules.length}</div>
@@ -15029,6 +15291,412 @@ function CustomerDetail({ plant, me, customer, onClose }) {
         </div>
       `)
     }
+  `;
+}
+
+// ============= BILL MAPPING (alias loop) =============
+// Aggregates every distinct billing-vendor name carried by outward docs
+// (dc_out / invoice_out) for this plant. Each unique name shows:
+//   • OCR'd name + GSTIN + how many docs use it
+//   • Whether the auto-matcher already resolved it to a schedule customer
+//   • A dropdown to pick a schedule customer + Save (writes an alias and
+//     re-fires the supply trigger on every doc carrying that name).
+//
+// Filters: All / Unmatched / Matched · plus free-text search.
+function BillMappingView({ plant, me }) {
+  const [docs, setDocs] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [aliases, setAliases] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState('unmatched'); // unmatched | all | matched
+  const [search, setSearch] = useState('');
+  const [picks, setPicks] = useState({});   // { key: customer_id }
+  const [busy, setBusy] = useState({});     // { key: bool }
+
+  const refresh = async () => {
+    setLoading(true);
+    const [d, c, a] = await Promise.all([
+      sb.from('mcp_logistics_documents')
+        .select('id, vendor_name_raw, vendor_gstin_raw, vendor_id, doc_type, doc_number, doc_date, plant_id')
+        .eq('plant_id', plant.id)
+        .in('doc_type', ['dc_out','invoice_out'])
+        .order('created_at', { ascending: false }),
+      sb.from('mcp_sched_customers').select('id, name, short_code, gstin').eq('plant_id', plant.id).order('name'),
+      sb.from('mcp_sched_customer_aliases').select('*').eq('plant_id', plant.id),
+    ]);
+    const docList = d.data || [];
+    // Mark which docs already produced supplies (≥1 supply row referencing this doc)
+    if (docList.length > 0) {
+      const ids = docList.map(x => x.id);
+      const { data: sup } = await sb.from('mcp_sched_supplies').select('source_doc_id, customer_id').in('source_doc_id', ids);
+      const supByDoc = new Map();
+      (sup || []).forEach(s => { if (!supByDoc.has(s.source_doc_id)) supByDoc.set(s.source_doc_id, s.customer_id); });
+      docList.forEach(x => { x._supply_customer_id = supByDoc.get(x.id) || null; });
+    }
+    setDocs(docList);
+    setCustomers(c.data || []);
+    setAliases(a.data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [plant.id]);
+
+  // Group outward docs by (vendor_name_raw + gstin) → one row per distinct billing name
+  const groups = (() => {
+    const map = new Map();
+    docs.forEach(d => {
+      const name = (d.vendor_name_raw || '').trim();
+      const gstin = (d.vendor_gstin_raw || '').trim().toUpperCase();
+      const key = name.toLowerCase() + '|' + gstin;
+      if (!map.has(key)) {
+        map.set(key, {
+          key, name, gstin,
+          docs: [], matched_customer_ids: new Set(),
+        });
+      }
+      const g = map.get(key);
+      g.docs.push(d);
+      if (d._supply_customer_id) g.matched_customer_ids.add(d._supply_customer_id);
+    });
+    return Array.from(map.values()).map(g => {
+      const matched = g.matched_customer_ids.size > 0;
+      const matchedCust = matched ? customers.find(c => g.matched_customer_ids.has(c.id)) : null;
+      // Suggest a customer: if matched → that one; else find an alias that already
+      // covers this name/gstin (the auto-matcher would pick it but the supply could
+      // still be zero if no schedule lines existed).
+      const aliasHit = aliases.find(a =>
+        (a.alias_gstin && g.gstin && a.alias_gstin.toUpperCase() === g.gstin) ||
+        (a.alias_name && a.alias_name.toLowerCase() === g.name.toLowerCase())
+      );
+      const suggested = matchedCust?.id || aliasHit?.customer_id || '';
+      return { ...g, matched, matched_customer: matchedCust, suggested };
+    });
+  })();
+
+  const visible = groups
+    .filter(g => filter === 'all' ? true : filter === 'matched' ? g.matched : !g.matched)
+    .filter(g => {
+      if (!search.trim()) return true;
+      const s = search.toLowerCase();
+      return (g.name || '').toLowerCase().includes(s) || (g.gstin || '').toLowerCase().includes(s);
+    })
+    .sort((a, b) => (b.docs.length - a.docs.length) || a.name.localeCompare(b.name));
+
+  const saveMapping = async (group) => {
+    const customerId = picks[group.key] ?? group.suggested;
+    if (!customerId) { alert('Pick a schedule customer first'); return; }
+    setBusy({ ...busy, [group.key]: true });
+    try {
+      // 1. Insert alias (name AND/OR gstin) — skip if an identical row already exists.
+      const aliasExists = aliases.some(a =>
+        a.customer_id === customerId &&
+        ((a.alias_name || '').toLowerCase() === (group.name || '').toLowerCase()) &&
+        ((a.alias_gstin || '').toUpperCase() === (group.gstin || '').toUpperCase())
+      );
+      if (!aliasExists) {
+        const { error: aErr } = await sb.from('mcp_sched_customer_aliases').insert({
+          plant_id: plant.id,
+          customer_id: customerId,
+          alias_name: group.name || null,
+          alias_gstin: group.gstin || null,
+          created_by: me.id,
+        });
+        if (aErr) throw aErr;
+      }
+      // 2. Re-fire the supply trigger on every doc carrying this billing name by
+      //    touching `items` (the trigger listens on UPDATE OF status, items).
+      let touched = 0;
+      for (const d of group.docs) {
+        const { data: full } = await sb.from('mcp_logistics_documents').select('items').eq('id', d.id).maybeSingle();
+        if (!full || !Array.isArray(full.items) || full.items.length === 0) continue;
+        const { error } = await sb.from('mcp_logistics_documents').update({ items: full.items }).eq('id', d.id);
+        if (!error) touched++;
+      }
+      showToast('✓ Alias saved · re-applied to ' + touched + ' doc' + (touched === 1 ? '' : 's'));
+      await refresh();
+    } catch (e) { alert('Save failed: ' + e.message); }
+    finally { setBusy({ ...busy, [group.key]: false }); }
+  };
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  const unmatchedCount = groups.filter(g => !g.matched).length;
+  const matchedCount = groups.filter(g => g.matched).length;
+
+  return html`
+    <div class="card" style="background:var(--slate-50);font-size:12px;color:var(--slate-700);margin-bottom:14px;padding:10px 12px">
+      Map every billing-vendor name the OCR has seen on outward bills (DC / invoice) to a schedule customer.
+      Saving creates an alias <i>and</i> re-fires the supply matcher on past bills carrying that name.
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:10px">
+      <button class=${'auth-tab' + (filter === 'unmatched' ? ' active' : '')} onClick=${() => setFilter('unmatched')}>Unmatched · ${unmatchedCount}</button>
+      <button class=${'auth-tab' + (filter === 'matched' ? ' active' : '')} onClick=${() => setFilter('matched')}>Matched · ${matchedCount}</button>
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All · ${groups.length}</button>
+    </div>
+
+    <div style="margin-bottom:10px">
+      <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search vendor name or GSTIN…" style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+    </div>
+
+    ${visible.length === 0 ? html`
+      <div class="card"><div class="empty">
+        <div class="icon">🎯</div>
+        <div style="font-size:13px">${filter === 'unmatched' ? 'Nothing to map — every billing name is already linked.' : 'No billing names match this filter.'}</div>
+      </div></div>
+    ` : visible.map(g => html`
+      <div class="card" key=${g.key} style="margin-bottom:8px;padding:12px 14px">
+        <div style="display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap">
+          <div style="flex:1;min-width:200px">
+            <div style="font-size:13px;font-weight:600">${g.name || '(no name)'}</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+              ${g.gstin ? html`<span class="mono">${g.gstin}</span> · ` : ''}${g.docs.length} doc${g.docs.length === 1 ? '' : 's'}
+              ${g.docs.slice(0, 3).map(d => html`<span style="margin-left:6px">${d.doc_number || '—'}</span>`)}
+              ${g.docs.length > 3 ? html`<span style="margin-left:6px;color:var(--slate-400)">+${g.docs.length - 3} more</span>` : ''}
+            </div>
+          </div>
+          ${g.matched ? html`
+            <div style="text-align:right;font-size:12px">
+              <span class="badge emerald">→ ${g.matched_customer?.name || '?'}</span>
+              ${g.matched_customer?.short_code ? html`<div style="font-size:10px;color:var(--slate-500);margin-top:2px">${g.matched_customer.short_code}</div>` : ''}
+            </div>
+          ` : html`<span class="badge rose">Unmatched</span>`}
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+          <select
+            value=${picks[g.key] ?? g.suggested ?? ''}
+            onChange=${e => setPicks({...picks, [g.key]: e.target.value})}
+            style="flex:1;min-width:200px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px"
+          >
+            <option value="">— Pick schedule customer —</option>
+            ${customers.map(c => html`
+              <option key=${c.id} value=${c.id}>${c.name}${c.short_code ? ' · ' + c.short_code : ''}${c.gstin ? ' · ' + c.gstin : ''}</option>
+            `)}
+          </select>
+          <button class="btn small" onClick=${() => saveMapping(g)} disabled=${busy[g.key] || (!(picks[g.key] ?? g.suggested))}>
+            ${busy[g.key] ? 'Saving…' : g.matched ? 'Re-link' : 'Map & re-apply'}
+          </button>
+        </div>
+      </div>
+    `)}
+  `;
+}
+
+// ============= SCHEDULE LINES MANAGER (CPN editor) =============
+// Lists every (customer, part_name_raw) combination across the plant's active/open
+// schedules. Surfaces lines whose customer_part_number is missing or a
+// short placeholder ("1", "2", etc.) so the user can fix them inline.
+//
+// Setting a CPN here applies plant-wide for that (customer, part_name_raw)
+// pair, then re-fires the supply trigger on outward docs so past bills
+// retroactively land on the right line.
+function ScheduleLinesManagerView({ plant, me }) {
+  const [lines, setLines] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState('missing');   // missing | all
+  const [customerFilter, setCustomerFilter] = useState('');
+  const [search, setSearch] = useState('');
+  const [editing, setEditing] = useState(null);      // group key
+  const [draftCpn, setDraftCpn] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    setLoading(true);
+    const [l, c] = await Promise.all([
+      // All schedule lines for active/open schedules in this plant
+      sb.from('mcp_sched_lines')
+        .select('id, part_name_raw, customer_part_number, planned_qty, uom, schedule_id, mcp_sched_schedules!inner(customer_id, status, mcp_sched_customers!inner(name, short_code))')
+        .eq('plant_id', plant.id)
+        .in('mcp_sched_schedules.status', ['active','open']),
+      sb.from('mcp_sched_customers').select('id, name, short_code').eq('plant_id', plant.id).order('name'),
+    ]);
+    const lineRows = l.data || [];
+    // Supplied totals — one batch query
+    if (lineRows.length > 0) {
+      const ids = lineRows.map(x => x.id);
+      const { data: sup } = await sb.from('mcp_sched_supplies')
+        .select('schedule_line_id, supplied_qty')
+        .in('schedule_line_id', ids);
+      const sumByLine = new Map();
+      (sup || []).forEach(s => {
+        sumByLine.set(s.schedule_line_id, (sumByLine.get(s.schedule_line_id) || 0) + parseFloat(s.supplied_qty || 0));
+      });
+      lineRows.forEach(x => { x._supplied = sumByLine.get(x.id) || 0; });
+    }
+    setLines(lineRows);
+    setCustomers(c.data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [plant.id]);
+
+  // Classify a CPN value: ok | placeholder | missing
+  const classifyCpn = (cpn) => {
+    if (!cpn || !cpn.trim()) return 'missing';
+    const t = cpn.trim();
+    // pure digits ≤ 3 chars looks like an auto-incrementing placeholder
+    if (/^\d{1,3}$/.test(t)) return 'placeholder';
+    return 'ok';
+  };
+
+  // Group (customer_id, part_name_raw) → one row per part per customer
+  const groups = (() => {
+    const map = new Map();
+    lines.forEach(l => {
+      const cust = l.mcp_sched_schedules?.mcp_sched_customers || {};
+      const customerId = l.mcp_sched_schedules?.customer_id;
+      const key = customerId + '||' + (l.part_name_raw || '');
+      if (!map.has(key)) {
+        map.set(key, {
+          key, customer_id: customerId,
+          customer_name: cust.name || '?',
+          customer_short_code: cust.short_code || '',
+          part_name_raw: l.part_name_raw || '(no name)',
+          cpns: new Set(),
+          lines: [],
+          planned: 0,
+          supplied: 0,
+        });
+      }
+      const g = map.get(key);
+      if (l.customer_part_number && l.customer_part_number.trim() !== '') g.cpns.add(l.customer_part_number.trim());
+      g.lines.push(l);
+      g.planned += parseFloat(l.planned_qty || 0);
+      g.supplied += parseFloat(l._supplied || 0);
+    });
+    return Array.from(map.values()).map(g => {
+      const cpnList = Array.from(g.cpns);
+      const statuses = cpnList.length === 0 ? ['missing'] : cpnList.map(classifyCpn);
+      const status = statuses.includes('ok') ? 'ok' : statuses.includes('placeholder') ? 'placeholder' : 'missing';
+      return { ...g, cpnList, status };
+    });
+  })();
+
+  const visible = groups
+    .filter(g => filter === 'missing' ? g.status !== 'ok' : true)
+    .filter(g => !customerFilter || g.customer_id === customerFilter)
+    .filter(g => {
+      if (!search.trim()) return true;
+      const s = search.toLowerCase();
+      return (g.part_name_raw || '').toLowerCase().includes(s)
+          || (g.customer_name || '').toLowerCase().includes(s)
+          || g.cpnList.some(c => c.toLowerCase().includes(s));
+    })
+    .sort((a, b) => {
+      // missing/placeholder first
+      const rank = { missing: 0, placeholder: 1, ok: 2 };
+      if (rank[a.status] !== rank[b.status]) return rank[a.status] - rank[b.status];
+      return a.customer_name.localeCompare(b.customer_name) || a.part_name_raw.localeCompare(b.part_name_raw);
+    });
+
+  const startEdit = (g) => {
+    setEditing(g.key);
+    setDraftCpn(g.cpnList[0] || '');
+  };
+  const cancelEdit = () => { setEditing(null); setDraftCpn(''); };
+
+  const saveCpn = async (g) => {
+    const newCpn = (draftCpn || '').trim();
+    setBusy(true);
+    try {
+      // Update every line for this (customer, part_name_raw) across this plant's
+      // active/open schedules — so a per-customer fix sticks across weekly lines.
+      const lineIds = lines.filter(l =>
+        l.mcp_sched_schedules?.customer_id === g.customer_id && (l.part_name_raw || '') === g.part_name_raw
+      ).map(l => l.id);
+      if (lineIds.length === 0) throw new Error('No lines to update');
+
+      const { error } = await sb.from('mcp_sched_lines')
+        .update({ customer_part_number: newCpn || null })
+        .in('id', lineIds);
+      if (error) throw error;
+
+      // Re-fire supply trigger on plant's outward docs by touching items.
+      const { data: docs } = await sb.from('mcp_logistics_documents')
+        .select('id, items')
+        .eq('plant_id', plant.id)
+        .in('doc_type', ['dc_out','invoice_out']);
+      let touched = 0;
+      for (const d of (docs || [])) {
+        if (!Array.isArray(d.items) || d.items.length === 0) continue;
+        const { error: uErr } = await sb.from('mcp_logistics_documents').update({ items: d.items }).eq('id', d.id);
+        if (!uErr) touched++;
+      }
+
+      showToast('✓ CPN saved on ' + lineIds.length + ' line' + (lineIds.length === 1 ? '' : 's') + ' · re-applied on ' + touched + ' bill' + (touched === 1 ? '' : 's'));
+      setEditing(null);
+      setDraftCpn('');
+      await refresh();
+    } catch (e) { alert('Save failed: ' + e.message); }
+    finally { setBusy(false); }
+  };
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  const missingCount = groups.filter(g => g.status !== 'ok').length;
+
+  return html`
+    <div class="card" style="background:var(--slate-50);font-size:12px;color:var(--slate-700);margin-bottom:14px;padding:10px 12px">
+      Edit the customer part number (CPN) on each schedule line. Bills match to lines by CPN — adding a real CPN to lines that have placeholder/missing values unlocks auto-supply for past and future bills.
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:10px">
+      <button class=${'auth-tab' + (filter === 'missing' ? ' active' : '')} onClick=${() => setFilter('missing')}>Missing CPN · ${missingCount}</button>
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All · ${groups.length}</button>
+    </div>
+
+    <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+      <select value=${customerFilter} onChange=${e => setCustomerFilter(e.target.value)} style="flex:1;min-width:160px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px">
+        <option value="">— All customers —</option>
+        ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.short_code ? ' · ' + c.short_code : ''}</option>`)}
+      </select>
+      <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search part name or CPN…" style="flex:2;min-width:160px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />
+    </div>
+
+    ${visible.length === 0 ? html`
+      <div class="card"><div class="empty">
+        <div class="icon">✅</div>
+        <div style="font-size:13px">${filter === 'missing' ? 'Every line has a real CPN. Bills will match on part number.' : 'No lines match this filter.'}</div>
+      </div></div>
+    ` : visible.map(g => {
+      const isEditing = editing === g.key;
+      const pct = g.planned > 0 ? Math.min(100, (g.supplied / g.planned) * 100) : 0;
+      const statusBadge = g.status === 'ok'
+        ? html`<span class="badge emerald" style="font-size:10px">CPN ${g.cpnList.join(', ')}</span>`
+        : g.status === 'placeholder'
+        ? html`<span class="badge amber" style="font-size:10px">⚙ placeholder · ${g.cpnList.join(', ')}</span>`
+        : html`<span class="badge rose" style="font-size:10px">⚠ no CPN</span>`;
+      return html`
+        <div class="card" key=${g.key} style="margin-bottom:8px;padding:12px 14px">
+          <div style="display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap">
+            <div style="flex:1;min-width:200px">
+              <div style="font-size:11px;color:var(--slate-500);font-weight:600">${g.customer_name}${g.customer_short_code ? ' · ' + g.customer_short_code : ''}</div>
+              <div style="font-size:14px;font-weight:600;margin-top:2px">${g.part_name_raw}</div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:4px">
+                ${g.lines.length} line${g.lines.length === 1 ? '' : 's'} · ${fmtNum(g.supplied)}/${fmtNum(g.planned)} ${g.lines[0]?.uom || ''} supplied (${pct.toFixed(0)}%)
+              </div>
+              <div style="background:var(--slate-100);height:4px;border-radius:2px;overflow:hidden;margin-top:6px">
+                <div style="background:${pct >= 90 ? 'var(--emerald-500)' : pct >= 60 ? 'var(--teal-500)' : 'var(--amber-500)'};height:100%;width:${pct}%"></div>
+              </div>
+            </div>
+            <div style="text-align:right">${statusBadge}</div>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap">
+            ${isEditing ? html`
+              <input type="text"
+                value=${draftCpn}
+                onChange=${e => setDraftCpn(e.target.value)}
+                placeholder="e.g. 10S30654 or 576041"
+                style="flex:1;min-width:160px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px;font-family:monospace"
+              />
+              <button class="btn small" onClick=${() => saveCpn(g)} disabled=${busy}>${busy ? 'Saving…' : 'Save & re-apply'}</button>
+              <button class="btn small ghost" onClick=${cancelEdit} disabled=${busy}>Cancel</button>
+            ` : html`
+              <button class="btn small ghost" onClick=${() => startEdit(g)} style="font-size:12px">✎ ${g.status === 'ok' ? 'Edit CPN' : 'Set CPN'}</button>
+            `}
+          </div>
+        </div>
+      `;
+    })}
   `;
 }
 
