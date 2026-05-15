@@ -1036,6 +1036,7 @@ const MORE_GROUPS = [
       { key:'tpm',           icon:'🛠', label:'TPM Daily Checks',     sub:'30-sec machine checks · oil, coolant, leaks, guards' },
       { key:'maintenance',   icon:'🔧', label:'Maintenance',          sub:'Breakdowns log, machine status' },
       { key:'stocks',        icon:'📦', label:'Stocks',               sub:'Inventory, items, in/out transactions' },
+      { key:'jobwork',       icon:'🏭', label:'Sub-Contracting',      sub:'Send / receive parts at job-work vendors · 180-day GST clock' },
       { key:'documents',     icon:'📄', label:'Documents · Bills',    sub:'OCR invoices/DCs, payments, vendors' },
       { key:'movements',     icon:'🔀', label:'Movements',            sub:'In/out material flow, GRN verification' },
       { key:'schedules',     icon:'📅', label:'Customer Schedules',   sub:'Plan vs actual, weekly supplies, AI extract' },
@@ -1170,6 +1171,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'iatf_docs'}><${IatfDocsLibrary} /></${Page}>
       <${Page} active=${tab === 'mom'}><${MomModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
 
       <div class="tabbar">
@@ -8174,6 +8176,410 @@ function RejectionBreakdown({ plant, stage, value, onChange }) {
     </div>
   `;
 }
+
+// =================================================================
+// SUB-CONTRACTING / JOB-WORK (parts sent to outside vendors for processing)
+// =================================================================
+// Send DC out → vendor holds stock → DC in with received + scrap.
+// Tracks days at vendor + 180-day GST clock (Sec 143 CGST).
+function SubContractingModule({ plant, me }) {
+  const [view, setView] = useState('pending'); // pending | send | history
+  const [lines, setLines] = useState([]);
+  const [vendors, setVendors] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [sendOpen, setSendOpen] = useState(false);
+  const [receiveLine, setReceiveLine] = useState(null);
+  const [search, setSearch] = useState('');
+  const [vendorFilter, setVendorFilter] = useState('all');
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [openL, closedL, vL] = await Promise.all([
+      sb.from('v_jobwork_open_lines').select('*').eq('plant_id', plant.id).order('sent_date', { ascending:true }).limit(500),
+      sb.from('mcp_logistics_jobwork_lines').select('*, vendor:vendor_id(name), part:part_id(part_number, name)').eq('plant_id', plant.id).eq('status', 'closed').order('closed_at', { ascending:false }).limit(100),
+      sb.from('mcp_logistics_vendors').select('id, name, gstin, is_jobwork_vendor').eq('plant_id', plant.id).order('name'),
+    ]);
+    setLines({ open: openL.data || [], closed: closedL.data || [] });
+    setVendors(vL.data || []);
+    setLoading(false);
+  }, [plant.id]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => {
+    if (!plant?.id) return;
+    const ch = sb.channel('jobwork-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_logistics_jobwork_lines', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_logistics_documents', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => sb.removeChannel(ch);
+  }, [plant.id, refresh]);
+
+  const openLines = lines.open || [];
+  const closedLines = lines.closed || [];
+
+  const filtered = openLines.filter(l => {
+    if (vendorFilter !== 'all' && l.vendor_id !== vendorFilter) return false;
+    if (!search.trim()) return true;
+    const q = search.toLowerCase();
+    return (l.vendor_name || '').toLowerCase().includes(q)
+        || (l.part_number || '').toLowerCase().includes(q)
+        || (l.item_name || '').toLowerCase().includes(q)
+        || (l.process || '').toLowerCase().includes(q)
+        || (l.doc_number || '').toLowerCase().includes(q);
+  });
+
+  const breachCount = openLines.filter(l => l.gst_180_breach).length;
+  const warningCount = openLines.filter(l => l.gst_180_warning).length;
+  const slaBreachCount = openLines.filter(l => l.sla_breach).length;
+  const totalPending = openLines.reduce((s, l) => s + parseFloat(l.qty_pending || 0), 0);
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
+      <div><h1>🏭 Sub-Contracting</h1><div class="sub">Parts at job-work vendors · ${openLines.length} open · ${fmtNum(totalPending)} pcs pending</div></div>
+      <button class="btn small" onClick=${() => setSendOpen(true)}>+ Send to vendor</button>
+    </div>
+
+    ${(breachCount > 0 || warningCount > 0 || slaBreachCount > 0) && html`
+      <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:12px">
+        <div class=${'stat ' + (breachCount > 0 ? 'rose' : 'teal')}>
+          <div class="stat-num">${breachCount}</div>
+          <div class="stat-label">180d GST breach</div>
+        </div>
+        <div class=${'stat ' + (warningCount > 0 ? 'amber' : 'teal')}>
+          <div class="stat-num">${warningCount}</div>
+          <div class="stat-label">150-180d warn</div>
+        </div>
+        <div class=${'stat ' + (slaBreachCount > 0 ? 'amber' : 'teal')}>
+          <div class="stat-num">${slaBreachCount}</div>
+          <div class="stat-label">SLA breach</div>
+        </div>
+      </div>
+    `}
+
+    <div class="auth-tabs" style="margin-bottom:12px">
+      <button class=${'auth-tab' + (view==='pending'?' active':'')} onClick=${() => setView('pending')}>At Vendor · ${openLines.length}</button>
+      <button class=${'auth-tab' + (view==='history'?' active':'')} onClick=${() => setView('history')}>History · ${closedLines.length}</button>
+    </div>
+
+    ${view === 'pending' && html`
+      <div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">
+        <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search vendor / part / process / DC#…" style="flex:1;min-width:180px;padding:8px 12px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />
+        <select value=${vendorFilter} onChange=${e => setVendorFilter(e.target.value)} style="padding:8px 12px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px">
+          <option value="all">All vendors</option>
+          ${vendors.filter(v => v.is_jobwork_vendor).map(v => html`<option key=${v.id} value=${v.id}>${v.name}</option>`)}
+        </select>
+      </div>
+
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        filtered.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🏭</div><div style="font-size:13px">${openLines.length === 0 ? 'No parts at any vendor. Tap + Send to vendor.' : 'No matches in this filter.'}</div></div></div>` :
+        Object.entries(filtered.reduce((acc, l) => {
+          const key = l.vendor_name || '— unassigned —';
+          if (!acc[key]) acc[key] = [];
+          acc[key].push(l);
+          return acc;
+        }, {})).map(([vname, vlines]) => html`
+          <details key=${vname} open style="margin-bottom:8px">
+            <summary style="cursor:pointer;padding:10px 12px;background:var(--slate-100);border-radius:8px;font-weight:600;font-size:13px;display:flex;justify-content:space-between;align-items:center;list-style:none">
+              <span>🏭 ${vname}</span>
+              <span style="font-size:11px;color:var(--slate-600);font-weight:500">${vlines.length} line${vlines.length>1?'s':''} · ${fmtNum(vlines.reduce((s,l) => s + parseFloat(l.qty_pending), 0))} pcs</span>
+            </summary>
+            <div style="padding:4px 0 8px">
+              ${vlines.map(l => html`
+                <div class="card" key=${l.id} style="margin:4px 0;padding:10px 12px;cursor:pointer;border-left:3px solid ${l.gst_180_breach ? 'var(--rose-500)' : l.gst_180_warning ? 'var(--amber-500)' : l.sla_breach ? 'var(--amber-400)' : 'var(--teal-300)'}" onClick=${() => setReceiveLine(l)}>
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                    <div style="flex:1;min-width:0">
+                      <div style="font-size:13px;font-weight:600">
+                        ${l.part_number ? html`<span style="font-family:monospace">${l.part_number}</span> · ` : ''}${l.item_name}
+                      </div>
+                      <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                        ${l.process ? l.process + ' · ' : ''}DC ${l.doc_number || '?'} · sent ${l.sent_date}
+                      </div>
+                      <div style="font-size:11px;margin-top:3px;display:flex;gap:6px;flex-wrap:wrap">
+                        <span class=${'badge ' + (l.gst_180_breach ? 'rose' : l.gst_180_warning ? 'amber' : 'teal')} style="font-size:10px">${l.days_at_vendor}d at vendor</span>
+                        ${l.gst_180_breach && html`<span class="badge rose" style="font-size:10px">⚠ 180d GST breach</span>`}
+                        ${l.expected_return_date && l.sla_breach && html`<span class="badge amber" style="font-size:10px">SLA breach</span>`}
+                        ${l.expected_return_date && !l.sla_breach && html`<span style="font-size:10px;color:var(--slate-500)">due ${l.expected_return_date}</span>`}
+                      </div>
+                    </div>
+                    <div style="text-align:right">
+                      <div style="font-size:15px;font-weight:700;color:var(--teal-700)">${fmtNum(l.qty_pending)}</div>
+                      <div style="font-size:10px;color:var(--slate-500)">of ${fmtNum(l.qty_sent)} ${l.uom || ''}</div>
+                    </div>
+                  </div>
+                </div>
+              `)}
+            </div>
+          </details>
+        `)
+      }
+    `}
+
+    ${view === 'history' && html`
+      ${closedLines.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📚</div><div style="font-size:13px">No closed lines yet.</div></div></div>` :
+        closedLines.map(l => html`
+          <div class="card" key=${l.id} style="margin-bottom:4px;padding:10px 12px;opacity:0.75">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+              <div style="flex:1">
+                <div style="font-size:13px;font-weight:500">${l.part?.part_number ? l.part.part_number + ' · ' : ''}${l.item_name}</div>
+                <div style="font-size:11px;color:var(--slate-500)">${l.vendor?.name || '?'} · ${l.process || ''} · closed ${l.closed_at ? new Date(l.closed_at).toLocaleDateString() : ''}</div>
+              </div>
+              <div style="text-align:right">
+                <div style="font-size:12px;font-weight:600;color:var(--emerald-600)">✓ ${fmtNum(l.qty_received_back)} of ${fmtNum(l.qty_sent)}</div>
+              </div>
+            </div>
+          </div>
+        `)
+      }
+    `}
+
+    ${sendOpen && html`<${JobworkSendModal} plant=${plant} me=${me} vendors=${vendors.filter(v => v.is_jobwork_vendor)} onClose=${() => setSendOpen(false)} onSaved=${() => { setSendOpen(false); refresh(); }} />`}
+    ${receiveLine && html`<${JobworkReceiveModal} plant=${plant} me=${me} line=${receiveLine} onClose=${() => setReceiveLine(null)} onSaved=${() => { setReceiveLine(null); refresh(); }} />`}
+  `;
+}
+
+function JobworkSendModal({ plant, me, vendors, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    vendor_id: '',
+    doc_number: '',
+    doc_date: new Date().toISOString().slice(0,10),
+    process: '',
+    expected_return_date: '',
+    sla_days: 14,
+    notes: '',
+    lines: [{ part_id: '', part_label: '', qty: '', uom: 'nos', rate: '' }],
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const setLine = (i, patch) => setForm(f => ({ ...f, lines: f.lines.map((l, idx) => idx === i ? { ...l, ...patch } : l) }));
+  const addLine = () => setForm(f => ({ ...f, lines: [...f.lines, { part_id: '', part_label: '', qty: '', uom: 'nos', rate: '' }] }));
+  const removeLine = (i) => setForm(f => ({ ...f, lines: f.lines.length <= 1 ? f.lines : f.lines.filter((_, idx) => idx !== i) }));
+
+  // Auto-fill expected_return_date from sla_days when sla_days changes
+  useEffect(() => {
+    if (form.sla_days && form.doc_date) {
+      const d = new Date(form.doc_date);
+      d.setDate(d.getDate() + parseInt(form.sla_days || 0));
+      setForm(f => ({ ...f, expected_return_date: d.toISOString().slice(0,10) }));
+    }
+  }, [form.sla_days, form.doc_date]);
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      if (!form.vendor_id) throw new Error('Pick a vendor');
+      const valid = form.lines.filter(l => l.part_label.trim() && parseFloat(l.qty || 0) > 0);
+      if (valid.length === 0) throw new Error('Add at least one part with qty');
+
+      const vendor = vendors.find(v => v.id === form.vendor_id);
+      const items = valid.map(l => ({
+        name: l.part_label.trim(),
+        part_id: l.part_id || null,
+        qty: parseFloat(l.qty),
+        uom: l.uom || 'nos',
+        rate: l.rate ? parseFloat(l.rate) : null,
+        process: form.process || null,
+      }));
+
+      const { data: doc, error } = await sb.from('mcp_logistics_documents').insert({
+        plant_id: plant.id,
+        doc_type: 'job_work_dc_out',
+        doc_number: form.doc_number.trim() || ('JW-' + Date.now().toString().slice(-6)),
+        doc_date: form.doc_date,
+        vendor_id: form.vendor_id,
+        vendor_name_raw: vendor?.name || null,
+        vendor_gstin_raw: vendor?.gstin || null,
+        status: 'approved',
+        items: items,
+        raw_extraction: { jobwork_process: form.process || null },
+        notes: form.notes || null,
+        created_by: me.id,
+      }).select('id').single();
+      if (error) throw error;
+
+      // The cascade trigger creates jobwork lines. Now patch SLA + expected return on those lines.
+      if (form.expected_return_date || form.sla_days) {
+        await sb.from('mcp_logistics_jobwork_lines').update({
+          sla_days: form.sla_days ? parseInt(form.sla_days) : null,
+          expected_return_date: form.expected_return_date || null,
+        }).eq('doc_id', doc.id);
+      }
+
+      showToast('🏭 Sent to vendor · ' + valid.length + ' line' + (valid.length>1?'s':''));
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target===e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">Send to Job-Work Vendor</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        ${vendors.length === 0 && html`<div class="alert" style="background:var(--amber-50);color:var(--amber-800);border:1px solid var(--amber-200);padding:8px 10px;border-radius:6px;font-size:12px;margin-bottom:10px">No job-work vendors yet. Add one in Documents → Vendors and toggle "Job-work vendor".</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Vendor *</label>
+            <select value=${form.vendor_id} required onChange=${e => setForm({...form, vendor_id: e.target.value})}>
+              <option value="">— Pick vendor —</option>
+              ${vendors.map(v => html`<option key=${v.id} value=${v.id}>${v.name}${v.gstin ? ' · ' + v.gstin : ''}</option>`)}
+            </select>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>DC number</label><input type="text" value=${form.doc_number} onChange=${e => setForm({...form, doc_number: e.target.value})} placeholder="auto if blank" /></div>
+            <div class="field"><label>DC date *</label><input type="date" required value=${form.doc_date} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Process / operation</label>
+            <input type="text" value=${form.process} onChange=${e => setForm({...form, process: e.target.value})} placeholder="Plating · Heat treatment · Grinding · Machining · Coating" />
+          </div>
+          <div class="field-row">
+            <div class="field"><label>SLA days</label><input type="number" min=${1} value=${form.sla_days} onChange=${e => setForm({...form, sla_days: e.target.value})} /></div>
+            <div class="field"><label>Expected return</label><input type="date" value=${form.expected_return_date} onChange=${e => setForm({...form, expected_return_date: e.target.value})} /></div>
+          </div>
+
+          <div class="field"><label>Parts to send *</label>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              ${form.lines.map((l, idx) => html`
+                <div key=${idx} style="border:1px solid var(--slate-200);border-radius:6px;padding:8px;background:var(--slate-50)">
+                  <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+                    <span style="font-size:11px;font-weight:600;color:var(--teal-700);min-width:18px">${idx+1}.</span>
+                    <div style="flex:1">
+                      <${PartPicker} plant=${plant} value=${l.part_id} onChange=${(id, p) => setLine(idx, { part_id: id, part_label: p ? (p.part_number + ' · ' + (p.name || '')) : l.part_label })} placeholder="— Pick part (or type free name below) —" />
+                    </div>
+                    ${form.lines.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => removeLine(idx)} style="padding:2px 8px;font-size:11px">×</button>`}
+                  </div>
+                  <input type="text" value=${l.part_label} onChange=${e => setLine(idx, { part_label: e.target.value })} placeholder="Part / item name (auto-filled from picker, or type if not in master)" style="width:100%;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;margin-bottom:6px;box-sizing:border-box" />
+                  <div style="display:grid;grid-template-columns:1fr 0.8fr 1fr;gap:6px">
+                    <input type="number" step="any" min=${0} value=${l.qty} onChange=${e => setLine(idx, { qty: e.target.value })} placeholder="Qty *" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                    <input type="text" value=${l.uom} onChange=${e => setLine(idx, { uom: e.target.value })} placeholder="UoM" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                    <input type="number" step="any" min=${0} value=${l.rate} onChange=${e => setLine(idx, { rate: e.target.value })} placeholder="Rate ₹/pc (job-work)" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  </div>
+                </div>
+              `)}
+              <button type="button" class="btn small ghost" onClick=${addLine} style="font-size:12px;align-self:flex-start">+ Add another part</button>
+            </div>
+          </div>
+
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})} placeholder="Anything the vendor should know"></textarea></div>
+
+          <button class="btn" disabled=${busy || !form.vendor_id}>${busy ? 'Sending…' : '🏭 Send to vendor'}</button>
+          <p style="font-size:11px;color:var(--slate-500);margin:6px 0 0">Creates a DC-out · auto-deducts from stock · starts 180-day GST clock · posts to All Hands.</p>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function JobworkReceiveModal({ plant, me, line, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    doc_number: '',
+    doc_date: new Date().toISOString().slice(0,10),
+    qty_received: '',
+    qty_scrap: '',
+    rate: line.rate || '',
+    notes: '',
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      const recv = parseFloat(form.qty_received || 0);
+      const scrap = parseFloat(form.qty_scrap || 0);
+      if (recv <= 0 && scrap <= 0) throw new Error('Enter received or scrap qty');
+      if (recv > parseFloat(line.qty_pending)) throw new Error('Received cannot exceed pending (' + line.qty_pending + ')');
+
+      // 1. Create the DC-in document (cascade trigger updates jobwork_lines.qty_received_back automatically? Check.)
+      const items = [{
+        name: line.item_name,
+        part_id: line.part_id || null,
+        qty: recv,
+        scrap_qty: scrap || null,
+        uom: line.uom || 'nos',
+        rate: form.rate ? parseFloat(form.rate) : null,
+        process: line.process,
+        original_doc_id: line.doc_id,
+        original_line_id: line.id,
+      }];
+
+      const { error: derr } = await sb.from('mcp_logistics_documents').insert({
+        plant_id: plant.id,
+        doc_type: 'job_work_dc_in',
+        doc_number: form.doc_number.trim() || ('JW-IN-' + Date.now().toString().slice(-6)),
+        doc_date: form.doc_date,
+        vendor_id: line.vendor_id,
+        vendor_name_raw: line.vendor_name,
+        parent_doc_id: line.doc_id,
+        status: 'approved',
+        items: items,
+        notes: form.notes || null,
+        created_by: me.id,
+      });
+      if (derr) throw derr;
+
+      // 2. Update the original jobwork_line with the received qty
+      const newReceived = parseFloat(line.qty_received_back || 0) + recv;
+      const fullyReceived = newReceived >= parseFloat(line.qty_sent);
+      const { error: uerr } = await sb.from('mcp_logistics_jobwork_lines').update({
+        qty_received_back: newReceived,
+        last_received_at: new Date().toISOString(),
+        status: fullyReceived ? 'closed' : 'partial',
+        closed_at: fullyReceived ? new Date().toISOString() : null,
+      }).eq('id', line.id);
+      if (uerr) throw uerr;
+
+      showToast(fullyReceived ? '✓ Line closed · all received' : '↩ ' + recv + ' received');
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target===e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">Receive from ${line.vendor_name}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+
+        <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:10px">
+          <div style="font-size:13px;font-weight:600">${line.part_number ? line.part_number + ' · ' : ''}${line.item_name}</div>
+          <div style="font-size:11px;color:var(--slate-600);margin-top:3px">
+            DC ${line.doc_number || '?'} · sent ${line.sent_date} · ${line.process || 'no process'}
+          </div>
+          <div style="display:flex;gap:8px;margin-top:6px;font-size:11px">
+            <div>Sent: <strong>${fmtNum(line.qty_sent)}</strong></div>
+            <div>Received: <strong>${fmtNum(line.qty_received_back)}</strong></div>
+            <div style="color:var(--teal-700)">Pending: <strong>${fmtNum(line.qty_pending)}</strong> ${line.uom || ''}</div>
+          </div>
+          ${line.gst_180_breach && html`<div style="font-size:11px;color:var(--rose-600);margin-top:6px;font-weight:600">⚠ ${line.days_at_vendor} days at vendor · GST Sec 143 180-day breach</div>`}
+        </div>
+
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>DC-in number</label><input type="text" value=${form.doc_number} onChange=${e => setForm({...form, doc_number: e.target.value})} placeholder="auto if blank" /></div>
+            <div class="field"><label>Received date *</label><input type="date" required value=${form.doc_date} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Qty received *</label>
+              <input type="number" step="any" min=${0} max=${line.qty_pending} value=${form.qty_received} onChange=${e => setForm({...form, qty_received: e.target.value})} placeholder=${'max ' + line.qty_pending} required />
+            </div>
+            <div class="field"><label>Scrap / loss qty</label>
+              <input type="number" step="any" min=${0} value=${form.qty_scrap} onChange=${e => setForm({...form, qty_scrap: e.target.value})} placeholder="0" />
+            </div>
+          </div>
+          <div class="field"><label>Processing rate ₹/pc</label>
+            <input type="number" step="any" min=${0} value=${form.rate} onChange=${e => setForm({...form, rate: e.target.value})} placeholder="Job-work rate per piece" />
+          </div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})} placeholder="Quality remarks, rework notes, vendor remarks…"></textarea></div>
+
+          <div style="display:flex;gap:6px">
+            <button type="button" class="btn ghost" onClick=${() => setForm({...form, qty_received: line.qty_pending})} style="flex:0 0 auto;padding:8px 12px;font-size:12px">All ${line.qty_pending}</button>
+            <button class="btn" style="flex:1" disabled=${busy || !form.qty_received}>${busy ? 'Saving…' : '↩ Receive & close'}</button>
+          </div>
+          <p style="font-size:11px;color:var(--slate-500);margin:6px 0 0">Creates DC-in · updates pending qty · adds to GRN · posts to All Hands. If everything is back, the line closes.</p>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
 
 // =================================================================
 // MOM MODULE (Minutes of Meeting · internal / customer / supplier)
