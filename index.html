@@ -858,13 +858,27 @@ function Wizard({ user, pendingInvite, onDone }) {
 
 // ============= MAIN APP =============
 // Capture deep-link params ONCE before they're stripped during profile load.
-// Push notifications send the user to /app?tab=chat&group=<uuid>; we
-// preserve those across the auth gate and apply them after the profile is up.
+// Push notifications send the user to /app?tab=chat&group=<uuid>, but older
+// notifications (still on locked phones) point to /chat?group=<uuid> or
+// /tasks?action=<uuid>. The Vercel catch-all rewrite serves index.html for
+// all those paths; this block extracts intent from BOTH pathname and query.
+const PATH_TAB_MAP = {
+  chat: 'chat',
+  tasks: 'actions',
+  actions: 'actions',
+  schedules: 'schedules',
+  documents: 'documents',
+  quality: 'quality',
+  maintenance: 'maintenance',
+  production: 'production',
+};
 const DEEP_LINK = (() => {
   try {
-    if (typeof window === 'undefined' || !window.location.search) return null;
+    if (typeof window === 'undefined') return null;
     const sp = new URLSearchParams(window.location.search);
-    const tab = sp.get('tab');
+    const path = window.location.pathname.replace(/^\/+|\/+$/g, '').toLowerCase();
+    const pathTab = PATH_TAB_MAP[path.split('/')[0]] || null;
+    const tab = sp.get('tab') || pathTab;
     const group = sp.get('group');
     if (!tab && !group) return null;
     return { tab, group };
