@@ -857,11 +857,25 @@ function Wizard({ user, pendingInvite, onDone }) {
 }
 
 // ============= MAIN APP =============
+// Capture deep-link params ONCE before they're stripped during profile load.
+// Push notifications send the user to /app?tab=chat&group=<uuid>; we
+// preserve those across the auth gate and apply them after the profile is up.
+const DEEP_LINK = (() => {
+  try {
+    if (typeof window === 'undefined' || !window.location.search) return null;
+    const sp = new URLSearchParams(window.location.search);
+    const tab = sp.get('tab');
+    const group = sp.get('group');
+    if (!tab && !group) return null;
+    return { tab, group };
+  } catch (_) { return null; }
+})();
+
 function App() {
   const [user, setUser] = useState(null);
   const [plant, setPlant] = useState(null);
   const [me, setMe] = useState(null);
-  const [tab, setTab] = useState('home');
+  const [tab, setTab] = useState(DEEP_LINK?.tab || 'home');
   const [loading, setLoading] = useState(true);
   const [pendingInvite, setPendingInvite] = useState(null);
   const [accessibleUnits, setAccessibleUnits] = useState([]);
@@ -1048,7 +1062,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'movements'}><${MovementsPage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'trace'}><${TracePage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} /></${Page}>
-      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} /></${Page}>
+      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
       <${Page} active=${tab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'calibration'}><${CalibrationModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -3363,9 +3377,10 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
 }
 
 // ============= CHAT =============
-function Chat({ plant, me, user }) {
+function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId }) {
   const [groups, setGroups] = useState([]);
   const [activeGroup, setActiveGroup] = useState(null);
+  const deepLinkAppliedRef = useRef(false);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
@@ -3551,6 +3566,15 @@ function Chat({ plant, me, user }) {
 
     setGroups(enriched);
     setLoading(false);
+
+    // Deep-link from push notification: auto-open the requested group once.
+    if (deepLinkGroupId && !deepLinkAppliedRef.current) {
+      const target = enriched.find(g => g.id === deepLinkGroupId);
+      if (target) {
+        setActiveGroup(target);
+        deepLinkAppliedRef.current = true;
+      }
+    }
   };
 
   const loadMessages = async (groupId) => {
