@@ -8045,13 +8045,53 @@ function NpdCreateModal({ plant, me, customers, users, onClose, onSaved }) {
   `;
 }
 
+// NPD document categories
+const NPD_DOC_KINDS = [
+  { key:'rfq',              label:'RFQ',                 emoji:'📥' },
+  { key:'customer_drawing', label:'Customer drawing',    emoji:'📐' },
+  { key:'quote',            label:'Quote',               emoji:'💬' },
+  { key:'feasibility',      label:'Feasibility (FMR)',   emoji:'🔍' },
+  { key:'tech_review',      label:'Tech review minutes', emoji:'🧠' },
+  { key:'tool_design',      label:'Tool design',         emoji:'🛠' },
+  { key:'tool_quote',       label:'Tool quote / PO',     emoji:'🧾' },
+  { key:'isir',             label:'ISIR / first sample', emoji:'🔬' },
+  { key:'control_plan',     label:'Control plan',        emoji:'📋' },
+  { key:'process_flow',     label:'Process flow',        emoji:'🔁' },
+  { key:'msa',              label:'MSA',                 emoji:'📏' },
+  { key:'spc',              label:'SPC',                 emoji:'📊' },
+  { key:'ppap_package',     label:'PPAP package',        emoji:'📑' },
+  { key:'psw_signed',       label:'PSW (signed)',        emoji:'✅' },
+  { key:'other',            label:'Other',               emoji:'📎' },
+];
+const NPD_DOC_KIND_BY_KEY = Object.fromEntries(NPD_DOC_KINDS.map(d => [d.key, d]));
+const NPD_UPDATE_KINDS = [
+  { key:'comment',     label:'Comment',     emoji:'💬' },
+  { key:'tech_review', label:'Tech review', emoji:'🧠' },
+  { key:'decision',    label:'Decision',    emoji:'✅' },
+  { key:'issue',       label:'Issue',       emoji:'⚠️' },
+  { key:'milestone',   label:'Milestone',   emoji:'🚩' },
+];
+
 // ============= NPD DETAIL =============
 function NpdDetail({ project, customers, users, me, onClose, onChanged }) {
   const [p, setP] = useState(project);
   const [busy, setBusy] = useState(false);
+  const [view, setView] = useState('timeline'); // timeline | commercials | docs | updates
+  const [docs, setDocs] = useState([]);
+  const [updates, setUpdates] = useState([]);
 
   const cust = customers.find(c => c.id === p.customer_id);
   const owner = users.find(u => u.id === p.responsible_user_id);
+
+  const reloadChildren = async () => {
+    const [d, u] = await Promise.all([
+      sb.from('mcp_npd_documents').select('*, users:uploaded_by(full_name)').eq('project_id', p.id).order('uploaded_at', { ascending: false }),
+      sb.from('mcp_npd_updates').select('*, users:author_id(full_name)').eq('project_id', p.id).order('created_at', { ascending: false }),
+    ]);
+    setDocs(d.data || []);
+    setUpdates(u.data || []);
+  };
+  useEffect(() => { reloadChildren(); }, [p.id]);
 
   const update = async (patch) => {
     setBusy(true);
@@ -8097,38 +8137,292 @@ function NpdDetail({ project, customers, users, me, onClose, onChanged }) {
       ${p.ppap_submission_id && html`<div class="card-row"><span class="label">PPAP</span><span class="value mono" style="font-size:11px">linked · ${p.ppap_submission_id.slice(0,8)}…</span></div>`}
     </div>
 
-    <div class="section-h">Phase timeline</div>
-    <div class="card" style="padding:0">
-      ${[
-        { label:'RFQ received', target:null, actual:'rfq_received_date' },
-        { label:'Quote', target:'quote_target_date', actual:'quote_sent_date' },
-        { label:'Award', target:'award_target_date', actual:'award_actual_date' },
-        { label:'Tooling start', target:'tooling_target_date', actual:'tooling_actual_date' },
-        { label:'Prototype', target:'prototype_target_date', actual:'prototype_actual_date' },
-        { label:'PPAP submission', target:'ppap_target_date', actual:'ppap_actual_date' },
-        { label:'SOP', target:'sop_target_date', actual:'sop_actual_date' },
-      ].map((row, i, arr) => html`
-        <div key=${row.label} style="padding:10px 12px;border-bottom:${i === arr.length - 1 ? 'none' : '1px solid var(--slate-100)'}">
-          <div style="font-size:13px;font-weight:500;margin-bottom:6px">${row.label}</div>
-          <div style="display:flex;gap:10px;flex-wrap:wrap">
-            ${row.target && html`
-              <label style="flex:1;min-width:120px;font-size:11px;color:var(--slate-500)">
-                Target
-                <input type="date" value=${p[row.target] || ''} onChange=${e => update({ [row.target]: e.target.value || null })} disabled=${busy} style="display:block;margin-top:2px;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px;width:100%" />
-              </label>
-            `}
-            ${row.actual && html`
-              <label style="flex:1;min-width:120px;font-size:11px;color:var(--slate-500)">
-                Actual
-                <input type="date" value=${p[row.actual] || ''} onChange=${e => update({ [row.actual]: e.target.value || null })} disabled=${busy} style="display:block;margin-top:2px;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px;width:100%" />
-              </label>
+    <div class="auth-tabs" style="margin:14px 0;flex-wrap:wrap">
+      <button class=${'auth-tab' + (view === 'timeline' ? ' active' : '')} onClick=${() => setView('timeline')}>📅 Timeline</button>
+      <button class=${'auth-tab' + (view === 'commercials' ? ' active' : '')} onClick=${() => setView('commercials')}>💰 Commercials</button>
+      <button class=${'auth-tab' + (view === 'docs' ? ' active' : '')} onClick=${() => setView('docs')}>📎 Documents · ${docs.length}</button>
+      <button class=${'auth-tab' + (view === 'updates' ? ' active' : '')} onClick=${() => setView('updates')}>💬 Updates · ${updates.length}</button>
+    </div>
+
+    ${view === 'timeline' && html`
+      <div class="card" style="padding:0">
+        ${[
+          { label:'RFQ received', target:null, actual:'rfq_received_date' },
+          { label:'Quote', target:'quote_target_date', actual:'quote_sent_date' },
+          { label:'Award', target:'award_target_date', actual:'award_actual_date' },
+          { label:'Tooling start', target:'tooling_target_date', actual:'tooling_actual_date' },
+          { label:'Prototype', target:'prototype_target_date', actual:'prototype_actual_date' },
+          { label:'PPAP submission', target:'ppap_target_date', actual:'ppap_actual_date' },
+          { label:'SOP', target:'sop_target_date', actual:'sop_actual_date' },
+        ].map((row, i, arr) => html`
+          <div key=${row.label} style="padding:10px 12px;border-bottom:${i === arr.length - 1 ? 'none' : '1px solid var(--slate-100)'}">
+            <div style="font-size:13px;font-weight:500;margin-bottom:6px">${row.label}</div>
+            <div style="display:flex;gap:10px;flex-wrap:wrap">
+              ${row.target && html`
+                <label style="flex:1;min-width:120px;font-size:11px;color:var(--slate-500)">
+                  Target
+                  <input type="date" value=${p[row.target] || ''} onChange=${e => update({ [row.target]: e.target.value || null })} disabled=${busy} style="display:block;margin-top:2px;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px;width:100%" />
+                </label>
+              `}
+              ${row.actual && html`
+                <label style="flex:1;min-width:120px;font-size:11px;color:var(--slate-500)">
+                  Actual
+                  <input type="date" value=${p[row.actual] || ''} onChange=${e => update({ [row.actual]: e.target.value || null })} disabled=${busy} style="display:block;margin-top:2px;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px;width:100%" />
+                </label>
+              `}
+            </div>
+          </div>
+        `)}
+      </div>
+      ${p.notes && html`<div class="alert info" style="margin-top:14px"><strong>Notes:</strong> ${p.notes}</div>`}
+    `}
+
+    ${view === 'commercials' && html`<${NpdCommercials} p=${p} busy=${busy} update=${update} />`}
+    ${view === 'docs' && html`<${NpdDocuments} project=${p} me=${me} docs=${docs} onReload=${reloadChildren} />`}
+    ${view === 'updates' && html`<${NpdUpdates} project=${p} me=${me} updates=${updates} onReload=${reloadChildren} />`}
+  `;
+}
+
+// ============= NPD COMMERCIALS =============
+function NpdCommercials({ p, busy, update }) {
+  const [draft, setDraft] = useState({
+    currency: p.currency || 'INR',
+    quote_qty: p.quote_qty ?? '',
+    quote_unit_price: p.quote_unit_price ?? '',
+    quote_total_value: p.quote_total_value ?? '',
+    tool_cost: p.tool_cost ?? '',
+    quote_validity_days: p.quote_validity_days ?? '',
+    award_po_number: p.award_po_number ?? '',
+    award_po_value: p.award_po_value ?? '',
+    final_unit_price: p.final_unit_price ?? '',
+    quote_notes: p.quote_notes ?? '',
+  });
+  const num = (v) => v === '' || v === null ? null : Number(v);
+  const save = async () => {
+    await update({
+      currency: draft.currency || 'INR',
+      quote_qty: num(draft.quote_qty),
+      quote_unit_price: num(draft.quote_unit_price),
+      quote_total_value: num(draft.quote_total_value),
+      tool_cost: num(draft.tool_cost),
+      quote_validity_days: num(draft.quote_validity_days),
+      award_po_number: draft.award_po_number || null,
+      award_po_value: num(draft.award_po_value),
+      final_unit_price: num(draft.final_unit_price),
+      quote_notes: draft.quote_notes || null,
+    });
+  };
+  const autoTotal = () => {
+    const q = num(draft.quote_qty), u = num(draft.quote_unit_price);
+    if (q && u) setDraft({ ...draft, quote_total_value: (q * u).toFixed(2) });
+  };
+  return html`
+    <div class="card">
+      <div class="card-title">Quote</div>
+      <div class="field-row">
+        <div class="field" style="flex:0 0 80px"><label>Currency</label>
+          <select value=${draft.currency} onChange=${e => setDraft({...draft, currency: e.target.value})}>
+            <option>INR</option><option>USD</option><option>EUR</option><option>GBP</option><option>JPY</option>
+          </select>
+        </div>
+        <div class="field"><label>Qty</label><input type="number" min=${0} value=${draft.quote_qty} onChange=${e => setDraft({...draft, quote_qty: e.target.value})} onBlur=${autoTotal} /></div>
+        <div class="field"><label>Unit price</label><input type="number" step="0.01" min=${0} value=${draft.quote_unit_price} onChange=${e => setDraft({...draft, quote_unit_price: e.target.value})} onBlur=${autoTotal} /></div>
+        <div class="field"><label>Total value</label><input type="number" step="0.01" min=${0} value=${draft.quote_total_value} onChange=${e => setDraft({...draft, quote_total_value: e.target.value})} /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Tool cost</label><input type="number" step="0.01" min=${0} value=${draft.tool_cost} onChange=${e => setDraft({...draft, tool_cost: e.target.value})} /></div>
+        <div class="field"><label>Quote validity (days)</label><input type="number" min=${0} value=${draft.quote_validity_days} onChange=${e => setDraft({...draft, quote_validity_days: e.target.value})} /></div>
+      </div>
+      <div class="field"><label>Quote notes</label><textarea rows=${2} value=${draft.quote_notes} onChange=${e => setDraft({...draft, quote_notes: e.target.value})} placeholder="Special terms, payment terms, freight, taxes excluded etc."></textarea></div>
+    </div>
+
+    <div class="card" style="margin-top:10px">
+      <div class="card-title">Award & final</div>
+      <div class="field-row">
+        <div class="field"><label>Award PO #</label><input type="text" value=${draft.award_po_number} onChange=${e => setDraft({...draft, award_po_number: e.target.value})} style="font-family:monospace" /></div>
+        <div class="field"><label>Award PO value</label><input type="number" step="0.01" min=${0} value=${draft.award_po_value} onChange=${e => setDraft({...draft, award_po_value: e.target.value})} /></div>
+        <div class="field"><label>Final unit price</label><input type="number" step="0.01" min=${0} value=${draft.final_unit_price} onChange=${e => setDraft({...draft, final_unit_price: e.target.value})} /></div>
+      </div>
+    </div>
+
+    <button class="btn" style="margin-top:10px" disabled=${busy} onClick=${save}>${busy ? 'Saving…' : 'Save commercials'}</button>
+  `;
+}
+
+// ============= NPD DOCUMENTS =============
+function NpdDocuments({ project, me, docs, onReload }) {
+  const fileInputRef = useRef(null);
+  const [pendingFile, setPendingFile] = useState(null);
+  const [form, setForm] = useState({ kind: 'rfq', title: '', notes: '' });
+  const [busy, setBusy] = useState(false);
+  const [filterKind, setFilterKind] = useState('all');
+
+  const pickFile = () => fileInputRef.current && fileInputRef.current.click();
+
+  const onFileChange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setPendingFile(file);
+    if (!form.title) setForm(f => ({ ...f, title: file.name.replace(/\.[^.]+$/, '') }));
+  };
+
+  const upload = async () => {
+    if (!pendingFile) { alert('Pick a file first'); return; }
+    setBusy(true);
+    try {
+      const ext = (pendingFile.name.split('.').pop() || 'bin').toLowerCase();
+      const path = 'npd/' + project.plant_id + '/' + project.id + '/' + crypto.randomUUID() + '.' + ext;
+      const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, pendingFile, {
+        cacheControl: '3600', contentType: pendingFile.type || 'application/octet-stream',
+      });
+      if (upErr) throw upErr;
+      const { data: { publicUrl } } = sb.storage.from('chat-attachments').getPublicUrl(path);
+      const { error: dbErr } = await sb.from('mcp_npd_documents').insert({
+        plant_id: project.plant_id, project_id: project.id,
+        kind: form.kind, title: (form.title || pendingFile.name).trim(),
+        file_url: publicUrl, file_size: pendingFile.size, content_type: pendingFile.type,
+        notes: form.notes || null, uploaded_by: me.id,
+      });
+      if (dbErr) throw dbErr;
+      setPendingFile(null); setForm({ kind: 'rfq', title: '', notes: '' });
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      showToast('📎 Uploaded');
+      onReload();
+    } catch (e) { alert('Upload failed: ' + e.message); } finally { setBusy(false); }
+  };
+
+  const removeDoc = async (id) => {
+    if (!confirm('Delete this document?')) return;
+    await sb.from('mcp_npd_documents').delete().eq('id', id);
+    onReload();
+  };
+
+  // Group by kind
+  const visible = filterKind === 'all' ? docs : docs.filter(d => d.kind === filterKind);
+  const grouped = {};
+  visible.forEach(d => { (grouped[d.kind] ||= []).push(d); });
+  const kindsInUse = NPD_DOC_KINDS.filter(k => grouped[k.key]?.length);
+
+  const fmtSize = (s) => !s ? '' : s < 1024 ? s + 'B' : s < 1024*1024 ? (s/1024).toFixed(0)+'KB' : (s/1024/1024).toFixed(1)+'MB';
+
+  return html`
+    <div class="card">
+      <div class="card-title">Upload document</div>
+      <div class="field-row">
+        <div class="field" style="flex:1.2"><label>Kind</label>
+          <select value=${form.kind} onChange=${e => setForm({...form, kind: e.target.value})}>
+            ${NPD_DOC_KINDS.map(k => html`<option key=${k.key} value=${k.key}>${k.emoji} ${k.label}</option>`)}
+          </select>
+        </div>
+        <div class="field" style="flex:2"><label>Title</label><input type="text" value=${form.title} onChange=${e => setForm({...form, title: e.target.value})} placeholder="e.g. RFQ from Bosch dated 8 May" /></div>
+      </div>
+      <div class="field"><label>Notes (optional)</label><input type="text" value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})} placeholder="Revision, validity, signed by…" /></div>
+      <input type="file" ref=${fileInputRef} onChange=${onFileChange} style="display:none" />
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn small ghost" onClick=${pickFile}>📎 ${pendingFile ? pendingFile.name : 'Pick file'}</button>
+        ${pendingFile && html`<span style="font-size:11px;color:var(--slate-500)">${fmtSize(pendingFile.size)}</span>`}
+        <button class="btn small" onClick=${upload} disabled=${!pendingFile || busy} style="margin-left:auto">${busy ? 'Uploading…' : 'Upload'}</button>
+      </div>
+    </div>
+
+    <div class="section-h" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <span style="flex:1">Attached · ${docs.length}</span>
+      <select value=${filterKind} onChange=${e => setFilterKind(e.target.value)} style="font-size:12px;padding:4px 8px;border:1px solid var(--slate-200);border-radius:6px">
+        <option value="all">All kinds</option>
+        ${NPD_DOC_KINDS.map(k => html`<option key=${k.key} value=${k.key}>${k.emoji} ${k.label}</option>`)}
+      </select>
+    </div>
+
+    ${docs.length === 0 ? html`
+      <div class="card"><div class="empty"><div class="icon">📎</div><div style="font-size:13px">No documents yet. Upload RFQ, drawings, quotes, ISIR, PPAP package, signed PSW etc.</div></div></div>
+    ` : kindsInUse.length === 0 ? html`
+      <div class="card"><div class="empty"><div style="font-size:13px">No documents under this filter.</div></div></div>
+    ` : kindsInUse.map(k => html`
+      <div key=${k.key}>
+        <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.5px;margin:8px 4px 4px">${k.emoji} ${k.label} · ${grouped[k.key].length}</div>
+        ${grouped[k.key].map(d => html`
+          <div class="card" key=${d.id} style="margin-bottom:6px;padding:10px 12px">
+            <div style="display:flex;gap:10px;align-items:flex-start">
+              <div style="flex:1;min-width:0">
+                <a href=${d.file_url} target="_blank" rel="noopener" style="font-size:13px;font-weight:600;color:var(--teal-700);text-decoration:none;word-break:break-word">${d.title}</a>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                  ${d.users?.full_name || '?'} · ${fmtDate(d.uploaded_at)}${d.file_size ? ' · ' + fmtSize(d.file_size) : ''}${d.content_type ? ' · ' + d.content_type.split('/')[1] : ''}
+                </div>
+                ${d.notes && html`<div style="font-size:11px;color:var(--slate-600);margin-top:4px;font-style:italic">${d.notes}</div>`}
+              </div>
+              <button class="btn small danger" onClick=${() => removeDoc(d.id)} style="padding:2px 8px;font-size:11px">×</button>
+            </div>
+          </div>
+        `)}
+      </div>
+    `)}
+  `;
+}
+
+// ============= NPD UPDATES (thread) =============
+function NpdUpdates({ project, me, updates, onReload }) {
+  const [body, setBody] = useState('');
+  const [kind, setKind] = useState('comment');
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    const text = body.trim();
+    if (!text) return;
+    setBusy(true);
+    try {
+      const { error } = await sb.from('mcp_npd_updates').insert({
+        plant_id: project.plant_id, project_id: project.id,
+        kind, body: text, author_id: me.id,
+      });
+      if (error) throw error;
+      setBody(''); setKind('comment');
+      onReload();
+      if (kind !== 'comment') showToast('Posted to All Hands too');
+    } catch (e) { alert(e.message); } finally { setBusy(false); }
+  };
+
+  const remove = async (id) => {
+    if (!confirm('Delete this update?')) return;
+    await sb.from('mcp_npd_updates').delete().eq('id', id);
+    onReload();
+  };
+
+  return html`
+    <div class="card">
+      <div class="card-title">New update</div>
+      <div class="field-row">
+        <div class="field" style="flex:0 0 160px"><label>Kind</label>
+          <select value=${kind} onChange=${e => setKind(e.target.value)}>
+            ${NPD_UPDATE_KINDS.map(k => html`<option key=${k.key} value=${k.key}>${k.emoji} ${k.label}</option>`)}
+          </select>
+        </div>
+      </div>
+      <textarea rows=${3} value=${body} onChange=${e => setBody(e.target.value)} placeholder="Tech review minutes, decision rationale, blocker, milestone reached…" style="width:100%;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px;resize:vertical;font-family:inherit"></textarea>
+      <button class="btn small" onClick=${submit} disabled=${busy || !body.trim()} style="margin-top:8px">${busy ? 'Posting…' : 'Post update'}</button>
+      ${kind !== 'comment' && html`<div style="font-size:11px;color:var(--slate-500);margin-top:6px">Will also post to All Hands chat</div>`}
+    </div>
+
+    ${updates.length === 0 ? html`
+      <div class="card"><div class="empty"><div class="icon">💬</div><div style="font-size:13px">No updates yet. Capture tech reviews, decisions, and blockers here.</div></div></div>
+    ` : updates.map(u => {
+      const kdef = NPD_UPDATE_KINDS.find(k => k.key === u.kind) || { emoji:'·', label:u.kind };
+      return html`
+        <div class="card" key=${u.id} style="margin-bottom:6px;padding:10px 12px">
+          <div style="display:flex;gap:8px;align-items:flex-start">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:11px;color:var(--slate-500);margin-bottom:4px">
+                <span class=${'badge ' + (u.kind === 'issue' ? 'rose' : u.kind === 'decision' ? 'emerald' : u.kind === 'milestone' ? 'amber' : 'teal')} style="font-size:10px">${kdef.emoji} ${kdef.label}</span>
+                <span style="margin-left:6px">${u.users?.full_name || '?'}</span> · ${fmtDate(u.created_at)}
+              </div>
+              <div style="font-size:13px;white-space:pre-wrap;word-break:break-word">${u.body}</div>
+            </div>
+            ${(u.author_id === me.id || me.role === 'plant_head' || me.role === 'admin') && html`
+              <button class="btn small danger" onClick=${() => remove(u.id)} style="padding:2px 8px;font-size:11px">×</button>
             `}
           </div>
         </div>
-      `)}
-    </div>
-
-    ${p.notes && html`<div class="alert info" style="margin-top:14px"><strong>Notes:</strong> ${p.notes}</div>`}
+      `;
+    })}
   `;
 }
 
