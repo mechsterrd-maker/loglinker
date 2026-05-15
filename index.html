@@ -13860,7 +13860,7 @@ function QuickTaskInGroupModal({ plant, me, group, onClose, onSaved }) {
 // SCHEDULES — Customer monthly schedules + plan-vs-actual tracking
 // =================================================================
 function Schedules({ plant, me }) {
-  const [view, setView] = useState('schedules'); // 'schedules' | 'customers'
+  const [view, setView] = useState('schedules'); // 'schedules' | 'plan_vs_supply' | 'customers' | 'mapping'
   const [activeSchedule, setActiveSchedule] = useState(null);
   const [activeCustomer, setActiveCustomer] = useState(null);
 
@@ -13880,10 +13880,12 @@ function Schedules({ plant, me }) {
       <button class=${'auth-tab' + (view === 'schedules' ? ' active' : '')} onClick=${() => setView('schedules')}>Schedules</button>
       <button class=${'auth-tab' + (view === 'plan_vs_supply' ? ' active' : '')} onClick=${() => setView('plan_vs_supply')}>📊 Plan vs Supply</button>
       <button class=${'auth-tab' + (view === 'customers' ? ' active' : '')} onClick=${() => setView('customers')}>Customers</button>
+      <button class=${'auth-tab' + (view === 'mapping' ? ' active' : '')} onClick=${() => setView('mapping')}>🔗 Bill Mapping</button>
     </div>
 
     ${view === 'schedules' ? html`<${SchedulesList} plant=${plant} me=${me} onOpen=${setActiveSchedule} />` :
       view === 'plan_vs_supply' ? html`<${PlanVsSupplyView} plant=${plant} me=${me} />` :
+      view === 'mapping' ? html`<${BillMappingView} plant=${plant} me=${me} />` :
       html`<${CustomersList} plant=${plant} me=${me} onOpen=${setActiveCustomer} />`}
   `;
 }
@@ -15134,6 +15136,193 @@ function CustomerDetail({ plant, me, customer: initialCustomer, onClose }) {
         </div>
       `)
     }
+  `;
+}
+
+// ============= BILL MAPPING (alias loop) =============
+// Aggregates every distinct billing-vendor name carried by outward docs
+// (dc_out / invoice_out) for this plant. Each unique name shows:
+//   • OCR'd name + GSTIN + how many docs use it
+//   • Whether the auto-matcher already resolved it to a schedule customer
+//   • A dropdown to pick a schedule customer + Save (writes an alias and
+//     re-fires the supply trigger on every doc carrying that name).
+//
+// Filters: All / Unmatched / Matched · plus free-text search.
+function BillMappingView({ plant, me }) {
+  const [docs, setDocs] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [aliases, setAliases] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState('unmatched'); // unmatched | all | matched
+  const [search, setSearch] = useState('');
+  const [picks, setPicks] = useState({});   // { key: customer_id }
+  const [busy, setBusy] = useState({});     // { key: bool }
+
+  const refresh = async () => {
+    setLoading(true);
+    const [d, c, a] = await Promise.all([
+      sb.from('mcp_logistics_documents')
+        .select('id, vendor_name_raw, vendor_gstin_raw, vendor_id, doc_type, doc_number, doc_date, plant_id')
+        .eq('plant_id', plant.id)
+        .in('doc_type', ['dc_out','invoice_out'])
+        .order('created_at', { ascending: false }),
+      sb.from('mcp_sched_customers').select('id, name, short_code, gstin').eq('plant_id', plant.id).order('name'),
+      sb.from('mcp_sched_customer_aliases').select('*').eq('plant_id', plant.id),
+    ]);
+    const docList = d.data || [];
+    // Mark which docs already produced supplies (≥1 supply row referencing this doc)
+    if (docList.length > 0) {
+      const ids = docList.map(x => x.id);
+      const { data: sup } = await sb.from('mcp_sched_supplies').select('source_doc_id, customer_id').in('source_doc_id', ids);
+      const supByDoc = new Map();
+      (sup || []).forEach(s => { if (!supByDoc.has(s.source_doc_id)) supByDoc.set(s.source_doc_id, s.customer_id); });
+      docList.forEach(x => { x._supply_customer_id = supByDoc.get(x.id) || null; });
+    }
+    setDocs(docList);
+    setCustomers(c.data || []);
+    setAliases(a.data || []);
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [plant.id]);
+
+  // Group outward docs by (vendor_name_raw + gstin) → one row per distinct billing name
+  const groups = (() => {
+    const map = new Map();
+    docs.forEach(d => {
+      const name = (d.vendor_name_raw || '').trim();
+      const gstin = (d.vendor_gstin_raw || '').trim().toUpperCase();
+      const key = name.toLowerCase() + '|' + gstin;
+      if (!map.has(key)) {
+        map.set(key, {
+          key, name, gstin,
+          docs: [], matched_customer_ids: new Set(),
+        });
+      }
+      const g = map.get(key);
+      g.docs.push(d);
+      if (d._supply_customer_id) g.matched_customer_ids.add(d._supply_customer_id);
+    });
+    return Array.from(map.values()).map(g => {
+      const matched = g.matched_customer_ids.size > 0;
+      const matchedCust = matched ? customers.find(c => g.matched_customer_ids.has(c.id)) : null;
+      // Suggest a customer: if matched → that one; else find an alias that already
+      // covers this name/gstin (the auto-matcher would pick it but the supply could
+      // still be zero if no schedule lines existed).
+      const aliasHit = aliases.find(a =>
+        (a.alias_gstin && g.gstin && a.alias_gstin.toUpperCase() === g.gstin) ||
+        (a.alias_name && a.alias_name.toLowerCase() === g.name.toLowerCase())
+      );
+      const suggested = matchedCust?.id || aliasHit?.customer_id || '';
+      return { ...g, matched, matched_customer: matchedCust, suggested };
+    });
+  })();
+
+  const visible = groups
+    .filter(g => filter === 'all' ? true : filter === 'matched' ? g.matched : !g.matched)
+    .filter(g => {
+      if (!search.trim()) return true;
+      const s = search.toLowerCase();
+      return (g.name || '').toLowerCase().includes(s) || (g.gstin || '').toLowerCase().includes(s);
+    })
+    .sort((a, b) => (b.docs.length - a.docs.length) || a.name.localeCompare(b.name));
+
+  const saveMapping = async (group) => {
+    const customerId = picks[group.key] ?? group.suggested;
+    if (!customerId) { alert('Pick a schedule customer first'); return; }
+    setBusy({ ...busy, [group.key]: true });
+    try {
+      // 1. Insert alias (name AND/OR gstin) — skip if an identical row already exists.
+      const aliasExists = aliases.some(a =>
+        a.customer_id === customerId &&
+        ((a.alias_name || '').toLowerCase() === (group.name || '').toLowerCase()) &&
+        ((a.alias_gstin || '').toUpperCase() === (group.gstin || '').toUpperCase())
+      );
+      if (!aliasExists) {
+        const { error: aErr } = await sb.from('mcp_sched_customer_aliases').insert({
+          plant_id: plant.id,
+          customer_id: customerId,
+          alias_name: group.name || null,
+          alias_gstin: group.gstin || null,
+          created_by: me.id,
+        });
+        if (aErr) throw aErr;
+      }
+      // 2. Re-fire the supply trigger on every doc carrying this billing name by
+      //    touching `items` (the trigger listens on UPDATE OF status, items).
+      let touched = 0;
+      for (const d of group.docs) {
+        const { data: full } = await sb.from('mcp_logistics_documents').select('items').eq('id', d.id).maybeSingle();
+        if (!full || !Array.isArray(full.items) || full.items.length === 0) continue;
+        const { error } = await sb.from('mcp_logistics_documents').update({ items: full.items }).eq('id', d.id);
+        if (!error) touched++;
+      }
+      showToast('✓ Alias saved · re-applied to ' + touched + ' doc' + (touched === 1 ? '' : 's'));
+      await refresh();
+    } catch (e) { alert('Save failed: ' + e.message); }
+    finally { setBusy({ ...busy, [group.key]: false }); }
+  };
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  const unmatchedCount = groups.filter(g => !g.matched).length;
+  const matchedCount = groups.filter(g => g.matched).length;
+
+  return html`
+    <div class="card" style="background:var(--slate-50);font-size:12px;color:var(--slate-700);margin-bottom:14px;padding:10px 12px">
+      Map every billing-vendor name the OCR has seen on outward bills (DC / invoice) to a schedule customer.
+      Saving creates an alias <i>and</i> re-fires the supply matcher on past bills carrying that name.
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:10px">
+      <button class=${'auth-tab' + (filter === 'unmatched' ? ' active' : '')} onClick=${() => setFilter('unmatched')}>Unmatched · ${unmatchedCount}</button>
+      <button class=${'auth-tab' + (filter === 'matched' ? ' active' : '')} onClick=${() => setFilter('matched')}>Matched · ${matchedCount}</button>
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All · ${groups.length}</button>
+    </div>
+
+    <div style="margin-bottom:10px">
+      <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search vendor name or GSTIN…" style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+    </div>
+
+    ${visible.length === 0 ? html`
+      <div class="card"><div class="empty">
+        <div class="icon">🎯</div>
+        <div style="font-size:13px">${filter === 'unmatched' ? 'Nothing to map — every billing name is already linked.' : 'No billing names match this filter.'}</div>
+      </div></div>
+    ` : visible.map(g => html`
+      <div class="card" key=${g.key} style="margin-bottom:8px;padding:12px 14px">
+        <div style="display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap">
+          <div style="flex:1;min-width:200px">
+            <div style="font-size:13px;font-weight:600">${g.name || '(no name)'}</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+              ${g.gstin ? html`<span class="mono">${g.gstin}</span> · ` : ''}${g.docs.length} doc${g.docs.length === 1 ? '' : 's'}
+              ${g.docs.slice(0, 3).map(d => html`<span style="margin-left:6px">${d.doc_number || '—'}</span>`)}
+              ${g.docs.length > 3 ? html`<span style="margin-left:6px;color:var(--slate-400)">+${g.docs.length - 3} more</span>` : ''}
+            </div>
+          </div>
+          ${g.matched ? html`
+            <div style="text-align:right;font-size:12px">
+              <span class="badge emerald">→ ${g.matched_customer?.name || '?'}</span>
+              ${g.matched_customer?.short_code ? html`<div style="font-size:10px;color:var(--slate-500);margin-top:2px">${g.matched_customer.short_code}</div>` : ''}
+            </div>
+          ` : html`<span class="badge rose">Unmatched</span>`}
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+          <select
+            value=${picks[g.key] ?? g.suggested ?? ''}
+            onChange=${e => setPicks({...picks, [g.key]: e.target.value})}
+            style="flex:1;min-width:200px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px"
+          >
+            <option value="">— Pick schedule customer —</option>
+            ${customers.map(c => html`
+              <option key=${c.id} value=${c.id}>${c.name}${c.short_code ? ' · ' + c.short_code : ''}${c.gstin ? ' · ' + c.gstin : ''}</option>
+            `)}
+          </select>
+          <button class="btn small" onClick=${() => saveMapping(g)} disabled=${busy[g.key] || (!(picks[g.key] ?? g.suggested))}>
+            ${busy[g.key] ? 'Saving…' : g.matched ? 'Re-link' : 'Map & re-apply'}
+          </button>
+        </div>
+      </div>
+    `)}
   `;
 }
 
