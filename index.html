@@ -1022,6 +1022,7 @@ const MORE_GROUPS = [
       { key:'calibration',    icon:'📏', label:'Calibration Register',         sub:'Instruments + due/overdue (IATF 7.1.5.2)' },
       { key:'training',       icon:'🎓', label:'Training Matrix',              sub:'Skills, records, validity (IATF 7.2)' },
       { key:'pm_schedule',    icon:'🔧', label:'Preventive Maintenance',       sub:'PM tasks, due dates (IATF 8.5.1.5)' },
+      { key:'tpm',            icon:'🛠', label:'TPM Daily Checks',             sub:'Operator daily machine checks · oil, coolant, leaks, guards' },
     ],
   },
   {
@@ -1145,6 +1146,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'risk_register'}><${RiskRegisterModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'contingency'}><${ContingencyModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'npd'}><${NpdModule} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
+      <${Page} active=${tab === 'tpm'}><${TpmModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
 
       <div class="tabbar">
@@ -1152,7 +1154,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr','scl','iap','pm_schedule','quality_objectives','risk_register','contingency','npd'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr','scl','iap','pm_schedule','quality_objectives','risk_register','contingency','npd','tpm'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
 
       ${/* Logi chatbot + Siri voice agent hidden per user request. Components
@@ -7790,6 +7792,426 @@ function IapEditModal({ plant, me, row, onClose, onSaved }) {
         <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
         <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Plan audit' : 'Save')}</button>
       </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// TPM MODULE (daily machine checks · oil, coolant, leaks, guards)
+// =================================================================
+// Default-to-OK pattern. Operator opens a machine's check, every item
+// is pre-marked ✓. They flip the bad ones to ⚠ Issue (with optional
+// note + photo), tap Submit. Full check should take ~30 seconds.
+// Critical items that fail auto-create a maintenance breakdown.
+function TpmModule({ plant, me }) {
+  const [view, setView] = useState('today');   // today | templates
+  const [activeMachineId, setActiveMachineId] = useState(null);
+  const [statusList, setStatusList] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = async () => {
+    setLoading(true);
+    const { data } = await sb.from('v_tpm_today').select('*').eq('plant_id', plant.id);
+    setStatusList((data || []).sort((a, b) => (a.machine_name || '').localeCompare(b.machine_name || '')));
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [plant.id]);
+
+  useEffect(() => {
+    const ch = sb.channel('tpm-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_tpm_runs', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_tpm_templates', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(ch); };
+  }, [plant.id]);
+
+  if (activeMachineId && view === 'today') {
+    return html`<${TpmDailyCheck} plant=${plant} me=${me} machineId=${activeMachineId} onClose=${() => { setActiveMachineId(null); refresh(); }} />`;
+  }
+  if (activeMachineId && view === 'templates') {
+    return html`<${TpmTemplateEditor} plant=${plant} me=${me} machineId=${activeMachineId} onClose=${() => { setActiveMachineId(null); refresh(); }} />`;
+  }
+
+  const isAdmin = me.role === 'plant_head' || me.role === 'admin' || me.role === 'maintenance';
+
+  const counts = {
+    pending: statusList.filter(s => s.today_status === 'pending').length,
+    done: statusList.filter(s => s.today_status === 'done').length,
+    issues: statusList.filter(s => s.today_status === 'issues').length,
+    no_template: statusList.filter(s => s.today_status === 'no_template').length,
+  };
+
+  return html`
+    <div class="page-header"><div><h1>🛠 TPM Daily Checks</h1><div class="sub">Operator-friendly machine checks · oil, coolant, leaks, guards, housekeeping</div></div></div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (view === 'today' ? ' active' : '')} onClick=${() => setView('today')}>Today's checks</button>
+      ${isAdmin && html`<button class=${'auth-tab' + (view === 'templates' ? ' active' : '')} onClick=${() => setView('templates')}>⚙️ Templates</button>`}
+    </div>
+
+    ${view === 'today' && html`
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:14px">
+        <div class="card" style="padding:10px 12px;background:${counts.pending > 0 ? 'var(--amber-50)' : 'var(--slate-50)'};text-align:center">
+          <div style="font-size:22px;font-weight:700">${counts.pending}</div>
+          <div style="font-size:11px;color:var(--slate-600)">⏰ Pending</div>
+        </div>
+        <div class="card" style="padding:10px 12px;background:var(--emerald-50);text-align:center">
+          <div style="font-size:22px;font-weight:700">${counts.done}</div>
+          <div style="font-size:11px;color:var(--slate-600)">🟢 Done</div>
+        </div>
+        <div class="card" style="padding:10px 12px;background:${counts.issues > 0 ? 'var(--rose-50)' : 'var(--slate-50)'};text-align:center">
+          <div style="font-size:22px;font-weight:700">${counts.issues}</div>
+          <div style="font-size:11px;color:var(--slate-600)">🔴 With issues</div>
+        </div>
+        ${counts.no_template > 0 && html`
+          <div class="card" style="padding:10px 12px;background:var(--slate-50);text-align:center">
+            <div style="font-size:22px;font-weight:700;color:var(--slate-400)">${counts.no_template}</div>
+            <div style="font-size:11px;color:var(--slate-600)">⊘ No template</div>
+          </div>
+        `}
+      </div>
+
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        statusList.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🛠</div><div style="font-size:13px">No machines configured yet. Add machines in Maintenance first.</div></div></div>` :
+        statusList.map(s => {
+          const badge = s.today_status === 'done' ? html`<span class="badge emerald" style="font-size:10px">🟢 Done</span>` :
+                        s.today_status === 'issues' ? html`<span class="badge rose" style="font-size:10px">🔴 ${s.today_issue_count} issue${s.today_issue_count===1?'':'s'}</span>` :
+                        s.today_status === 'pending' ? html`<span class="badge amber" style="font-size:10px">⏰ Pending</span>` :
+                        html`<span class="badge" style="font-size:10px;background:var(--slate-100);color:var(--slate-500)">⊘ No template</span>`;
+          const bg = s.today_status === 'issues' ? 'var(--rose-50)' : s.today_status === 'done' ? '' : '';
+          return html`
+            <div class="card" key=${s.machine_id} onClick=${() => setActiveMachineId(s.machine_id)} style="margin-bottom:6px;padding:12px 14px;cursor:pointer;${bg ? 'background:' + bg : ''}">
+              <div style="display:flex;align-items:center;gap:10px">
+                <div style="flex:1">
+                  <div style="font-size:14px;font-weight:600">${s.machine_name || '(machine)'}</div>
+                  <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                    ${s.template_id ? html`${s.item_count} check item${s.item_count===1?'':'s'}` : 'No checklist yet'}
+                    ${s.today_submitted_at ? html` · last submitted ${fmtDate(s.today_submitted_at)}` : ''}
+                  </div>
+                </div>
+                ${badge}
+                <span style="color:var(--slate-400);font-size:18px">›</span>
+              </div>
+            </div>
+          `;
+        })}
+    `}
+
+    ${view === 'templates' && html`<${TpmTemplatesList} plant=${plant} me=${me} statusList=${statusList} onOpen=${setActiveMachineId} onReload=${refresh} />`}
+  `;
+}
+
+// ============= TPM DAILY CHECK SCREEN (operator) =============
+function TpmDailyCheck({ plant, me, machineId, onClose }) {
+  const [machine, setMachine] = useState(null);
+  const [template, setTemplate] = useState(null);
+  const [items, setItems] = useState([]);
+  const [run, setRun] = useState(null);
+  const [results, setResults] = useState({});  // { item_id: { status, value, note, photo_url } }
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => { (async () => {
+    setLoading(true);
+    const [mRes, tRes, rRes] = await Promise.all([
+      sb.from('machines').select('id, display_name, code').eq('id', machineId).maybeSingle(),
+      sb.from('mcp_tpm_templates').select('*').eq('plant_id', plant.id).eq('machine_id', machineId).maybeSingle(),
+      sb.from('mcp_tpm_runs').select('*').eq('plant_id', plant.id).eq('machine_id', machineId).eq('check_date', new Date().toISOString().slice(0,10)).maybeSingle(),
+    ]);
+    setMachine(mRes.data);
+    setTemplate(tRes.data);
+    setRun(rRes.data);
+    if (tRes.data) {
+      const { data: itemsData } = await sb.from('mcp_tpm_template_items').select('*').eq('template_id', tRes.data.id).order('ord');
+      setItems(itemsData || []);
+      // Pre-fill results: if run exists, load saved; else all-OK
+      if (rRes.data) {
+        const { data: resData } = await sb.from('mcp_tpm_results').select('*').eq('run_id', rRes.data.id);
+        const map = {};
+        (resData || []).forEach(r => {
+          map[r.template_item_id] = { status: r.status, value: r.value || '', note: r.note || '', photo_url: r.photo_url || '' };
+        });
+        // Any new items without saved result default to OK
+        (itemsData || []).forEach(it => { if (!map[it.id]) map[it.id] = { status: 'ok', value: '', note: '', photo_url: '' }; });
+        setResults(map);
+      } else {
+        const map = {};
+        (itemsData || []).forEach(it => { map[it.id] = { status: 'ok', value: '', note: '', photo_url: '' }; });
+        setResults(map);
+      }
+    }
+    setLoading(false);
+  })(); }, [machineId, plant.id]);
+
+  const setItem = (itemId, patch) => setResults(prev => ({ ...prev, [itemId]: { ...prev[itemId], ...patch } }));
+
+  const submit = async () => {
+    if (!template || items.length === 0) { alert('No checklist for this machine yet'); return; }
+    setBusy(true);
+    try {
+      let runId = run?.id;
+      if (!runId) {
+        const { data, error } = await sb.from('mcp_tpm_runs').insert({
+          plant_id: plant.id, machine_id: machineId, template_id: template.id,
+          check_date: new Date().toISOString().slice(0,10),
+          operator_id: me.id,
+        }).select('*').single();
+        if (error) throw error;
+        runId = data.id;
+        setRun(data);
+      } else {
+        // Existing run today — wipe old results before re-inserting
+        await sb.from('mcp_tpm_results').delete().eq('run_id', runId);
+      }
+
+      const rows = items.map(it => {
+        const r = results[it.id] || { status: 'ok' };
+        return {
+          plant_id: plant.id, run_id: runId, template_item_id: it.id,
+          item_label: it.label, item_type: it.item_type, critical: it.critical,
+          status: r.status, value: r.value || null, note: r.note || null, photo_url: r.photo_url || null,
+        };
+      });
+      const { error: iErr } = await sb.from('mcp_tpm_results').insert(rows);
+      if (iErr) throw iErr;
+      showToast('✓ TPM check submitted');
+      onClose();
+    } catch (e) { alert('Submit failed: ' + e.message); } finally { setBusy(false); }
+  };
+
+  const markAllOk = () => {
+    const map = {};
+    items.forEach(it => { map[it.id] = { status: 'ok', value: '', note: '', photo_url: '' }; });
+    setResults(map);
+  };
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+  if (!template || items.length === 0) {
+    return html`
+      <div class="page-header" style="display:flex;align-items:center;gap:10px">
+        <button class="btn ghost small" onClick=${onClose}>← Back</button>
+        <h1 style="font-size:18px;flex:1">${machine?.display_name || machine?.code || 'Machine'}</h1>
+      </div>
+      <div class="card"><div class="empty">
+        <div class="icon">🛠</div>
+        <div style="font-size:13px">No TPM checklist for this machine yet.</div>
+        <div style="font-size:12px;color:var(--slate-500);margin-top:6px">Ask an admin to add items in the Templates tab, or seed an 8-item default.</div>
+      </div></div>
+    `;
+  }
+
+  const issueCount = Object.values(results).filter(r => r.status === 'issue').length;
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <button class="btn ghost small" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:120px">
+        <h1 style="font-size:18px">${machine?.display_name || machine?.code}</h1>
+        <div class="sub">${new Date().toLocaleDateString('en-IN', { weekday:'long', day:'numeric', month:'short' })} · ${items.length} check${items.length===1?'':'s'}${run ? ' · saved earlier' : ''}</div>
+      </div>
+      <button class="btn small ghost" onClick=${markAllOk} disabled=${busy}>✓ All OK</button>
+    </div>
+
+    <div style="margin-bottom:90px">
+      ${items.map(it => {
+        const r = results[it.id] || { status: 'ok' };
+        const isOk = r.status === 'ok';
+        const isIssue = r.status === 'issue';
+        const isNa = r.status === 'na';
+        const btnStyle = (active, color) => 'flex:1;padding:10px 6px;border:1px solid ' + (active ? color : 'var(--slate-200)') + ';background:' + (active ? color : 'white') + ';color:' + (active ? 'white' : 'var(--slate-700)') + ';font-size:13px;font-weight:600;border-radius:6px;cursor:pointer;transition:all 0.1s';
+        return html`
+          <div class="card" key=${it.id} style="margin-bottom:8px;padding:12px 14px">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:10px">
+              <div style="flex:1">
+                <div style="font-size:13px;font-weight:600;line-height:1.3">${it.label}${it.critical ? html` <span class="badge rose" style="font-size:9px;padding:1px 5px;margin-left:4px">CRITICAL</span>` : ''}</div>
+                ${it.expected_value && html`<div style="font-size:11px;color:var(--slate-500);margin-top:2px">Expected: ${it.expected_value}</div>`}
+              </div>
+            </div>
+            <div style="display:flex;gap:6px">
+              <button onClick=${() => setItem(it.id, { status: 'ok' })} style=${btnStyle(isOk, 'var(--emerald-600)')}>✓ OK</button>
+              <button onClick=${() => setItem(it.id, { status: 'issue' })} style=${btnStyle(isIssue, 'var(--rose-600)')}>⚠ Issue</button>
+              <button onClick=${() => setItem(it.id, { status: 'na' })} style=${btnStyle(isNa, 'var(--slate-500)')}>⊘ N/A</button>
+            </div>
+            ${(isIssue || isNa) && html`
+              <div style="margin-top:10px">
+                ${it.item_type === 'level' && isIssue && html`
+                  <div style="display:flex;gap:6px;margin-bottom:6px">
+                    ${['low','med','high'].map(lvl => html`
+                      <button key=${lvl} onClick=${() => setItem(it.id, { value: lvl })} style=${'flex:1;padding:8px;font-size:12px;border:1px solid ' + (r.value === lvl ? 'var(--teal-600)' : 'var(--slate-200)') + ';background:' + (r.value === lvl ? 'var(--teal-50)' : 'white') + ';border-radius:5px;font-weight:600;color:' + (r.value === lvl ? 'var(--teal-700)' : 'var(--slate-700)') + ';cursor:pointer'}>${lvl.toUpperCase()}</button>
+                    `)}
+                  </div>
+                `}
+                ${it.item_type === 'numeric' && isIssue && html`
+                  <input type="number" step="any" value=${r.value} onChange=${e => setItem(it.id, { value: e.target.value })} placeholder=${'Measured value' + (it.unit ? ' (' + it.unit + ')' : '')} style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--slate-200);border-radius:5px;margin-bottom:6px" />
+                `}
+                <input type="text" value=${r.note} onChange=${e => setItem(it.id, { note: e.target.value })} placeholder="Note (optional) — what did you see?" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--slate-200);border-radius:5px" />
+              </div>
+            `}
+          </div>
+        `;
+      })}
+    </div>
+
+    <div style="position:fixed;bottom:0;left:0;right:0;padding:10px 14px;background:white;border-top:1px solid var(--slate-200);box-shadow:0 -4px 16px rgba(0,0,0,0.05);z-index:50">
+      <div style="max-width:600px;margin:0 auto;display:flex;align-items:center;gap:10px">
+        <div style="flex:1;font-size:12px;color:var(--slate-600)">
+          ${issueCount === 0 ? html`<span style="color:var(--emerald-700);font-weight:600">All ${items.length} OK</span>` : html`<span style="color:var(--rose-600);font-weight:600">${issueCount} issue${issueCount === 1 ? '' : 's'}</span> · ${items.length - issueCount} OK`}
+        </div>
+        <button class="btn" onClick=${submit} disabled=${busy} style="min-width:120px">${busy ? 'Submitting…' : (run ? 'Resubmit' : 'Submit check')}</button>
+      </div>
+    </div>
+  `;
+}
+
+// ============= TPM TEMPLATES LIST (admin) =============
+function TpmTemplatesList({ plant, me, statusList, onOpen, onReload }) {
+  const [seedingId, setSeedingId] = useState(null);
+
+  const seed = async (machineId) => {
+    setSeedingId(machineId);
+    try {
+      const { error } = await sb.rpc('tpm_seed_default_template', { p_machine_id: machineId });
+      if (error) throw error;
+      showToast('🛠 8-item template created — open it to customize');
+      onReload();
+    } catch (e) { alert(e.message); } finally { setSeedingId(null); }
+  };
+
+  return html`
+    <div class="card" style="background:var(--slate-50);font-size:12px;color:var(--slate-700);margin-bottom:14px;padding:10px 12px">
+      Per-machine checklist defines what operators see daily. Tap a machine to edit items.
+      For machines without a template, tap <b>+ Seed defaults</b> to get an 8-item starter (oil, coolant, leaks, guards, housekeeping etc.).
+    </div>
+    ${statusList.map(s => html`
+      <div class="card" key=${s.machine_id} style="margin-bottom:6px;padding:10px 12px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div style="flex:1">
+            <div style="font-size:13px;font-weight:600">${s.machine_name || '(machine)'}</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+              ${s.template_id ? html`${s.item_count} item${s.item_count===1?'':'s'} · ${s.template_active ? 'active' : 'inactive'}` : 'No template'}
+            </div>
+          </div>
+          ${s.template_id ? html`
+            <button class="btn small ghost" onClick=${() => onOpen(s.machine_id)}>Edit ›</button>
+          ` : html`
+            <button class="btn small" onClick=${() => seed(s.machine_id)} disabled=${seedingId === s.machine_id}>${seedingId === s.machine_id ? '…' : '+ Seed defaults'}</button>
+          `}
+        </div>
+      </div>
+    `)}
+  `;
+}
+
+// ============= TPM TEMPLATE EDITOR =============
+function TpmTemplateEditor({ plant, me, machineId, onClose }) {
+  const [machine, setMachine] = useState(null);
+  const [template, setTemplate] = useState(null);
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [newItem, setNewItem] = useState({ label:'', item_type:'ok_issue', critical:false, expected_value:'', unit:'' });
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    const [m, t] = await Promise.all([
+      sb.from('machines').select('id, display_name, code').eq('id', machineId).maybeSingle(),
+      sb.from('mcp_tpm_templates').select('*').eq('plant_id', plant.id).eq('machine_id', machineId).maybeSingle(),
+    ]);
+    setMachine(m.data);
+    setTemplate(t.data);
+    if (t.data) {
+      const { data: itemsData } = await sb.from('mcp_tpm_template_items').select('*').eq('template_id', t.data.id).order('ord');
+      setItems(itemsData || []);
+    }
+    setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [machineId, plant.id]);
+
+  const toggleActive = async () => {
+    await sb.from('mcp_tpm_templates').update({ active: !template.active }).eq('id', template.id);
+    refresh();
+  };
+
+  const addItem = async () => {
+    if (!newItem.label.trim()) return;
+    setBusy(true);
+    try {
+      const ord = items.length > 0 ? Math.max(...items.map(i => i.ord)) + 1 : 1;
+      const { error } = await sb.from('mcp_tpm_template_items').insert({
+        plant_id: plant.id, template_id: template.id, ord,
+        label: newItem.label.trim(), item_type: newItem.item_type,
+        critical: newItem.critical,
+        expected_value: newItem.expected_value || null,
+        unit: newItem.unit || null,
+      });
+      if (error) throw error;
+      setNewItem({ label:'', item_type:'ok_issue', critical:false, expected_value:'', unit:'' });
+      refresh();
+    } catch (e) { alert(e.message); } finally { setBusy(false); }
+  };
+
+  const removeItem = async (id) => {
+    if (!confirm('Delete this check item?')) return;
+    await sb.from('mcp_tpm_template_items').delete().eq('id', id);
+    refresh();
+  };
+
+  const toggleCritical = async (item) => {
+    await sb.from('mcp_tpm_template_items').update({ critical: !item.critical }).eq('id', item.id);
+    refresh();
+  };
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <button class="btn ghost small" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:120px">
+        <h1 style="font-size:18px">${machine?.display_name || machine?.code}</h1>
+        <div class="sub">TPM check template · ${items.length} item${items.length===1?'':'s'}</div>
+      </div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--slate-600)">
+        <input type="checkbox" checked=${template.active} onChange=${toggleActive} /> Active
+      </label>
+    </div>
+
+    ${items.length === 0 ? html`
+      <div class="card"><div class="empty"><div style="font-size:13px">No items yet. Add the first check below.</div></div></div>
+    ` : items.map(it => html`
+      <div class="card" key=${it.id} style="margin-bottom:6px;padding:10px 12px">
+        <div style="display:flex;align-items:flex-start;gap:10px">
+          <div style="flex:1">
+            <div style="font-size:13px;font-weight:600">${it.ord}. ${it.label}${it.critical ? html` <span class="badge rose" style="font-size:9px;padding:1px 5px;margin-left:4px">CRITICAL</span>` : ''}</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+              type: ${it.item_type}${it.expected_value ? ' · expected: ' + it.expected_value : ''}${it.unit ? ' · unit: ' + it.unit : ''}
+            </div>
+          </div>
+          <button class="btn small ghost" onClick=${() => toggleCritical(it)} title="Toggle critical">${it.critical ? '✓ Critical' : 'Mark critical'}</button>
+          <button class="btn small danger" onClick=${() => removeItem(it.id)} style="padding:4px 8px">×</button>
+        </div>
+      </div>
+    `)}
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-title">Add check item</div>
+      <div class="field"><label>Label *</label><input type="text" value=${newItem.label} onChange=${e => setNewItem({...newItem, label: e.target.value})} placeholder="e.g. Hydraulic oil level (sight glass)" /></div>
+      <div class="field-row">
+        <div class="field"><label>Type</label>
+          <select value=${newItem.item_type} onChange=${e => setNewItem({...newItem, item_type: e.target.value})}>
+            <option value="ok_issue">OK / Issue (visual)</option>
+            <option value="level">Level (Low/Med/High)</option>
+            <option value="numeric">Numeric value</option>
+          </select>
+        </div>
+        ${newItem.item_type === 'numeric' && html`
+          <div class="field"><label>Unit</label><input type="text" value=${newItem.unit} onChange=${e => setNewItem({...newItem, unit: e.target.value})} placeholder="bar, °C, mm" /></div>
+        `}
+      </div>
+      <div class="field"><label>Expected (optional)</label><input type="text" value=${newItem.expected_value} onChange=${e => setNewItem({...newItem, expected_value: e.target.value})} placeholder="Between MIN and MAX · 5–7 bar · No leak" /></div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:10px;color:var(--slate-700)">
+        <input type="checkbox" checked=${newItem.critical} onChange=${e => setNewItem({...newItem, critical: e.target.checked})} />
+        Mark as critical (auto-creates a maintenance breakdown if flagged ⚠ Issue)
+      </label>
+      <button class="btn small" onClick=${addItem} disabled=${busy || !newItem.label.trim()}>+ Add item</button>
     </div>
   `;
 }
