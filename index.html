@@ -14988,15 +14988,70 @@ function CustomerModal({ plant, me, editTarget, onClose, onSaved }) {
 
 function CustomerDetail({ plant, me, customer, onClose }) {
   const [schedules, setSchedules] = useState([]);
+  const [aliases, setAliases] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [aliasForm, setAliasForm] = useState({ alias_name: '', alias_gstin: '' });
+  const [aliasBusy, setAliasBusy] = useState(false);
+  const [aliasErr, setAliasErr] = useState('');
+  const [reapplying, setReapplying] = useState(false);
 
   const refresh = async () => {
     setLoading(true);
-    const { data } = await sb.from('mcp_sched_schedules').select('*').eq('customer_id', customer.id).order('schedule_month', { ascending: false });
-    setSchedules(data || []);
+    const [s, a] = await Promise.all([
+      sb.from('mcp_sched_schedules').select('*').eq('customer_id', customer.id).order('schedule_month', { ascending: false }),
+      sb.from('mcp_sched_customer_aliases').select('*').eq('customer_id', customer.id).order('created_at'),
+    ]);
+    setSchedules(s.data || []);
+    setAliases(a.data || []);
     setLoading(false);
   };
   useEffect(() => { refresh(); }, [customer.id]);
+
+  const addAlias = async () => {
+    setAliasErr('');
+    const name = (aliasForm.alias_name || '').trim();
+    const gstin = (aliasForm.alias_gstin || '').trim().toUpperCase();
+    if (!name && !gstin) { setAliasErr('Enter a billing name or a GSTIN'); return; }
+    setAliasBusy(true);
+    try {
+      const { error } = await sb.from('mcp_sched_customer_aliases').insert({
+        plant_id: plant.id,
+        customer_id: customer.id,
+        alias_name: name || null,
+        alias_gstin: gstin || null,
+        created_by: me.id,
+      });
+      if (error) throw error;
+      setAliasForm({ alias_name: '', alias_gstin: '' });
+      await refresh();
+    } catch (e) { setAliasErr(e.message); } finally { setAliasBusy(false); }
+  };
+
+  const deleteAlias = async (id) => {
+    if (!confirm('Remove this alias?')) return;
+    await sb.from('mcp_sched_customer_aliases').delete().eq('id', id);
+    refresh();
+  };
+
+  // Re-fire the supply trigger on this customer's existing outward docs so a
+  // newly-added alias retroactively links past unmatched bills.
+  const reapplyAliases = async () => {
+    setReapplying(true);
+    try {
+      const { data: docs } = await sb.from('mcp_logistics_documents')
+        .select('id, items')
+        .eq('plant_id', plant.id)
+        .in('doc_type', ['dc_out','invoice_out']);
+      let touched = 0;
+      for (const d of (docs || [])) {
+        if (!Array.isArray(d.items) || d.items.length === 0) continue;
+        const { error } = await sb.from('mcp_logistics_documents').update({ items: d.items }).eq('id', d.id);
+        if (!error) touched++;
+      }
+      showToast('Re-applied aliases on ' + touched + ' outward doc' + (touched === 1 ? '' : 's'));
+      refresh();
+    } catch (e) { alert('Re-apply failed: ' + e.message); } finally { setReapplying(false); }
+  };
 
   return html`
     <div class="page-header" style="display:flex;align-items:center;gap:10px">
@@ -15012,6 +15067,47 @@ function CustomerDetail({ plant, me, customer, onClose }) {
       ${customer.contact_person && html`<div class="card-row"><span class="label">Contact</span><span class="value">${customer.contact_person} · ${customer.contact_phone || ''}</span></div>`}
       ${customer.contact_email && html`<div class="card-row"><span class="label">Email</span><span class="value">${customer.contact_email}</span></div>`}
       <div class="card-row"><span class="label">Payment terms</span><span class="value">${customer.default_payment_terms_days || 45} days</span></div>
+    </div>
+
+    <div class="section-h" style="display:flex;align-items:center;gap:8px">
+      <span style="flex:1">Billing-name aliases · ${aliases.length}</span>
+      ${aliases.length > 0 && html`
+        <button class="btn small ghost" onClick=${reapplyAliases} disabled=${reapplying} title="Re-fire the supply matcher on past outward docs so newly-added aliases retroactively attach unmatched bills.">
+          ${reapplying ? '…' : '↻ Re-apply to past bills'}
+        </button>
+      `}
+    </div>
+    <div class="card" style="background:var(--slate-50);font-size:12px;color:var(--slate-700);margin-bottom:8px;padding:10px 12px">
+      Names or GSTINs the OCR'd bills carry that should map to <b>${customer.name}</b>. Use this when the printed bill name differs from this customer's name (e.g. "ROOP POLYMERS LTD" → "ROOP POLYMERS"). Aliases win over fuzzy matching.
+    </div>
+    ${aliases.length > 0 && html`
+      <div class="card" style="padding:0;margin-bottom:8px">
+        ${aliases.map(a => html`
+          <div class="list-item" key=${a.id}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                ${a.alias_name && html`<div class="list-item-title" style="font-size:13px">${a.alias_name}</div>`}
+                ${a.alias_gstin && html`<div class="list-item-sub mono" style="font-size:11px">GSTIN ${a.alias_gstin}</div>`}
+              </div>
+              <button class="btn small danger" onClick=${() => deleteAlias(a.id)} style="padding:4px 8px">×</button>
+            </div>
+          </div>
+        `)}
+      </div>
+    `}
+    <div class="card" style="margin-bottom:14px">
+      ${aliasErr && html`<div class="alert error" style="margin-bottom:8px">${aliasErr}</div>`}
+      <div class="field-row">
+        <div class="field" style="flex:2">
+          <label style="font-size:11px">Billing name (as printed on bill)</label>
+          <input type="text" value=${aliasForm.alias_name} onChange=${e => setAliasForm({...aliasForm, alias_name: e.target.value})} placeholder="ROOP POLYMERS LTD" />
+        </div>
+        <div class="field" style="flex:1">
+          <label style="font-size:11px">or GSTIN</label>
+          <input type="text" maxLength=${15} value=${aliasForm.alias_gstin} onChange=${e => setAliasForm({...aliasForm, alias_gstin: e.target.value.toUpperCase()})} placeholder="33ABCDE…" style="font-family:monospace" />
+        </div>
+      </div>
+      <button class="btn small" onClick=${addAlias} disabled=${aliasBusy}>${aliasBusy ? 'Saving…' : '+ Add alias'}</button>
     </div>
 
     <div class="section-h">Schedules · ${schedules.length}</div>
