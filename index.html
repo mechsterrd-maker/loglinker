@@ -3399,6 +3399,7 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
   });
   // Structured rejection breakdown: array of { rejection_type_id, label_snapshot, qty }
   const [rejBreakdown, setRejBreakdown] = useState([]);
+  const [attach, setAttach] = useState({ attachments: [], email_ref: '' });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -3430,6 +3431,8 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
         notes: form.notes || null,
         recorded_by_user_id: me.id,
         recorded_at: new Date().toISOString(),
+        attachments: attach.attachments || [],
+        email_ref: attach.email_ref || null,
       };
       const { data: inserted, error } = await sb.from('mcp_pdc_shots').insert(payload).select('id').single();
       if (error) throw error;
@@ -3484,10 +3487,9 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
             </select>
           </div>
           <div class="field"><label>Part Made ${form.part_id ? '— BOM will auto-consume stock' : '— optional'}</label>
-            <select value=${form.part_id || ''} onChange=${e => setForm({...form, part_id: e.target.value})}>
-              <option value="">— None / unknown —</option>
-              ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number} · Rev ${p.revision} · ${p.name}</option>`)}
-            </select>
+            <${PartPicker} plant=${plant} value=${form.part_id}
+              onChange=${(id) => setForm({...form, part_id: id || ''})}
+              placeholder="— None / unknown —" />
           </div>
           <div class="field"><label>Operator</label>
             <select value=${form.operator_user_id} onChange=${e => setForm({...form, operator_user_id: e.target.value})}>
@@ -3507,6 +3509,7 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
             <div class="field"><label>Metal (kg)</label><input type="number" step="0.01" value=${form.metal_consumed_kg} onChange=${e => setForm({...form, metal_consumed_kg: e.target.value})} placeholder="850" /></div>
           </div>
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <div style="margin:10px 0"><${EntryAttachments} plant=${plant} me=${me} scope="shot" value=${attach} onChange=${setAttach} /></div>
           <button class="btn" disabled=${loading}>${loading ? 'Logging…' : 'Submit'}</button>
         </form>
       </div>
@@ -8160,6 +8163,198 @@ function RejectionBreakdown({ plant, stage, value, onChange }) {
 }
 
 // =================================================================
+// PART PICKER (strict dropdown · searchable · type-ahead)
+// =================================================================
+// Replaces every free-text part-number input. Returns parts master id
+// + part_number snapshot so downstream queries can join cleanly.
+function PartPicker({ plant, value, onChange, placeholder, required, allowClear = true }) {
+  const [parts, setParts] = useState([]);
+  const [search, setSearch] = useState('');
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const wrapRef = useRef(null);
+
+  useEffect(() => {
+    sb.from('mcp_pdc_parts').select('id, part_number, name, customer_part_number, revision')
+      .eq('plant_id', plant.id).order('part_number')
+      .then(({ data }) => { setParts(data || []); setLoading(false); });
+  }, [plant.id]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [open]);
+
+  const selected = parts.find(p => p.id === value);
+  const filtered = !search.trim() ? parts : parts.filter(p =>
+    (p.part_number + ' ' + (p.name || '') + ' ' + (p.customer_part_number || '')).toLowerCase().includes(search.toLowerCase())
+  );
+
+  const pick = (p) => {
+    onChange(p ? p.id : null, p);
+    setOpen(false);
+    setSearch('');
+  };
+
+  return html`
+    <div ref=${wrapRef} style="position:relative">
+      <button type="button" onClick=${() => setOpen(o => !o)}
+        style="width:100%;text-align:left;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;background:white;font-size:13px;cursor:pointer;display:flex;align-items:center;gap:8px;${required && !selected ? 'border-color:var(--rose-300);background:var(--rose-50)' : ''}">
+        ${selected ? html`
+          <span style="font-family:monospace;font-weight:600">${selected.part_number}</span>
+          <span style="color:var(--slate-600)">${selected.name}</span>
+          ${selected.customer_part_number && html`<span style="color:var(--slate-400);font-size:11px;margin-left:auto">cust: ${selected.customer_part_number}</span>`}
+        ` : html`<span style="color:var(--slate-400)">${placeholder || (loading ? 'Loading parts…' : (parts.length === 0 ? 'No parts in master — add one first' : '— Select part —'))}</span>`}
+        <span style="margin-left:auto;color:var(--slate-400);font-size:11px">▾</span>
+      </button>
+      ${open && html`
+        <div style="position:absolute;top:100%;left:0;right:0;margin-top:4px;background:white;border:1px solid var(--slate-200);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.08);max-height:280px;overflow-y:auto;z-index:50">
+          <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search part # / name / customer #…"
+            style="width:100%;padding:8px 10px;border:none;border-bottom:1px solid var(--slate-100);font-size:13px;outline:none;box-sizing:border-box" autoFocus />
+          ${allowClear && selected && html`
+            <button type="button" onClick=${() => pick(null)} style="width:100%;text-align:left;padding:8px 10px;background:transparent;border:none;border-bottom:1px solid var(--slate-100);color:var(--slate-500);font-size:12px;cursor:pointer">✕ Clear selection</button>
+          `}
+          ${filtered.length === 0 ? html`
+            <div style="padding:14px;text-align:center;color:var(--slate-500);font-size:12px">
+              ${parts.length === 0 ? 'No parts in master. Add parts in Production → Masters first.' : 'No matches.'}
+            </div>
+          ` : filtered.slice(0, 50).map(p => html`
+            <button type="button" key=${p.id} onClick=${() => pick(p)}
+              style="width:100%;text-align:left;padding:8px 10px;background:${p.id === value ? 'var(--teal-50)' : 'transparent'};border:none;border-bottom:1px solid var(--slate-100);cursor:pointer;font-size:13px;display:flex;flex-direction:column;gap:2px"
+              onMouseOver=${e => { if (p.id !== value) e.currentTarget.style.background = 'var(--slate-50)'; }}
+              onMouseOut=${e => { if (p.id !== value) e.currentTarget.style.background = 'transparent'; }}>
+              <div style="display:flex;gap:6px;align-items:center">
+                <span style="font-family:monospace;font-weight:600">${p.part_number}</span>
+                ${p.revision && html`<span style="font-size:10px;color:var(--slate-500)">Rev ${p.revision}</span>`}
+              </div>
+              <div style="color:var(--slate-600);font-size:12px">${p.name || ''}${p.customer_part_number ? html` <span style="color:var(--slate-400);margin-left:6px">· cust ${p.customer_part_number}</span>` : ''}</div>
+            </button>
+          `)}
+          ${filtered.length > 50 && html`<div style="padding:8px 10px;font-size:11px;color:var(--slate-500);text-align:center">${filtered.length - 50} more — keep typing to narrow</div>`}
+        </div>
+      `}
+    </div>
+  `;
+}
+
+// =================================================================
+// ENTRY ATTACHMENTS (photo upload · voice note recording · email ref)
+// =================================================================
+// Drops into any entry form. Stores into JSONB attachments column on
+// the parent row + a text email_ref. Uses chat-attachments bucket.
+function EntryAttachments({ plant, me, scope, value, onChange, showEmail = true }) {
+  const [busy, setBusy] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const fileRef = useRef(null);
+  const cameraRef = useRef(null);
+  const mediaRecRef = useRef(null);
+  const chunksRef = useRef([]);
+
+  const attachments = (value && value.attachments) || [];
+  const emailRef = (value && value.email_ref) || '';
+
+  const update = (newAttachments, newEmailRef) => {
+    onChange({
+      attachments: newAttachments !== undefined ? newAttachments : attachments,
+      email_ref: newEmailRef !== undefined ? newEmailRef : emailRef,
+    });
+  };
+
+  const uploadFile = async (file, kind) => {
+    setBusy(true);
+    try {
+      const baseName = (file.name || '').replace(/[^\w.\-]+/g, '_');
+      const ext = baseName.includes('.') ? baseName.split('.').pop() : (kind === 'voice' ? 'webm' : 'bin');
+      const path = (scope || 'entry') + '/' + plant.id + '/' + (crypto.randomUUID()) + '.' + ext;
+      const { error } = await sb.storage.from('chat-attachments').upload(path, file, {
+        contentType: file.type || 'application/octet-stream',
+        cacheControl: '3600',
+      });
+      if (error) throw error;
+      const { data: { publicUrl } } = sb.storage.from('chat-attachments').getPublicUrl(path);
+      update([...attachments, {
+        kind, url: publicUrl,
+        name: baseName || ('voice-' + Date.now() + '.' + ext),
+        size: file.size, content_type: file.type,
+      }]);
+    } catch (e) { alert('Upload failed: ' + e.message); }
+    finally { setBusy(false); }
+  };
+
+  const onFile = (e) => { const f = e.target.files?.[0]; if (f) uploadFile(f, 'photo'); e.target.value = ''; };
+
+  const startRec = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mr = new MediaRecorder(stream);
+      chunksRef.current = [];
+      mr.ondataavailable = (e) => chunksRef.current.push(e.data);
+      mr.onstop = async () => {
+        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
+        const file = new File([blob], 'voice-' + Date.now() + '.webm', { type: 'audio/webm' });
+        await uploadFile(file, 'voice');
+        stream.getTracks().forEach(t => t.stop());
+      };
+      mr.start();
+      mediaRecRef.current = mr;
+      setRecording(true);
+    } catch (e) { alert('Microphone access denied: ' + e.message); }
+  };
+  const stopRec = () => {
+    if (mediaRecRef.current && mediaRecRef.current.state !== 'inactive') {
+      mediaRecRef.current.stop();
+    }
+    setRecording(false);
+  };
+
+  const remove = (idx) => update(attachments.filter((_, i) => i !== idx));
+
+  return html`
+    <div style="background:var(--slate-50);border:1px solid var(--slate-200);border-radius:8px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">📎 Attachments</div>
+      ${attachments.length > 0 && html`
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+          ${attachments.map((a, idx) => html`
+            <div key=${idx} style="position:relative;border:1px solid var(--slate-200);border-radius:6px;padding:6px;background:white">
+              ${a.kind === 'photo' ? html`<a href=${a.url} target="_blank" rel="noopener"><img src=${a.url} style="max-width:80px;max-height:80px;display:block;border-radius:4px;object-fit:cover" /></a>` :
+                a.kind === 'voice' ? html`<audio controls src=${a.url} style="height:32px;max-width:220px"></audio>` :
+                html`<a href=${a.url} target="_blank" rel="noopener" style="font-size:11px">${a.name}</a>`}
+              <button type="button" onClick=${() => remove(idx)} title="Remove"
+                style="position:absolute;top:-6px;right:-6px;background:white;border:1px solid var(--rose-200);color:var(--rose-600);width:20px;height:20px;border-radius:10px;cursor:pointer;font-size:11px;line-height:18px;padding:0;font-weight:700">×</button>
+            </div>
+          `)}
+        </div>
+      `}
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+        <input type="file" ref=${fileRef} accept="image/*,application/pdf" onChange=${onFile} style="display:none" />
+        <input type="file" ref=${cameraRef} accept="image/*" capture="environment" onChange=${onFile} style="display:none" />
+        <button type="button" class="btn small ghost" onClick=${() => cameraRef.current?.click()} disabled=${busy} style="font-size:11px;padding:4px 10px">📷 Camera</button>
+        <button type="button" class="btn small ghost" onClick=${() => fileRef.current?.click()} disabled=${busy} style="font-size:11px;padding:4px 10px">🖼 Pick file</button>
+        ${recording ? html`
+          <button type="button" onClick=${stopRec} style="font-size:11px;padding:4px 10px;background:var(--rose-600);color:white;border:none;border-radius:5px;cursor:pointer">⏹ Stop · recording…</button>
+        ` : html`
+          <button type="button" class="btn small ghost" onClick=${startRec} disabled=${busy} style="font-size:11px;padding:4px 10px">🎙 Voice note</button>
+        `}
+        ${busy && html`<span style="font-size:11px;color:var(--slate-500)">Uploading…</span>`}
+      </div>
+      ${showEmail && html`
+        <div style="margin-top:10px">
+          <label style="font-size:11px;color:var(--slate-500);display:block;margin-bottom:3px">📧 Email reference (optional)</label>
+          <input type="text" value=${emailRef} onChange=${e => update(undefined, e.target.value)}
+            placeholder="Paste Gmail / Outlook link, thread URL, or message-ID"
+            style="width:100%;padding:6px 10px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px;font-family:monospace;box-sizing:border-box" />
+          ${emailRef && /^https?:\/\//.test(emailRef) && html`
+            <a href=${emailRef} target="_blank" rel="noopener" style="font-size:11px;color:var(--teal-700);margin-top:4px;display:inline-block">↗ Open linked email</a>
+          `}
+        </div>
+      `}
+    </div>
+  `;
+}
+
+// =================================================================
 // TPM MODULE (daily machine checks · oil, coolant, leaks, guards)
 // =================================================================
 // Default-to-OK pattern. Operator opens a machine's check, every item
@@ -11250,7 +11445,8 @@ function EntityTimeline({ entityType, entityId, plant, me, allowComments = true 
 function NcrModal({ plant, me, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget ? {...editTarget} : {
     title:'', description:'', severity:'minor', source:'manual',
-    part_number:'', qty_affected:'', root_cause:'', corrective_action:''
+    part_id: null, part_number:'', qty_affected:'', root_cause:'', corrective_action:'',
+    attachments: [], email_ref: '',
   });
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -11268,11 +11464,14 @@ function NcrModal({ plant, me, editTarget, onClose, onSaved }) {
         const updates = {
           title: form.title, description: form.description,
           severity: form.severity, status: form.status,
+          part_id: form.part_id || null,
           part_number: form.part_number || null,
           qty_affected: form.qty_affected ? parseInt(form.qty_affected) : null,
           root_cause: form.root_cause || null,
           corrective_action: form.corrective_action || null,
           assigned_to: form.assigned_to || null,
+          attachments: form.attachments || [],
+          email_ref: form.email_ref || null,
         };
         if (form.status === 'closed' && !editTarget.closed_at) {
           updates.closed_at = new Date().toISOString();
@@ -11282,7 +11481,6 @@ function NcrModal({ plant, me, editTarget, onClose, onSaved }) {
         if (error) throw error;
       } else {
         // ncr_number is auto-filled by the autogen_ncr_number trigger.
-        // Send null and the DB picks the next free per-plant suffix safely.
         const { error } = await sb.from('mcp_quality_ncrs').insert({
           plant_id: plant.id,
           source: form.source || 'manual',
@@ -11291,8 +11489,11 @@ function NcrModal({ plant, me, editTarget, onClose, onSaved }) {
           severity: form.severity,
           raised_by: me.id,
           assigned_to: form.assigned_to || null,
+          part_id: form.part_id || null,
           part_number: form.part_number || null,
           qty_affected: form.qty_affected ? parseInt(form.qty_affected) : null,
+          attachments: form.attachments || [],
+          email_ref: form.email_ref || null,
         });
         if (error) throw error;
       }
@@ -11313,8 +11514,12 @@ function NcrModal({ plant, me, editTarget, onClose, onSaved }) {
           <div class="field"><label>Title *</label><input type="text" required value=${form.title} onChange=${e => setForm({...form, title: e.target.value})} placeholder="Surface defect on filterhead" /></div>
           <div class="field"><label>Description</label><textarea rows=${3} value=${form.description || ''} onChange=${e => setForm({...form, description: e.target.value})}></textarea></div>
           <div class="field-row">
-            <div class="field"><label>Part Number</label><input type="text" value=${form.part_number || ''} onChange=${e => setForm({...form, part_number: e.target.value})} /></div>
-            <div class="field"><label>Qty Affected</label><input type="number" value=${form.qty_affected || ''} onChange=${e => setForm({...form, qty_affected: e.target.value})} /></div>
+            <div class="field" style="flex:2"><label>Part *</label>
+              <${PartPicker} plant=${plant} value=${form.part_id}
+                onChange=${(id, p) => setForm({...form, part_id: id, part_number: p ? p.part_number : null})}
+                placeholder="Pick from parts master" />
+            </div>
+            <div class="field" style="flex:1"><label>Qty Affected</label><input type="number" value=${form.qty_affected || ''} onChange=${e => setForm({...form, qty_affected: e.target.value})} /></div>
           </div>
           <div class="field"><label>Severity</label>
             <select value=${form.severity} onChange=${e => setForm({...form, severity: e.target.value})}>
@@ -11339,6 +11544,11 @@ function NcrModal({ plant, me, editTarget, onClose, onSaved }) {
             <div class="field"><label>Root Cause</label><textarea rows=${2} value=${form.root_cause || ''} onChange=${e => setForm({...form, root_cause: e.target.value})}></textarea></div>
             <div class="field"><label>Corrective Action</label><textarea rows=${2} value=${form.corrective_action || ''} onChange=${e => setForm({...form, corrective_action: e.target.value})}></textarea></div>
           `}
+          <div style="margin:10px 0">
+            <${EntryAttachments} plant=${plant} me=${me} scope="ncr"
+              value=${{ attachments: form.attachments || [], email_ref: form.email_ref || '' }}
+              onChange=${(v) => setForm({...form, attachments: v.attachments, email_ref: v.email_ref })} />
+          </div>
           <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update NCR' : 'Raise NCR')}</button>
         </form>
         ${editTarget && html`<${EntityTimeline} entityType="ncr" entityId=${editTarget.id} plant=${plant} me=${me} />`}
@@ -11438,6 +11648,8 @@ function BreakdownModal({ plant, me, machines, users, editTarget, onClose, onSav
     machine_id: machines[0]?.id || '',
     description: '',
     status: 'open',
+    attachments: [],
+    email_ref: '',
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -11452,6 +11664,8 @@ function BreakdownModal({ plant, me, machines, users, editTarget, onClose, onSav
           status: form.status,
           attended_by: form.attended_by || null,
           resolution_notes: form.resolution_notes || null,
+          attachments: form.attachments || [],
+          email_ref: form.email_ref || null,
         };
         if (form.status === 'attended' && !editTarget.attended_at) {
           updates.attended_at = new Date().toISOString();
@@ -11470,6 +11684,8 @@ function BreakdownModal({ plant, me, machines, users, editTarget, onClose, onSav
           description: form.description,
           reported_by: me.id,
           status: 'open',
+          attachments: form.attachments || [],
+          email_ref: form.email_ref || null,
         });
         if (error) throw error;
       }
@@ -11508,6 +11724,11 @@ function BreakdownModal({ plant, me, machines, users, editTarget, onClose, onSav
             </div>
             <div class="field"><label>Resolution Notes</label><textarea rows=${2} value=${form.resolution_notes || ''} onChange=${e => setForm({...form, resolution_notes: e.target.value})}></textarea></div>
           `}
+          <div style="margin:10px 0">
+            <${EntryAttachments} plant=${plant} me=${me} scope="breakdown"
+              value=${{ attachments: form.attachments || [], email_ref: form.email_ref || '' }}
+              onChange=${(v) => setForm({...form, attachments: v.attachments, email_ref: v.email_ref })} />
+          </div>
           <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Report')}</button>
         </form>
         ${editTarget && html`<${EntityTimeline} entityType="breakdown" entityId=${editTarget.id} plant=${plant} me=${me} />`}
