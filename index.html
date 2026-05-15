@@ -1054,6 +1054,8 @@ const MORE_GROUPS = [
       { key:'actions',  icon:'✓',  label:'Action Hub',          sub:'All open commitments, owners, due dates' },
       { key:'npd',      icon:'🧪', label:'NPD Projects (APQP)', sub:'RFQ → SOP lifecycle, PPAP auto-feed, commercials' },
       { key:'ppap',     icon:'📑', label:'PPAP Submissions',    sub:'Part approval status (IATF 8.3.4.4)' },
+      { key:'customer_complaints', icon:'📞', label:'Customer Complaints', sub:'Closure workflow · 8D · email reference · customer signoff' },
+      { key:'mom',      icon:'📝', label:'MOM (Minutes of Meeting)', sub:'Internal / customer / supplier · action items auto-task' },
       { key:'iap',      icon:'🗓', label:'Internal Audit Plan', sub:'Annual schedule + auditor assignments (IATF 9.2.2)' },
     ],
   },
@@ -1166,6 +1168,8 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'tpm'}><${TpmModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'rejection_types'}><${RejectionTypesModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'iatf_docs'}><${IatfDocsLibrary} /></${Page}>
+      <${Page} active=${tab === 'mom'}><${MomModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
 
       <div class="tabbar">
@@ -1173,7 +1177,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr','scl','iap','pm_schedule','quality_objectives','risk_register','contingency','npd','tpm','rejection_types','iatf_docs'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr','scl','iap','pm_schedule','quality_objectives','risk_register','contingency','npd','tpm','rejection_types','iatf_docs','mom','customer_complaints'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
 
       ${/* Logi chatbot + Siri voice agent hidden per user request. Components
@@ -8168,6 +8172,544 @@ function RejectionBreakdown({ plant, stage, value, onChange }) {
         `}
       </div>
     </div>
+  `;
+}
+
+// =================================================================
+// MOM MODULE (Minutes of Meeting · internal / customer / supplier)
+// =================================================================
+function MomModule({ plant, me }) {
+  const [view, setView] = useState('list');
+  const [meetings, setMeetings] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState('all');
+  const [active, setActive] = useState(null);
+  const [createOpen, setCreateOpen] = useState(false);
+
+  const refresh = async () => {
+    setLoading(true);
+    const [m, u] = await Promise.all([
+      sb.from('mcp_mom_meetings').select('*').eq('plant_id', plant.id).order('meeting_date', { ascending:false }).limit(200),
+      sb.from('users').select('id, full_name, role').eq('plant_id', plant.id).order('full_name'),
+    ]);
+    setMeetings(m.data || []); setUsers(u.data || []); setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [plant.id]);
+  useEffect(() => {
+    const ch = sb.channel('mom-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_mom_meetings', filter:'plant_id=eq.' + plant.id }, () => refresh()).subscribe();
+    return () => sb.removeChannel(ch);
+  }, [plant.id]);
+
+  if (active) return html`<${MomDetail} plant=${plant} me=${me} meeting=${active} users=${users} onClose=${() => { setActive(null); refresh(); }} />`;
+
+  const visible = meetings.filter(m => filter === 'all' || m.meeting_type === filter);
+  const counts = {
+    all: meetings.length,
+    internal: meetings.filter(m => m.meeting_type === 'internal').length,
+    customer: meetings.filter(m => m.meeting_type === 'customer').length,
+    supplier: meetings.filter(m => m.meeting_type === 'supplier').length,
+  };
+  const emoji = (t) => t === 'customer' ? '🤝' : t === 'supplier' ? '🛒' : '🏛';
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap">
+      <div><h1>📝 MOM (Minutes of Meeting)</h1><div class="sub">Internal · customer · supplier meetings · action items auto-create tasks</div></div>
+      <button class="btn small" onClick=${() => setCreateOpen(true)}>+ New MOM</button>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px;flex-wrap:wrap">
+      <button class=${'auth-tab' + (filter==='all'?' active':'')} onClick=${() => setFilter('all')}>All · ${counts.all}</button>
+      <button class=${'auth-tab' + (filter==='internal'?' active':'')} onClick=${() => setFilter('internal')}>🏛 Internal · ${counts.internal}</button>
+      <button class=${'auth-tab' + (filter==='customer'?' active':'')} onClick=${() => setFilter('customer')}>🤝 Customer · ${counts.customer}</button>
+      <button class=${'auth-tab' + (filter==='supplier'?' active':'')} onClick=${() => setFilter('supplier')}>🛒 Supplier · ${counts.supplier}</button>
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      visible.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📝</div><div style="font-size:13px">No meetings yet. Tap + New MOM to record one.</div></div></div>` :
+      visible.map(m => html`
+        <div class="card" key=${m.id} onClick=${() => setActive(m)} style="cursor:pointer;margin-bottom:6px;padding:10px 12px">
+          <div style="display:flex;align-items:flex-start;gap:8px">
+            <div style="flex:1">
+              <div style="font-size:11px;color:var(--slate-500);font-weight:600">${m.mom_no || ''} · ${m.meeting_date}${m.meeting_time ? ' ' + m.meeting_time.slice(0,5) : ''}</div>
+              <div style="font-size:14px;font-weight:600;margin-top:2px">${emoji(m.meeting_type)} ${m.subject}</div>
+              ${m.external_org_name && html`<div style="font-size:11px;color:var(--slate-600);margin-top:2px">with ${m.external_org_name}</div>`}
+            </div>
+            <span class=${'badge ' + (m.status==='closed'?'emerald':m.status==='published'?'teal':'amber')} style="font-size:10px">${m.status}</span>
+          </div>
+        </div>
+      `)
+    }
+
+    ${createOpen && html`<${MomCreateModal} plant=${plant} me=${me} users=${users} onClose=${() => setCreateOpen(false)} onSaved=${(id) => { setCreateOpen(false); refresh().then(() => { const found = meetings.find(x => x.id === id); if (found) setActive(found); }); }} />`}
+  `;
+}
+
+function MomCreateModal({ plant, me, users, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    meeting_type: 'internal', subject: '',
+    meeting_date: new Date().toISOString().slice(0,10),
+    meeting_time: '', duration_minutes: '',
+    location: '', external_org_name: '',
+    chairperson_user_id: me.id,
+    internal_attendees: [me.id],
+    agenda: '', email_ref: '',
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const toggleAttendee = (uid) => {
+    setForm(f => ({ ...f, internal_attendees: f.internal_attendees.includes(uid) ? f.internal_attendees.filter(x => x !== uid) : [...f.internal_attendees, uid] }));
+  };
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      const { data, error } = await sb.from('mcp_mom_meetings').insert({
+        plant_id: plant.id, meeting_type: form.meeting_type, subject: form.subject.trim(),
+        meeting_date: form.meeting_date, meeting_time: form.meeting_time || null,
+        duration_minutes: form.duration_minutes ? parseInt(form.duration_minutes) : null,
+        location: form.location || null,
+        external_org_name: ['customer','supplier'].includes(form.meeting_type) ? (form.external_org_name || null) : null,
+        chairperson_user_id: form.chairperson_user_id || me.id,
+        internal_attendees: form.internal_attendees,
+        agenda: form.agenda || null,
+        email_ref: form.email_ref || null,
+        created_by: me.id,
+      }).select('id').single();
+      if (error) throw error;
+      showToast('📝 MOM created');
+      onSaved(data.id);
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target===e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">New MOM</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Meeting type *</label>
+            <select value=${form.meeting_type} onChange=${e => setForm({...form, meeting_type: e.target.value})}>
+              <option value="internal">🏛 Internal</option>
+              <option value="customer">🤝 Customer</option>
+              <option value="supplier">🛒 Supplier</option>
+            </select>
+          </div>
+          ${['customer','supplier'].includes(form.meeting_type) && html`
+            <div class="field"><label>${form.meeting_type === 'customer' ? 'Customer' : 'Supplier'} organisation *</label>
+              <input type="text" required value=${form.external_org_name} onChange=${e => setForm({...form, external_org_name: e.target.value})} placeholder=${form.meeting_type === 'customer' ? 'Bosch / Simpson / ROOP …' : 'Vendor name'} />
+            </div>
+          `}
+          <div class="field"><label>Subject *</label><input type="text" required value=${form.subject} onChange=${e => setForm({...form, subject: e.target.value})} placeholder="Weekly quality review · 8D for porosity · Audit planning" /></div>
+          <div class="field-row">
+            <div class="field"><label>Date *</label><input type="date" required value=${form.meeting_date} onChange=${e => setForm({...form, meeting_date: e.target.value})} /></div>
+            <div class="field"><label>Time</label><input type="time" value=${form.meeting_time} onChange=${e => setForm({...form, meeting_time: e.target.value})} /></div>
+            <div class="field"><label>Duration (min)</label><input type="number" min=${0} value=${form.duration_minutes} onChange=${e => setForm({...form, duration_minutes: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Location</label><input type="text" value=${form.location} onChange=${e => setForm({...form, location: e.target.value})} placeholder="Conference room / Zoom link" /></div>
+          <div class="field"><label>Chairperson</label>
+            <select value=${form.chairperson_user_id} onChange=${e => setForm({...form, chairperson_user_id: e.target.value})}>
+              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + u.role : ''}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Internal attendees · tap to add/remove</label>
+            <div style="display:flex;flex-wrap:wrap;gap:6px;padding:6px 0">
+              ${users.map(u => {
+                const sel = form.internal_attendees.includes(u.id);
+                return html`<button type="button" key=${u.id} onClick=${() => toggleAttendee(u.id)}
+                  style=${'padding:4px 10px;font-size:11px;border:1px solid '+(sel?'var(--teal-600)':'var(--slate-200)')+';background:'+(sel?'var(--teal-50)':'white')+';color:'+(sel?'var(--teal-700)':'var(--slate-700)')+';border-radius:5px;cursor:pointer;font-weight:'+(sel?'600':'500')}>${sel?'✓ ':''}${u.full_name}</button>`;
+              })}
+            </div>
+          </div>
+          <div class="field"><label>Agenda</label><textarea rows=${3} value=${form.agenda} onChange=${e => setForm({...form, agenda: e.target.value})} placeholder="Bullet points / topics"></textarea></div>
+          <div class="field"><label>📧 Email reference (optional)</label><input type="text" value=${form.email_ref} onChange=${e => setForm({...form, email_ref: e.target.value})} placeholder="Paste Gmail / Outlook thread link" style="font-family:monospace" /></div>
+          <button class="btn" disabled=${busy || !form.subject.trim()}>${busy ? 'Saving…' : 'Create MOM'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
+  const [m, setM] = useState(initialMeeting);
+  const [actionItems, setActionItems] = useState([]);
+  const [newAction, setNewAction] = useState({ description: '', owner_user_id: '', due_date: '' });
+  const [editingMinutes, setEditingMinutes] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    const [a, b] = await Promise.all([
+      sb.from('mcp_mom_meetings').select('*').eq('id', m.id).maybeSingle(),
+      sb.from('mcp_mom_action_items').select('*, owner:owner_user_id(full_name), action:action_id(status,due_at)').eq('meeting_id', m.id).order('ord'),
+    ]);
+    if (a.data) setM(a.data);
+    setActionItems(b.data || []);
+  };
+  useEffect(() => { refresh(); }, [m.id]);
+
+  const update = async (patch) => {
+    setBusy(true);
+    try {
+      const { data, error } = await sb.from('mcp_mom_meetings').update(patch).eq('id', m.id).select('*').single();
+      if (error) throw error;
+      setM(data); showToast('Saved');
+    } catch (e) { alert(e.message); } finally { setBusy(false); }
+  };
+
+  const addAction = async () => {
+    if (!newAction.description.trim()) return;
+    setBusy(true);
+    try {
+      const ord = actionItems.length > 0 ? Math.max(...actionItems.map(a => a.ord)) + 1 : 1;
+      const { error } = await sb.from('mcp_mom_action_items').insert({
+        plant_id: plant.id, meeting_id: m.id, ord,
+        description: newAction.description.trim(),
+        owner_user_id: newAction.owner_user_id || null,
+        due_date: newAction.due_date || null,
+      });
+      if (error) throw error;
+      setNewAction({ description: '', owner_user_id: '', due_date: '' });
+      refresh();
+    } catch (e) { alert(e.message); } finally { setBusy(false); }
+  };
+
+  const removeAction = async (id) => {
+    if (!confirm('Remove this action item?')) return;
+    await sb.from('mcp_mom_action_items').delete().eq('id', id);
+    refresh();
+  };
+
+  const emoji = m.meeting_type === 'customer' ? '🤝' : m.meeting_type === 'supplier' ? '🛒' : '🏛';
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:160px">
+        <h1 style="font-size:18px">${emoji} ${m.subject}</h1>
+        <div class="sub">${m.mom_no} · ${m.meeting_date} ${m.external_org_name ? ' · ' + m.external_org_name : ''}</div>
+      </div>
+      <select value=${m.status} onChange=${e => update({ status: e.target.value })} disabled=${busy} style="padding:5px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px">
+        <option value="draft">Draft</option><option value="published">Published</option><option value="closed">Closed</option>
+      </select>
+    </div>
+
+    <div class="card">
+      ${m.agenda && html`<div class="card-row"><span class="label">Agenda</span><span class="value" style="white-space:pre-wrap">${m.agenda}</span></div>`}
+      ${m.email_ref && html`<div class="card-row"><span class="label">Email</span><span class="value" style="font-size:11px;word-break:break-all">${/^https?:\/\//.test(m.email_ref) ? html`<a href=${m.email_ref} target="_blank" rel="noopener">↗ Open thread</a>` : m.email_ref}</span></div>`}
+    </div>
+
+    <div class="section-h" style="display:flex;align-items:center;gap:8px"><span style="flex:1">Minutes / Discussion</span>
+      <button class="btn small ghost" onClick=${() => setEditingMinutes(!editingMinutes)} style="font-size:11px">${editingMinutes ? 'Done' : '✎ Edit'}</button>
+    </div>
+    ${editingMinutes ? html`
+      <textarea rows=${6} value=${m.minutes || ''} onChange=${e => setM({...m, minutes: e.target.value})} onBlur=${() => update({ minutes: m.minutes || null })} style="width:100%;padding:10px;font-size:13px;border:1px solid var(--slate-200);border-radius:6px;box-sizing:border-box" placeholder="Discussion notes, points raised, decisions taken…"></textarea>
+    ` : html`
+      <div class="card" style="white-space:pre-wrap;min-height:60px;color:${m.minutes ? 'var(--slate-800)' : 'var(--slate-400)'}">${m.minutes || 'Tap ✎ Edit to add minutes.'}</div>
+    `}
+
+    <div class="section-h">Action items · ${actionItems.length}</div>
+    ${actionItems.map(a => html`
+      <div class="card" key=${a.id} style="margin-bottom:6px;padding:10px 12px">
+        <div style="display:flex;align-items:flex-start;gap:8px">
+          <div style="flex:1">
+            <div style="font-size:13px;font-weight:500">${a.ord}. ${a.description}</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+              ${a.owner ? '👤 ' + a.owner.full_name : (a.owner_external_name ? '👤 ' + a.owner_external_name : '— unassigned —')}
+              ${a.due_date ? ' · 📅 ' + a.due_date : ''}
+              ${a.action_id ? html` · <span class="badge teal" style="font-size:9px">📌 task created</span>` : ''}
+            </div>
+          </div>
+          <button class="btn small danger" onClick=${() => removeAction(a.id)} style="padding:2px 8px;font-size:11px">×</button>
+        </div>
+      </div>
+    `)}
+
+    <div class="card" style="margin-top:8px;background:var(--teal-50);border-color:var(--teal-200)">
+      <div class="card-title">+ Add action item</div>
+      <div class="field"><label>Description *</label><input type="text" value=${newAction.description} onChange=${e => setNewAction({...newAction, description: e.target.value})} placeholder="What needs to be done?" /></div>
+      <div class="field-row">
+        <div class="field"><label>Owner</label>
+          <select value=${newAction.owner_user_id} onChange=${e => setNewAction({...newAction, owner_user_id: e.target.value})}>
+            <option value="">— Pick owner —</option>
+            ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+          </select>
+        </div>
+        <div class="field"><label>Due date</label><input type="date" value=${newAction.due_date} onChange=${e => setNewAction({...newAction, due_date: e.target.value})} /></div>
+      </div>
+      <button class="btn small" onClick=${addAction} disabled=${busy || !newAction.description.trim()}>+ Add</button>
+      <p style="font-size:11px;color:var(--slate-500);margin:6px 0 0">Assigning an internal owner auto-creates a task in their Action Hub with the meeting context.</p>
+    </div>
+  `;
+}
+
+// =================================================================
+// CUSTOMER COMPLAINTS MODULE
+// =================================================================
+const COMPLAINT_STATUSES = [
+  { key:'open',              label:'Open',              emoji:'🆕' },
+  { key:'containment',       label:'Containment',       emoji:'🛡' },
+  { key:'investigation',     label:'Investigation',     emoji:'🔍' },
+  { key:'corrective_action', label:'Corrective action', emoji:'🔧' },
+  { key:'customer_review',   label:'Customer review',   emoji:'👀' },
+  { key:'closed',            label:'Closed',            emoji:'✅' },
+  { key:'cancelled',         label:'Cancelled',         emoji:'❌' },
+];
+
+function CustomerComplaintsModule({ plant, me }) {
+  const [list, setList] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState('open');
+  const [severity, setSeverity] = useState('all');
+  const [active, setActive] = useState(null);
+  const [createOpen, setCreateOpen] = useState(false);
+
+  const refresh = async () => {
+    setLoading(true);
+    const [c, cu, u] = await Promise.all([
+      sb.from('mcp_customer_complaints').select('*').eq('plant_id', plant.id).order('complaint_date', { ascending:false }).limit(200),
+      sb.from('mcp_sched_customers').select('id, name, short_code').eq('plant_id', plant.id).order('name'),
+      sb.from('users').select('id, full_name, role').eq('plant_id', plant.id).order('full_name'),
+    ]);
+    setList(c.data || []); setCustomers(cu.data || []); setUsers(u.data || []); setLoading(false);
+  };
+  useEffect(() => { refresh(); }, [plant.id]);
+  useEffect(() => {
+    const ch = sb.channel('cc-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_customer_complaints', filter:'plant_id=eq.' + plant.id }, () => refresh()).subscribe();
+    return () => sb.removeChannel(ch);
+  }, [plant.id]);
+
+  if (active) return html`<${ComplaintDetail} plant=${plant} me=${me} complaint=${active} customers=${customers} users=${users} onClose=${() => { setActive(null); refresh(); }} />`;
+
+  const visible = list
+    .filter(c => filter === 'all' ? true : filter === 'open' ? !['closed','cancelled'].includes(c.status) : c.status === filter)
+    .filter(c => severity === 'all' ? true : c.severity === severity);
+
+  const counts = {
+    open: list.filter(c => !['closed','cancelled'].includes(c.status)).length,
+    closed: list.filter(c => c.status === 'closed').length,
+    all: list.length,
+    critical: list.filter(c => c.severity === 'critical' && !['closed','cancelled'].includes(c.status)).length,
+  };
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap">
+      <div><h1>📞 Customer Complaints</h1><div class="sub">Containment → root cause → corrective → customer signoff · email-linked · 8D ready</div></div>
+      <button class="btn small" onClick=${() => setCreateOpen(true)}>+ Raise complaint</button>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:10px;flex-wrap:wrap">
+      <button class=${'auth-tab' + (filter==='open'?' active':'')} onClick=${() => setFilter('open')}>Open · ${counts.open}</button>
+      <button class=${'auth-tab' + (filter==='closed'?' active':'')} onClick=${() => setFilter('closed')}>Closed · ${counts.closed}</button>
+      <button class=${'auth-tab' + (filter==='all'?' active':'')} onClick=${() => setFilter('all')}>All · ${counts.all}</button>
+      ${counts.critical > 0 && html`<button class=${'auth-tab' + (severity==='critical'?' active':'')} onClick=${() => setSeverity(severity==='critical'?'all':'critical')} style="color:var(--rose-600)">⚠ Critical · ${counts.critical}</button>`}
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      visible.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📞</div><div style="font-size:13px">Nothing matches.</div></div></div>` :
+      visible.map(c => {
+        const cust = customers.find(x => x.id === c.customer_id);
+        const st = COMPLAINT_STATUSES.find(s => s.key === c.status) || { emoji:'·', label:c.status };
+        return html`
+          <div class="card" key=${c.id} onClick=${() => setActive(c)} style="cursor:pointer;margin-bottom:6px;padding:10px 12px;${c.severity==='critical'?'background:var(--rose-50);border-color:var(--rose-200)':''}">
+            <div style="display:flex;align-items:flex-start;gap:8px">
+              <div style="flex:1">
+                <div style="font-size:11px;color:var(--slate-500);font-weight:600">${c.complaint_no} · ${c.complaint_date}</div>
+                <div style="font-size:14px;font-weight:600;margin-top:2px">${cust ? cust.name : (c.customer_name_raw || '?')}${c.part_number_raw ? ' · ' + c.part_number_raw : ''}</div>
+                <div style="font-size:12px;color:var(--slate-600);margin-top:2px">${(c.description || '').slice(0, 100)}${(c.description || '').length > 100 ? '…' : ''}</div>
+              </div>
+              <div style="text-align:right;display:flex;flex-direction:column;gap:3px;align-items:flex-end">
+                <span class=${'badge ' + (c.severity==='critical'?'rose':c.severity==='major'?'amber':'')} style="font-size:10px">${c.severity}</span>
+                <span class="badge teal" style="font-size:10px">${st.emoji} ${st.label}</span>
+              </div>
+            </div>
+          </div>
+        `;
+      })
+    }
+
+    ${createOpen && html`<${ComplaintCreateModal} plant=${plant} me=${me} customers=${customers} users=${users} onClose=${() => setCreateOpen(false)} onSaved=${(id) => { setCreateOpen(false); refresh().then(() => { const found = list.find(x => x.id === id); if (found) setActive(found); }); }} />`}
+  `;
+}
+
+function ComplaintCreateModal({ plant, me, customers, users, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    customer_id: '', customer_name_raw: '',
+    part_id: null, part_number_raw: '',
+    qty_affected: '', complaint_date: new Date().toISOString().slice(0,10),
+    channel: 'email', email_ref: '',
+    severity: 'minor', description: '',
+    assigned_to: me.id,
+    attachments: [], email_ref_attach: '',
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      const { data, error } = await sb.from('mcp_customer_complaints').insert({
+        plant_id: plant.id,
+        customer_id: form.customer_id || null,
+        customer_name_raw: form.customer_id ? null : (form.customer_name_raw || null),
+        part_id: form.part_id || null,
+        part_number_raw: form.part_number_raw || null,
+        qty_affected: form.qty_affected ? parseInt(form.qty_affected) : null,
+        complaint_date: form.complaint_date,
+        channel: form.channel,
+        email_ref: form.email_ref || null,
+        severity: form.severity,
+        description: form.description.trim(),
+        assigned_to: form.assigned_to || me.id,
+        attachments: form.attachments || [],
+        created_by: me.id, status: 'open',
+      }).select('id').single();
+      if (error) throw error;
+      showToast('📞 Complaint raised · task assigned');
+      onSaved(data.id);
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target===e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">Raise customer complaint</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Customer *</label>
+            <select value=${form.customer_id} onChange=${e => setForm({...form, customer_id: e.target.value, customer_name_raw: ''})}>
+              <option value="">— Pick or type below —</option>
+              ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.short_code ? ' · ' + c.short_code : ''}</option>`)}
+            </select>
+            ${!form.customer_id && html`<input type="text" value=${form.customer_name_raw} onChange=${e => setForm({...form, customer_name_raw: e.target.value})} placeholder="Or type customer name" style="margin-top:6px" />`}
+          </div>
+          <div class="field"><label>Part</label>
+            <${PartPicker} plant=${plant} value=${form.part_id} onChange=${(id, p) => setForm({...form, part_id: id, part_number_raw: p ? p.part_number : form.part_number_raw})} placeholder="— Pick part (optional) —" />
+            ${!form.part_id && html`<input type="text" value=${form.part_number_raw} onChange=${e => setForm({...form, part_number_raw: e.target.value})} placeholder="Or type customer part number" style="margin-top:6px;font-family:monospace" />`}
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Qty affected</label><input type="number" min=${0} value=${form.qty_affected} onChange=${e => setForm({...form, qty_affected: e.target.value})} /></div>
+            <div class="field"><label>Complaint date *</label><input type="date" required value=${form.complaint_date} onChange=${e => setForm({...form, complaint_date: e.target.value})} /></div>
+            <div class="field"><label>Severity</label>
+              <select value=${form.severity} onChange=${e => setForm({...form, severity: e.target.value})}>
+                <option value="minor">Minor</option><option value="major">Major</option><option value="critical">Critical</option>
+              </select>
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Channel</label>
+              <select value=${form.channel} onChange=${e => setForm({...form, channel: e.target.value})}>
+                <option value="email">Email</option><option value="phone">Phone</option><option value="portal">Customer portal</option><option value="audit">Audit</option><option value="meeting">Meeting</option><option value="other">Other</option>
+              </select>
+            </div>
+            <div class="field"><label>Assigned to</label>
+              <select value=${form.assigned_to} onChange=${e => setForm({...form, assigned_to: e.target.value})}>
+                ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Description *</label><textarea required rows=${3} value=${form.description} onChange=${e => setForm({...form, description: e.target.value})} placeholder="What did the customer report?"></textarea></div>
+          <div class="field"><label>📧 Email reference</label><input type="text" value=${form.email_ref} onChange=${e => setForm({...form, email_ref: e.target.value})} placeholder="Paste Gmail / Outlook thread URL or message-ID" style="font-family:monospace" /></div>
+          <button class="btn" disabled=${busy || !form.description.trim() || (!form.customer_id && !form.customer_name_raw)}>${busy ? 'Raising…' : 'Raise complaint'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function ComplaintDetail({ plant, me, complaint: initialC, customers, users, onClose }) {
+  const [c, setC] = useState(initialC);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    const { data } = await sb.from('mcp_customer_complaints').select('*').eq('id', c.id).maybeSingle();
+    if (data) setC(data);
+  };
+  useEffect(() => { refresh(); }, [c.id]);
+
+  const update = async (patch) => {
+    setBusy(true);
+    try {
+      const { data, error } = await sb.from('mcp_customer_complaints').update(patch).eq('id', c.id).select('*').single();
+      if (error) throw error;
+      setC(data); showToast('Saved');
+    } catch (e) { alert(e.message); } finally { setBusy(false); }
+  };
+
+  const close = async () => {
+    const customer_signoff_by_name = prompt('Customer signoff person name (the customer rep who accepted closure):', '');
+    if (customer_signoff_by_name === null) return;
+    await update({
+      status: 'closed',
+      customer_signoff_at: new Date().toISOString(),
+      customer_signoff_by_name: customer_signoff_by_name || null,
+      closed_at: new Date().toISOString(),
+      closed_by: me.id,
+    });
+  };
+
+  const cust = customers.find(x => x.id === c.customer_id);
+  const owner = users.find(u => u.id === c.assigned_to);
+  const st = COMPLAINT_STATUSES.find(s => s.key === c.status) || { emoji:'·', label:c.status };
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:160px">
+        <h1 style="font-size:18px">📞 ${c.complaint_no}</h1>
+        <div class="sub">${cust ? cust.name : (c.customer_name_raw || '?')} · ${c.complaint_date}${c.part_number_raw ? ' · ' + c.part_number_raw : ''}</div>
+      </div>
+      <select value=${c.status} onChange=${e => update({ status: e.target.value })} disabled=${busy || c.status==='closed'} style="padding:5px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px">
+        ${COMPLAINT_STATUSES.map(s => html`<option key=${s.key} value=${s.key}>${s.emoji} ${s.label}</option>`)}
+      </select>
+    </div>
+
+    <div class="card">
+      <div class="card-row"><span class="label">Severity</span><span class="value"><span class=${'badge ' + (c.severity==='critical'?'rose':c.severity==='major'?'amber':'')}>${c.severity}</span></span></div>
+      <div class="card-row"><span class="label">Channel</span><span class="value">${c.channel || '—'}</span></div>
+      ${c.qty_affected && html`<div class="card-row"><span class="label">Qty affected</span><span class="value">${c.qty_affected}</span></div>`}
+      ${owner && html`<div class="card-row"><span class="label">Assigned to</span><span class="value">${owner.full_name}</span></div>`}
+      ${c.email_ref && html`<div class="card-row"><span class="label">📧 Email</span><span class="value" style="word-break:break-all;font-size:11px">${/^https?:\/\//.test(c.email_ref) ? html`<a href=${c.email_ref} target="_blank" rel="noopener">↗ Open thread</a>` : c.email_ref}</span></div>`}
+    </div>
+
+    <div class="section-h">Customer description</div>
+    <div class="card" style="white-space:pre-wrap">${c.description}</div>
+
+    <div class="section-h">Closure workflow</div>
+    ${[
+      { key:'containment_action', label:'🛡 Containment action', placeholder:'Sort, isolate, sub-contract sort, customer notice…', done:'containment_done_at' },
+      { key:'root_cause',         label:'🔍 Root cause',         placeholder:'5-why, Ishikawa, what proved it' },
+      { key:'corrective_action',  label:'🔧 Corrective action',  placeholder:'Permanent fix · who · by when' },
+      { key:'preventive_action',  label:'🚧 Preventive action',  placeholder:'Stop it happening on similar parts' },
+      { key:'eight_d_url',        label:'📄 8D report URL',      placeholder:'Link to signed 8D pdf', input:true },
+    ].map(f => html`
+      <div class="card" key=${f.key} style="margin-bottom:6px;padding:10px 12px">
+        <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px">${f.label}</div>
+        ${f.input ? html`
+          <input type="text" value=${c[f.key] || ''} onChange=${e => setC({...c, [f.key]: e.target.value})} onBlur=${() => update({ [f.key]: c[f.key] || null })} placeholder=${f.placeholder} style="width:100%;padding:6px 10px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px;box-sizing:border-box" />
+        ` : html`
+          <textarea rows=${2} value=${c[f.key] || ''} onChange=${e => setC({...c, [f.key]: e.target.value})} onBlur=${() => update({ [f.key]: c[f.key] || null })} placeholder=${f.placeholder} style="width:100%;padding:6px 10px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px;box-sizing:border-box;font-family:inherit"></textarea>
+        `}
+      </div>
+    `)}
+
+    ${c.status !== 'closed' && html`
+      <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);margin-top:12px;padding:12px 14px">
+        <div style="font-size:13px;font-weight:600;color:var(--emerald-800);margin-bottom:6px">Ready to close?</div>
+        <p style="font-size:12px;color:var(--emerald-700);margin:0 0 8px">All 4 sections filled + customer accepted? Tap to record signoff and close.</p>
+        <button class="btn small" onClick=${close} disabled=${busy}>✅ Close with customer signoff</button>
+      </div>
+    `}
+    ${c.status === 'closed' && html`
+      <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);margin-top:12px;padding:12px 14px">
+        <div style="font-size:13px;font-weight:600;color:var(--emerald-800)">✅ Closed on ${new Date(c.closed_at).toLocaleString('en-IN')}</div>
+        ${c.customer_signoff_by_name && html`<div style="font-size:12px;color:var(--emerald-700);margin-top:2px">Customer signoff: ${c.customer_signoff_by_name}</div>`}
+      </div>
+    `}
   `;
 }
 
