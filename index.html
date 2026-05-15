@@ -1037,6 +1037,7 @@ const MORE_GROUPS = [
       { key:'maintenance',   icon:'🔧', label:'Maintenance',          sub:'Breakdowns log, machine status' },
       { key:'stocks',        icon:'📦', label:'Stocks',               sub:'Inventory, items, in/out transactions' },
       { key:'jobwork',       icon:'🏭', label:'Sub-Contracting',      sub:'Send / receive parts at job-work vendors · 180-day GST clock' },
+      { key:'supplier_chase',icon:'🛒', label:'Supplier Chase',       sub:'Raw material runway vs upcoming schedule · auto-alerts which vendor to chase' },
       { key:'documents',     icon:'📄', label:'Documents · Bills',    sub:'OCR invoices/DCs, payments, vendors' },
       { key:'movements',     icon:'🔀', label:'Movements',            sub:'In/out material flow, GRN verification' },
       { key:'schedules',     icon:'📅', label:'Customer Schedules',   sub:'Plan vs actual, weekly supplies, AI extract' },
@@ -1172,6 +1173,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'mom'}><${MomModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
 
       <div class="tabbar">
@@ -1417,6 +1419,7 @@ function Home({ plant, me, setTab, reload }) {
 
       <div class="dashboard-col-side">
         <${TopConcernsCard} plant=${plant} setTab=${setTab} />
+        <${SupplierChaseBanner} plant=${plant} setTab=${setTab} />
         <${MaterialBurnRateCard} plant=${plant} setTab=${setTab} />
         <${StageLagCard} plant=${plant} me=${me} setTab=${setTab} />
         <${StockAlerts} plant=${plant} setTab=${setTab} />
@@ -5186,6 +5189,39 @@ function TopConcernsCard({ plant, setTab }) {
   `;
 }
 
+function SupplierChaseBanner({ plant, setTab }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!plant?.id) return;
+    sb.from('v_raw_material_runway').select('*').eq('plant_id', plant.id).in('severity', ['critical','high'])
+      .then(({ data }) => { setRows(data || []); setLoading(false); });
+  }, [plant?.id]);
+
+  if (loading || rows.length === 0) return null;
+  const top = rows.slice().sort((a,b) => (a.severity === 'critical' ? -1 : 1) - (b.severity === 'critical' ? -1 : 1)).slice(0, 3);
+  const critCount = rows.filter(r => r.severity === 'critical').length;
+
+  return html`
+    <div class="card" style=${'margin-bottom:12px;padding:10px 12px;border-left:3px solid '+(critCount>0?'var(--rose-500)':'var(--amber-500)')+';cursor:pointer'} onClick=${() => setTab('supplier_chase')}>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px">
+        <div style="font-size:11px;font-weight:700;color:${critCount>0?'var(--rose-600)':'var(--amber-700)'};text-transform:uppercase;letter-spacing:0.5px">
+          ${critCount>0?'🚨 ':'⚠️ '}Suppliers to chase · ${rows.length}
+        </div>
+        <span style="font-size:11px;color:var(--slate-500)">→</span>
+      </div>
+      ${top.map(r => html`
+        <div key=${r.stock_item_id} style="font-size:11px;color:var(--slate-700);margin-bottom:3px">
+          <strong>${r.item_name}</strong>${r.suggested_vendor_name?' · chase '+r.suggested_vendor_name:''}
+          <span style="color:var(--slate-500)"> · need ${fmtNum(r.demand_7d)}${r.uom?' '+r.uom:''}, have ${fmtNum(r.current_qty)}</span>
+        </div>
+      `)}
+      ${rows.length > 3 && html`<div style="font-size:11px;color:var(--slate-500);margin-top:3px">+${rows.length-3} more · tap to view all</div>`}
+    </div>
+  `;
+}
+
 function StockAlerts({ plant, setTab }) {
   const [alerts, setAlerts] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -8176,6 +8212,140 @@ function RejectionBreakdown({ plant, stage, value, onChange }) {
     </div>
   `;
 }
+
+// =================================================================
+// SUPPLIER CHASE — raw material runway vs upcoming customer schedule
+// =================================================================
+// Reads v_raw_material_runway. For each raw stock item, computes
+// demand (next 14d) from open schedule lines via BOM, vs on-hand +
+// incoming POs. Names the supplier to chase.
+function SupplierChaseModule({ plant, me }) {
+  const [rows, setRows] = useState([]);
+  const [alertLog, setAlertLog] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState('shortage'); // shortage | all
+  const [tab, setTab] = useState('runway'); // runway | log
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [r, l] = await Promise.all([
+      sb.from('v_raw_material_runway').select('*').eq('plant_id', plant.id),
+      sb.from('mcp_supplier_alert_log').select('*').eq('plant_id', plant.id).order('created_at', { ascending:false }).limit(100),
+    ]);
+    setRows(r.data || []);
+    setAlertLog(l.data || []);
+    setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const severityOrder = { critical:0, high:1, medium:2, ok:3, null:4 };
+  const sorted = [...rows].sort((a,b) => (severityOrder[a.severity] - severityOrder[b.severity]) || (new Date(a.earliest_need_date||'2999-01-01') - new Date(b.earliest_need_date||'2999-01-01')));
+  const visible = filter === 'shortage' ? sorted.filter(r => ['critical','high','medium'].includes(r.severity)) : sorted;
+  const counts = {
+    critical: rows.filter(r => r.severity === 'critical').length,
+    high:     rows.filter(r => r.severity === 'high').length,
+    medium:   rows.filter(r => r.severity === 'medium').length,
+  };
+
+  const sevBadge = (s) => {
+    const map = { critical:'rose', high:'amber', medium:'amber', ok:'emerald' };
+    const label = { critical:'🚨 critical', high:'⚠ high', medium:'medium', ok:'ok' };
+    return s ? html`<span class=${'badge ' + (map[s] || '')} style="font-size:10px">${label[s] || s}</span>` : '';
+  };
+
+  const whatsappLink = (phone, body) => {
+    const p = (phone || '').replace(/[^0-9]/g, '');
+    if (!p) return null;
+    return 'https://wa.me/' + (p.length === 10 ? '91' + p : p) + '?text=' + encodeURIComponent(body);
+  };
+
+  const composeMsg = (r) => {
+    return 'Hi, kindly confirm dispatch for: ' + (r.item_code ? r.item_code + ' / ' : '') + r.item_name + '. We need ' + fmtNum(r.demand_7d) + ' ' + (r.uom || '') + ' within 7 days. Our current stock is only ' + fmtNum(r.current_qty) + (r.incoming_qty > 0 ? ' (+' + fmtNum(r.incoming_qty) + ' incoming)' : '') + '. Please confirm earliest delivery. Thanks.';
+  };
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
+      <div><h1>🛒 Supplier Chase</h1><div class="sub">Raw material runway vs upcoming customer schedule (next 14 days)</div></div>
+    </div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:12px">
+      <div class=${'stat ' + (counts.critical > 0 ? 'rose' : 'teal')}>
+        <div class="stat-num">${counts.critical}</div><div class="stat-label">🚨 Critical</div>
+      </div>
+      <div class=${'stat ' + (counts.high > 0 ? 'amber' : 'teal')}>
+        <div class="stat-num">${counts.high}</div><div class="stat-label">High</div>
+      </div>
+      <div class=${'stat ' + (counts.medium > 0 ? 'amber' : 'teal')}>
+        <div class="stat-num">${counts.medium}</div><div class="stat-label">Medium</div>
+      </div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:12px">
+      <button class=${'auth-tab' + (tab==='runway'?' active':'')} onClick=${() => setTab('runway')}>Live Runway</button>
+      <button class=${'auth-tab' + (tab==='log'?' active':'')} onClick=${() => setTab('log')}>Alert History · ${alertLog.length}</button>
+    </div>
+
+    ${tab === 'runway' && html`
+      <div style="display:flex;gap:6px;margin-bottom:10px">
+        <button class=${'auth-tab' + (filter==='shortage'?' active':'')} onClick=${() => setFilter('shortage')} style="border-radius:6px;padding:5px 10px;font-size:11px">Shortages only</button>
+        <button class=${'auth-tab' + (filter==='all'?' active':'')} onClick=${() => setFilter('all')} style="border-radius:6px;padding:5px 10px;font-size:11px">Show all raw items</button>
+      </div>
+
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        visible.length === 0 ? html`
+          <div class="card"><div class="empty"><div class="icon">${filter==='shortage'?'✅':'📦'}</div>
+            <div style="font-size:13px">${filter==='shortage' ? 'No raw-material shortages against next 14 days schedule.' : 'No raw stock items in master.'}</div>
+            ${rows.length > 0 && rows.every(r => !r.demand_14d || r.demand_14d == 0) && html`
+              <div style="font-size:11px;color:var(--slate-500);margin-top:6px">No alerts will fire until BOM is linked from parts to raw stock items. Set up BOM under Production → Masters.</div>
+            `}
+          </div></div>
+        ` :
+        visible.map(r => {
+          const phone = r.suggested_vendor_phone;
+          const waUrl = phone ? whatsappLink(phone, composeMsg(r)) : null;
+          return html`
+            <div class="card" key=${r.stock_item_id} style=${'margin-bottom:6px;padding:10px 12px;border-left:3px solid '+
+              (r.severity==='critical'?'var(--rose-500)':r.severity==='high'?'var(--amber-500)':r.severity==='medium'?'var(--amber-300)':'var(--teal-200)')}>
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:13px;font-weight:600">
+                    ${r.item_code ? html`<span style="font-family:monospace;color:var(--slate-500);font-size:12px">${r.item_code}</span> · ` : ''}${r.item_name}
+                  </div>
+                  <div style="font-size:11px;color:var(--slate-500);margin-top:3px">
+                    On-hand <strong style="color:var(--slate-700)">${fmtNum(r.current_qty)}</strong>${r.uom?' '+r.uom:''}
+                    ${r.incoming_qty > 0 ? html` · 📥 ${fmtNum(r.incoming_qty)} incoming` : ''}
+                    ${r.demand_7d > 0 ? html` · need <strong style="color:var(--rose-600)">${fmtNum(r.demand_7d)}</strong> in 7d` : ''}
+                    ${r.days_cover != null ? html` · ${r.days_cover}d cover` : ''}
+                    ${r.earliest_need_date ? html` · earliest ${r.earliest_need_date}` : ''}
+                  </div>
+                  ${r.suggested_vendor_name && html`
+                    <div style="font-size:11px;margin-top:5px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                      <span style="color:var(--slate-600)">🛒 Chase: <strong>${r.suggested_vendor_name}</strong></span>
+                      ${phone && waUrl ? html`<a href=${waUrl} target="_blank" rel="noopener" style="background:#25D366;color:white;padding:3px 8px;border-radius:4px;font-size:11px;text-decoration:none;font-weight:600">WhatsApp ↗</a>` : ''}
+                    </div>
+                  `}
+                </div>
+                <div style="text-align:right">${sevBadge(r.severity)}</div>
+              </div>
+            </div>
+          `;
+        })
+      }
+    `}
+
+    ${tab === 'log' && html`
+      ${alertLog.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📜</div><div style="font-size:13px">No supplier-chase alerts have been fired yet. Daily check runs at 09:50 IST.</div></div></div>` :
+        alertLog.map(a => html`
+          <div class="card" key=${a.id} style="margin-bottom:4px;padding:8px 12px">
+            <div style="font-size:11px;color:var(--slate-500)">${new Date(a.created_at).toLocaleString()} · ${a.severity}</div>
+            <div style="font-size:12px;margin-top:3px;white-space:pre-wrap">${a.body}</div>
+          </div>
+        `)
+      }
+    `}
+  `;
+}
+
 
 // =================================================================
 // SUB-CONTRACTING / JOB-WORK (parts sent to outside vendors for processing)
