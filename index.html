@@ -8255,7 +8255,8 @@ function MomCreateModal({ plant, me, users, onClose, onSaved }) {
     chairperson_user_id: me.id,
     internal_attendees: [me.id],
     external_attendees: [],
-    agenda: '', email_ref: '',
+    points: [{ description: '', owner_user_id: '', due_date: '' }],
+    email_ref: '',
   });
   const [extDraft, setExtDraft] = useState({ name: '', email: '', role: '' });
   const [busy, setBusy] = useState(false);
@@ -8272,11 +8273,20 @@ function MomCreateModal({ plant, me, users, onClose, onSaved }) {
   };
   const removeExternal = (idx) => setForm(f => ({ ...f, external_attendees: f.external_attendees.filter((_, i) => i !== idx) }));
 
+  const setPoint = (idx, patch) => setForm(f => ({ ...f, points: f.points.map((p, i) => i === idx ? { ...p, ...patch } : p) }));
+  const addPoint = () => setForm(f => ({ ...f, points: [...f.points, { description: '', owner_user_id: '', due_date: '' }] }));
+  const removePoint = (idx) => setForm(f => ({ ...f, points: f.points.length <= 1 ? f.points : f.points.filter((_, i) => i !== idx) }));
+
   const submit = async (e) => {
     e.preventDefault(); setErr(''); setBusy(true);
     try {
       const isExternal = ['customer','supplier'].includes(form.meeting_type);
-      const { data, error } = await sb.from('mcp_mom_meetings').insert({
+      const validPoints = form.points.filter(p => p.description.trim());
+      if (validPoints.length === 0) { setErr('Add at least one agenda point'); setBusy(false); return; }
+
+      const agendaText = validPoints.map((p, i) => (i+1) + '. ' + p.description.trim()).join('\n');
+
+      const { data: meeting, error } = await sb.from('mcp_mom_meetings').insert({
         plant_id: plant.id, meeting_type: form.meeting_type, subject: form.subject.trim(),
         meeting_date: form.meeting_date, meeting_time: form.meeting_time || null,
         duration_minutes: form.duration_minutes ? parseInt(form.duration_minutes) : null,
@@ -8285,13 +8295,23 @@ function MomCreateModal({ plant, me, users, onClose, onSaved }) {
         external_attendees: isExternal ? form.external_attendees : [],
         chairperson_user_id: form.chairperson_user_id || me.id,
         internal_attendees: form.internal_attendees,
-        agenda: form.agenda || null,
+        agenda: agendaText,
         email_ref: form.email_ref || null,
         created_by: me.id,
       }).select('id').single();
       if (error) throw error;
-      showToast('📝 MOM created');
-      onSaved(data.id);
+
+      const rows = validPoints.map((p, i) => ({
+        plant_id: plant.id, meeting_id: meeting.id, ord: i + 1,
+        description: p.description.trim(),
+        owner_user_id: p.owner_user_id || null,
+        due_date: p.due_date || null,
+      }));
+      const { error: aerr } = await sb.from('mcp_mom_action_items').insert(rows);
+      if (aerr) throw aerr;
+
+      showToast('📝 MOM created · ' + validPoints.length + ' point' + (validPoints.length>1?'s':''));
+      onSaved(meeting.id);
     } catch (e) { setErr(e.message); } finally { setBusy(false); }
   };
 
@@ -8355,7 +8375,28 @@ function MomCreateModal({ plant, me, users, onClose, onSaved }) {
               })}
             </div>
           </div>
-          <div class="field"><label>Agenda</label><textarea rows=${3} value=${form.agenda} onChange=${e => setForm({...form, agenda: e.target.value})} placeholder="Bullet points / topics"></textarea></div>
+          <div class="field"><label>Agenda points · address each to a person responsible</label>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              ${form.points.map((p, idx) => html`
+                <div key=${idx} style="border:1px solid var(--slate-200);border-radius:6px;padding:8px;background:var(--slate-50)">
+                  <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+                    <span style="font-size:11px;font-weight:600;color:var(--teal-700);min-width:18px">${idx+1}.</span>
+                    <input type="text" value=${p.description} onChange=${e => setPoint(idx, { description: e.target.value })} placeholder="Point to discuss / decision needed / action required" style="flex:1;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                    ${form.points.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => removePoint(idx)} style="padding:2px 8px;font-size:11px">×</button>`}
+                  </div>
+                  <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:6px">
+                    <select value=${p.owner_user_id} onChange=${e => setPoint(idx, { owner_user_id: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px">
+                      <option value="">— Responsible person —</option>
+                      ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + u.role : ''}</option>`)}
+                    </select>
+                    <input type="date" value=${p.due_date} onChange=${e => setPoint(idx, { due_date: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  </div>
+                </div>
+              `)}
+              <button type="button" class="btn small ghost" onClick=${addPoint} style="font-size:12px;align-self:flex-start">+ Add another point</button>
+            </div>
+            <p style="font-size:11px;color:var(--slate-500);margin:6px 0 0">Each point with a responsible person → auto-creates a task. When the task closes, the point closes too.</p>
+          </div>
           <div class="field"><label>📧 Email reference (optional)</label><input type="text" value=${form.email_ref} onChange=${e => setForm({...form, email_ref: e.target.value})} placeholder="Paste Gmail / Outlook thread link" style="font-family:monospace" /></div>
           <button class="btn" disabled=${busy || !form.subject.trim()}>${busy ? 'Saving…' : 'Create MOM'}</button>
         </form>
@@ -8445,7 +8486,6 @@ function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
     </div>
 
     <div class="card">
-      ${m.agenda && html`<div class="card-row"><span class="label">Agenda</span><span class="value" style="white-space:pre-wrap">${m.agenda}</span></div>`}
       ${m.email_ref && html`<div class="card-row"><span class="label">Email</span><span class="value" style="font-size:11px;word-break:break-all">${/^https?:\/\//.test(m.email_ref) ? html`<a href=${m.email_ref} target="_blank" rel="noopener">↗ Open thread</a>` : m.email_ref}</span></div>`}
       ${intAttendees.length > 0 && html`
         <div class="card-row"><span class="label">Internal</span><span class="value" style="font-size:12px">${intAttendees.map(u => u.full_name).join(', ')}</span></div>
@@ -8469,7 +8509,7 @@ function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
     `}
 
     <div class="section-h" style="display:flex;align-items:center;gap:8px">
-      <span style="flex:1">Action items · ${doneItems}/${totalItems} done</span>
+      <span style="flex:1">Agenda points · ${doneItems}/${totalItems} closed</span>
       ${totalItems > 0 && html`<span style="font-size:11px;color:var(--slate-500)">${Math.round(100*doneItems/totalItems)}%</span>`}
     </div>
     ${totalItems > 0 && html`
@@ -8500,7 +8540,7 @@ function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
     })}
 
     <div class="card" style="margin-top:8px;background:var(--teal-50);border-color:var(--teal-200)">
-      <div class="card-title">+ Add action item</div>
+      <div class="card-title">+ Add another point</div>
       <div class="field"><label>Description *</label><input type="text" value=${newAction.description} onChange=${e => setNewAction({...newAction, description: e.target.value})} placeholder="What needs to be done?" /></div>
       <div class="field-row">
         <div class="field"><label>Owner</label>
