@@ -8254,8 +8254,10 @@ function MomCreateModal({ plant, me, users, onClose, onSaved }) {
     location: '', external_org_name: '',
     chairperson_user_id: me.id,
     internal_attendees: [me.id],
+    external_attendees: [],
     agenda: '', email_ref: '',
   });
+  const [extDraft, setExtDraft] = useState({ name: '', email: '', role: '' });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
@@ -8263,15 +8265,24 @@ function MomCreateModal({ plant, me, users, onClose, onSaved }) {
     setForm(f => ({ ...f, internal_attendees: f.internal_attendees.includes(uid) ? f.internal_attendees.filter(x => x !== uid) : [...f.internal_attendees, uid] }));
   };
 
+  const addExternal = () => {
+    if (!extDraft.name.trim()) return;
+    setForm(f => ({ ...f, external_attendees: [...f.external_attendees, { name: extDraft.name.trim(), email: extDraft.email.trim() || null, role: extDraft.role.trim() || null }] }));
+    setExtDraft({ name: '', email: '', role: '' });
+  };
+  const removeExternal = (idx) => setForm(f => ({ ...f, external_attendees: f.external_attendees.filter((_, i) => i !== idx) }));
+
   const submit = async (e) => {
     e.preventDefault(); setErr(''); setBusy(true);
     try {
+      const isExternal = ['customer','supplier'].includes(form.meeting_type);
       const { data, error } = await sb.from('mcp_mom_meetings').insert({
         plant_id: plant.id, meeting_type: form.meeting_type, subject: form.subject.trim(),
         meeting_date: form.meeting_date, meeting_time: form.meeting_time || null,
         duration_minutes: form.duration_minutes ? parseInt(form.duration_minutes) : null,
         location: form.location || null,
-        external_org_name: ['customer','supplier'].includes(form.meeting_type) ? (form.external_org_name || null) : null,
+        external_org_name: isExternal ? (form.external_org_name || null) : null,
+        external_attendees: isExternal ? form.external_attendees : [],
         chairperson_user_id: form.chairperson_user_id || me.id,
         internal_attendees: form.internal_attendees,
         agenda: form.agenda || null,
@@ -8300,6 +8311,27 @@ function MomCreateModal({ plant, me, users, onClose, onSaved }) {
           ${['customer','supplier'].includes(form.meeting_type) && html`
             <div class="field"><label>${form.meeting_type === 'customer' ? 'Customer' : 'Supplier'} organisation *</label>
               <input type="text" required value=${form.external_org_name} onChange=${e => setForm({...form, external_org_name: e.target.value})} placeholder=${form.meeting_type === 'customer' ? 'Bosch / Simpson / ROOP …' : 'Vendor name'} />
+            </div>
+            <div class="field"><label>${form.meeting_type === 'customer' ? 'Customer-side' : 'Supplier-side'} attendees</label>
+              ${form.external_attendees.length > 0 && html`
+                <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:6px">
+                  ${form.external_attendees.map((a, i) => html`
+                    <div key=${i} style="display:flex;align-items:center;gap:6px;padding:6px 8px;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:5px;font-size:12px">
+                      <div style="flex:1">
+                        <div style="font-weight:500">${a.name}${a.role ? ' · ' + a.role : ''}</div>
+                        ${a.email && html`<div style="font-size:10px;color:var(--slate-500)">${a.email}</div>`}
+                      </div>
+                      <button type="button" class="btn small danger" onClick=${() => removeExternal(i)} style="padding:2px 8px;font-size:11px">×</button>
+                    </div>
+                  `)}
+                </div>
+              `}
+              <div style="display:grid;grid-template-columns:1.2fr 1.4fr 1fr auto;gap:6px;align-items:end">
+                <input type="text" value=${extDraft.name} onChange=${e => setExtDraft({...extDraft, name: e.target.value})} placeholder="Name *" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                <input type="email" value=${extDraft.email} onChange=${e => setExtDraft({...extDraft, email: e.target.value})} placeholder="Email (optional)" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                <input type="text" value=${extDraft.role} onChange=${e => setExtDraft({...extDraft, role: e.target.value})} placeholder="Role / desig." style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                <button type="button" class="btn small" onClick=${addExternal} disabled=${!extDraft.name.trim()} style="padding:6px 10px;font-size:11px">+ Add</button>
+              </div>
             </div>
           `}
           <div class="field"><label>Subject *</label><input type="text" required value=${form.subject} onChange=${e => setForm({...form, subject: e.target.value})} placeholder="Weekly quality review · 8D for porosity · Audit planning" /></div>
@@ -8381,7 +8413,24 @@ function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
     refresh();
   };
 
+  const toggleActionDone = async (a) => {
+    const next = a.status === 'completed' ? 'open' : 'completed';
+    setBusy(true);
+    try {
+      const { error } = await sb.from('mcp_mom_action_items').update({
+        status: next,
+        closed_at: next === 'completed' ? new Date().toISOString() : null,
+      }).eq('id', a.id);
+      if (error) throw error;
+      refresh();
+    } catch (e) { alert(e.message); } finally { setBusy(false); }
+  };
+
+  const extAttendees = Array.isArray(m.external_attendees) ? m.external_attendees : [];
+  const intAttendees = (m.internal_attendees || []).map(uid => users.find(u => u.id === uid)).filter(Boolean);
   const emoji = m.meeting_type === 'customer' ? '🤝' : m.meeting_type === 'supplier' ? '🛒' : '🏛';
+  const totalItems = actionItems.length;
+  const doneItems = actionItems.filter(a => a.status === 'completed' || a.status === 'cancelled').length;
 
   return html`
     <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -8398,6 +8447,16 @@ function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
     <div class="card">
       ${m.agenda && html`<div class="card-row"><span class="label">Agenda</span><span class="value" style="white-space:pre-wrap">${m.agenda}</span></div>`}
       ${m.email_ref && html`<div class="card-row"><span class="label">Email</span><span class="value" style="font-size:11px;word-break:break-all">${/^https?:\/\//.test(m.email_ref) ? html`<a href=${m.email_ref} target="_blank" rel="noopener">↗ Open thread</a>` : m.email_ref}</span></div>`}
+      ${intAttendees.length > 0 && html`
+        <div class="card-row"><span class="label">Internal</span><span class="value" style="font-size:12px">${intAttendees.map(u => u.full_name).join(', ')}</span></div>
+      `}
+      ${extAttendees.length > 0 && html`
+        <div class="card-row"><span class="label">${m.meeting_type === 'supplier' ? 'Supplier-side' : 'Customer-side'}</span>
+          <span class="value" style="font-size:12px">
+            ${extAttendees.map((a, i) => html`<div key=${i}>👤 <strong>${a.name}</strong>${a.role ? ' · ' + a.role : ''}${a.email ? ' · ' + a.email : ''}</div>`)}
+          </span>
+        </div>
+      `}
     </div>
 
     <div class="section-h" style="display:flex;align-items:center;gap:8px"><span style="flex:1">Minutes / Discussion</span>
@@ -8409,22 +8468,36 @@ function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
       <div class="card" style="white-space:pre-wrap;min-height:60px;color:${m.minutes ? 'var(--slate-800)' : 'var(--slate-400)'}">${m.minutes || 'Tap ✎ Edit to add minutes.'}</div>
     `}
 
-    <div class="section-h">Action items · ${actionItems.length}</div>
-    ${actionItems.map(a => html`
-      <div class="card" key=${a.id} style="margin-bottom:6px;padding:10px 12px">
-        <div style="display:flex;align-items:flex-start;gap:8px">
-          <div style="flex:1">
-            <div style="font-size:13px;font-weight:500">${a.ord}. ${a.description}</div>
-            <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
-              ${a.owner ? '👤 ' + a.owner.full_name : (a.owner_external_name ? '👤 ' + a.owner_external_name : '— unassigned —')}
-              ${a.due_date ? ' · 📅 ' + a.due_date : ''}
-              ${a.action_id ? html` · <span class="badge teal" style="font-size:9px">📌 task created</span>` : ''}
+    <div class="section-h" style="display:flex;align-items:center;gap:8px">
+      <span style="flex:1">Action items · ${doneItems}/${totalItems} done</span>
+      ${totalItems > 0 && html`<span style="font-size:11px;color:var(--slate-500)">${Math.round(100*doneItems/totalItems)}%</span>`}
+    </div>
+    ${totalItems > 0 && html`
+      <div style="height:5px;background:var(--slate-100);border-radius:3px;overflow:hidden;margin:-2px 0 8px"><div style=${'height:100%;background:'+(doneItems===totalItems?'var(--teal-600)':'var(--teal-400)')+';width:'+Math.round(100*doneItems/totalItems)+'%;transition:width 0.3s'}></div></div>
+    `}
+    ${actionItems.map(a => {
+      const isDone = a.status === 'completed' || a.status === 'cancelled';
+      return html`
+        <div class="card" key=${a.id} style=${'margin-bottom:6px;padding:10px 12px;'+(isDone?'opacity:0.65;background:var(--slate-50)':'')}>
+          <div style="display:flex;align-items:flex-start;gap:8px">
+            <button type="button" onClick=${() => toggleActionDone(a)} disabled=${busy} title=${isDone ? 'Mark open' : 'Mark complete'}
+              style=${'flex-shrink:0;width:22px;height:22px;border-radius:5px;border:1.5px solid '+(isDone?'var(--teal-600)':'var(--slate-300)')+';background:'+(isDone?'var(--teal-600)':'white')+';color:white;font-size:14px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center'}>
+              ${isDone ? '✓' : ''}
+            </button>
+            <div style="flex:1">
+              <div style=${'font-size:13px;font-weight:500;'+(isDone?'text-decoration:line-through':'')}>${a.ord}. ${a.description}</div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                ${a.owner ? '👤 ' + a.owner.full_name : (a.owner_external_name ? '👤 ' + a.owner_external_name : '— unassigned —')}
+                ${a.due_date ? ' · 📅 ' + a.due_date : ''}
+                ${a.action_id ? html` · <span class="badge teal" style="font-size:9px">📌 task</span>` : ''}
+                ${isDone && a.closed_at ? ' · ✓ ' + new Date(a.closed_at).toLocaleDateString() : ''}
+              </div>
             </div>
+            ${!isDone && html`<button class="btn small danger" onClick=${() => removeAction(a.id)} style="padding:2px 8px;font-size:11px">×</button>`}
           </div>
-          <button class="btn small danger" onClick=${() => removeAction(a.id)} style="padding:2px 8px;font-size:11px">×</button>
         </div>
-      </div>
-    `)}
+      `;
+    })}
 
     <div class="card" style="margin-top:8px;background:var(--teal-50);border-color:var(--teal-200)">
       <div class="card-title">+ Add action item</div>
@@ -8439,7 +8512,7 @@ function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
         <div class="field"><label>Due date</label><input type="date" value=${newAction.due_date} onChange=${e => setNewAction({...newAction, due_date: e.target.value})} /></div>
       </div>
       <button class="btn small" onClick=${addAction} disabled=${busy || !newAction.description.trim()}>+ Add</button>
-      <p style="font-size:11px;color:var(--slate-500);margin:6px 0 0">Assigning an internal owner auto-creates a task in their Action Hub with the meeting context.</p>
+      <p style="font-size:11px;color:var(--slate-500);margin:6px 0 0">Assigning an internal owner auto-creates a task in their Action Hub. When that task closes, this MOM action auto-closes too — and when every item is done, the MOM auto-closes.</p>
     </div>
   `;
 }
