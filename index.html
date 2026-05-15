@@ -1066,6 +1066,7 @@ const MORE_GROUPS = [
       { key:'iatf',         icon:'🛡', label:'IATF 16949 Readiness',     sub:'Doc inventory, status, owners, cadences' },
       { key:'mgmt_review',  icon:'🏛', label:'Management Reviews',       sub:'MR minutes + action items (IATF 9.3)' },
       { key:'reports',      icon:'📑', label:'Reports & Documents',      sub:'Generate audit-ready reports from live data' },
+      { key:'iatf_docs',    icon:'📚', label:'IATF Doc Library',         sub:'Glossary · what every IATF document does, who owns it, when reviewed' },
       { key:'trace',        icon:'🔍', label:'Trace · Audit Investigation', sub:'Linked timeline by date / part / machine' },
     ],
   },
@@ -1164,6 +1165,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'npd'}><${NpdModule} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'tpm'}><${TpmModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'rejection_types'}><${RejectionTypesModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'iatf_docs'}><${IatfDocsLibrary} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
 
       <div class="tabbar">
@@ -1171,7 +1173,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr','scl','iap','pm_schedule','quality_objectives','risk_register','contingency','npd','tpm','rejection_types'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr','scl','iap','pm_schedule','quality_objectives','risk_register','contingency','npd','tpm','rejection_types','iatf_docs'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
 
       ${/* Logi chatbot + Siri voice agent hidden per user request. Components
@@ -8166,6 +8168,311 @@ function RejectionBreakdown({ plant, stage, value, onChange }) {
         `}
       </div>
     </div>
+  `;
+}
+
+// =================================================================
+// IATF DOCUMENT LIBRARY — reference glossary
+// =================================================================
+// Static catalog of every IATF 16949:2016 document. Each entry carries
+// the standard clause, a one-line purpose, a longer 'what it does',
+// who typically owns it, and how often it's reviewed. Search + filter
+// by category. Pure reference content — no DB read.
+const IATF_DOC_CATEGORIES = [
+  { key:'planning',    label:'Planning & Design (APQP)', emoji:'🧭' },
+  { key:'quality',     label:'Quality & Control',         emoji:'✓' },
+  { key:'operations',  label:'Operations & Maintenance',  emoji:'🛠' },
+  { key:'people',      label:'People & Competence',       emoji:'👥' },
+  { key:'governance',  label:'Governance & Audit',        emoji:'🛡' },
+  { key:'records',     label:'Records & Disposition',     emoji:'📜' },
+];
+
+const IATF_DOCS = [
+  // ─── Planning & Design (APQP) ───────────────────────────────────────────
+  {
+    key:'apqp', name:'APQP — Advanced Product Quality Planning', clause:'IATF 8.3', category:'planning',
+    purpose:'The umbrella plan that walks a new part from RFQ through SOP.',
+    detail:'APQP is the cross-functional roadmap covering 5 phases — plan, product design, process design, validation, feedback. It lists the milestones, deliverables and gate reviews. PPAP is the final exit deliverable of APQP. The org charts who owns each deliverable, who signs off each phase, and when prototype / pre-launch / mass-production status is achieved.',
+    owner:'NPD / Project Manager', cadence:'One per new product, reviewed at each phase gate',
+  },
+  {
+    key:'pfd', name:'PFD — Process Flow Diagram', clause:'IATF 8.3',  category:'planning',
+    purpose:'Top-to-bottom flow chart of every operation a part goes through.',
+    detail:'Documents each operation step, where inspections happen, where materials enter, where scrap exits. PFD is the parent doc — PFMEA and Control Plan must align step-for-step with it. Updated whenever route changes (new operation added / removed / outsourced).',
+    owner:'Process / Manufacturing Engineering', cadence:'Reviewed at PPAP and whenever route changes',
+  },
+  {
+    key:'pfmea', name:'PFMEA — Process Failure Mode and Effects Analysis', clause:'IATF 8.3',  category:'planning',
+    purpose:'Forecast of what can go wrong at each process step and what controls catch it.',
+    detail:'For each operation: list failure modes, their effects, causes, current controls (prevention + detection), then score Severity × Occurrence × Detection = RPN. High RPN items drive Control Plan tightening. PFMEA must be living — re-evaluated after any field failure, NCR or design change. AIAG-VDA harmonised PFMEA is the current standard (replaced the older 4th-ed RPN ranking).',
+    owner:'Quality + Process Engineering team', cadence:'Annual review + after every change or major failure',
+  },
+  {
+    key:'control_plan', name:'Control Plan', clause:'IATF 8.5.1.1',  category:'planning',
+    purpose:'Per-step list of WHAT to check, HOW, HOW OFTEN, by WHOM, and the reaction plan.',
+    detail:'Three states: prototype, pre-launch, production. Each row corresponds to a PFD step + a PFMEA finding. Columns capture characteristic, specification, evaluation method, sample size, frequency, control method (SPC / inspection / poke-yoke), and reaction-plan trigger. Auditors verify operators are using the latest revision and recording readings as the Control Plan requires.',
+    owner:'Quality Engineering', cadence:'Reviewed at every PPAP and engineering change',
+  },
+  {
+    key:'special_chars', name:'Special Characteristics (CC / SC)', clause:'IATF 8.3.3.3',  category:'planning',
+    purpose:'Customer-flagged features where failure means safety risk or regulatory non-compliance.',
+    detail:'CC (Critical Characteristic) = safety/regulatory; SC (Significant Characteristic) = function/fit/durability. Customer drawings carry the symbols. CC/SC must be flagged on PFMEA, Control Plan, layout inspection, and operator work instructions. Some OEMs require capability evidence (Cpk ≥ 1.67 / 1.33).',
+    owner:'Quality + Customer Engineering', cadence:'At launch, then whenever drawing revisions land',
+  },
+  {
+    key:'msa', name:'MSA — Measurement System Analysis', clause:'IATF 7.1.5.1.1',  category:'planning',
+    purpose:'Proves your gauges + operators measure the same part the same way.',
+    detail:'Gauge R&R study computes variation from the measurement system itself (repeatability = same operator) vs reproducibility (different operators). %GR&R < 10% is acceptable, 10-30% conditional, > 30% reject. Variable data uses ANOVA / X-bar R; attribute data uses Kappa. Required for every CC/SC measurement gauge before PPAP.',
+    owner:'Quality / Metrology', cadence:'Before PPAP + every 3 years thereafter',
+  },
+  {
+    key:'spc', name:'SPC — Statistical Process Control', clause:'IATF 9.1.1.1',  category:'planning',
+    purpose:'Live process behaviour charts that show whether you stay in spec over time.',
+    detail:'Control charts (X-bar R, Individuals, p-chart) track process performance against control limits. Cp/Cpk show capability; trend rules (Western Electric / Nelson) detect drift before specs are violated. Customer expects SPC on every CC/SC and on output of any process where Control Plan says SPC. Out-of-control events must trigger reaction plan + recorded corrective action.',
+    owner:'Production + Quality', cadence:'Continuous logging; reviewed daily at shift handover',
+  },
+  {
+    key:'ppap', name:'PPAP — Production Part Approval Process', clause:'IATF 8.3.4.4',  category:'planning',
+    purpose:'18-element evidence package proving a new/changed part is ready for mass production.',
+    detail:'Levels 1-5 (1 = PSW only, 3 = standard, 5 = full review at customer). Elements include design records, FMEA, PFD, Control Plan, MSA, SPC studies, layout inspection, material test results, qualified lab credentials, sample parts and the signed PSW. Customer-approved PPAP is mandatory before shipping production parts; any change (4M) re-triggers it.',
+    owner:'NPD / Quality', cadence:'On launch and after every customer-notified change',
+  },
+  {
+    key:'psw', name:'PSW — Part Submission Warrant', clause:'IATF 8.3.4.4',  category:'planning',
+    purpose:'Single-page signed warrant declaring PPAP package meets customer requirements.',
+    detail:'Final page of every PPAP submission. Lists part number, change level, reason for submission, supplier sign-off, and customer disposition (Approved / Interim Approval / Rejected). Interim approvals carry an expiry. Once signed by the customer, the supplier is authorised to ship production parts.',
+    owner:'Quality (supplier) / Customer engineer', cadence:'One per PPAP submission',
+  },
+
+  // ─── Quality & Control ──────────────────────────────────────────────────
+  {
+    key:'quality_manual', name:'Quality Manual', clause:'IATF 4.4',  category:'quality',
+    purpose:'The top-level description of how the plant\'s QMS operates.',
+    detail:'Defines scope of the QMS (which sites / product families), references all main IATF procedures, contains the quality policy, process interaction maps, and process owner list. Light document compared to ISO 9001 days — IATF expects supporting procedures referenced rather than reproduced inside.',
+    owner:'Management Representative / Quality Head', cadence:'Reviewed annually at Mgmt Review',
+  },
+  {
+    key:'work_instr', name:'Work Instructions / SOPs', clause:'IATF 8.5.1',  category:'quality',
+    purpose:'Step-by-step shop-floor instructions an operator follows.',
+    detail:'One per workstation / operation. Includes pictures, settings (RPM, pressure, temperature), poka-yoke checks, what-to-do-if-defect-found. Operators must have the latest revision visible at the point of use. Auditors will verify operator can demonstrate the SOP and that the SOP matches the Control Plan.',
+    owner:'Production Engineering', cadence:'Reviewed annually + on every process change',
+  },
+  {
+    key:'layout', name:'Layout Inspection', clause:'IATF 8.6.2',  category:'quality',
+    purpose:'Full-feature dimensional check against the drawing on a sample.',
+    detail:'Every dimension on the print measured and recorded — not just CC/SC. Required at PPAP and at the cadence customer specifies (typically annual). Done in metrology lab with calibrated gauges + CMM where applicable. Out-of-tolerance findings drive corrective action.',
+    owner:'Quality / Metrology', cadence:'PPAP + annually (or per customer requirement)',
+  },
+  {
+    key:'inspection_records', name:'In-process / Final Inspection Records', clause:'IATF 8.5.1',  category:'quality',
+    purpose:'Evidence operators ran the inspections the Control Plan requires.',
+    detail:'Hourly checks, setup approval first-piece, last-piece, end-of-shift visual. Stored at the workstation or in the QMS. Auditors trace a part from final inspection record back to original Control Plan row.',
+    owner:'Production operator + QA verifier', cadence:'Per Control Plan frequency',
+  },
+  {
+    key:'ncr', name:'NCR — Non-Conformance Report', clause:'IATF 8.7',  category:'records',
+    purpose:'Formal record of a non-conforming product + disposition decision.',
+    detail:'Captures what failed, qty affected, severity, root cause, containment, disposition (use-as-is / rework / scrap / return / concession), and link to corrective action if systemic. Each NCR carries a unique number (NCR-YYMM-NNNN here). Customer NCRs and internal NCRs are tracked together but reported separately.',
+    owner:'Quality (assigned to responsible function)', cadence:'Raised on event; closed within target days per severity',
+  },
+  {
+    key:'corrective_action', name:'CAR / 8D — Corrective Action Report', clause:'IATF 10.2',  category:'records',
+    purpose:'Disciplined root-cause investigation and permanent corrective action.',
+    detail:'8D = 8 disciplines: team, problem description, containment, root cause (5-why or Ishikawa), permanent corrective action, validation, prevent recurrence, team congratulation. Required for customer complaints and major internal NCRs. Effectiveness is verified (is the fix actually working?) before closing.',
+    owner:'Quality team led by problem owner', cadence:'Per customer SLA — typically 24h containment, 14d permanent',
+  },
+  {
+    key:'customer_complaints', name:'Customer Complaints Register', clause:'IATF 8.7.1.7',  category:'records',
+    purpose:'Centralised log of all customer-reported issues + resolution.',
+    detail:'Each entry: customer, problem, qty affected, severity, containment, 8D number, resolution date, customer acceptance. PPM (parts per million) reject rate trends fed back to top management at Mgmt Review.',
+    owner:'Customer Quality / Service', cadence:'Logged on receipt; reviewed weekly at quality meeting',
+  },
+
+  // ─── Operations & Maintenance ───────────────────────────────────────────
+  {
+    key:'tpm', name:'TPM — Total Productive Maintenance daily checks', clause:'IATF 8.5.1.5',  category:'operations',
+    purpose:'Operator-led daily checks that catch problems before they cause breakdown.',
+    detail:'Each machine has an autonomous-maintenance checklist (oil sight glass, coolant, air pressure, leaks, guards, housekeeping). Operator does it at shift start, flags any issue. Critical-item issues create a maintenance breakdown automatically.',
+    owner:'Production operator (autonomous); Maintenance follows up', cadence:'Every shift / every day',
+  },
+  {
+    key:'pm', name:'PM — Preventive Maintenance Schedule + Log', clause:'IATF 8.5.1.5',  category:'operations',
+    purpose:'Scheduled maintenance done to prevent failure, not to fix it.',
+    detail:'Each machine has a master list of recurring tasks (lubrication weekly, belt change quarterly, bearing replacement annually, etc.) with next-due dates. Each execution is logged with date, who did it, duration, findings, parts consumed. Skipped or overdue PMs feed into Mgmt Review as a KPI.',
+    owner:'Maintenance Engineering', cadence:'Per-task frequency · MIS reviewed monthly',
+  },
+  {
+    key:'breakdown', name:'Breakdown Log + MTTR / MTBF', clause:'IATF 8.5.1.5',  category:'operations',
+    purpose:'Record of every unplanned stoppage with downtime and root cause.',
+    detail:'Each entry: machine, reported time, attended time, resolved time, root cause, parts consumed, cost. From this MTTR (Mean Time To Repair) and MTBF (Mean Time Between Failure) are computed per machine — both required at Mgmt Review and a key OEE input.',
+    owner:'Maintenance + Production', cadence:'Logged on event; KPI reviewed monthly',
+  },
+  {
+    key:'calibration', name:'Calibration Register + Records', clause:'IATF 7.1.5.2',  category:'operations',
+    purpose:'Master list of every measuring instrument and proof each is still accurate.',
+    detail:'Register lists each instrument (code, type, range, location, owner) with last calibration date, next due date, traceability to a national standard (NPL etc.). Records hold the certificate, result (Pass / Conditional / Fail), and out-of-tolerance reaction. Out-of-tolerance instruments require recall of parts measured since the last good calibration.',
+    owner:'Quality / Metrology', cadence:'Frequency per instrument (typically annual); register reviewed monthly',
+  },
+  {
+    key:'jobwork', name:'Job-Work / Sub-contract Records', clause:'IATF 8.4',  category:'operations',
+    purpose:'Material movement and quality control for outsourced operations.',
+    detail:'Job-work DCs (out + in) track material that leaves the plant for processing (plating, heat treat, etc.) and returns. Vendor must be in supplier list, parts identified, returnable basis tagged, quantity reconciled. Quality of returned work is treated like internal inspection — non-conforming returns get NCR\'d.',
+    owner:'Logistics + Quality', cadence:'Per job-work shipment; reconciliation done weekly',
+  },
+  {
+    key:'grn', name:'GRN — Goods Receipt Note', clause:'IATF 8.4 / 8.5.6',  category:'operations',
+    purpose:'Record that received material was counted, identified and accepted into stock.',
+    detail:'Created at receiving against the supplier invoice/DC. Quantity verified, packing damage noted, lot/batch numbers captured for traceability. Short receipt → shortage NCR + claim against supplier. GRN is the trigger for stock-in transaction and AP recognition.',
+    owner:'Stores / Receiving', cadence:'On every receipt',
+  },
+
+  // ─── People & Competence ───────────────────────────────────────────────
+  {
+    key:'skills_matrix', name:'Skills Matrix / Competency Matrix', clause:'IATF 7.2',  category:'people',
+    purpose:'Grid of who can do what to what level.',
+    detail:'Rows = employees, columns = skills/operations. Each cell shows competency level (e.g., 0 = no exposure, 1 = trained, 2 = qualified, 3 = trainer). Drives where each operator can be deployed safely. New parts / new equipment require re-evaluation of skills coverage.',
+    owner:'HR + Department Heads', cadence:'Reviewed quarterly + on any role / equipment change',
+  },
+  {
+    key:'training_records', name:'Training Records', clause:'IATF 7.2',  category:'people',
+    purpose:'Evidence each employee was trained on the skills the Skills Matrix says they have.',
+    detail:'One record per (employee, skill, training event). Includes trainer, date, evaluation method, pre/post-test scores, on-job evaluation score, validity period if applicable (re-training cycle). Customer / industry training (e.g., IATF awareness, internal auditor) tracked here too.',
+    owner:'HR + L&D + Trainer', cadence:'On each training event; matrix updated immediately',
+  },
+  {
+    key:'awareness', name:'IATF Awareness Training Records', clause:'IATF 7.3',  category:'people',
+    purpose:'Proof every employee understands the QMS, their role and customer-specific requirements.',
+    detail:'Annual refresher covering: quality policy, the consequence of non-conformity, why your role matters, key customer requirements you must respect. Often combined with EHS awareness. Failure to demonstrate awareness during an audit is one of the most common findings.',
+    owner:'Management Representative', cadence:'Annually + on induction',
+  },
+
+  // ─── Governance & Audit ────────────────────────────────────────────────
+  {
+    key:'quality_policy', name:'Quality Policy + Quality Objectives', clause:'IATF 5.2 / 6.2',  category:'governance',
+    purpose:'Top management\'s commitment, broken into measurable KPI targets.',
+    detail:'Policy is a 3-5 line statement of intent (continuous improvement, customer focus, etc.). Objectives are SMART KPIs deployed function-by-function (PPM, OTD %, scrap %, MTTR) with monthly tracking. Off-track objectives must have a documented recovery action.',
+    owner:'Top management; tracked by Quality', cadence:'Reviewed monthly + at Mgmt Review',
+  },
+  {
+    key:'risk_register', name:'Risk Register', clause:'IATF 6.1',  category:'governance',
+    purpose:'List of risks that could prevent the QMS from achieving its objectives + mitigation.',
+    detail:'Each entry: risk description, likelihood × impact = score, current controls, target score, mitigation action, owner, review date. Includes business risks (single-source supplier, key-person dependence) and process risks (capability loss, cybersecurity).',
+    owner:'Management Rep + Risk Owner', cadence:'Reviewed quarterly + after any incident',
+  },
+  {
+    key:'contingency', name:'Contingency Plans', clause:'IATF 6.1.2.3',  category:'governance',
+    purpose:'Pre-defined responses to disruptions (power loss, fire, key supplier failure, pandemic, cyber attack).',
+    detail:'Scenario-by-scenario playbook: immediate response (first 24h), short-term continuity (1 week), recovery. Tested via drills at customer-specified frequency. Customers verify contingency capability — single point of failure (one machine for a CC) is an audit red flag without contingency.',
+    owner:'Plant Head + EHS + Function Heads', cadence:'Reviewed annually; tested per drill schedule',
+  },
+  {
+    key:'iap', name:'IAP — Internal Audit Plan / Programme', clause:'IATF 9.2.2',  category:'governance',
+    purpose:'Annual schedule of internal audits covering every clause + manufacturing process.',
+    detail:'Three audit types per IATF: System (QMS clauses), Manufacturing Process, Product. Plan lists area, auditor (qualified, independent of work area), planned date, clauses covered. Each audit produces findings (Major NC, Minor NC, Observation, Opportunity) → corrective action loops.',
+    owner:'Management Rep', cadence:'Annual plan; audit performance reviewed at Mgmt Review',
+  },
+  {
+    key:'lpa', name:'LPA — Layered Process Audit', clause:'IATF 9.2.2.3',  category:'governance',
+    purpose:'Short, repeatable in-process audit done at multiple management layers.',
+    detail:'L1 = supervisor (daily / per shift), L2 = manager (weekly), L3 = plant head (monthly). Same checklist focused on standardised work, work instructions visible, FIFO, 5S, safety. Findings get rapid corrective action. LPA fatigue (everyone scoring 100%) is itself a red flag.',
+    owner:'Plant management at every layer', cadence:'L1 daily, L2 weekly, L3 monthly',
+  },
+  {
+    key:'mgmt_review', name:'Management Review', clause:'IATF 9.3',  category:'governance',
+    purpose:'Top management\'s formal review of QMS performance and decisions taken.',
+    detail:'Inputs: previous MR action status, customer complaints, audit results, NC trends, KPI attainment, training needs, risk changes, supplier performance, capacity changes. Outputs: decisions, resource changes, objective revisions, improvement projects with owners + due dates. Documented as minutes + action list tracked to closure.',
+    owner:'Top management (chaired by CEO/Plant Head)', cadence:'Quarterly minimum; monthly recommended',
+  },
+  {
+    key:'csr', name:'CSR — Customer-Specific Requirements', clause:'IATF 8.2.2',  category:'governance',
+    purpose:'Each customer\'s addenda to IATF rules — what THEY require beyond the standard.',
+    detail:'Customer-by-customer register. Examples: Ford Q1 + W-Specs, Daimler MBN, Stellantis CSR-1000, Bosch SQA. Each line of customer-specific rule mapped to which internal process satisfies it. Customer audits start here.',
+    owner:'Customer Quality / SQA', cadence:'Reviewed annually + on every revision the customer issues',
+  },
+  {
+    key:'supplier_approval', name:'Approved Supplier List + Supplier Evaluation', clause:'IATF 8.4',  category:'governance',
+    purpose:'Only listed suppliers are approved to provide product / services. Each is re-rated.',
+    detail:'For every supplier: name, GSTIN, scope (which material/service), approval status, last audit date, current rating (A/B/C). Quality + delivery + commercial score is updated monthly. C-rated suppliers require corrective action plan; persistent C → de-approval.',
+    owner:'Procurement + SQA', cadence:'Monthly rating, annual re-audit',
+  },
+];
+
+function IatfDocsLibrary() {
+  const [search, setSearch] = useState('');
+  const [category, setCategory] = useState('all');
+  const [expanded, setExpanded] = useState({});
+
+  const toggle = (key) => setExpanded(prev => ({ ...prev, [key]: !prev[key] }));
+
+  const filtered = IATF_DOCS.filter(d => {
+    if (category !== 'all' && d.category !== category) return false;
+    if (!search.trim()) return true;
+    const q = search.toLowerCase();
+    return (d.name + ' ' + d.clause + ' ' + d.purpose + ' ' + d.detail + ' ' + d.owner).toLowerCase().includes(q);
+  });
+
+  const grouped = {};
+  filtered.forEach(d => { (grouped[d.category] ||= []).push(d); });
+
+  return html`
+    <div class="page-header">
+      <div><h1>📚 IATF Doc Library</h1><div class="sub">What every IATF 16949 document does · clause · owner · review cadence</div></div>
+    </div>
+
+    <div class="card" style="background:var(--slate-50);font-size:12px;color:var(--slate-700);margin-bottom:14px;padding:10px 12px">
+      Quick reference for auditors, new joiners and team members preparing audit responses. Tap any document to expand the full description. Search hits anywhere — name, clause, purpose, even the detail body.
+    </div>
+
+    <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+      <input type="search" value=${search} onChange=${e => setSearch(e.target.value)}
+        placeholder="Search by name, clause, role, keyword…"
+        style="flex:1;min-width:200px;padding:8px 12px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />
+    </div>
+
+    <div style="display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap">
+      <button class=${'auth-tab' + (category === 'all' ? ' active' : '')} onClick=${() => setCategory('all')} style="font-size:11px">All · ${IATF_DOCS.length}</button>
+      ${IATF_DOC_CATEGORIES.map(c => html`
+        <button key=${c.key} class=${'auth-tab' + (category === c.key ? ' active' : '')} onClick=${() => setCategory(c.key)} style="font-size:11px">
+          ${c.emoji} ${c.label} · ${IATF_DOCS.filter(d => d.category === c.key).length}
+        </button>
+      `)}
+    </div>
+
+    ${filtered.length === 0 ? html`
+      <div class="card"><div class="empty"><div class="icon">📚</div><div style="font-size:13px">No documents match — try a different keyword.</div></div></div>
+    ` : Object.entries(grouped).map(([catKey, items]) => {
+      const cat = IATF_DOC_CATEGORIES.find(c => c.key === catKey);
+      return html`
+        <div key=${catKey} style="margin-bottom:18px">
+          <div style="font-size:11px;font-weight:700;color:var(--slate-700);text-transform:uppercase;letter-spacing:0.5px;margin:6px 4px 8px">${cat?.emoji || '·'} ${cat?.label || catKey}</div>
+          ${items.map(d => {
+            const open = expanded[d.key];
+            return html`
+              <div class="card" key=${d.key} style="margin-bottom:6px;padding:0;overflow:hidden">
+                <div onClick=${() => toggle(d.key)} style="padding:12px 14px;cursor:pointer">
+                  <div style="display:flex;align-items:flex-start;gap:8px">
+                    <div style="flex:1">
+                      <div style="font-size:13px;font-weight:700;line-height:1.3">${d.name}</div>
+                      <div style="font-size:11px;color:var(--slate-500);margin-top:3px"><span class="mono" style="background:var(--slate-100);padding:1px 6px;border-radius:3px">${d.clause}</span> · ${d.purpose}</div>
+                    </div>
+                    <span style="color:var(--slate-400);font-size:14px;margin-top:2px">${open ? '▾' : '▸'}</span>
+                  </div>
+                  ${open && html`
+                    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--slate-100);font-size:12px;color:var(--slate-700);line-height:1.55">
+                      <p style="margin:0 0 10px">${d.detail}</p>
+                      <div style="display:flex;gap:14px;flex-wrap:wrap;font-size:11px">
+                        <div><span style="color:var(--slate-500);font-weight:600">👤 Owner: </span>${d.owner}</div>
+                        <div><span style="color:var(--slate-500);font-weight:600">🔄 Cadence: </span>${d.cadence}</div>
+                      </div>
+                    </div>
+                  `}
+                </div>
+              </div>
+            `;
+          })}
+        </div>
+      `;
+    })}
   `;
 }
 
