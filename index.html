@@ -1062,7 +1062,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'movements'}><${MovementsPage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'trace'}><${TracePage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} /></${Page}>
-      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} /></${Page}>
+      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
       <${Page} active=${tab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'calibration'}><${CalibrationModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -3376,8 +3376,122 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
   `;
 }
 
+// ============= PENDING TASKS PANEL (sticky in chat) =============
+// Plant-wide pending tasks, collapsible header that shows counts. Each row
+// has inline Done / Start / Snooze quick actions; the link icon jumps to the
+// Actions tab. Subscribes to the actions table so updates appear instantly.
+function PendingTasksPanel({ plant, setTab }) {
+  const [open, setOpen] = useState(false);
+  const [tasks, setTasks] = useState([]);
+  const [busy, setBusy] = useState({});
+
+  const refresh = useCallback(async () => {
+    const { data } = await sb.from('actions')
+      .select('id, title, status, due_at, owner_id, department')
+      .eq('plant_id', plant.id)
+      .not('status', 'in', '(completed,cancelled)')
+      .order('due_at', { ascending: true, nullsFirst: false })
+      .limit(50);
+    const list = data || [];
+    const ownerIds = [...new Set(list.map(t => t.owner_id).filter(Boolean))];
+    if (ownerIds.length > 0) {
+      const { data: us } = await sb.from('users').select('id, full_name').in('id', ownerIds);
+      const m = new Map((us || []).map(u => [u.id, u.full_name]));
+      list.forEach(t => { t._owner_name = m.get(t.owner_id) || '?'; });
+    }
+    setTasks(list);
+  }, [plant.id]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  useEffect(() => {
+    const ch = sb.channel('pending-tasks-panel-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'actions', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => { sb.removeChannel(ch); };
+  }, [plant.id, refresh]);
+
+  const today = new Date().toISOString().slice(0, 10);
+  const overdue = tasks.filter(t => t.due_at && t.due_at.slice(0,10) < today);
+  const dueToday = tasks.filter(t => t.due_at && t.due_at.slice(0,10) === today);
+
+  const doAction = async (taskId, kind) => {
+    setBusy(prev => ({ ...prev, [taskId]: kind }));
+    try {
+      if (kind === 'done') {
+        await sb.from('actions').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('id', taskId);
+        showToast('✅ Task closed');
+      } else if (kind === 'start') {
+        await sb.from('actions').update({ status: 'in_progress' }).eq('id', taskId);
+        showToast('▶️ Started');
+      } else if (kind === 'snooze') {
+        const t = tasks.find(x => x.id === taskId);
+        const base = t?.due_at ? new Date(t.due_at) : new Date();
+        const next = new Date(base.getTime() + 24 * 60 * 60 * 1000);
+        await sb.from('actions').update({ due_at: next.toISOString() }).eq('id', taskId);
+        showToast('⏰ Snoozed 1 day');
+      }
+    } catch (e) { alert(e.message); }
+    finally { setBusy(prev => { const c = { ...prev }; delete c[taskId]; return c; }); }
+  };
+
+  if (tasks.length === 0) return null;
+
+  const headerBg = overdue.length > 0 ? 'var(--rose-50)' : dueToday.length > 0 ? 'var(--amber-50)' : 'var(--slate-50)';
+
+  return html`
+    <div class="card" style="padding:0;margin-bottom:14px;border-radius:10px;overflow:hidden">
+      <div onClick=${() => setOpen(!open)} style="padding:10px 12px;display:flex;align-items:center;gap:8px;cursor:pointer;background:${headerBg};border-bottom:${open ? '1px solid var(--slate-200)' : 'none'}">
+        <div style="font-size:13px;font-weight:600;flex:1">
+          📋 ${tasks.length} pending plant task${tasks.length === 1 ? '' : 's'}
+          ${overdue.length > 0 ? html` · <span style="color:var(--rose-600)">⚠️ ${overdue.length} overdue</span>` : ''}
+          ${dueToday.length > 0 ? html` · <span style="color:var(--amber-700)">⏰ ${dueToday.length} due today</span>` : ''}
+        </div>
+        <span style="font-size:11px;color:var(--slate-500)">${open ? '▾' : '▸'}</span>
+      </div>
+      ${open && html`
+        <div style="max-height:360px;overflow-y:auto">
+          ${tasks.slice(0, 20).map(t => {
+            const isOverdue = t.due_at && t.due_at.slice(0,10) < today;
+            const isToday = t.due_at && t.due_at.slice(0,10) === today;
+            const dueLabel = !t.due_at ? 'no due' :
+              isOverdue ? '⚠️ ' + Math.abs(Math.floor((new Date(today) - new Date(t.due_at.slice(0,10))) / 86400000)) + 'd overdue' :
+              isToday ? '⏰ due today' :
+              'due ' + new Date(t.due_at).toLocaleDateString('en-IN', { day:'numeric', month:'short' });
+            return html`
+              <div key=${t.id} style="padding:10px 12px;border-bottom:1px solid var(--slate-100);background:${isOverdue ? 'var(--rose-50)' : ''}">
+                <div style="font-size:13px;font-weight:500;line-height:1.3">${t.title}</div>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:3px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+                  ${t.department ? html`<span class="badge teal" style="font-size:10px;padding:1px 6px">${t.department}</span>` : ''}
+                  <span>${t._owner_name || '—'}</span>
+                  <span>·</span>
+                  <span style=${isOverdue ? 'color:var(--rose-600);font-weight:600' : isToday ? 'color:var(--amber-700);font-weight:600' : ''}>${dueLabel}</span>
+                  <span>·</span>
+                  <span style="color:var(--slate-400)">${t.status}</span>
+                </div>
+                <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
+                  <button class="btn small" onClick=${() => doAction(t.id, 'done')} disabled=${!!busy[t.id]} style="padding:4px 10px;font-size:11px">${busy[t.id]==='done' ? '…' : '✅ Done'}</button>
+                  ${t.status !== 'in_progress' && html`<button class="btn small ghost" onClick=${() => doAction(t.id, 'start')} disabled=${!!busy[t.id]} style="padding:4px 10px;font-size:11px">${busy[t.id]==='start' ? '…' : '▶️ Start'}</button>`}
+                  <button class="btn small ghost" onClick=${() => doAction(t.id, 'snooze')} disabled=${!!busy[t.id]} style="padding:4px 10px;font-size:11px">${busy[t.id]==='snooze' ? '…' : '⏰ +1d'}</button>
+                  <button class="btn small ghost" onClick=${() => setTab && setTab('actions')} style="padding:4px 10px;font-size:11px;margin-left:auto" title="Open in Actions">🔗</button>
+                </div>
+              </div>
+            `;
+          })}
+          ${tasks.length > 20 && html`
+            <div style="padding:10px 12px;text-align:center;font-size:12px;color:var(--slate-500)">
+              + ${tasks.length - 20} more ·
+              <button class="btn small ghost" onClick=${() => setTab && setTab('actions')} style="padding:2px 8px;font-size:11px;margin-left:4px">Open Actions tab</button>
+            </div>
+          `}
+        </div>
+      `}
+    </div>
+  `;
+}
+
 // ============= CHAT =============
-function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId }) {
+function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
   const [groups, setGroups] = useState([]);
   const [activeGroup, setActiveGroup] = useState(null);
   const deepLinkAppliedRef = useRef(false);
@@ -3945,6 +4059,7 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId }) {
 
   return html`
     <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start"><div><h1>Chat</h1><div class="sub">Plant communication</div></div><button class="btn small" onClick=${() => setGroupModal(true)} style="margin-top:6px">+ New Group</button></div>
+    <${PendingTasksPanel} plant=${plant} setTab=${setTab} />
     ${notifPerm === 'default' && html`
       <div class="setup-banner" style="margin-bottom:14px">
         <div class="setup-banner-title">🔔 Enable notifications</div>
