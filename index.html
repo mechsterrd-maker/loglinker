@@ -14986,7 +14986,8 @@ function CustomerModal({ plant, me, editTarget, onClose, onSaved }) {
   `;
 }
 
-function CustomerDetail({ plant, me, customer, onClose }) {
+function CustomerDetail({ plant, me, customer: initialCustomer, onClose }) {
+  const [customer, setCustomer] = useState(initialCustomer);
   const [schedules, setSchedules] = useState([]);
   const [aliases, setAliases] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -14994,13 +14995,16 @@ function CustomerDetail({ plant, me, customer, onClose }) {
   const [aliasBusy, setAliasBusy] = useState(false);
   const [aliasErr, setAliasErr] = useState('');
   const [reapplying, setReapplying] = useState(false);
+  const [editModal, setEditModal] = useState(false);
 
   const refresh = async () => {
     setLoading(true);
-    const [s, a] = await Promise.all([
+    const [c, s, a] = await Promise.all([
+      sb.from('mcp_sched_customers').select('*').eq('id', customer.id).maybeSingle(),
       sb.from('mcp_sched_schedules').select('*').eq('customer_id', customer.id).order('schedule_month', { ascending: false }),
       sb.from('mcp_sched_customer_aliases').select('*').eq('customer_id', customer.id).order('created_at'),
     ]);
+    if (c.data) setCustomer(c.data);
     setSchedules(s.data || []);
     setAliases(a.data || []);
     setLoading(false);
@@ -15060,14 +15064,19 @@ function CustomerDetail({ plant, me, customer, onClose }) {
         <h1 style="font-size:18px">${customer.name}</h1>
         <div class="sub">${customer.short_code || customer.city || ''}</div>
       </div>
+      <button class="btn small ghost" onClick=${() => setEditModal(true)}>✎ Edit</button>
     </div>
 
     <div class="card">
-      ${customer.gstin && html`<div class="card-row"><span class="label">GSTIN</span><span class="value mono">${customer.gstin}</span></div>`}
+      <div class="card-row"><span class="label">Name</span><span class="value">${customer.name}</span></div>
+      ${customer.short_code && html`<div class="card-row"><span class="label">Short code</span><span class="value mono">${customer.short_code}</span></div>`}
+      <div class="card-row"><span class="label">GSTIN</span><span class="value mono" style=${customer.gstin ? '' : 'color:var(--slate-400)'}>${customer.gstin || '— tap Edit to add —'}</span></div>
       ${customer.contact_person && html`<div class="card-row"><span class="label">Contact</span><span class="value">${customer.contact_person} · ${customer.contact_phone || ''}</span></div>`}
       ${customer.contact_email && html`<div class="card-row"><span class="label">Email</span><span class="value">${customer.contact_email}</span></div>`}
       <div class="card-row"><span class="label">Payment terms</span><span class="value">${customer.default_payment_terms_days || 45} days</span></div>
     </div>
+
+    ${editModal && html`<${CustomerModal} plant=${plant} me=${me} editTarget=${customer} onClose=${() => setEditModal(false)} onSaved=${() => { setEditModal(false); refresh(); }} />`}
 
     <div class="section-h" style="display:flex;align-items:center;gap:8px">
       <span style="flex:1">Billing-name aliases · ${aliases.length}</span>
