@@ -1348,14 +1348,6 @@ function Home({ plant, me, setTab, reload }) {
     setLoading(false);
   };
 
-  const setupSteps = [
-    { done: stats.units > 0, label: 'Add units (Unit 1, 2, 3)' },
-    { done: stats.users > 1, label: 'Invite users (supervisors, QA)' },
-    { done: stats.machines > 0, label: 'Add PDC machines' },
-    { done: stats.dies > 0, label: 'Add dies' },
-    { done: stats.shotsToday > 0, label: 'Log first production shot' },
-  ];
-  const setupComplete = setupSteps.every(s => s.done);
   const greeting = me.full_name.split(' ')[0];
   const alerts = stats.openNcrs + stats.openBreakdowns + stats.lowStock;
 
@@ -1399,17 +1391,7 @@ function Home({ plant, me, setTab, reload }) {
       </div>
     </div>
 
-    ${!setupComplete && html`
-      <div class="setup-banner">
-        <div class="setup-banner-title">⚡ Quick setup</div>
-        ${setupSteps.map(s => html`
-          <div class=${'setup-step' + (s.done ? ' done' : '')}>
-            <div class="num">${s.done ? '✓' : ''}</div>
-            <span>${s.label}</span>
-          </div>
-        `)}
-      </div>
-    `}
+    <${PettyCashHomeCard} plant=${plant} setTab=${setTab} />
 
     <div class="dashboard-grid">
       <div class="dashboard-col-main">
@@ -5198,6 +5180,72 @@ function TopConcernsCard({ plant, setTab }) {
         onClose=${() => setDrilldown(null)}
       />
     `}
+  `;
+}
+
+function PettyCashHomeCard({ plant, setTab }) {
+  const [balances, setBalances] = useState([]);
+  const [outstanding, setOutstanding] = useState(0);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!plant?.id) return;
+    Promise.all([
+      sb.from('v_petty_cash_book_balance').select('*').eq('plant_id', plant.id),
+      sb.from('v_petty_cash_outstanding_advances').select('outstanding').eq('plant_id', plant.id),
+    ]).then(([b, a]) => {
+      setBalances(b.data || []);
+      const out = (a.data || []).reduce((s, x) => s + Math.max(0, parseFloat(x.outstanding || 0)), 0);
+      setOutstanding(out);
+      setLoading(false);
+    });
+  }, [plant?.id]);
+
+  if (loading) return null;
+
+  if (balances.length === 0) {
+    return html`
+      <div class="card" style="margin-bottom:14px;padding:10px 12px;cursor:pointer" onClick=${() => setTab('petty_cash')}>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div>
+            <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.5px">💰 Petty Cash</div>
+            <div style="font-size:12px;color:var(--slate-600);margin-top:3px">No cash book yet — tap to set up</div>
+          </div>
+          <span style="font-size:12px;color:var(--slate-400)">→</span>
+        </div>
+      </div>
+    `;
+  }
+
+  const total = balances.reduce((s, b) => s + parseFloat(b.current_balance || 0), 0);
+  const todaySpent = balances.reduce((s, b) => s + parseFloat(b.total_expense || 0), 0); // total across all time; refined below if needed
+
+  return html`
+    <div class="card" style="margin-bottom:14px;padding:12px 14px;cursor:pointer" onClick=${() => setTab('petty_cash')}>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px">
+        <div style="flex:1">
+          <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.5px">💰 Petty Cash</div>
+          <div style="display:flex;gap:14px;margin-top:8px;flex-wrap:wrap">
+            <div>
+              <div style="font-size:20px;font-weight:700;color:var(--teal-700);line-height:1">₹${fmtNum(total.toFixed(0))}</div>
+              <div style="font-size:10px;color:var(--slate-500);margin-top:2px">in hand · ${balances.length} book${balances.length>1?'s':''}</div>
+            </div>
+            ${outstanding > 0 && html`
+              <div>
+                <div style="font-size:20px;font-weight:700;color:var(--rose-600);line-height:1">₹${fmtNum(outstanding.toFixed(0))}</div>
+                <div style="font-size:10px;color:var(--slate-500);margin-top:2px">owed by team</div>
+              </div>
+            `}
+          </div>
+          ${balances.length > 1 && html`
+            <div style="font-size:11px;color:var(--slate-500);margin-top:8px;display:flex;gap:10px;flex-wrap:wrap">
+              ${balances.map(b => html`<span key=${b.book_id}>${b.name}: <strong style="color:var(--slate-700)">₹${fmtNum(parseFloat(b.current_balance).toFixed(0))}</strong></span>`)}
+            </div>
+          `}
+        </div>
+        <span style="font-size:12px;color:var(--slate-400);flex-shrink:0">→</span>
+      </div>
+    </div>
   `;
 }
 
