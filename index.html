@@ -477,6 +477,39 @@ const promptInstallApp = async () => {
 const escapeHtml = s => (s || '').toString();
 const fmtDate = d => new Date(d).toLocaleString('en-IN', { day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' });
 const fmtNum = n => Number(n || 0).toLocaleString('en-IN');
+
+// Map a route-step / stage value to the candidate machine.category values
+// that can perform that operation. Used to filter machine dropdowns in
+// route-step add, shot entry, and stage-log entry forms.
+const OP_MACHINE_CATEGORIES = {
+  pdc: ['pdc'],
+  trimming: ['pdc', 'press', 'trimming'],
+  deflashing: ['pdc', 'deflashing'],
+  shot_blast: ['shot_blast'],
+  cnc: ['cnc', 'vmc', 'lathe', 'machining'],
+  vmc: ['cnc', 'vmc'],
+  lathe: ['cnc', 'lathe'],
+  machining: ['cnc', 'vmc', 'lathe', 'machining'],
+  drilling: ['cnc', 'drilling'],
+  tapping: ['cnc', 'tapping'],
+  press: ['press'],
+  grinding: ['grinding', 'cnc'],
+  plating: ['plating'],
+  painting: ['painting'],
+  heat_treat: ['heat_treat'],
+  inspection: ['inspection'],
+  packing: [],
+  dispatch: [],
+  outsource: [],
+  assembly: [],
+  other: [],
+};
+function filterMachinesByOp(machines, opType) {
+  if (!opType) return machines;
+  const cats = OP_MACHINE_CATEGORIES[opType];
+  if (!cats || cats.length === 0) return machines;
+  return machines.filter(m => cats.includes((m.category || '').toLowerCase()));
+}
 const generateInviteCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 
 // =============== NOTIFICATIONS + SOUND ===============
@@ -1035,6 +1068,7 @@ const MORE_GROUPS = [
     items: [
       { key:'tpm',           icon:'🛠', label:'TPM Daily Checks',     sub:'30-sec machine checks · oil, coolant, leaks, guards' },
       { key:'maintenance',   icon:'🔧', label:'Maintenance',          sub:'Breakdowns log, machine status' },
+      { key:'machine_prod',  icon:'📊', label:'Machine Production',   sub:'Per-machine runtime · idle reasons · MTBF · MTTR · availability' },
       { key:'stocks',        icon:'📦', label:'Stocks',               sub:'Inventory, items, in/out transactions' },
       { key:'jobwork',       icon:'🏭', label:'Sub-Contracting',      sub:'Send / receive parts at job-work vendors · 180-day GST clock' },
       { key:'supplier_chase',icon:'🛒', label:'Supplier Chase',       sub:'Raw material runway vs upcoming schedule · auto-alerts which vendor to chase' },
@@ -1174,6 +1208,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'mom'}><${MomModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'machine_prod'}><${MachineProductionModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'petty_cash'}><${PettyCashModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
@@ -2687,11 +2722,14 @@ function RouteStepModal({ plant, route, machines, editTarget, nextSeq, onClose, 
             </div>
           </div>
           <div class="field"><label>Operation Name *</label><input type="text" required value=${form.op_name} onChange=${e => setForm({...form, op_name: e.target.value})} placeholder="Bore facing on VMC" /></div>
-          <div class="field"><label>Machine</label>
+          <div class="field"><label>Machine ${form.op_type && html`<span style="font-weight:400;color:var(--slate-500);font-size:11px"> · filtered to ${form.op_type}</span>`}</label>
             <select value=${form.machine_id || ''} onChange=${e => setForm({...form, machine_id: e.target.value})}>
               <option value="">— Any / NA —</option>
-              ${machines.map(m => html`<option key=${m.id} value=${m.id}>${m.code} · ${m.make || ''}</option>`)}
+              ${filterMachinesByOp(machines, form.op_type).map(m => html`<option key=${m.id} value=${m.id}>${m.code}${m.category ? ' · ' + m.category : ''}${m.make ? ' · ' + m.make : ''}</option>`)}
             </select>
+            ${filterMachinesByOp(machines, form.op_type).length === 0 && machines.length > 0 && html`
+              <div style="font-size:11px;color:var(--amber-700);margin-top:4px">No machines under "${form.op_type}" category. Add machines under this category in Production → Masters, or change the operation type.</div>
+            `}
           </div>
           <div class="field"><label>Fixture / Tool</label><input type="text" value=${form.fixture || ''} onChange=${e => setForm({...form, fixture: e.target.value})} /></div>
           <div class="field-row">
@@ -3488,10 +3526,11 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
               ${shifts.map(s => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
             </select>
           </div>
-          <div class="field"><label>Machine *</label>
+          <div class="field"><label>Machine * <span style="font-weight:400;color:var(--slate-500);font-size:11px">· PDC only</span></label>
             <select required value=${form.machine_id} onChange=${e => setForm({...form, machine_id: e.target.value})}>
-              ${machines.map(m => html`<option key=${m.id} value=${m.id}>${m.code} · ${m.make || ''}</option>`)}
+              ${filterMachinesByOp(machines, 'pdc').map(m => html`<option key=${m.id} value=${m.id}>${m.code} · ${m.make || ''}</option>`)}
             </select>
+            ${filterMachinesByOp(machines, 'pdc').length === 0 && html`<div style="font-size:11px;color:var(--amber-700);margin-top:4px">No PDC machines. Add one under Production → Masters with category=pdc.</div>`}
           </div>
           <div class="field"><label>Die *</label>
             <select required value=${form.die_id} onChange=${e => onDieChange(e.target.value)}>
@@ -8898,6 +8937,240 @@ function PettyCashTxnModal({ plant, me, books, users, initial, advances, onClose
 // =================================================================
 // Send DC out → vendor holds stock → DC in with received + scrap.
 // Tracks days at vendor + 180-day GST clock (Sec 143 CGST).
+// =================================================================
+// MACHINE PRODUCTION — per-machine runtime, idle reasons, MTBF/MTTR
+// =================================================================
+function MachineProductionModule({ plant, me }) {
+  const [summary, setSummary] = useState([]);
+  const [machines, setMachines] = useState([]);
+  const [recent, setRecent] = useState([]); // recent idle logs
+  const [shifts, setShifts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [idleModal, setIdleModal] = useState(null); // machine row to log idle for
+  const [tab, setTab] = useState('runtime'); // runtime | idle_history | not_run_today
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [s, m, r, sh] = await Promise.all([
+      sb.from('v_machine_runtime_summary').select('*').eq('plant_id', plant.id).order('availability_pct', { ascending:true, nullsFirst:false }),
+      sb.from('machines').select('*').eq('plant_id', plant.id).order('code'),
+      sb.from('mcp_pdc_machine_idle_log').select('*, machine:machine_id(code, display_name), creator:created_by(full_name)').eq('plant_id', plant.id).order('log_date', { ascending:false }).order('created_at', { ascending:false }).limit(200),
+      sb.from('shifts').select('*').eq('plant_id', plant.id).order('name'),
+    ]);
+    setSummary(s.data || []);
+    setMachines(m.data || []);
+    setRecent(r.data || []);
+    setShifts(sh.data || []);
+    setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  useEffect(() => {
+    if (!plant?.id) return;
+    const ch = sb.channel('machine-prod-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_pdc_machine_idle_log', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => sb.removeChannel(ch);
+  }, [plant.id, refresh]);
+
+  // "Didn't run today" = machines that have no shot today AND no stage_log today AND no idle log today
+  const [notRunIds, setNotRunIds] = useState([]);
+  useEffect(() => {
+    if (!plant?.id) return;
+    const today = new Date().toISOString().slice(0,10);
+    Promise.all([
+      sb.from('mcp_pdc_shots').select('machine_id').eq('plant_id', plant.id).gte('recorded_at', today + 'T00:00:00'),
+      sb.from('mcp_pdc_stage_log').select('machine_id').eq('plant_id', plant.id).eq('log_date', today),
+      sb.from('mcp_pdc_machine_idle_log').select('machine_id').eq('plant_id', plant.id).eq('log_date', today),
+    ]).then(([s, sl, il]) => {
+      const ran = new Set([
+        ...(s.data || []).map(x => x.machine_id).filter(Boolean),
+        ...(sl.data || []).map(x => x.machine_id).filter(Boolean),
+        ...(il.data || []).map(x => x.machine_id).filter(Boolean),
+      ]);
+      setNotRunIds(machines.filter(m => !ran.has(m.id)).map(m => m.id));
+    });
+  }, [plant?.id, machines, recent]);
+
+  const reasonEmoji = (r) => ({ no_plan:'📭', maintenance:'🔧', no_manpower:'👥', setup:'⚙️', other:'⏸' }[r] || '⏸');
+  const reasonLabel = (r) => ({ no_plan:'No plan', maintenance:'Maintenance', no_manpower:'No manpower', setup:'Setup', other:'Other' }[r] || r);
+
+  return html`
+    <div class="page-header"><div><h1>📊 Machine Production</h1><div class="sub">Per-machine runtime · idle reasons · MTBF · MTTR · 90-day window</div></div></div>
+
+    <div class="auth-tabs" style="margin-bottom:12px">
+      <button class=${'auth-tab' + (tab==='runtime'?' active':'')} onClick=${() => setTab('runtime')}>Runtime</button>
+      <button class=${'auth-tab' + (tab==='not_run_today'?' active':'')} onClick=${() => setTab('not_run_today')}>Didn't run today${notRunIds.length>0?' · '+notRunIds.length:''}</button>
+      <button class=${'auth-tab' + (tab==='idle_history'?' active':'')} onClick=${() => setTab('idle_history')}>Idle history · ${recent.length}</button>
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      tab === 'runtime' ? html`
+        ${summary.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📊</div><div style="font-size:13px">No machines yet. Add some under Production → Masters.</div></div></div>` :
+          summary.map(s => {
+            const avail = parseFloat(s.availability_pct || 0);
+            const colour = avail >= 75 ? 'teal' : avail >= 50 ? 'amber' : 'rose';
+            return html`
+              <div class="card" key=${s.machine_id} style=${'margin-bottom:6px;padding:10px 12px;border-left:3px solid var(--'+colour+'-500)'}>
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap">
+                  <div style="flex:1;min-width:160px">
+                    <div style="font-size:13px;font-weight:600">${s.code}${s.display_name?' · '+s.display_name:''}${s.category?html` <span class="badge teal" style="font-size:9px">${s.category}</span>`:''}</div>
+                    <div style="font-size:11px;color:var(--slate-500);margin-top:4px">
+                      Ran ${s.running_days_90d} of 90d · ${fmtNum(parseFloat(s.operating_hours_90d).toFixed(0))}h operated · ${fmtNum(parseFloat(s.idle_hours_90d).toFixed(0))}h idle · ${fmtNum(parseFloat(s.breakdown_hours_90d).toFixed(0))}h down
+                    </div>
+                  </div>
+                  <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+                    <div style="text-align:center">
+                      <div style=${'font-size:18px;font-weight:700;color:var(--'+colour+'-700)'}>${s.availability_pct != null ? s.availability_pct + '%' : '—'}</div>
+                      <div style="font-size:9px;color:var(--slate-500)">availability</div>
+                    </div>
+                    <div style="text-align:center">
+                      <div style="font-size:14px;font-weight:600;color:var(--slate-700)">${s.mtbf_hours != null ? s.mtbf_hours + 'h' : '—'}</div>
+                      <div style="font-size:9px;color:var(--slate-500)">MTBF</div>
+                    </div>
+                    <div style="text-align:center">
+                      <div style="font-size:14px;font-weight:600;color:var(--slate-700)">${s.mttr_hours != null ? s.mttr_hours + 'h' : '—'}</div>
+                      <div style="font-size:9px;color:var(--slate-500)">MTTR</div>
+                    </div>
+                    <div style="text-align:center">
+                      <div style="font-size:14px;font-weight:600;color:var(--rose-600)">${s.breakdowns_90d}</div>
+                      <div style="font-size:9px;color:var(--slate-500)">BD/90d</div>
+                    </div>
+                    <button class="btn small ghost" onClick=${() => setIdleModal(s)} style="font-size:11px;padding:4px 10px">⏸ Log idle</button>
+                  </div>
+                </div>
+              </div>
+            `;
+          })
+        }
+      ` : tab === 'not_run_today' ? html`
+        ${notRunIds.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✅</div><div style="font-size:13px">Every machine either ran today or has an idle reason logged. Good.</div></div></div>` :
+          html`
+            <div class="card" style="margin-bottom:10px;background:var(--amber-50);border-color:var(--amber-200)">
+              <div style="font-size:12px;color:var(--amber-800)">
+                <strong>${notRunIds.length} machine${notRunIds.length>1?'s':''}</strong> didn't run today and have no idle reason logged. Tap one to record why (no plan / maintenance / no manpower).
+              </div>
+            </div>
+            ${machines.filter(m => notRunIds.includes(m.id)).map(m => html`
+              <div class="card" key=${m.id} style="margin-bottom:4px;padding:10px 12px;cursor:pointer" onClick=${() => setIdleModal(m)}>
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                  <div>
+                    <div style="font-size:13px;font-weight:600">${m.code}${m.display_name?' · '+m.display_name:''}</div>
+                    <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${m.category || ''} · status: ${m.status || 'unknown'}</div>
+                  </div>
+                  <span class="btn small">⏸ Log reason</span>
+                </div>
+              </div>
+            `)}
+          `
+        }
+      ` : html`
+        ${recent.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📜</div><div style="font-size:13px">No idle logs yet.</div></div></div>` :
+          recent.map(r => html`
+            <div class="card" key=${r.id} style="margin-bottom:4px;padding:9px 12px">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="flex:1">
+                  <div style="font-size:13px;font-weight:600">${reasonEmoji(r.reason)} ${r.machine?.code || '?'}${r.machine?.display_name?' · '+r.machine.display_name:''}</div>
+                  <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                    ${r.log_date} · ${reasonLabel(r.reason)}${r.idle_hours?' · '+r.idle_hours+'h':''}
+                    ${r.creator?.full_name?' · '+r.creator.full_name:''}
+                  </div>
+                  ${r.notes && html`<div style="font-size:11px;color:var(--slate-600);margin-top:3px">${r.notes}</div>`}
+                </div>
+              </div>
+            </div>
+          `)
+        }
+      `
+    }
+
+    ${idleModal && html`<${IdleLogModal} plant=${plant} me=${me} machine=${idleModal} shifts=${shifts} onClose=${() => setIdleModal(null)} onSaved=${() => { setIdleModal(null); refresh(); }} />`}
+  `;
+}
+
+function IdleLogModal({ plant, me, machine, shifts, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    log_date: new Date().toISOString().slice(0,10),
+    shift_id: '',
+    reason: 'no_plan',
+    idle_hours: '',
+    notes: '',
+    attachments: [],
+    email_ref: '',
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      const { error } = await sb.from('mcp_pdc_machine_idle_log').insert({
+        plant_id: plant.id,
+        machine_id: machine.id || machine.machine_id,
+        log_date: form.log_date,
+        shift_id: form.shift_id || null,
+        reason: form.reason,
+        idle_hours: form.idle_hours ? parseFloat(form.idle_hours) : null,
+        notes: form.notes || null,
+        attachments: form.attachments,
+        email_ref: form.email_ref || null,
+        created_by: me.id,
+      });
+      if (error) throw error;
+      showToast('⏸ Idle reason logged');
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target===e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">⏸ Log idle reason · ${machine.code || ''}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Date *</label><input type="date" required value=${form.log_date} onChange=${e => setForm({...form, log_date: e.target.value})} /></div>
+            <div class="field"><label>Shift</label>
+              <select value=${form.shift_id} onChange=${e => setForm({...form, shift_id: e.target.value})}>
+                <option value="">— Full day —</option>
+                ${shifts.map(s => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Reason *</label>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:6px">
+              ${[
+                { v:'no_plan', label:'📭 No plan', desc:'No customer order to run' },
+                { v:'maintenance', label:'🔧 Maintenance', desc:'PM or repair work' },
+                { v:'no_manpower', label:'👥 No manpower', desc:'Operator unavailable' },
+                { v:'setup', label:'⚙️ Setup', desc:'Die change / fixture' },
+                { v:'other', label:'⏸ Other', desc:'Specify in notes' },
+              ].map(o => html`
+                <button type="button" key=${o.v} onClick=${() => setForm({...form, reason: o.v})}
+                  style=${'padding:8px 6px;border:1.5px solid '+(form.reason===o.v?'var(--teal-600)':'var(--slate-200)')+';background:'+(form.reason===o.v?'var(--teal-50)':'white')+';border-radius:6px;cursor:pointer;font-family:inherit;text-align:center;font-size:11px;font-weight:'+(form.reason===o.v?'600':'500')+';color:'+(form.reason===o.v?'var(--teal-700)':'var(--slate-700)')}>
+                  ${o.label}
+                </button>
+              `)}
+            </div>
+            <div style="font-size:10px;color:var(--slate-500);margin-top:4px">${({no_plan:'No customer order/schedule to run',maintenance:'PM or repair work — counts as planned downtime',no_manpower:'Operator unavailable',setup:'Die change / fixture setup',other:'Specify in notes'})[form.reason]}</div>
+          </div>
+          <div class="field"><label>Idle hours (optional)</label>
+            <input type="number" step="0.5" min=${0} max=${24} value=${form.idle_hours} onChange=${e => setForm({...form, idle_hours: e.target.value})} placeholder="hours machine was idle" />
+          </div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})} placeholder="What happened, what's needed to restart"></textarea></div>
+          <${EntryAttachments} plant=${plant} me=${me} scope="machine_idle"
+            value=${{ attachments: form.attachments, email_ref: form.email_ref }}
+            onChange=${(v) => setForm({...form, attachments: v.attachments, email_ref: v.email_ref})}
+            showEmail=${false} />
+          <button class="btn" disabled=${busy}>${busy ? 'Saving…' : '⏸ Record idle reason'}</button>
+          <p style="font-size:11px;color:var(--slate-500);margin:6px 0 0">Feeds MTBF/MTTR + availability % · posts to All Hands.</p>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+
 function SubContractingModule({ plant, me }) {
   const [view, setView] = useState('pending'); // pending | send | history
   const [lines, setLines] = useState([]);
@@ -16950,11 +17223,12 @@ function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, 
           ${(tpl.showMachine || tpl.showDie) && html`
             <div class="field-row">
               ${tpl.showMachine && html`
-                <div class="field"><label>Machine</label>
+                <div class="field"><label>Machine <span style="font-weight:400;color:var(--slate-500);font-size:11px">· filtered by ${form.stage}</span></label>
                   <select value=${form.machine_id} onChange=${e => setForm({...form, machine_id: e.target.value})}>
                     <option value="">— None —</option>
-                    ${machines.map(m => html`<option key=${m.id} value=${m.id}>${m.code}${m.category && m.category !== 'pdc' ? ' (' + m.category + ')' : ''}</option>`)}
+                    ${filterMachinesByOp(machines, form.stage).map(m => html`<option key=${m.id} value=${m.id}>${m.code}${m.category ? ' (' + m.category + ')' : ''}</option>`)}
                   </select>
+                  ${filterMachinesByOp(machines, form.stage).length === 0 && machines.length > 0 && html`<div style="font-size:11px;color:var(--amber-700);margin-top:4px">No machines for "${form.stage}". Add machines under this category in Production → Masters.</div>`}
                 </div>
               `}
               ${tpl.showDie && html`
