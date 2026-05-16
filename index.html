@@ -2562,6 +2562,33 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
       </div>
     </div>
 
+    ${(() => {
+      const linkedStock = stockItems.find(s => s.code === part.part_number);
+      return html`
+        <div class="card" style=${'margin-bottom:14px;background:'+(linkedStock?'var(--emerald-50)':'var(--slate-50)')+';border-color:'+(linkedStock?'var(--emerald-200)':'var(--slate-200)')}>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <div style="font-size:11px;font-weight:700;color:var(--slate-700);text-transform:uppercase;letter-spacing:0.5px">📦 Inventory</div>
+            ${linkedStock && html`<span style="font-size:10px;background:var(--emerald-700);color:white;padding:1px 6px;border-radius:3px;font-weight:600">linked</span>`}
+          </div>
+          ${linkedStock ? html`
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div>
+                <div style="font-size:18px;font-weight:700;color:var(--emerald-800)">${fmtNum(linkedStock.current_qty)} <span style="font-size:12px;color:var(--slate-600);font-weight:500">${linkedStock.uom}</span></div>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${linkedStock.code} · reorder at ${fmtNum(linkedStock.reorder_level)}</div>
+              </div>
+              <div style="display:flex;gap:6px">
+                <button class="btn small" onClick=${() => { setEditTarget({ item: linkedStock, txn_type: 'receipt' }); setModal('stock_txn'); }} style="padding:5px 10px;font-size:12px">+ Receipt</button>
+                <button class="btn small ghost" onClick=${() => { setEditTarget({ item: linkedStock, txn_type: 'consumption' }); setModal('stock_txn'); }} style="padding:5px 10px;font-size:12px">− Issue</button>
+              </div>
+            </div>
+          ` : html`
+            <div style="font-size:12px;color:var(--slate-600);margin-bottom:8px">No stock ledger for this part yet. Create one to track on-hand quantity (e.g. job-work returns, GRN-in, manual receipts).</div>
+            <button class="btn small" onClick=${() => { setEditTarget(part); setModal('track_stock'); }} style="font-size:12px">📦 Track stock for this part</button>
+          `}
+        </div>
+      `;
+    })()}
+
     <div class="auth-tabs" style="margin-bottom:14px">
       <button class=${'auth-tab' + (tab === 'route' ? ' active' : '')} onClick=${() => setTab('route')}>Route</button>
       <button class=${'auth-tab' + (tab === 'bom' ? ' active' : '')} onClick=${() => setTab('bom')}>BOM</button>
@@ -2649,7 +2676,157 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
     ${modal === 'step' && html`<${RouteStepModal} plant=${plant} route=${route} machines=${machines} editTarget=${editTarget} nextSeq=${steps.length > 0 ? Math.max(...steps.map(s => s.seq)) + 10 : 10} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'bom' && html`<${BomModal} plant=${plant} parentPart=${part} parts=${parts} stockItems=${stockItems} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'part' && html`<${PartModal} plant=${plant} me=${me} dies=${dies} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); onClose(); }} />`}
+    ${modal === 'track_stock' && html`<${TrackStockForPartModal} plant=${plant} me=${me} part=${part} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'stock_txn' && html`<${PartStockTxnModal} plant=${plant} me=${me} item=${editTarget.item} txnType=${editTarget.txn_type} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${aliasModalOpen && html`<${PartAliasesModal} plant=${plant} me=${me} part=${part} onClose=${() => setAliasModalOpen(false)} onSaved=${() => { setAliasModalOpen(false); refresh(); }} />`}
+  `;
+}
+
+// =================================================================
+// "Track stock for this part" — Path A shortcut:
+// creates a matching mcp_stocks_items row and optionally logs an
+// opening receipt in one step. Keeps part code = stock item code so
+// the PartDetail inventory card auto-links.
+// =================================================================
+function TrackStockForPartModal({ plant, me, part, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    code: part.part_number,
+    name: part.name || part.part_number,
+    category: part.part_type === 'sub_assembly' ? 'sub_assembly' : (part.part_type === 'raw_part' ? 'raw' : 'wip'),
+    uom: part.uom || 'nos',
+    reorder_level: 0,
+    unit_cost: '',
+    opening_qty: 0,
+    opening_reference: 'Opening balance',
+  });
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setLoading(true);
+    try {
+      // Create the stock item
+      const { data: item, error } = await sb.from('mcp_stocks_items').insert({
+        plant_id: plant.id,
+        code: form.code.trim(),
+        name: form.name.trim(),
+        category: form.category || null,
+        uom: form.uom || 'nos',
+        current_qty: 0,
+        reorder_level: parseFloat(form.reorder_level) || 0,
+        unit_cost: form.unit_cost ? parseFloat(form.unit_cost) : null,
+      }).select('id').single();
+      if (error) throw error;
+
+      // Optionally log opening receipt
+      const opening = parseFloat(form.opening_qty);
+      if (opening > 0) {
+        const { error: tErr } = await sb.from('mcp_stocks_transactions').insert({
+          plant_id: plant.id,
+          item_id: item.id,
+          txn_type: 'receipt',
+          qty: opening,
+          reference: form.opening_reference || 'Opening balance',
+          notes: 'Auto-created when linking part ' + part.part_number + ' to stock ledger',
+          performed_by: me.id,
+        });
+        if (tErr) throw tErr;
+      }
+
+      showToast('📦 Stock ledger created' + (opening > 0 ? ' · opening ' + fmtNum(opening) + ' ' + form.uom : ''));
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">📦 Track stock for ${part.part_number}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div style="font-size:12px;color:var(--slate-600);margin-bottom:10px;background:var(--slate-50);padding:8px 10px;border-radius:6px;border-left:3px solid var(--teal-500)">
+          Creates a stock-ledger row matching this part. Code must match (${part.part_number}) so PartDetail auto-links. After this, add Receipts whenever vendor returns the sub-assembly, or Issues for outflow.
+        </div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Code *</label><input type="text" required value=${form.code} onChange=${e => setForm({...form, code: e.target.value})} /></div>
+            <div class="field"><label>UoM *</label><input type="text" required value=${form.uom} onChange=${e => setForm({...form, uom: e.target.value})} placeholder="nos / kg / m" /></div>
+          </div>
+          <div class="field"><label>Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} /></div>
+          <div class="field-row">
+            <div class="field"><label>Category</label>
+              <select value=${form.category} onChange=${e => setForm({...form, category: e.target.value})}>
+                <option value="raw">Raw material</option>
+                <option value="component">Component</option>
+                <option value="sub_assembly">Sub-assembly</option>
+                <option value="wip">WIP</option>
+                <option value="finished">Finished</option>
+                <option value="consumable">Consumable</option>
+                <option value="spare">Spare</option>
+              </select>
+            </div>
+            <div class="field"><label>Reorder at</label><input type="number" min=${0} step="any" value=${form.reorder_level} onChange=${e => setForm({...form, reorder_level: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Unit cost (₹, optional)</label><input type="number" min=${0} step="any" value=${form.unit_cost} onChange=${e => setForm({...form, unit_cost: e.target.value})} placeholder="for valuation" /></div>
+          <div style="border-top:1px dashed var(--slate-300);padding-top:10px;margin-top:8px">
+            <div style="font-size:11px;font-weight:700;color:var(--slate-600);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px">Opening balance · optional</div>
+            <div class="field-row">
+              <div class="field"><label>Opening qty</label><input type="number" min=${0} step="any" value=${form.opening_qty} onChange=${e => setForm({...form, opening_qty: e.target.value})} placeholder="0" /></div>
+              <div class="field"><label>Reference</label><input type="text" value=${form.opening_reference} onChange=${e => setForm({...form, opening_reference: e.target.value})} /></div>
+            </div>
+          </div>
+          <button class="btn" disabled=${loading} style="width:100%;margin-top:8px">${loading ? 'Creating…' : 'Create stock ledger'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function PartStockTxnModal({ plant, me, item, txnType, onClose, onSaved }) {
+  const isInward = txnType === 'receipt';
+  const [form, setForm] = useState({ qty: '', reference: '', notes: '' });
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setLoading(true);
+    try {
+      const q = parseFloat(form.qty);
+      if (!q || q <= 0) throw new Error('Quantity must be > 0');
+      if (!isInward && q > parseFloat(item.current_qty || 0)) {
+        if (!confirm('Stock will go to ' + fmtNum(parseFloat(item.current_qty || 0) - q) + '. Continue?')) {
+          setLoading(false); return;
+        }
+      }
+      const { error } = await sb.from('mcp_stocks_transactions').insert({
+        plant_id: plant.id, item_id: item.id, txn_type: txnType, qty: q,
+        reference: form.reference || null, notes: form.notes || null, performed_by: me.id,
+      });
+      if (error) throw error;
+      showToast((isInward ? '+ ' : '− ') + fmtNum(q) + ' ' + item.uom);
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${isInward ? '+ Receipt' : '− Issue'} · ${item.code}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div style="font-size:12px;color:var(--slate-500);margin-bottom:10px">Current on-hand: <strong>${fmtNum(item.current_qty)} ${item.uom}</strong></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Qty *</label><input type="number" required min=${0.001} step="any" value=${form.qty} onChange=${e => setForm({...form, qty: e.target.value})} autoFocus /></div>
+          <div class="field"><label>Reference</label><input type="text" value=${form.reference} onChange=${e => setForm({...form, reference: e.target.value})} placeholder=${isInward ? 'GRN / vendor DC / job-work return' : 'consumed for / issued to'} /></div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading} style="width:100%">${loading ? 'Saving…' : (isInward ? '+ Add receipt' : '− Issue stock')}</button>
+        </form>
+      </div>
+    </div>
   `;
 }
 
