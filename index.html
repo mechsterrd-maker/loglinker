@@ -3447,6 +3447,7 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
     metal_alloy: 'ADC-12',
     metal_consumed_kg: '',
     notes: '',
+    shot_date: new Date().toISOString().slice(0,10),
   });
   // Structured rejection breakdown: array of { rejection_type_id, label_snapshot, qty }
   const [rejBreakdown, setRejBreakdown] = useState([]);
@@ -3488,7 +3489,14 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
         metal_consumed_kg: form.metal_consumed_kg ? parseFloat(form.metal_consumed_kg) : null,
         notes: form.notes || null,
         recorded_by_user_id: me.id,
-        recorded_at: new Date().toISOString(),
+        // Backdated entries get the chosen date with the current time-of-day,
+        // so within-day ordering by recorded_at still reflects the entry sequence.
+        recorded_at: (() => {
+          const today = new Date().toISOString().slice(0,10);
+          if (!form.shot_date || form.shot_date === today) return new Date().toISOString();
+          const now = new Date();
+          return form.shot_date + 'T' + now.toTimeString().slice(0,8);
+        })(),
         attachments: attach.attachments || [],
         email_ref: attach.email_ref || null,
       };
@@ -3529,6 +3537,9 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
         <form onSubmit=${submit}>
+          <div class="field"><label>Shot date *${form.shot_date && form.shot_date !== new Date().toISOString().slice(0,10) ? html` <span style="font-weight:400;color:var(--amber-700);font-size:11px">· backdated</span>` : ''}</label>
+            <input type="date" required max=${new Date().toISOString().slice(0,10)} value=${form.shot_date} onChange=${e => setForm({...form, shot_date: e.target.value})} />
+          </div>
           <div class="field"><label>Shift *</label>
             <select required value=${form.shift_id} onChange=${e => setForm({...form, shift_id: e.target.value})}>
               ${shifts.map(s => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
