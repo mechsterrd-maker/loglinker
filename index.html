@@ -1513,6 +1513,7 @@ function Production({ plant, me }) {
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [activePart, setActivePart] = useState(null);
+  const [activeMachine, setActiveMachine] = useState(null);
   const [loading, setLoading] = useState(true);
   const [voiceOpen, setVoiceOpen] = useState(false);
 
@@ -1555,6 +1556,10 @@ function Production({ plant, me }) {
   }
 
   // If a part is selected, show its detail (route + BOM)
+  if (activeMachine) {
+    return html`<${MachineDetail} plant=${plant} me=${me} machine=${activeMachine} units=${units} users=${users} dies=${dies} parts=${parts} onClose=${() => { setActiveMachine(null); refresh(); }} />`;
+  }
+
   if (activePart) {
     return html`<${PartDetail} plant=${plant} me=${me} part=${activePart} machines=${machines} dies=${dies} parts=${parts.filter(x => x.id !== activePart.id)} onClose=${() => { setActivePart(null); refresh(); }} />`;
   }
@@ -1696,7 +1701,7 @@ function Production({ plant, me }) {
               ${grouped[cat].map(m => {
                 const supervisor = users.find(u => u.id === m.default_supervisor_id);
                 return html`
-                  <div class="list-item" key=${m.id} onClick=${() => { setEditTarget(m); setModal('machine'); }}>
+                  <div class="list-item" key=${m.id} onClick=${() => setActiveMachine(m)}>
                     <div class="list-item-row">
                       <div class="list-item-main">
                         <div class="list-item-title">${m.code}${m.display_name ? ' (' + m.display_name + ')' : ''} ${m.make ? '· ' + m.make : ''} ${m.model || ''}</div>
@@ -3160,6 +3165,198 @@ function BomModal({ plant, parentPart, parts, stockItems, onClose, onSaved }) {
 }
 
 // ============= MACHINE MODAL =============
+// =================================================================
+// MACHINE HISTORY CARD — unified timeline across all sources.
+// Pulls from: breakdowns, tool_change_events, machine_idle_log,
+// shots (rolled up per day), PM executions, calibration records.
+// =================================================================
+function MachineDetail({ plant, me, machine, units, users, dies, parts, onClose }) {
+  const [tab, setTab] = useState('history');
+  const [period, setPeriod] = useState('30');
+  const [filterType, setFilterType] = useState('all');
+  const [events, setEvents] = useState([]);
+  const [stats, setStats] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const periodStart = new Date(); periodStart.setDate(periodStart.getDate() - parseInt(period));
+    const periodStartIso = periodStart.toISOString();
+    const periodStartDate = periodStart.toISOString().slice(0,10);
+
+    // Step 1: get PM task ids for this machine (PM executions are linked via task, not machine directly)
+    const { data: pmTasks } = await sb.from('iatf_pm_tasks').select('id, task_name, frequency_type').eq('machine_id', machine.id);
+    const pmTaskIds = (pmTasks || []).map(t => t.id);
+    const pmTaskMap = Object.fromEntries((pmTasks || []).map(t => [t.id, t]));
+
+    const [brk, tc, idle, shots, pm] = await Promise.all([
+      sb.from('mcp_maintenance_breakdowns').select('id, description, reported_at, attended_at, resolved_at, downtime_minutes, status, resolution_notes, attended:attended_by(full_name), reporter:reported_by(full_name)').eq('machine_id', machine.id).gte('reported_at', periodStartIso).order('reported_at', { ascending: false }),
+      sb.from('tool_change_events').select('id, changed_at, change_reason, pieces_done, minutes_used, notes, tool:tool_id(code, name), users:changed_by(full_name)').eq('machine_id', machine.id).gte('changed_at', periodStartIso).order('changed_at', { ascending: false }),
+      sb.from('mcp_pdc_machine_idle_log').select('id, log_date, idle_hours, reason, notes, shifts:shift_id(name)').eq('machine_id', machine.id).gte('log_date', periodStartDate).order('log_date', { ascending: false }),
+      sb.from('mcp_pdc_shots').select('id, recorded_at, shots_good, shots_rejected, pieces_good, pieces_rejected, cavities, mcp_pdc_dies(code), mcp_pdc_parts(part_number)').eq('machine_id', machine.id).gte('recorded_at', periodStartIso).order('recorded_at', { ascending: false }),
+      pmTaskIds.length > 0
+        ? sb.from('iatf_pm_executions').select('id, performed_date, status, notes, findings, duration_minutes, task_id, performed_by:performed_by_user_id(full_name)').in('task_id', pmTaskIds).gte('performed_date', periodStartDate).order('performed_date', { ascending: false })
+        : Promise.resolve({ data: [] }),
+    ]);
+
+    const merged = [];
+    (brk.data || []).forEach(b => merged.push({
+      kind: 'breakdown', icon: '🔧', color: 'rose', at: b.reported_at,
+      title: 'Breakdown · ' + b.status, body: b.description,
+      sub: 'reported by ' + (b.reporter?.full_name || '?') + (b.attended?.full_name ? ' · attended by ' + b.attended.full_name : '') + (b.downtime_minutes ? ' · ' + b.downtime_minutes + 'min downtime' : ''),
+      notes: b.resolution_notes, id: b.id,
+    }));
+    (tc.data || []).forEach(t => merged.push({
+      kind: 'tool_change', icon: '🛠️', color: 'amber', at: t.changed_at,
+      title: 'Tool change' + (t.change_reason ? ' · ' + t.change_reason : ''),
+      body: (t.tool?.code ? t.tool.code + (t.tool?.name ? ' · ' + t.tool.name : '') : '') + (t.pieces_done ? ' · ' + t.pieces_done + ' pcs done' : '') + (t.minutes_used ? ' · ' + t.minutes_used + 'min' : ''),
+      sub: (t.users?.full_name ? 'by ' + t.users.full_name : '') + (t.notes ? (t.users?.full_name ? ' · ' : '') + t.notes : ''),
+    }));
+    (idle.data || []).forEach(i => merged.push({
+      kind: 'idle', icon: '⏸️', color: 'slate', at: i.log_date + 'T12:00:00',
+      title: 'Idle · ' + (i.reason || 'no reason'),
+      body: (i.idle_hours ? i.idle_hours + ' hr idle' : '') + (i.shifts?.name ? ' · ' + i.shifts.name : ''),
+      sub: i.notes,
+    }));
+    (pm.data || []).forEach(p => {
+      const task = pmTaskMap[p.task_id];
+      merged.push({
+        kind: 'pm', icon: '⚙️', color: p.status === 'completed' ? 'emerald' : 'amber', at: p.performed_date + 'T12:00:00',
+        title: 'PM · ' + (task?.task_name || 'preventive maintenance'),
+        body: (task?.frequency_type ? task.frequency_type + ' · ' : '') + (p.status || '') + (p.duration_minutes ? ' · ' + p.duration_minutes + 'min' : ''),
+        sub: 'by ' + (p.performed_by?.full_name || '?') + (p.findings ? ' · findings: ' + p.findings : '') + (p.notes ? ' · ' + p.notes : ''),
+      });
+    });
+
+    // Roll up shots per day per part
+    const shotsByDay = {};
+    (shots.data || []).forEach(s => {
+      const day = s.recorded_at.slice(0, 10);
+      const key = day + '|' + (s.mcp_pdc_parts?.part_number || 'unknown');
+      if (!shotsByDay[key]) shotsByDay[key] = {
+        day, part: s.mcp_pdc_parts?.part_number || 'unknown',
+        die: s.mcp_pdc_dies?.code, shots: 0, good: 0, rej: 0,
+      };
+      shotsByDay[key].shots += 1;
+      shotsByDay[key].good += s.pieces_good ?? (s.shots_good||0) * (s.cavities||1);
+      shotsByDay[key].rej  += s.pieces_rejected ?? (s.shots_rejected||0) * (s.cavities||1);
+    });
+    Object.values(shotsByDay).forEach(d => merged.push({
+      kind: 'production', icon: '🔥', color: 'teal', at: d.day + 'T23:59:59',
+      title: 'Production · ' + d.part + (d.die ? ' (die ' + d.die + ')' : ''),
+      body: d.shots + ' shot' + (d.shots===1?'':'s') + ' · ' + fmtNum(d.good) + ' pcs good · ' + fmtNum(d.rej) + ' rej',
+    }));
+
+    merged.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
+    setEvents(merged);
+
+    // Stats
+    const totalBrk = (brk.data || []).length;
+    const totalDowntime = (brk.data || []).reduce((s,b) => s + (b.downtime_minutes||0), 0);
+    const totalShots = (shots.data || []).length;
+    const totalPieces = (shots.data || []).reduce((s, sh) => s + (sh.pieces_good ?? (sh.shots_good||0) * (sh.cavities||1)), 0);
+    const lastPm = (pm.data || []).length > 0 ? (pm.data[0]).performed_date : null;
+    const lastBrk = (brk.data || []).length > 0 ? brk.data[0].reported_at?.slice(0,10) : null;
+    setStats({ totalBrk, totalDowntime, totalShots, totalPieces, lastPm, lastBrk });
+    setLoading(false);
+  }, [machine.id, period]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const filteredEvents = filterType === 'all' ? events : events.filter(e => e.kind === filterType);
+
+  if (editing) {
+    return html`<${MachineModal} plant=${plant} units=${units} users=${users} editTarget=${machine} onClose=${() => setEditing(false)} onSaved=${() => { setEditing(false); onClose(); }} />`;
+  }
+
+  const supervisor = users.find(u => u.id === machine.default_supervisor_id);
+  const unit = units.find(u => u.id === machine.unit_id);
+  const statusBadge = machine.status === 'running' ? 'emerald' : machine.status === 'breakdown' ? 'rose' : machine.status === 'maintenance' ? 'amber' : 'slate';
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:0">
+        <h1 style="font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${machine.code} ${machine.display_name ? '(' + machine.display_name + ')' : ''}</h1>
+        <div class="sub">${machine.make || ''} ${machine.model || ''} · ${machine.category || 'pdc'}${machine.tonnage ? ' · ' + machine.tonnage + 'T' : ''}</div>
+      </div>
+      <span class=${'badge ' + statusBadge}>${machine.status || 'unknown'}</span>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (tab === 'history' ? ' active' : '')} onClick=${() => setTab('history')}>📋 History</button>
+      <button class=${'auth-tab' + (tab === 'details' ? ' active' : '')} onClick=${() => setTab('details')}>📝 Details</button>
+    </div>
+
+    ${tab === 'history' && html`
+      <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px">
+        <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.totalBrk||0}</div><div class="stat-label" style="font-size:10px">Breakdowns</div></div>
+        <div class="stat amber" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.totalDowntime||0}m</div><div class="stat-label" style="font-size:10px">Downtime</div></div>
+        <div class="stat teal" style="padding:8px"><div class="stat-num" style="font-size:16px">${fmtNum(stats.totalPieces||0)}</div><div class="stat-label" style="font-size:10px">Pieces</div></div>
+        <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:13px">${stats.lastPm || '—'}</div><div class="stat-label" style="font-size:10px">Last PM</div></div>
+      </div>
+
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;align-items:center">
+        <select value=${period} onChange=${e => setPeriod(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
+          <option value="7">Last 7d</option>
+          <option value="30">Last 30d</option>
+          <option value="90">Last 90d</option>
+          <option value="365">Last 12 mo</option>
+          <option value="3650">All time</option>
+        </select>
+        <select value=${filterType} onChange=${e => setFilterType(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
+          <option value="all">All events · ${events.length}</option>
+          <option value="breakdown">🔧 Breakdowns</option>
+          <option value="pm">⚙️ PM</option>
+          <option value="tool_change">🛠️ Tool changes</option>
+          <option value="idle">⏸️ Idle</option>
+          <option value="production">🔥 Production (rolled up)</option>
+        </select>
+        <button class="btn small ghost" onClick=${() => window.print()} style="font-size:11px">🖨 Print card</button>
+      </div>
+
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        filteredEvents.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📋</div><div style="font-size:13px">No events ${events.length === 0 ? 'recorded for this machine' : 'matching current filters'} in the selected period.</div></div></div>` :
+        html`
+          <div style="position:relative;padding-left:24px;border-left:2px solid var(--slate-200)">
+            ${filteredEvents.map((ev, idx) => html`
+              <div key=${idx} style="margin-bottom:12px;position:relative">
+                <span style=${'position:absolute;left:-31px;top:0;width:22px;height:22px;border-radius:50%;background:var(--'+ev.color+'-100);border:2px solid var(--'+ev.color+'-500);display:flex;align-items:center;justify-content:center;font-size:11px'}>${ev.icon}</span>
+                <div class="card" style="padding:10px 12px;margin:0">
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                    <div style="flex:1;min-width:0">
+                      <div style="font-size:13px;font-weight:600;color:var(--slate-800)">${ev.title}</div>
+                      ${ev.body && html`<div style="font-size:11px;color:var(--slate-600);margin-top:2px">${ev.body}</div>`}
+                      ${ev.sub && html`<div style="font-size:10px;color:var(--slate-500);margin-top:3px">${ev.sub}</div>`}
+                    </div>
+                    <div style="font-size:11px;color:var(--slate-500);white-space:nowrap;flex-shrink:0">${fmtDate(ev.at)}</div>
+                  </div>
+                  ${ev.notes && html`<div style="font-size:11px;color:var(--slate-600);margin-top:6px;padding-top:6px;border-top:1px dashed var(--slate-200);font-style:italic">${ev.notes}</div>`}
+                </div>
+              </div>
+            `)}
+          </div>
+        `
+      }
+    `}
+
+    ${tab === 'details' && html`
+      <div class="card" style="margin-bottom:14px">
+        <div class="card-row"><span class="label">Code</span><span class="value mono">${machine.code}</span></div>
+        ${machine.display_name && html`<div class="card-row"><span class="label">Display name</span><span class="value">${machine.display_name}</span></div>`}
+        <div class="card-row"><span class="label">Category</span><span class="value">${machine.category || 'pdc'}</span></div>
+        ${machine.make && html`<div class="card-row"><span class="label">Make</span><span class="value">${machine.make}</span></div>`}
+        ${machine.model && html`<div class="card-row"><span class="label">Model</span><span class="value">${machine.model}</span></div>`}
+        ${machine.tonnage && html`<div class="card-row"><span class="label">Tonnage</span><span class="value">${machine.tonnage} T</span></div>`}
+        <div class="card-row"><span class="label">Unit</span><span class="value">${unit?.name || '—'}</span></div>
+        <div class="card-row"><span class="label">Supervisor</span><span class="value">${supervisor?.full_name || '—'}</span></div>
+        <div class="card-row"><span class="label">Status</span><span class="value"><span class=${'badge ' + statusBadge}>${machine.status || 'unknown'}</span></span></div>
+      </div>
+      <button class="btn" onClick=${() => setEditing(true)} style="width:100%">✏️ Edit machine</button>
+    `}
+  `;
+}
+
 function MachineModal({ plant, units, users, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget || {
     code:'', display_name:'', make:'', model:'', category:'pdc',
