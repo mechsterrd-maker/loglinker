@@ -1074,6 +1074,7 @@ const MORE_GROUPS = [
       { key:'supplier_chase',icon:'🛒', label:'Supplier Chase',       sub:'Raw material runway vs upcoming schedule · auto-alerts which vendor to chase' },
       { key:'petty_cash',    icon:'💰', label:'Petty Cash',           sub:'Expenses · advances · recollection · who owes how much' },
       { key:'documents',     icon:'📄', label:'Documents · Bills',    sub:'OCR invoices/DCs, payments, vendors' },
+      { key:'sales_docs',    icon:'📤', label:'Make DC / Invoice',    sub:'Create outward DCs + GST tax invoices · per-plant continuous numbering' },
       { key:'movements',     icon:'🔀', label:'Movements',            sub:'In/out material flow, GRN verification' },
       { key:'schedules',     icon:'📅', label:'Customer Schedules',   sub:'Plan vs actual, weekly supplies, AI extract' },
       { key:'calibration',   icon:'📏', label:'Calibration Register', sub:'Instruments + due/overdue log (IATF 7.1.5.2)' },
@@ -1208,6 +1209,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'mom'}><${MomModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'machine_prod'}><${MachineProductionModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'petty_cash'}><${PettyCashModule} plant=${plant} me=${me} /></${Page}>
@@ -9204,6 +9206,397 @@ function IdleLogModal({ plant, me, machine, shifts, onClose, onSaved }) {
           <button class="btn" disabled=${busy}>${busy ? 'Saving…' : '⏸ Record idle reason'}</button>
           <p style="font-size:11px;color:var(--slate-500);margin:6px 0 0">Feeds MTBF/MTTR + availability % · posts to All Hands.</p>
         </form>
+      </div>
+    </div>
+  `;
+}
+
+
+// =================================================================
+// SALES DOC MAKER — create outward DCs + GST tax invoices
+// =================================================================
+// Per-plant continuous numbering: each plant has its own sequence,
+// gapless per financial year. Numbers don't jump when you switch plants.
+function SalesDocMakerModule({ plant, me }) {
+  const [tab, setTab] = useState('list'); // list | new_dc | new_invoice
+  const [docKind, setDocKind] = useState('dc'); // dc | invoice for the new form
+  const [recent, setRecent] = useState([]);
+  const [previewNumber, setPreviewNumber] = useState('—');
+  const [customers, setCustomers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [view, setView] = useState(null); // doc to view/print
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [docs, cust] = await Promise.all([
+      sb.from('mcp_logistics_documents')
+        .select('id, doc_type, doc_number, doc_date, vendor_name_raw, taxable_value, tax_amount, total_value, items, status, created_at')
+        .eq('plant_id', plant.id)
+        .in('doc_type', ['invoice_out','dc_out'])
+        .eq('extracted_by_ai', false)
+        .order('created_at', { ascending: false })
+        .limit(100),
+      sb.from('mcp_sched_customers').select('id, name, short_code, gstin, address, city, state, contact_person, contact_phone, contact_email').eq('plant_id', plant.id).order('name'),
+    ]);
+    setRecent(docs.data || []);
+    setCustomers(cust.data || []);
+    setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  useEffect(() => {
+    if (!plant?.id) return;
+    const ch = sb.channel('sales-docs-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_logistics_documents', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => sb.removeChannel(ch);
+  }, [plant.id, refresh]);
+
+  // Peek the next number whenever the form mode changes
+  useEffect(() => {
+    if (tab === 'new_dc' || tab === 'new_invoice') {
+      const kind = tab === 'new_dc' ? 'dc' : 'invoice';
+      setDocKind(kind);
+      sb.rpc('peek_next_logistics_doc_number', { p_plant_id: plant.id, p_doc_kind: kind }).then(({ data }) => {
+        setPreviewNumber(data || '—');
+      });
+    }
+  }, [tab, plant.id]);
+
+  if (view) return html`<${SalesDocPreview} doc=${view} plant=${plant} customers=${customers} onClose=${() => setView(null)} />`;
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
+      <div><h1>📤 Make DC / Invoice</h1><div class="sub">Outward delivery challans + GST tax invoices · continuous numbering per plant</div></div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (tab==='list'?' active':'')} onClick=${() => setTab('list')}>📃 Recent · ${recent.length}</button>
+      <button class=${'auth-tab' + (tab==='new_dc'?' active':'')} onClick=${() => setTab('new_dc')}>+ New DC</button>
+      <button class=${'auth-tab' + (tab==='new_invoice'?' active':'')} onClick=${() => setTab('new_invoice')}>+ New Invoice</button>
+    </div>
+
+    ${(tab === 'new_dc' || tab === 'new_invoice') && html`
+      <${SalesDocCreateForm}
+        plant=${plant}
+        me=${me}
+        kind=${docKind}
+        previewNumber=${previewNumber}
+        customers=${customers}
+        onSaved=${(doc) => { setTab('list'); refresh(); setView(doc); }}
+        onCancel=${() => setTab('list')}
+      />
+    `}
+
+    ${tab === 'list' && html`
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        recent.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📤</div><div style="font-size:13px">No DCs or Invoices made yet. Tap <strong>+ New DC</strong> or <strong>+ New Invoice</strong> above.</div></div></div>` :
+        recent.map(d => html`
+          <div class="card" key=${d.id} style="margin-bottom:6px;padding:10px 12px;cursor:pointer" onClick=${() => setView(d)}>
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+              <div style="flex:1;min-width:0">
+                <div style="font-size:13px;font-weight:600">
+                  ${d.doc_type === 'invoice_out' ? '🧾' : '📦'} ${d.doc_number}
+                </div>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                  ${d.doc_type === 'invoice_out' ? 'Tax Invoice' : 'Delivery Challan'} · ${d.doc_date}
+                  ${d.vendor_name_raw ? ' · ' + d.vendor_name_raw : ''}
+                  · ${Array.isArray(d.items) ? d.items.length : 0} item${(d.items?.length||0)===1?'':'s'}
+                </div>
+              </div>
+              <div style="text-align:right;flex-shrink:0">
+                ${d.total_value && html`<div style="font-size:14px;font-weight:600">₹${fmtNum(d.total_value)}</div>`}
+                <div style="font-size:11px;color:var(--teal-600);margin-top:2px">↗ Print</div>
+              </div>
+            </div>
+          </div>
+        `)
+      }
+    `}
+  `;
+}
+
+function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onSaved, onCancel }) {
+  const isInvoice = kind === 'invoice';
+  const [form, setForm] = useState({
+    doc_date: new Date().toISOString().slice(0,10),
+    customer_id: '',
+    place_of_supply: '',
+    vehicle_no: '',
+    eway_bill: '',
+    po_reference: '',
+    notes: '',
+    igst: false, // true if interstate (no SGST/CGST)
+    items: [{ part_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }],
+    cgst_pct: 9,
+    sgst_pct: 9,
+    igst_pct: 18,
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const setItem = (i, patch) => setForm(f => ({ ...f, items: f.items.map((x, idx) => idx === i ? { ...x, ...patch } : x) }));
+  const addItem = () => setForm(f => ({ ...f, items: [...f.items, { part_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }] }));
+  const removeItem = (i) => setForm(f => ({ ...f, items: f.items.length <= 1 ? f.items : f.items.filter((_, idx) => idx !== i) }));
+  const recalcAmount = (i) => {
+    const it = form.items[i];
+    const qty = parseFloat(it.qty) || 0;
+    const rate = parseFloat(it.rate) || 0;
+    setItem(i, { amount: (qty * rate).toFixed(2) });
+  };
+
+  // Totals
+  const validItems = form.items.filter(it => it.name && parseFloat(it.qty) > 0);
+  const taxableValue = validItems.reduce((s, it) => s + (parseFloat(it.amount) || 0), 0);
+  const cgst = isInvoice && !form.igst ? taxableValue * (parseFloat(form.cgst_pct) || 0) / 100 : 0;
+  const sgst = isInvoice && !form.igst ? taxableValue * (parseFloat(form.sgst_pct) || 0) / 100 : 0;
+  const igst = isInvoice && form.igst ? taxableValue * (parseFloat(form.igst_pct) || 0) / 100 : 0;
+  const taxAmount = cgst + sgst + igst;
+  const total = taxableValue + taxAmount;
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      if (!form.customer_id) throw new Error('Pick a customer');
+      if (validItems.length === 0) throw new Error('Add at least one item with qty');
+      const cust = customers.find(c => c.id === form.customer_id);
+      // Allocate the next number atomically (this commits it — even if save fails, the number is consumed)
+      const { data: docNo, error: numErr } = await sb.rpc('get_next_logistics_doc_number', {
+        p_plant_id: plant.id, p_doc_kind: kind, p_date: form.doc_date,
+      });
+      if (numErr) throw numErr;
+
+      const items = validItems.map(it => ({
+        name: it.name.trim(),
+        part_id: it.part_id || null,
+        hsn: it.hsn || null,
+        qty: parseFloat(it.qty),
+        uom: it.uom || 'nos',
+        rate: isInvoice && it.rate ? parseFloat(it.rate) : null,
+        amount: isInvoice && it.amount ? parseFloat(it.amount) : null,
+      }));
+
+      const { data: doc, error } = await sb.from('mcp_logistics_documents').insert({
+        plant_id: plant.id,
+        doc_type: isInvoice ? 'invoice_out' : 'dc_out',
+        doc_number: docNo,
+        doc_date: form.doc_date,
+        vendor_id: form.customer_id,
+        vendor_name_raw: cust?.name || null,
+        vendor_gstin_raw: cust?.gstin || null,
+        taxable_value: isInvoice ? taxableValue : null,
+        tax_amount: isInvoice ? taxAmount : null,
+        total_value: isInvoice ? total : null,
+        items: items,
+        raw_extraction: {
+          place_of_supply: form.place_of_supply || null,
+          vehicle_no: form.vehicle_no || null,
+          eway_bill: form.eway_bill || null,
+          po_reference: form.po_reference || null,
+          igst: form.igst,
+          cgst_pct: form.cgst_pct, sgst_pct: form.sgst_pct, igst_pct: form.igst_pct,
+          customer: cust ? { name: cust.name, gstin: cust.gstin, address: cust.address, city: cust.city, state: cust.state } : null,
+        },
+        status: 'approved',
+        notes: form.notes || null,
+        extracted_by_ai: false,
+        extraction_status: 'completed',
+        created_by: me.id,
+      }).select('*').single();
+      if (error) throw error;
+      showToast((isInvoice ? '🧾 Invoice ' : '📦 DC ') + docNo + ' created');
+      onSaved(doc);
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="card" style="margin-bottom:14px;padding:14px;background:var(--teal-50);border-color:var(--teal-200)">
+      <div style="font-size:11px;font-weight:700;color:var(--teal-700);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">${isInvoice ? '🧾 New tax invoice' : '📦 New delivery challan'}</div>
+      <div style="font-size:18px;font-weight:700;color:var(--slate-900);font-family:monospace">${previewNumber}</div>
+      <div style="font-size:11px;color:var(--slate-500);margin-top:2px">Next number — assigned atomically when you save. Continuous per plant per financial year.</div>
+    </div>
+
+    ${err && html`<div class="alert error">${err}</div>`}
+
+    <form onSubmit=${submit}>
+      <div class="field-row">
+        <div class="field"><label>Doc date *</label><input type="date" required value=${form.doc_date} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
+        <div class="field"><label>Customer *</label>
+          <select required value=${form.customer_id} onChange=${e => setForm({...form, customer_id: e.target.value})}>
+            <option value="">— Pick customer —</option>
+            ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.gstin?' · '+c.gstin:''}</option>`)}
+          </select>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field"><label>Vehicle no</label><input type="text" value=${form.vehicle_no} onChange=${e => setForm({...form, vehicle_no: e.target.value})} placeholder="TN-09-CD-1234" /></div>
+        <div class="field"><label>E-way bill</label><input type="text" value=${form.eway_bill} onChange=${e => setForm({...form, eway_bill: e.target.value})} placeholder="if applicable" /></div>
+      </div>
+
+      ${isInvoice && html`
+        <div class="field-row">
+          <div class="field"><label>Place of supply</label><input type="text" value=${form.place_of_supply} onChange=${e => setForm({...form, place_of_supply: e.target.value})} placeholder="State name" /></div>
+          <div class="field"><label>Customer PO ref</label><input type="text" value=${form.po_reference} onChange=${e => setForm({...form, po_reference: e.target.value})} /></div>
+        </div>
+        <div class="field"><label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" checked=${form.igst} onChange=${e => setForm({...form, igst: e.target.checked})} />
+          <span><strong>Interstate (IGST)</strong> — uncheck for intrastate (CGST + SGST)</span>
+        </label></div>
+      `}
+
+      <div class="field"><label>Items *</label>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          ${form.items.map((it, idx) => html`
+            <div key=${idx} style="border:1px solid var(--slate-200);border-radius:6px;padding:8px;background:var(--slate-50)">
+              <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
+                <span style="font-size:11px;font-weight:600;color:var(--teal-700);min-width:18px">${idx+1}.</span>
+                <div style="flex:1">
+                  <${PartPicker} plant=${plant} value=${it.part_id} onChange=${(id, p) => setItem(idx, { part_id: id, name: p ? (p.part_number + ' · ' + (p.name || '')) : it.name })} placeholder="— Pick part —" />
+                </div>
+                ${form.items.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => removeItem(idx)} style="padding:2px 8px;font-size:11px">×</button>`}
+              </div>
+              <input type="text" value=${it.name} onChange=${e => setItem(idx, { name: e.target.value })} placeholder="Item description" style="width:100%;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;box-sizing:border-box;margin-bottom:6px" />
+              <div style=${'display:grid;grid-template-columns:'+(isInvoice?'0.7fr 0.6fr 0.5fr 0.8fr 0.8fr':'1fr 0.7fr 0.6fr')+';gap:6px'}>
+                <input type="text" value=${it.hsn} onChange=${e => setItem(idx, { hsn: e.target.value })} placeholder="HSN" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                <input type="number" step="any" min=${0} value=${it.qty} onChange=${e => { setItem(idx, { qty: e.target.value }); }} onBlur=${() => recalcAmount(idx)} placeholder="Qty *" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                <input type="text" value=${it.uom} onChange=${e => setItem(idx, { uom: e.target.value })} placeholder="UoM" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.rate} onChange=${e => setItem(idx, { rate: e.target.value })} onBlur=${() => recalcAmount(idx)} placeholder="Rate ₹" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />`}
+                ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.amount} onChange=${e => setItem(idx, { amount: e.target.value })} placeholder="Amount ₹" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;font-weight:600" />`}
+              </div>
+            </div>
+          `)}
+          <button type="button" class="btn small ghost" onClick=${addItem} style="font-size:12px;align-self:flex-start">+ Add another item</button>
+        </div>
+      </div>
+
+      ${isInvoice && html`
+        <div class="card" style="background:var(--slate-50);border-color:var(--slate-200);margin-top:14px">
+          <div class="card-title">Totals</div>
+          <div style="display:grid;grid-template-columns:1fr auto;gap:6px;font-size:13px">
+            <div>Taxable value</div><div style="text-align:right;font-family:monospace">₹${fmtNum(taxableValue.toFixed(2))}</div>
+            ${form.igst ? html`
+              <div>IGST <input type="number" step="any" min=${0} value=${form.igst_pct} onChange=${e => setForm({...form, igst_pct: e.target.value})} style="width:54px;padding:2px 4px;border:1px solid var(--slate-200);border-radius:3px;font-size:11px" />%</div>
+              <div style="text-align:right;font-family:monospace">₹${fmtNum(igst.toFixed(2))}</div>
+            ` : html`
+              <div>CGST <input type="number" step="any" min=${0} value=${form.cgst_pct} onChange=${e => setForm({...form, cgst_pct: e.target.value})} style="width:54px;padding:2px 4px;border:1px solid var(--slate-200);border-radius:3px;font-size:11px" />%</div>
+              <div style="text-align:right;font-family:monospace">₹${fmtNum(cgst.toFixed(2))}</div>
+              <div>SGST <input type="number" step="any" min=${0} value=${form.sgst_pct} onChange=${e => setForm({...form, sgst_pct: e.target.value})} style="width:54px;padding:2px 4px;border:1px solid var(--slate-200);border-radius:3px;font-size:11px" />%</div>
+              <div style="text-align:right;font-family:monospace">₹${fmtNum(sgst.toFixed(2))}</div>
+            `}
+            <div style="font-weight:700;border-top:1px solid var(--slate-200);padding-top:6px">Total</div>
+            <div style="text-align:right;font-family:monospace;font-weight:700;border-top:1px solid var(--slate-200);padding-top:6px">₹${fmtNum(total.toFixed(2))}</div>
+          </div>
+        </div>
+      `}
+
+      <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})} placeholder="Anything to print on the doc"></textarea></div>
+
+      <div style="display:flex;gap:6px">
+        <button type="button" class="btn ghost" onClick=${onCancel} style="padding:8px 16px">Cancel</button>
+        <button class="btn" disabled=${busy} style="flex:1">${busy ? 'Saving…' : (isInvoice ? '🧾 Create Invoice' : '📦 Create DC')}</button>
+      </div>
+    </form>
+  `;
+}
+
+function SalesDocPreview({ doc, plant, customers, onClose }) {
+  const isInvoice = doc.doc_type === 'invoice_out';
+  const cust = customers.find(c => c.id === doc.vendor_id) || (doc.raw_extraction?.customer || null);
+  const items = Array.isArray(doc.items) ? doc.items : [];
+  const igst = !!doc.raw_extraction?.igst;
+  const printIt = () => window.print();
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn ghost small" onClick=${onClose} style="padding:6px 10px">← Back</button>
+      <div style="flex:1"><h1 style="font-size:18px">${isInvoice ? '🧾 Tax Invoice' : '📦 Delivery Challan'} · ${doc.doc_number}</h1></div>
+      <button class="btn small" onClick=${printIt}>🖨 Print</button>
+    </div>
+
+    <style>
+      @media print {
+        body { background: white !important; }
+        .tabbar, .page-header, .auth-tabs { display: none !important; }
+        .print-doc { box-shadow: none !important; border: 1px solid #000 !important; }
+      }
+    </style>
+
+    <div class="card print-doc" style="padding:24px;font-family:'Segoe UI',Arial,sans-serif;max-width:780px;margin:0 auto;background:white;border:1px solid var(--slate-300)">
+      <div style="text-align:center;border-bottom:2px solid #000;padding-bottom:12px;margin-bottom:14px">
+        <div style="font-size:22px;font-weight:800;letter-spacing:0.5px">${plant.legal_name || plant.name}</div>
+        ${plant.address && html`<div style="font-size:11px;color:#444;margin-top:2px">${plant.address}${plant.city?', '+plant.city:''}${plant.state?', '+plant.state:''}${plant.pincode?' - '+plant.pincode:''}</div>`}
+        ${plant.gstin && html`<div style="font-size:11px;color:#444;margin-top:2px">GSTIN: <strong>${plant.gstin}</strong></div>`}
+      </div>
+
+      <div style="text-align:center;font-size:14px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:14px">
+        ${isInvoice ? 'Tax Invoice' : 'Delivery Challan'}
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:14px;font-size:12px">
+        <div>
+          <div style="color:#666;font-weight:600;font-size:10px;text-transform:uppercase">Bill to</div>
+          <div style="font-weight:700;margin-top:2px">${cust?.name || doc.vendor_name_raw || '?'}</div>
+          ${cust?.address && html`<div style="color:#444;margin-top:2px">${cust.address}${cust.city?', '+cust.city:''}${cust.state?', '+cust.state:''}</div>`}
+          ${cust?.gstin && html`<div style="color:#444;margin-top:2px">GSTIN: <strong>${cust.gstin}</strong></div>`}
+        </div>
+        <div style="text-align:right">
+          <div><span style="color:#666">${isInvoice?'Invoice':'DC'} No: </span><strong style="font-family:monospace">${doc.doc_number}</strong></div>
+          <div style="margin-top:3px"><span style="color:#666">Date: </span><strong>${doc.doc_date}</strong></div>
+          ${doc.raw_extraction?.po_reference && html`<div style="margin-top:3px"><span style="color:#666">PO ref: </span>${doc.raw_extraction.po_reference}</div>`}
+          ${doc.raw_extraction?.vehicle_no && html`<div style="margin-top:3px"><span style="color:#666">Vehicle: </span>${doc.raw_extraction.vehicle_no}</div>`}
+          ${doc.raw_extraction?.eway_bill && html`<div style="margin-top:3px"><span style="color:#666">E-way: </span>${doc.raw_extraction.eway_bill}</div>`}
+          ${doc.raw_extraction?.place_of_supply && html`<div style="margin-top:3px"><span style="color:#666">Place of supply: </span>${doc.raw_extraction.place_of_supply}</div>`}
+        </div>
+      </div>
+
+      <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:14px">
+        <thead>
+          <tr style="background:#f0f0f0;border:1px solid #000">
+            <th style="padding:6px;text-align:left;border:1px solid #000;width:30px">#</th>
+            <th style="padding:6px;text-align:left;border:1px solid #000">Description</th>
+            <th style="padding:6px;text-align:center;border:1px solid #000;width:60px">HSN</th>
+            <th style="padding:6px;text-align:right;border:1px solid #000;width:60px">Qty</th>
+            <th style="padding:6px;text-align:center;border:1px solid #000;width:50px">UoM</th>
+            ${isInvoice && html`<th style="padding:6px;text-align:right;border:1px solid #000;width:80px">Rate</th>`}
+            ${isInvoice && html`<th style="padding:6px;text-align:right;border:1px solid #000;width:100px">Amount</th>`}
+          </tr>
+        </thead>
+        <tbody>
+          ${items.map((it, i) => html`
+            <tr key=${i} style="border:1px solid #000">
+              <td style="padding:6px;border:1px solid #000;text-align:center">${i+1}</td>
+              <td style="padding:6px;border:1px solid #000">${it.name}</td>
+              <td style="padding:6px;border:1px solid #000;text-align:center">${it.hsn||''}</td>
+              <td style="padding:6px;border:1px solid #000;text-align:right">${it.qty}</td>
+              <td style="padding:6px;border:1px solid #000;text-align:center">${it.uom||''}</td>
+              ${isInvoice && html`<td style="padding:6px;border:1px solid #000;text-align:right;font-family:monospace">${it.rate?fmtNum(it.rate):''}</td>`}
+              ${isInvoice && html`<td style="padding:6px;border:1px solid #000;text-align:right;font-family:monospace">${it.amount?fmtNum(it.amount):''}</td>`}
+            </tr>
+          `)}
+        </tbody>
+      </table>
+
+      ${isInvoice && html`
+        <div style="display:flex;justify-content:flex-end;margin-bottom:14px">
+          <table style="font-size:12px;border-collapse:collapse">
+            <tr><td style="padding:4px 12px;text-align:right;color:#666">Taxable value</td><td style="padding:4px 12px;text-align:right;font-family:monospace">₹${fmtNum(doc.taxable_value)}</td></tr>
+            ${igst ? html`
+              <tr><td style="padding:4px 12px;text-align:right;color:#666">IGST @ ${doc.raw_extraction?.igst_pct||18}%</td><td style="padding:4px 12px;text-align:right;font-family:monospace">₹${fmtNum(doc.tax_amount)}</td></tr>
+            ` : html`
+              <tr><td style="padding:4px 12px;text-align:right;color:#666">CGST @ ${doc.raw_extraction?.cgst_pct||9}%</td><td style="padding:4px 12px;text-align:right;font-family:monospace">₹${fmtNum((doc.tax_amount||0)/2)}</td></tr>
+              <tr><td style="padding:4px 12px;text-align:right;color:#666">SGST @ ${doc.raw_extraction?.sgst_pct||9}%</td><td style="padding:4px 12px;text-align:right;font-family:monospace">₹${fmtNum((doc.tax_amount||0)/2)}</td></tr>
+            `}
+            <tr style="border-top:2px solid #000"><td style="padding:6px 12px;text-align:right;font-weight:700">Total</td><td style="padding:6px 12px;text-align:right;font-family:monospace;font-weight:700">₹${fmtNum(doc.total_value)}</td></tr>
+          </table>
+        </div>
+      `}
+
+      ${doc.notes && html`<div style="font-size:11px;color:#666;border-top:1px solid #ccc;padding-top:8px;margin-bottom:14px"><strong>Notes:</strong> ${doc.notes}</div>`}
+
+      <div style="display:flex;justify-content:space-between;margin-top:50px;font-size:11px;color:#666">
+        <div>Received the above goods in good condition.<br/><br/>Signature & Date</div>
+        <div style="text-align:right">For <strong>${plant.legal_name || plant.name}</strong><br/><br/><br/>Authorised Signatory</div>
       </div>
     </div>
   `;
