@@ -1520,8 +1520,8 @@ function Production({ plant, me }) {
     setLoading(true);
     const [m, d, s, p, u, sh, us, t, si] = await Promise.all([
       sb.from('machines').select('*, units(name)').order('code'),
-      sb.from('mcp_pdc_dies').select('*').order('code'),
-      sb.from('mcp_pdc_shots').select('*, units(name), shifts(name), mcp_pdc_dies(code,part_number), machines(code), users:operator_user_id(full_name)').order('recorded_at', { ascending:false }).limit(50),
+      sb.from('mcp_pdc_dies').select('*, cavities').order('code'),
+      sb.from('mcp_pdc_shots').select('*, cavities, pieces_good, pieces_rejected, units(name), shifts(name), mcp_pdc_dies(code,part_number,cavities), machines(code), users:operator_user_id(full_name)').order('recorded_at', { ascending:false }).limit(50),
       sb.from('mcp_pdc_parts').select('*').order('part_number'),
       sb.from('units').select('*').order('name'),
       sb.from('shifts').select('*').order('start_time'),
@@ -1560,8 +1560,10 @@ function Production({ plant, me }) {
   }
 
   const todayShots = shots.filter(s => new Date(s.recorded_at).toDateString() === new Date().toDateString());
-  const todayGood = todayShots.reduce((a,s) => a + (s.shots_good || 0), 0);
-  const todayReject = todayShots.reduce((a,s) => a + (s.shots_rejected || 0), 0);
+  // Operator-facing totals are in PIECES (shots × cavities). Use the DB-generated
+  // pieces_good / pieces_rejected when present, fall back to shots × cavities.
+  const todayGood = todayShots.reduce((a,s) => a + (s.pieces_good ?? (s.shots_good||0) * (s.cavities||1)), 0);
+  const todayReject = todayShots.reduce((a,s) => a + (s.pieces_rejected ?? (s.shots_rejected||0) * (s.cavities||1)), 0);
   const rejectRate = todayGood + todayReject > 0 ? ((todayReject / (todayGood + todayReject)) * 100).toFixed(1) : 0;
 
   return html`
@@ -1623,7 +1625,7 @@ function Production({ plant, me }) {
         <div class="list-item" key=${s.id}>
           <div class="list-item-row">
             <div class="list-item-main">
-              <div class="list-item-title">${s.mcp_pdc_dies?.code || '?'} on ${s.machines?.code || '?'} · ${fmtNum(s.shots_good)} good${s.shots_rejected > 0 ? ' / ' + s.shots_rejected + ' rej' : ''}</div>
+              <div class="list-item-title">${s.mcp_pdc_dies?.code || '?'} on ${s.machines?.code || '?'} · ${(s.cavities||1) > 1 ? fmtNum(s.pieces_good||s.shots_good*(s.cavities||1)) + ' pcs (' + s.shots_good + '×' + s.cavities + ')' : fmtNum(s.shots_good) + ' good'}${s.shots_rejected > 0 ? ' / ' + ((s.cavities||1) > 1 ? (s.pieces_rejected||s.shots_rejected*(s.cavities||1)) + ' pcs rej' : s.shots_rejected + ' rej') : ''}</div>
               <div class="list-item-sub">${s.units?.name} · ${s.shifts?.name} · ${s.users?.full_name || '?'}</div>
             </div>
             <div class="list-item-meta">${fmtDate(s.recorded_at)}</div>
@@ -1795,7 +1797,7 @@ function Production({ plant, me }) {
           <div class="list-item" key=${s.id}>
             <div class="list-item-row">
               <div class="list-item-main">
-                <div class="list-item-title">${s.mcp_pdc_dies?.code || '?'} on ${s.machines?.code || '?'} · ${fmtNum(s.shots_good)} good${s.shots_rejected > 0 ? ' / ' + s.shots_rejected + ' rej' : ''}</div>
+                <div class="list-item-title">${s.mcp_pdc_dies?.code || '?'} on ${s.machines?.code || '?'} · ${(s.cavities||1) > 1 ? fmtNum(s.pieces_good||s.shots_good*(s.cavities||1)) + ' pcs (' + s.shots_good + '×' + s.cavities + ')' : fmtNum(s.shots_good) + ' good'}${s.shots_rejected > 0 ? ' / ' + ((s.cavities||1) > 1 ? (s.pieces_rejected||s.shots_rejected*(s.cavities||1)) + ' pcs rej' : s.shots_rejected + ' rej') : ''}</div>
                 <div class="list-item-sub">${s.units?.name} · ${s.shifts?.name} · ${s.users?.full_name || '?'}</div>
               </div>
               <div class="list-item-meta">${fmtDate(s.recorded_at)}</div>
@@ -3148,7 +3150,7 @@ function MachineBulkAddModal({ plant, units, users, onClose, onSaved }) {
 
 // ============= DIE MODAL =============
 function DieModal({ plant, me, parts, editTarget, onClose, onSaved }) {
-  const [form, setForm] = useState(editTarget || { code:'', part_number:'', customer_name:'', max_strokes:300000, corepin_count:0, ejector_pin_count:0, status:'active', default_part_id:'' });
+  const [form, setForm] = useState(editTarget || { code:'', part_number:'', customer_name:'', cavities:1, max_strokes:300000, corepin_count:0, ejector_pin_count:0, status:'active', default_part_id:'' });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [history, setHistory] = useState([]);
@@ -3180,6 +3182,7 @@ function DieModal({ plant, me, parts, editTarget, onClose, onSaved }) {
         code: form.code,
         part_number: form.part_number,
         customer_name: form.customer_name || null,
+        cavities: Math.max(1, parseInt(form.cavities) || 1),
         max_strokes: parseInt(form.max_strokes) || 300000,
         corepin_count: parseInt(form.corepin_count) || 0,
         ejector_pin_count: parseInt(form.ejector_pin_count) || 0,
@@ -3223,7 +3226,10 @@ function DieModal({ plant, me, parts, editTarget, onClose, onSaved }) {
           <div class="field"><label>Die Code *</label><input type="text" required value=${form.code} onChange=${e => setForm({...form, code: e.target.value})} placeholder="FH-21" /></div>
           <div class="field"><label>Part Number *</label><input type="text" required value=${form.part_number} onChange=${e => setForm({...form, part_number: e.target.value})} placeholder="Filterhead" /></div>
           <div class="field"><label>Customer</label><input type="text" value=${form.customer_name || ''} onChange=${e => setForm({...form, customer_name: e.target.value})} placeholder="Bosch" /></div>
-          <div class="field"><label>Max Strokes</label><input type="number" value=${form.max_strokes} onChange=${e => setForm({...form, max_strokes: e.target.value})} placeholder="300000" /></div>
+          <div class="field-row">
+            <div class="field"><label>Cavities * <span style="font-weight:400;color:var(--slate-500);font-size:11px">· pieces per shot</span></label><input type="number" required min=${1} step=${1} value=${form.cavities ?? 1} onChange=${e => setForm({...form, cavities: e.target.value})} placeholder="1" /></div>
+            <div class="field"><label>Max Strokes</label><input type="number" value=${form.max_strokes} onChange=${e => setForm({...form, max_strokes: e.target.value})} placeholder="300000" /></div>
+          </div>
           <div class="field-row">
             <div class="field"><label>Corepins</label><input type="number" value=${form.corepin_count} onChange=${e => setForm({...form, corepin_count: e.target.value})} /></div>
             <div class="field"><label>Ejector Pins</label><input type="number" value=${form.ejector_pin_count} onChange=${e => setForm({...form, ejector_pin_count: e.target.value})} /></div>
@@ -3550,9 +3556,22 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
             </select>
           </div>
           <div class="field-row">
-            <div class="field"><label>Good *</label><input type="number" required min=${0} value=${form.shots_good} onChange=${e => setForm({...form, shots_good: e.target.value})} /></div>
-            <div class="field"><label>Rejected (total)</label><input type="number" min=${0} value=${totalRejected} disabled style="background:var(--slate-50);color:var(--slate-700);font-weight:600" /></div>
+            <div class="field"><label>Good shots *</label><input type="number" required min=${0} value=${form.shots_good} onChange=${e => setForm({...form, shots_good: e.target.value})} /></div>
+            <div class="field"><label>Rejected shots (total)</label><input type="number" min=${0} value=${totalRejected} disabled style="background:var(--slate-50);color:var(--slate-700);font-weight:600" /></div>
           </div>
+          ${(() => {
+            const cav = Math.max(1, parseInt(dies.find(d => d.id === form.die_id)?.cavities) || 1);
+            const g = parseInt(form.shots_good) || 0;
+            const r = totalRejected || 0;
+            if (cav <= 1) return null;
+            return html`<div class="card" style="background:var(--teal-50);border-color:var(--teal-200);padding:8px 10px;margin-bottom:10px">
+              <div style="font-size:11px;font-weight:700;color:var(--teal-700);text-transform:uppercase;letter-spacing:0.5px">📐 ${cav}-cavity die · pieces auto-calculated</div>
+              <div style="font-size:13px;margin-top:4px;color:var(--slate-900)">
+                Good: <strong>${g} shots × ${cav}</strong> = <strong style="color:var(--emerald-700)">${g * cav} pieces</strong>
+                ${r > 0 && html` · Rejected: <strong>${r} × ${cav}</strong> = <strong style="color:var(--rose-700)">${r * cav} pieces</strong>`}
+              </div>
+            </div>`;
+          })()}
           <div class="field">
             <label style="font-size:11px;color:var(--slate-500)">Reject breakdown · type the count next to each defect (total above auto-fills)</label>
             <${RejectionBreakdown} plant=${plant} stage="pdc" value=${rejBreakdown} onChange=${setRejBreakdown} />
@@ -23459,12 +23478,13 @@ async function genDailyProduction(plant, date) {
   const startOfDay = date + 'T00:00:00';
   const endOfDay = date + 'T23:59:59';
   const { data: shots } = await sb.from('mcp_pdc_shots')
-    .select('*, units(name), shifts(name), machines(code), mcp_pdc_dies(code), mcp_pdc_parts(part_number, name), users:operator_user_id(full_name)')
+    .select('*, cavities, pieces_good, pieces_rejected, units(name), shifts(name), machines(code), mcp_pdc_dies(code, cavities), mcp_pdc_parts(part_number, name), users:operator_user_id(full_name)')
     .gte('recorded_at', startOfDay).lte('recorded_at', endOfDay)
     .order('recorded_at');
 
-  const totalGood = (shots || []).reduce((s, r) => s + (r.shots_good || 0), 0);
-  const totalReject = (shots || []).reduce((s, r) => s + (r.shots_rejected || 0), 0);
+  // "Qty" totals are PIECES (shots × cavities). Use DB-generated pieces_*, fall back to shots × cavities.
+  const totalGood = (shots || []).reduce((s, r) => s + (r.pieces_good ?? (r.shots_good||0) * (r.cavities||1)), 0);
+  const totalReject = (shots || []).reduce((s, r) => s + (r.pieces_rejected ?? (r.shots_rejected||0) * (r.cavities||1)), 0);
   const total = totalGood + totalReject;
   const rejectPct = total > 0 ? (totalReject / total * 100).toFixed(2) : '0.00';
 
