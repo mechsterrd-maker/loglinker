@@ -14850,13 +14850,13 @@ function BreakdownModal({ plant, me, machines, users, editTarget, onClose, onSav
 function Stocks({ plant, me }) {
   const [items, setItems] = useState([]);
   const [transactions, setTransactions] = useState([]);
-  const [view, setView] = useState('items'); // items | transactions
-  const [layout, setLayout] = useState('list'); // list | by_category
+  const [pendingReceptions, setPendingReceptions] = useState([]); // doc-backed GRNs awaiting verification
+  const [view, setView] = useState('home'); // home | items | transactions
+  const [layout, setLayout] = useState('list');
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [search, setSearch] = useState('');
-  // Transaction-specific filters
   const [txnSearch, setTxnSearch] = useState('');
-  const [txnTypeFilter, setTxnTypeFilter] = useState('all'); // all | inward | outward | <specific>
+  const [txnTypeFilter, setTxnTypeFilter] = useState('all');
   const [txnDateFrom, setTxnDateFrom] = useState('');
   const [txnDateTo, setTxnDateTo] = useState('');
   const [modal, setModal] = useState(null);
@@ -14864,17 +14864,20 @@ function Stocks({ plant, me }) {
   const [activeItem, setActiveItem] = useState(null);
   const [loading, setLoading] = useState(true);
   const [voiceOpen, setVoiceOpen] = useState(false);
+  const isAdmin = me?.role === 'admin' || me?.role === 'plant_head';
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [i, t] = await Promise.all([
+    const [i, t, recs] = await Promise.all([
       sb.from('mcp_stocks_items').select('*').order('name'),
       sb.from('mcp_stocks_transactions').select('*, mcp_stocks_items(code,name,uom,category), users:performed_by(full_name)').order('created_at', { ascending:false }).limit(500),
+      sb.from('mcp_logistics_grn_receptions').select('id, document_id, vendor_name, reference_no, reception_date, status, source, mcp_logistics_documents(doc_number, doc_date, total_value, doc_type)').eq('plant_id', plant.id).eq('status', 'pending_verification').order('reception_date', { ascending: false }).limit(50),
     ]);
     setItems(i.data || []);
     setTransactions(t.data || []);
+    setPendingReceptions(recs.data || []);
     setLoading(false);
-  }, []);
+  }, [plant.id]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
@@ -14936,10 +14939,7 @@ function Stocks({ plant, me }) {
           </div>
           <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
             <span class=${'badge ' + (isLow ? 'rose' : 'emerald')}>${fmtNum(i.current_qty)} ${i.uom}</span>
-            <div style="display:flex;gap:4px">
-              <button class="btn small" onClick=${(e) => { e.stopPropagation(); setEditTarget({...i, _txnHint:'grn'}); setModal('txn'); }} style="background:var(--emerald-600);color:white;padding:4px 10px">+ In</button>
-              <button class="btn small ghost" onClick=${(e) => { e.stopPropagation(); setEditTarget({...i, _txnHint:'issue'}); setModal('txn'); }} style="padding:4px 10px">− Out</button>
-            </div>
+            ${!i.opening_recorded_at && html`<span style="font-size:9px;color:var(--amber-700);font-weight:600">NO OPENING</span>`}
           </div>
         </div>
       </div>
@@ -14951,18 +14951,101 @@ function Stocks({ plant, me }) {
   }
 
   return html`
-    <div class="page-header"><div><h1>Stocks</h1><div class="sub">Items, GRN, issues, valuation</div></div></div>
-
-    <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
-      <div class="stat teal"><div class="stat-num">${items.length}</div><div class="stat-label">Items</div></div>
-      <div class="stat ${lowStockCount > 0 ? 'amber' : 'teal'}"><div class="stat-num">${lowStockCount}</div><div class="stat-label">Low Stock</div></div>
-      <div class="stat teal"><div class="stat-num" style="font-size:18px">₹${(totalValue/100000).toFixed(1)}L</div><div class="stat-label">Value</div></div>
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+      <div><h1>Stocks</h1><div class="sub">${view==='home'?'Doc-backed inventory · opening only manual':'Items · GRN · valuation'}</div></div>
+      ${view !== 'home' && html`<button class="btn ghost small" onClick=${() => setView('home')}>← Home</button>`}
     </div>
 
-    <div class="auth-tabs" style="margin-bottom:10px">
-      <button class=${'auth-tab' + (view === 'items' ? ' active' : '')} onClick=${() => setView('items')}>Items</button>
-      <button class=${'auth-tab' + (view === 'transactions' ? ' active' : '')} onClick=${() => setView('transactions')}>Transactions</button>
-    </div>
+    ${view === 'home' && html`
+      ${(() => {
+        // Compute home-screen rollups
+        const today = new Date(); const sevenAgo = new Date(today); sevenAgo.setDate(today.getDate() - 7);
+        const recent = transactions.filter(t => new Date(t.created_at) >= sevenAgo);
+        const last24h = transactions.filter(t => (today - new Date(t.created_at)) <= 86400000);
+        const lowStock = items.filter(i => i.reorder_level && parseFloat(i.current_qty) <= parseFloat(i.reorder_level));
+        const inwardLast7 = recent.filter(t => ['grn','return','opening','adjustment_in','jobwork_in'].includes(t.txn_type)).reduce((s,t) => s + parseFloat(t.qty||0), 0);
+        const outwardLast7 = recent.filter(t => ['issue','consumption','scrap','adjustment_out'].includes(t.txn_type)).reduce((s,t) => s + parseFloat(t.qty||0), 0);
+        return html`
+          <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+            <div class=${'stat ' + (pendingReceptions.length > 0 ? 'amber' : 'teal')}>
+              <div class="stat-num">${pendingReceptions.length}</div>
+              <div class="stat-label">Pending Receive</div>
+            </div>
+            <div class=${'stat ' + (lowStock.length > 0 ? 'rose' : 'teal')}>
+              <div class="stat-num">${lowStock.length}</div>
+              <div class="stat-label">Low Stock</div>
+            </div>
+            <div class="stat teal">
+              <div class="stat-num">${items.length}</div>
+              <div class="stat-label">Items</div>
+            </div>
+          </div>
+
+          <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:14px">
+            <button class="card" style="text-align:left;padding:14px;cursor:pointer;background:var(--teal-50);border-color:var(--teal-300);position:relative" onClick=${() => setModal('receive_picker')}>
+              <div style="font-size:24px">📥</div>
+              <div style="font-size:13px;font-weight:700;margin-top:4px;color:var(--teal-800)">Receive from Doc</div>
+              <div style="font-size:11px;color:var(--slate-600);margin-top:2px">From approved vendor bill, DC, job-work return</div>
+              ${pendingReceptions.length > 0 && html`<span style="position:absolute;top:8px;right:8px;background:var(--amber-600);color:white;font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px">${pendingReceptions.length}</span>`}
+            </button>
+            <button class="card" style="text-align:left;padding:14px;cursor:pointer;background:var(--slate-50);border-color:var(--slate-300)" onClick=${() => { setEditTarget(null); setModal('item'); }}>
+              <div style="font-size:24px">➕</div>
+              <div style="font-size:13px;font-weight:700;margin-top:4px;color:var(--slate-800)">New Item + Opening</div>
+              <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Create item with one-time opening balance</div>
+            </button>
+            <button class="card" style="text-align:left;padding:14px;cursor:pointer" onClick=${() => setView('items')}>
+              <div style="font-size:24px">📦</div>
+              <div style="font-size:13px;font-weight:700;margin-top:4px">View All Items</div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${items.length} items · category filter · search</div>
+            </button>
+            <button class="card" style="text-align:left;padding:14px;cursor:pointer" onClick=${() => setView('transactions')}>
+              <div style="font-size:24px">📋</div>
+              <div style="font-size:13px;font-weight:700;margin-top:4px">Full Ledger</div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${transactions.length} txns · all filters</div>
+            </button>
+          </div>
+
+          ${lowStock.length > 0 && html`
+            <div class="section-h">⚠ Low Stock · ${lowStock.length}</div>
+            ${lowStock.slice(0, 5).map(i => html`
+              <div class="list-item" key=${i.id} onClick=${() => setActiveItem(i)} style="border-left:3px solid var(--rose-500)">
+                <div class="list-item-row">
+                  <div class="list-item-main">
+                    <div class="list-item-title">${i.code} · ${i.name}</div>
+                    <div class="list-item-sub">at ${fmtNum(i.current_qty)} ${i.uom} · reorder ${fmtNum(i.reorder_level)} ${i.uom}</div>
+                  </div>
+                  <span class="badge rose">LOW</span>
+                </div>
+              </div>
+            `)}
+            ${lowStock.length > 5 && html`<button class="btn small ghost" onClick=${() => setView('items')} style="font-size:11px;margin-top:4px">View all ${lowStock.length} →</button>`}
+          `}
+
+          <div class="section-h" style="margin-top:14px">Last 7 days · +${fmtNum(inwardLast7)} in · −${fmtNum(outwardLast7)} out</div>
+          ${recent.length === 0 ? html`<div class="card"><div class="empty" style="padding:14px"><div style="font-size:24px">🌙</div><div style="font-size:12px;color:var(--slate-500);margin-top:4px">Nothing moved this week.</div></div></div>` :
+            recent.slice(0, 12).map(t => {
+              const inward = ['grn','return','opening','adjustment_in','jobwork_in'].includes(t.txn_type);
+              const LABEL = {grn:'GRN', return:'Return', opening:'Opening', adjustment_in:'Adj+', adjustment_out:'Adj−', jobwork_in:'JW In', issue:'Issue', consumption:'Used', scrap:'Scrap'};
+              const isNow = (today - new Date(t.created_at)) <= 86400000;
+              return html`
+                <div class="list-item" key=${t.id} onClick=${() => { const itm = items.find(i => i.id === t.item_id); if (itm) setActiveItem(itm); }}>
+                  <div class="list-item-row">
+                    <div class="list-item-main">
+                      <div class="list-item-title">${t.mcp_stocks_items?.code || '?'} · ${t.mcp_stocks_items?.name || ''}</div>
+                      <div class="list-item-sub">${t.reference || (t.users?.full_name || '?')} · ${fmtDate(t.created_at)}${isNow?' · today':''}</div>
+                    </div>
+                    <span class=${'badge ' + (inward ? 'emerald' : 'amber')}>${LABEL[t.txn_type] || t.txn_type} ${inward ? '+' : '−'}${fmtNum(t.qty)}</span>
+                  </div>
+                </div>
+              `;
+            })
+          }
+          ${recent.length > 12 && html`<button class="btn small ghost" onClick=${() => setView('transactions')} style="font-size:11px;margin-top:4px">View all ${recent.length} →</button>`}
+        `;
+      })()}
+    `}
+
+    ${view !== 'home' && html`
 
     ${view === 'items' && html`
       <div style="display:flex;gap:6px;margin-bottom:10px">
@@ -15101,15 +15184,19 @@ function Stocks({ plant, me }) {
         `;
       })()}
     `}
+    `}
 
-    ${modal === 'item' && html`<${ItemModal} plant=${plant} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
-    ${modal === 'txn' && html`<${TxnModal} plant=${plant} me=${me} item=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'item' && html`<${ItemModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'txn' && html`<${TxnModal} plant=${plant} me=${me} item=${editTarget} isAdmin=${isAdmin} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'receive_picker' && html`<${ReceiveFromDocPicker} plant=${plant} me=${me} pendingReceptions=${pendingReceptions} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="stock_issue" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
   `;
 }
 
-function ItemModal({ plant, editTarget, onClose, onSaved }) {
-  const [form, setForm] = useState(editTarget || { code:'', name:'', category:'general', uom:'nos', current_qty:0, reorder_level:'', unit_cost:'' });
+function ItemModal({ plant, me, editTarget, onClose, onSaved }) {
+  const isEdit = !!editTarget;
+  const alreadyOpened = isEdit && !!editTarget.opening_recorded_at;
+  const [form, setForm] = useState(editTarget || { code:'', name:'', category:'general', uom:'nos', reorder_level:'', unit_cost:'', opening_qty: 0 });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -15122,15 +15209,29 @@ function ItemModal({ plant, editTarget, onClose, onSaved }) {
         code: form.code, name: form.name,
         category: form.category || 'general',
         uom: form.uom,
-        current_qty: parseFloat(form.current_qty) || 0,
         reorder_level: form.reorder_level ? parseFloat(form.reorder_level) : null,
         unit_cost: form.unit_cost ? parseFloat(form.unit_cost) : null,
       };
-      const { error } = editTarget
-        ? await sb.from('mcp_stocks_items').update(payload).eq('id', editTarget.id)
-        : await sb.from('mcp_stocks_items').insert(payload);
-      if (error) throw error;
-      showToast(editTarget ? 'Item updated' : 'Item added');
+      if (isEdit) {
+        const { error } = await sb.from('mcp_stocks_items').update(payload).eq('id', editTarget.id);
+        if (error) throw error;
+        showToast('Item updated');
+      } else {
+        // Create with current_qty=0; opening txn will increment it via constraint
+        const { data: newItem, error } = await sb.from('mcp_stocks_items').insert({ ...payload, current_qty: 0, opening_qty: parseFloat(form.opening_qty) || 0 }).select('id').single();
+        if (error) throw error;
+        // Log the opening txn (constraint trigger will mark opening_recorded_at)
+        const opening = parseFloat(form.opening_qty) || 0;
+        if (opening >= 0) {
+          const { error: tErr } = await sb.from('mcp_stocks_transactions').insert({
+            plant_id: plant.id, item_id: newItem.id, txn_type: 'opening',
+            qty: opening, reference: 'Opening balance', notes: 'Created with item · ' + (me?.full_name || 'unknown'),
+            performed_by: me?.id || null,
+          });
+          if (tErr) throw tErr;
+        }
+        showToast('📦 Item added · opening ' + fmtNum(opening) + ' ' + form.uom);
+      }
       onSaved();
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
@@ -15166,12 +15267,147 @@ function ItemModal({ plant, editTarget, onClose, onSaved }) {
             </select>
           </div>
           <div class="field-row">
-            <div class="field"><label>Current Qty</label><input type="number" step="0.001" value=${form.current_qty} onChange=${e => setForm({...form, current_qty: e.target.value})} /></div>
-            <div class="field"><label>Reorder Level</label><input type="number" step="0.001" value=${form.reorder_level || ''} onChange=${e => setForm({...form, reorder_level: e.target.value})} /></div>
+            ${!isEdit ? html`
+              <div class="field"><label>Opening qty * <span style="font-weight:400;color:var(--amber-700);font-size:11px">· one-time</span></label><input type="number" required min=${0} step="0.001" value=${form.opening_qty} onChange=${e => setForm({...form, opening_qty: e.target.value})} placeholder="0" /></div>
+            ` : html`
+              <div class="field"><label>Current qty</label><input type="number" disabled value=${editTarget.current_qty} style="background:var(--slate-100);color:var(--slate-700);font-weight:600" /></div>
+            `}
+            <div class="field"><label>Reorder level</label><input type="number" step="0.001" value=${form.reorder_level || ''} onChange=${e => setForm({...form, reorder_level: e.target.value})} /></div>
           </div>
-          <div class="field"><label>Unit Cost (₹)</label><input type="number" step="0.01" value=${form.unit_cost || ''} onChange=${e => setForm({...form, unit_cost: e.target.value})} /></div>
-          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
+          <div class="field"><label>Unit cost (₹)</label><input type="number" step="0.01" value=${form.unit_cost || ''} onChange=${e => setForm({...form, unit_cost: e.target.value})} /></div>
+          ${!isEdit && html`
+            <div class="card" style="background:var(--amber-50);border-color:var(--amber-200);padding:8px 10px;margin-bottom:10px">
+              <div style="font-size:11px;color:var(--amber-800);line-height:1.5">
+                <strong>📌 Opening balance is one-time only.</strong> Once saved, this item can only receive stock through a document
+                (vendor bill, DC, job-work return) or an admin adjustment. Use <strong>📥 Receive from Doc</strong> for every subsequent inward.
+              </div>
+            </div>
+          `}
+          ${isEdit && alreadyOpened && html`
+            <div style="font-size:11px;color:var(--slate-600);background:var(--slate-50);padding:6px 10px;border-radius:5px;margin-bottom:10px">
+              ✓ Opening recorded ${fmtDate(editTarget.opening_recorded_at)}. To change qty, use receive-from-doc or an admin adjustment.
+            </div>
+          `}
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (isEdit ? 'Update' : '➕ Create item + opening')}</button>
         </form>
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// Receive from Document — picks an approved inward doc that has a
+// pending GRN reception and posts the receipts. The DB cascade
+// already creates the pending reception when a vendor bill / dc_in /
+// invoice_in is approved; this UI just confirms and posts.
+// =================================================================
+function ReceiveFromDocPicker({ plant, me, pendingReceptions, onClose, onSaved }) {
+  const [activeRec, setActiveRec] = useState(null);
+  const [grnLines, setGrnLines] = useState([]);
+  const [allItems, setAllItems] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+
+  const openRec = async (rec) => {
+    setActiveRec(rec); setErr(''); setLoading(true);
+    const [lines, items] = await Promise.all([
+      sb.from('mcp_logistics_grn_lines').select('*, mcp_stocks_items(id, code, name, uom, current_qty, opening_recorded_at)').eq('grn_id', rec.id),
+      sb.from('mcp_stocks_items').select('id, code, name, uom, current_qty, opening_recorded_at').eq('plant_id', plant.id).order('name'),
+    ]);
+    setGrnLines((lines.data || []).map(l => ({ ...l, _post_qty: l.doc_qty || 0, _stock_item_id: l.item_id || '' })));
+    setAllItems(items.data || []);
+    setLoading(false);
+  };
+
+  const setLine = (i, patch) => setGrnLines(arr => arr.map((l, idx) => idx === i ? { ...l, ...patch } : l));
+
+  const post = async () => {
+    setErr(''); setLoading(true);
+    try {
+      const toPost = grnLines.filter(l => l._stock_item_id && parseFloat(l._post_qty) > 0);
+      if (toPost.length === 0) throw new Error('Pick a stock item and qty for at least one line');
+      const unopened = toPost.map(l => allItems.find(i => i.id === l._stock_item_id)).filter(i => i && !i.opening_recorded_at);
+      if (unopened.length > 0) throw new Error('These items need opening balance first: ' + unopened.map(i => i.code).join(', '));
+
+      const rows = toPost.map(l => ({
+        plant_id: plant.id, item_id: l._stock_item_id, txn_type: 'grn',
+        qty: parseFloat(l._post_qty),
+        reference: 'GRN from ' + (activeRec.reference_no || activeRec.mcp_logistics_documents?.doc_number || activeRec.id.slice(0,8)) + ' · ' + (activeRec.vendor_name || ''),
+        notes: 'Doc-backed receipt from reception ' + activeRec.id,
+        performed_by: me.id,
+        document_id: activeRec.document_id,
+      }));
+      const { error } = await sb.from('mcp_stocks_transactions').insert(rows);
+      if (error) throw error;
+      await sb.from('mcp_logistics_grn_receptions').update({ status: 'completed', verified_at: new Date().toISOString(), verified_by: me.id }).eq('id', activeRec.id);
+      showToast('📥 ' + rows.length + ' line' + (rows.length===1?'':'s') + ' received');
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+  };
+
+  if (activeRec) {
+    return html`
+      <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+        <div class="modal" style="max-width:680px">
+          <div class="modal-header">
+            <div class="modal-title">📥 Receive · ${activeRec.mcp_logistics_documents?.doc_number || activeRec.reference_no || 'doc'}</div>
+            <button class="close-btn" onClick=${() => setActiveRec(null)}>×</button>
+          </div>
+          <div style="font-size:12px;color:var(--slate-600);margin-bottom:10px">Vendor: <strong>${activeRec.vendor_name||'?'}</strong> · Date: <strong>${fmtDate(activeRec.reception_date)}</strong></div>
+          ${err && html`<div class="alert error">${err}</div>`}
+          ${loading && grnLines.length === 0 ? html`<div class="loader"><div class="spinner"></div></div>` : html`
+            ${grnLines.length === 0 ? html`<div class="card"><div class="empty"><div style="font-size:13px">No lines on this doc.</div></div></div>` :
+              grnLines.map((l, idx) => {
+                const item = allItems.find(i => i.id === l._stock_item_id);
+                const needsOpening = item && !item.opening_recorded_at;
+                return html`
+                  <div class="card" key=${l.id} style="margin-bottom:6px;padding:10px;border-left:3px solid ${l._stock_item_id ? 'var(--emerald-500)' : 'var(--amber-500)'}">
+                    <div style="font-size:12px;font-weight:600;margin-bottom:6px">${l.item_name_raw}</div>
+                    <div style="font-size:11px;color:var(--slate-500);margin-bottom:6px">Doc qty: <strong>${fmtNum(l.doc_qty)} ${l.uom||''}</strong>${l.unit_price?' · @ ₹'+l.unit_price:''}</div>
+                    <div class="field-row" style="margin-bottom:0">
+                      <div class="field" style="margin-bottom:0"><label style="font-size:10px">Stock item to credit</label>
+                        <select value=${l._stock_item_id} onChange=${e => setLine(idx, { _stock_item_id: e.target.value })}>
+                          <option value="">— Pick item —</option>
+                          ${allItems.map(i => html`<option key=${i.id} value=${i.id}>${i.code} · ${i.name}${i.opening_recorded_at?'':' (NO opening)'}</option>`)}
+                        </select>
+                      </div>
+                      <div class="field" style="margin-bottom:0"><label style="font-size:10px">Qty to receive</label><input type="number" step="0.001" min=${0} value=${l._post_qty} onChange=${e => setLine(idx, { _post_qty: e.target.value })} /></div>
+                    </div>
+                    ${needsOpening && html`<div style="font-size:11px;color:var(--rose-700);margin-top:4px">⚠ This item has no opening balance yet — set one first via "New Item + Opening" or edit it.</div>`}
+                  </div>
+                `;
+              })
+            }
+            <div style="display:flex;gap:6px;margin-top:10px">
+              <button class="btn ghost" onClick=${() => setActiveRec(null)} style="flex:1">Cancel</button>
+              <button class="btn" disabled=${loading} onClick=${post} style="flex:2">${loading ? 'Posting…' : '✓ Post receipts to stock'}</button>
+            </div>
+          `}
+        </div>
+      </div>
+    `;
+  }
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header">
+          <div class="modal-title">📥 Pending receptions · ${pendingReceptions.length}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${pendingReceptions.length === 0 ? html`
+          <div class="empty" style="padding:20px"><div style="font-size:28px">✅</div><div style="font-size:13px;margin-top:8px;color:var(--slate-600)">Nothing pending. Approve a vendor bill or DC and a reception will appear here automatically.</div></div>
+        ` : pendingReceptions.map(r => html`
+          <div class="list-item" key=${r.id} onClick=${() => openRec(r)} style="border-left:3px solid var(--amber-500)">
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${r.mcp_logistics_documents?.doc_number || r.reference_no || 'no doc#'}</div>
+                <div class="list-item-sub">${r.vendor_name||'?'} · ${fmtDate(r.reception_date)}${r.mcp_logistics_documents?.total_value?' · ₹'+fmtNum(r.mcp_logistics_documents.total_value):''}</div>
+              </div>
+              <span class="badge amber">${r.source||'manual'} →</span>
+            </div>
+          </div>
+        `)}
       </div>
     </div>
   `;
