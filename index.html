@@ -1038,6 +1038,7 @@ const MORE_GROUPS = [
       { key:'stocks',        icon:'📦', label:'Stocks',               sub:'Inventory, items, in/out transactions' },
       { key:'jobwork',       icon:'🏭', label:'Sub-Contracting',      sub:'Send / receive parts at job-work vendors · 180-day GST clock' },
       { key:'supplier_chase',icon:'🛒', label:'Supplier Chase',       sub:'Raw material runway vs upcoming schedule · auto-alerts which vendor to chase' },
+      { key:'petty_cash',    icon:'💰', label:'Petty Cash',           sub:'Expenses · advances · recollection · who owes how much' },
       { key:'documents',     icon:'📄', label:'Documents · Bills',    sub:'OCR invoices/DCs, payments, vendors' },
       { key:'movements',     icon:'🔀', label:'Movements',            sub:'In/out material flow, GRN verification' },
       { key:'schedules',     icon:'📅', label:'Customer Schedules',   sub:'Plan vs actual, weekly supplies, AI extract' },
@@ -1174,6 +1175,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'petty_cash'}><${PettyCashModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
 
       <div class="tabbar">
@@ -8343,6 +8345,492 @@ function SupplierChaseModule({ plant, me }) {
         `)
       }
     `}
+  `;
+}
+
+
+// =================================================================
+// PETTY CASH — expenses · advances · recollection
+// =================================================================
+function PettyCashModule({ plant, me }) {
+  const [books, setBooks] = useState([]);
+  const [balances, setBalances] = useState([]);
+  const [txns, setTxns] = useState([]);
+  const [advances, setAdvances] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState('summary'); // summary | txns | advances | books
+  const [createBookOpen, setCreateBookOpen] = useState(false);
+  const [createTxnOpen, setCreateTxnOpen] = useState(null); // {type, prefilledAdvanceId?}
+  const [period, setPeriod] = useState('30'); // last N days for txns list
+  const [filterType, setFilterType] = useState('all');
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [bks, bal, tx, adv, us] = await Promise.all([
+      sb.from('mcp_petty_cash_books').select('*').eq('plant_id', plant.id).eq('active', true).order('created_at'),
+      sb.from('v_petty_cash_book_balance').select('*').eq('plant_id', plant.id),
+      sb.from('mcp_petty_cash_txns').select('*, book:book_id(name), party:party_user_id(full_name), creator:created_by(full_name)').eq('plant_id', plant.id).order('txn_date', { ascending:false }).order('created_at', { ascending:false }).limit(300),
+      sb.from('v_petty_cash_outstanding_advances').select('*').eq('plant_id', plant.id),
+      sb.from('users').select('id, full_name, role, phone').eq('plant_id', plant.id).order('full_name'),
+    ]);
+    setBooks(bks.data || []);
+    setBalances(bal.data || []);
+    setTxns(tx.data || []);
+    setAdvances(adv.data || []);
+    setUsers(us.data || []);
+    setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  useEffect(() => {
+    if (!plant?.id) return;
+    const ch = sb.channel('petty-cash-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_petty_cash_txns', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_petty_cash_books', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => sb.removeChannel(ch);
+  }, [plant.id, refresh]);
+
+  const totalBalance = balances.reduce((s, b) => s + parseFloat(b.current_balance || 0), 0);
+  const totalOutstanding = advances.reduce((s, a) => s + Math.max(0, parseFloat(a.outstanding || 0)), 0);
+
+  const today = new Date().toISOString().slice(0,10);
+  const monthStart = today.slice(0,7) + '-01';
+  const todayTxns = txns.filter(t => t.txn_date === today);
+  const todayExpense = todayTxns.filter(t => t.txn_type === 'expense').reduce((s,t) => s + parseFloat(t.amount), 0);
+  const todayAdvance = todayTxns.filter(t => t.txn_type === 'advance_given').reduce((s,t) => s + parseFloat(t.amount), 0);
+  const monthExpense = txns.filter(t => t.txn_date >= monthStart && t.txn_type === 'expense').reduce((s,t) => s + parseFloat(t.amount), 0);
+
+  const visibleTxns = txns.filter(t => {
+    if (filterType !== 'all' && t.txn_type !== filterType) return false;
+    const daysAgo = (new Date(today) - new Date(t.txn_date)) / 86400000;
+    return daysAgo <= parseInt(period);
+  });
+
+  const emoji = (t) => ({topup:'⬆️', expense:'🧾', advance_given:'💸', advance_returned:'↩️'}[t] || '💰');
+  const txnLabel = (t) => ({topup:'Top-up', expense:'Expense', advance_given:'Advance', advance_returned:'Returned'}[t] || t);
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  if (books.length === 0) {
+    return html`
+      <div class="page-header"><div><h1>💰 Petty Cash</h1><div class="sub">Set up your first cash book to start</div></div></div>
+      <div class="card"><div class="empty"><div class="icon">💰</div>
+        <div style="font-size:13px;margin-bottom:10px">No petty cash book yet. Create one to start recording expenses + advances.</div>
+        <button class="btn" onClick=${() => setCreateBookOpen(true)}>+ Create cash book</button>
+      </div></div>
+      ${createBookOpen && html`<${PettyCashBookModal} plant=${plant} me=${me} users=${users} onClose=${() => setCreateBookOpen(false)} onSaved=${() => { setCreateBookOpen(false); refresh(); }} />`}
+    `;
+  }
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
+      <div><h1>💰 Petty Cash</h1><div class="sub">${books.length} book${books.length>1?'s':''} · ₹${fmtNum(totalBalance.toFixed(0))} in hand · ₹${fmtNum(totalOutstanding.toFixed(0))} owed by team</div></div>
+    </div>
+
+    <div class="card" style="margin-bottom:12px;padding:10px 12px;background:var(--teal-50);border-color:var(--teal-200)">
+      <div style="font-size:11px;font-weight:700;color:var(--teal-700);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">⚡ Quick entry</div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px">
+        ${[
+          { t:'expense', emoji:'🧾', label:'Expense' },
+          { t:'advance_given', emoji:'💸', label:'Advance' },
+          { t:'advance_returned', emoji:'↩️', label:'Return' },
+          { t:'topup', emoji:'⬆️', label:'Top-up' },
+        ].map(b => html`
+          <button key=${b.t} onClick=${() => setCreateTxnOpen({ type: b.t })}
+            style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:8px 4px;background:white;border:1px solid var(--slate-200);border-radius:8px;cursor:pointer;font-family:inherit">
+            <span style="font-size:18px">${b.emoji}</span>
+            <span style="font-size:11px;font-weight:600;color:var(--slate-700)">${b.label}</span>
+          </button>
+        `)}
+      </div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:12px">
+      <button class=${'auth-tab' + (tab==='summary'?' active':'')} onClick=${() => setTab('summary')}>Today</button>
+      <button class=${'auth-tab' + (tab==='txns'?' active':'')} onClick=${() => setTab('txns')}>Transactions · ${txns.length}</button>
+      <button class=${'auth-tab' + (tab==='advances'?' active':'')} onClick=${() => setTab('advances')}>Outstanding · ${advances.filter(a => parseFloat(a.outstanding) > 0).length}</button>
+      <button class=${'auth-tab' + (tab==='books'?' active':'')} onClick=${() => setTab('books')}>Books · ${books.length}</button>
+    </div>
+
+    ${tab === 'summary' && html`
+      <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:12px">
+        <div class="stat teal"><div class="stat-num" style="font-size:16px">₹${fmtNum(totalBalance.toFixed(0))}</div><div class="stat-label">In hand</div></div>
+        <div class=${'stat ' + (todayExpense > 0 ? 'amber' : 'teal')}><div class="stat-num" style="font-size:16px">₹${fmtNum(todayExpense.toFixed(0))}</div><div class="stat-label">Today's spend</div></div>
+        <div class=${'stat ' + (totalOutstanding > 0 ? 'amber' : 'teal')}><div class="stat-num" style="font-size:16px">₹${fmtNum(totalOutstanding.toFixed(0))}</div><div class="stat-label">Outstanding</div></div>
+      </div>
+
+      <div class="section-h">Books</div>
+      ${balances.map(b => html`
+        <div class="card" key=${b.book_id} style="padding:10px 12px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center">
+          <div>
+            <div style="font-size:13px;font-weight:600">${b.name}</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+              opening ₹${fmtNum(b.opening_balance)} · +₹${fmtNum(b.total_topup)} top-up · −₹${fmtNum(b.total_expense)} spent · −₹${fmtNum(b.total_advance_given - b.total_advance_returned)} net advance
+            </div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:18px;font-weight:700;color:var(--teal-700)">₹${fmtNum(parseFloat(b.current_balance).toFixed(0))}</div>
+            <div style="font-size:10px;color:var(--slate-500)">balance</div>
+          </div>
+        </div>
+      `)}
+
+      ${todayTxns.length > 0 && html`
+        <div class="section-h">Today · ${todayTxns.length} entr${todayTxns.length===1?'y':'ies'}</div>
+        ${todayTxns.slice(0, 8).map(t => html`
+          <div class="card" key=${t.id} style="margin-bottom:4px;padding:8px 12px;display:flex;justify-content:space-between;align-items:center">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:12px;font-weight:600">${emoji(t.txn_type)} ${t.description}</div>
+              <div style="font-size:10px;color:var(--slate-500)">${t.txn_no} · ${t.party?.full_name || t.party_name || t.vendor_name || '—'} · ${t.creator?.full_name || ''}</div>
+            </div>
+            <div style=${'font-size:13px;font-weight:600;color:'+(t.txn_type==='topup'||t.txn_type==='advance_returned'?'var(--emerald-600)':'var(--rose-600)')}>${t.txn_type==='topup'||t.txn_type==='advance_returned'?'+':'−'}₹${fmtNum(t.amount)}</div>
+          </div>
+        `)}
+      `}
+    `}
+
+    ${tab === 'txns' && html`
+      <div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">
+        <select value=${filterType} onChange=${e => setFilterType(e.target.value)} style="padding:6px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px">
+          <option value="all">All types</option>
+          <option value="expense">🧾 Expenses</option>
+          <option value="advance_given">💸 Advances</option>
+          <option value="advance_returned">↩️ Returns</option>
+          <option value="topup">⬆️ Top-ups</option>
+        </select>
+        <select value=${period} onChange=${e => setPeriod(e.target.value)} style="padding:6px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px">
+          <option value="7">Last 7 days</option>
+          <option value="30">Last 30 days</option>
+          <option value="90">Last 90 days</option>
+          <option value="365">Last 365 days</option>
+        </select>
+      </div>
+      ${visibleTxns.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📜</div><div style="font-size:13px">No transactions in this window.</div></div></div>` :
+        visibleTxns.map(t => html`
+          <div class="card" key=${t.id} style="margin-bottom:4px;padding:9px 12px">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+              <div style="flex:1;min-width:0">
+                <div style="font-size:13px;font-weight:600">${emoji(t.txn_type)} ${t.description}</div>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                  ${t.txn_no} · ${t.txn_date} · ${txnLabel(t.txn_type)}
+                  ${t.party?.full_name ? ' · ' + t.party.full_name : (t.party_name ? ' · ' + t.party_name : '')}
+                  ${t.vendor_name ? ' · ' + t.vendor_name : ''}
+                  ${t.category ? ' · ' + t.category : ''}
+                </div>
+                ${t.creator?.full_name && html`<div style="font-size:10px;color:var(--slate-400);margin-top:2px">by ${t.creator.full_name}</div>`}
+                ${(t.attachments && t.attachments.length > 0) && html`<div style="font-size:10px;color:var(--teal-600);margin-top:3px">📎 ${t.attachments.length} attachment${t.attachments.length>1?'s':''}</div>`}
+              </div>
+              <div style=${'font-size:15px;font-weight:700;color:'+(t.txn_type==='topup'||t.txn_type==='advance_returned'?'var(--emerald-600)':'var(--rose-600)')+';flex-shrink:0'}>
+                ${t.txn_type==='topup'||t.txn_type==='advance_returned'?'+':'−'}₹${fmtNum(t.amount)}
+              </div>
+            </div>
+          </div>
+        `)
+      }
+    `}
+
+    ${tab === 'advances' && html`
+      ${advances.filter(a => parseFloat(a.outstanding) > 0).length === 0 ? html`
+        <div class="card"><div class="empty"><div class="icon">✅</div><div style="font-size:13px">No outstanding advances. Everyone has settled.</div></div></div>
+      ` : advances.filter(a => parseFloat(a.outstanding) > 0).sort((a,b) => parseFloat(b.outstanding) - parseFloat(a.outstanding)).map(a => {
+        const days = a.last_advance_date ? Math.floor((new Date(today) - new Date(a.last_advance_date)) / 86400000) : null;
+        return html`
+          <div class="card" key=${a.user_id} style=${'margin-bottom:6px;padding:10px 12px;border-left:3px solid '+(days && days > 14 ? 'var(--rose-500)' : days && days > 7 ? 'var(--amber-500)' : 'var(--teal-300)')}>
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+              <div style="flex:1">
+                <div style="font-size:13px;font-weight:600">👤 ${a.full_name || '?'}</div>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                  Given ₹${fmtNum(a.given_total)} · Returned ₹${fmtNum(a.returned_total)} · Bills ₹${fmtNum(a.adjusted_total)}
+                  ${a.last_advance_date ? ' · last ' + a.last_advance_date + (days !== null ? ' (' + days + 'd)' : '') : ''}
+                </div>
+              </div>
+              <div style="text-align:right">
+                <div style="font-size:16px;font-weight:700;color:var(--rose-600)">₹${fmtNum(parseFloat(a.outstanding).toFixed(0))}</div>
+                <div style="display:flex;gap:4px;margin-top:4px;justify-content:flex-end">
+                  <button class="btn small" onClick=${() => setCreateTxnOpen({ type:'advance_returned', prefillUser: a.user_id, prefillAmount: a.outstanding })} style="padding:3px 8px;font-size:10px">↩️ Recover</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        `;
+      })}
+    `}
+
+    ${tab === 'books' && html`
+      <div class="section-h" style="display:flex;justify-content:space-between;align-items:center"><span>Cash books</span><button class="btn small ghost" onClick=${() => setCreateBookOpen(true)}>+ Add book</button></div>
+      ${balances.map(b => {
+        const custodian = users.find(u => u.id === b.custodian_user_id);
+        return html`
+          <div class="card" key=${b.book_id} style="margin-bottom:6px;padding:10px 12px">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+              <div style="flex:1">
+                <div style="font-size:13px;font-weight:600">${b.name}</div>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                  ${custodian ? '👤 ' + custodian.full_name + ' · ' : ''}
+                  opened ${b.opening_date} with ₹${fmtNum(b.opening_balance)}
+                </div>
+              </div>
+              <div style="text-align:right">
+                <div style="font-size:16px;font-weight:700;color:var(--teal-700)">₹${fmtNum(parseFloat(b.current_balance).toFixed(0))}</div>
+              </div>
+            </div>
+          </div>
+        `;
+      })}
+    `}
+
+    ${createBookOpen && html`<${PettyCashBookModal} plant=${plant} me=${me} users=${users} onClose=${() => setCreateBookOpen(false)} onSaved=${() => { setCreateBookOpen(false); refresh(); }} />`}
+    ${createTxnOpen && html`<${PettyCashTxnModal} plant=${plant} me=${me} books=${books} users=${users} initial=${createTxnOpen} advances=${advances} onClose=${() => setCreateTxnOpen(null)} onSaved=${() => { setCreateTxnOpen(null); refresh(); }} />`}
+  `;
+}
+
+function PettyCashBookModal({ plant, me, users, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    name: 'Plant Office Cash',
+    custodian_user_id: me.id,
+    opening_balance: '0',
+    opening_date: new Date().toISOString().slice(0,10),
+    notes: '',
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      const { error } = await sb.from('mcp_petty_cash_books').insert({
+        plant_id: plant.id,
+        name: form.name.trim(),
+        custodian_user_id: form.custodian_user_id || null,
+        opening_balance: parseFloat(form.opening_balance || 0),
+        opening_date: form.opening_date,
+        notes: form.notes || null,
+        created_by: me.id,
+      });
+      if (error) throw error;
+      showToast('💰 Cash book created');
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target===e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">New cash book</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Name *</label>
+            <input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} placeholder="Plant Office · Unit 2 Gate · Director's Imprest" />
+          </div>
+          <div class="field"><label>Custodian *</label>
+            <select value=${form.custodian_user_id} onChange=${e => setForm({...form, custodian_user_id: e.target.value})}>
+              <option value="">— Pick custodian —</option>
+              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role?' · '+u.role:''}</option>`)}
+            </select>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Opening balance ₹</label>
+              <input type="number" step="any" min=${0} value=${form.opening_balance} onChange=${e => setForm({...form, opening_balance: e.target.value})} />
+            </div>
+            <div class="field"><label>As of date</label>
+              <input type="date" value=${form.opening_date} onChange=${e => setForm({...form, opening_date: e.target.value})} />
+            </div>
+          </div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${busy || !form.name.trim()}>${busy ? 'Saving…' : 'Create book'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function PettyCashTxnModal({ plant, me, books, users, initial, advances, onClose, onSaved }) {
+  const txnType = initial.type;
+  const isExpense = txnType === 'expense';
+  const isAdvanceGiven = txnType === 'advance_given';
+  const isAdvanceReturned = txnType === 'advance_returned';
+  const isTopup = txnType === 'topup';
+
+  const [form, setForm] = useState({
+    book_id: books[0]?.id || '',
+    txn_date: new Date().toISOString().slice(0,10),
+    amount: initial.prefillAmount ? String(initial.prefillAmount) : '',
+    party_user_id: initial.prefillUser || '',
+    party_name: '',
+    category: '',
+    vendor_name: '',
+    bill_number: '',
+    description: '',
+    related_advance_id: '',
+    attachments: [],
+    email_ref: '',
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  // For expense against advance — list this user's open advances
+  const userOpenAdvances = isExpense && form.party_user_id
+    ? advances.filter(a => a.user_id === form.party_user_id && parseFloat(a.outstanding) > 0)
+    : [];
+
+  const titleByType = {
+    topup: '⬆️ Top-up cash box',
+    expense: '🧾 Record expense',
+    advance_given: '💸 Give advance',
+    advance_returned: '↩️ Recover advance',
+  };
+
+  const labelByType = {
+    topup: 'Cash brought in from',
+    expense: 'Paid to (vendor / supplier / person)',
+    advance_given: 'Given to (employee)',
+    advance_returned: 'Returned by (employee)',
+  };
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      if (!form.book_id) throw new Error('Pick a cash book');
+      if (!form.description.trim()) throw new Error('Enter a description / purpose');
+      const amount = parseFloat(form.amount || 0);
+      if (amount <= 0) throw new Error('Amount must be > 0');
+
+      if ((isAdvanceGiven || isAdvanceReturned) && !form.party_user_id) throw new Error('Pick the employee');
+
+      // If expense is to be adjusted against an advance, find the most-recent
+      // open advance_given row for that user.
+      let resolvedAdvanceId = null;
+      if (isExpense && form.party_user_id && form.related_advance_id === '__user_advance__') {
+        const { data: adv } = await sb.from('mcp_petty_cash_txns')
+          .select('id')
+          .eq('plant_id', plant.id)
+          .eq('party_user_id', form.party_user_id)
+          .eq('txn_type', 'advance_given')
+          .order('txn_date', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        resolvedAdvanceId = adv?.id || null;
+      }
+
+      const row = {
+        plant_id: plant.id,
+        book_id: form.book_id,
+        txn_date: form.txn_date,
+        txn_type: txnType,
+        amount: amount,
+        party_user_id: form.party_user_id || null,
+        party_name: form.party_user_id ? null : (form.party_name || null),
+        category: form.category || null,
+        vendor_name: isExpense ? (form.vendor_name || null) : null,
+        bill_number: isExpense ? (form.bill_number || null) : null,
+        related_advance_id: resolvedAdvanceId,
+        description: form.description.trim(),
+        attachments: form.attachments,
+        email_ref: form.email_ref || null,
+        created_by: me.id,
+      };
+
+      const { error } = await sb.from('mcp_petty_cash_txns').insert(row);
+      if (error) throw error;
+      showToast(({topup:'⬆️ Top-up recorded', expense:'🧾 Expense logged', advance_given:'💸 Advance given', advance_returned:'↩️ Recovery recorded'})[txnType]);
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  // For "Recover" linked to specific advance txn
+  const findAdvanceTxnsForUser = (uid) => uid
+    ? null  // can't easily query inline; we'll let user link via outstanding view (one row per user)
+    : [];
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target===e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">${titleByType[txnType] || 'New transaction'}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Book *</label>
+              <select value=${form.book_id} onChange=${e => setForm({...form, book_id: e.target.value})}>
+                ${books.map(b => html`<option key=${b.id} value=${b.id}>${b.name}</option>`)}
+              </select>
+            </div>
+            <div class="field"><label>Date *</label>
+              <input type="date" required value=${form.txn_date} onChange=${e => setForm({...form, txn_date: e.target.value})} />
+            </div>
+          </div>
+          <div class="field"><label>Amount ₹ *</label>
+            <input type="number" step="any" min=${0.01} required value=${form.amount} onChange=${e => setForm({...form, amount: e.target.value})} placeholder="0" autoFocus />
+          </div>
+          <div class="field"><label>Purpose / description *</label>
+            <input type="text" required value=${form.description} onChange=${e => setForm({...form, description: e.target.value})}
+              placeholder=${isExpense ? 'e.g. Diesel for forklift · Tea & snacks · Stationery'
+                : isAdvanceGiven ? 'e.g. Travel to Bosch Bangalore · Local purchase'
+                : isAdvanceReturned ? 'e.g. Returned unused balance · Submitted bills'
+                : 'e.g. Cash drawn from bank · Director top-up'} />
+          </div>
+
+          ${(isAdvanceGiven || isAdvanceReturned) && html`
+            <div class="field"><label>${labelByType[txnType]} *</label>
+              <select value=${form.party_user_id} required onChange=${e => setForm({...form, party_user_id: e.target.value})}>
+                <option value="">— Pick person —</option>
+                ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role?' · '+u.role:''}</option>`)}
+              </select>
+              ${isAdvanceReturned && form.party_user_id && html`
+                ${(() => {
+                  const a = advances.find(x => x.user_id === form.party_user_id);
+                  if (!a || parseFloat(a.outstanding) <= 0) return html`<div style="font-size:11px;color:var(--slate-500);margin-top:4px">No outstanding advance for this person.</div>`;
+                  return html`<div style="font-size:11px;color:var(--teal-700);margin-top:4px">Outstanding: ₹${fmtNum(parseFloat(a.outstanding).toFixed(0))} · last given ${a.last_advance_date}</div>`;
+                })()}
+              `}
+            </div>
+          `}
+
+          ${isExpense && html`
+            <div class="field"><label>${labelByType[txnType]}</label>
+              <input type="text" value=${form.vendor_name} onChange=${e => setForm({...form, vendor_name: e.target.value})} placeholder="HP Petrol Bunk · A-One Stationery · Anna Tea Shop" />
+            </div>
+            <div class="field"><label>Category</label>
+              <select value=${form.category} onChange=${e => setForm({...form, category: e.target.value})}>
+                <option value="">— Pick category —</option>
+                ${['Diesel/Fuel','Travel/Conveyance','Stationery','Tea/Snacks','Repairs','Postage/Courier','Local purchase','Wages/Casual','Misc.'].map(c => html`<option key=${c} value=${c}>${c}</option>`)}
+              </select>
+            </div>
+            <div class="field-row">
+              <div class="field"><label>Bill number</label><input type="text" value=${form.bill_number} onChange=${e => setForm({...form, bill_number: e.target.value})} /></div>
+              <div class="field"><label>Or person (if non-vendor)</label><input type="text" value=${form.party_name} onChange=${e => setForm({...form, party_name: e.target.value})} placeholder="Casual labourer / helper" /></div>
+            </div>
+            <div class="field"><label>Submitted by (against whose advance?)</label>
+              <select value=${form.party_user_id} onChange=${e => setForm({...form, party_user_id: e.target.value, related_advance_id: ''})}>
+                <option value="">— No one (paid directly from box) —</option>
+                ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+              </select>
+              ${userOpenAdvances.length > 0 && html`
+                <div style="font-size:11px;color:var(--teal-700);margin-top:4px">
+                  ${userOpenAdvances[0].full_name} has outstanding ₹${fmtNum(parseFloat(userOpenAdvances[0].outstanding).toFixed(0))}.
+                  <label style="display:inline-flex;align-items:center;gap:4px;margin-left:6px"><input type="checkbox" checked=${!!form.related_advance_id} onChange=${e => setForm({...form, related_advance_id: e.target.checked ? '__user_advance__' : ''})} />Adjust against advance</label>
+                </div>
+              `}
+            </div>
+          `}
+
+          ${isTopup && html`
+            <div class="field"><label>Source (where did the cash come from?)</label>
+              <input type="text" value=${form.party_name} onChange=${e => setForm({...form, party_name: e.target.value})} placeholder="Bank withdrawal · Director top-up · Sales receipt" />
+            </div>
+          `}
+
+          <${EntryAttachments} plant=${plant} me=${me} scope="pettycash"
+            value=${{ attachments: form.attachments, email_ref: form.email_ref }}
+            onChange=${(v) => setForm({...form, attachments: v.attachments, email_ref: v.email_ref})}
+            showEmail=${true} />
+
+          <button class="btn" disabled=${busy}>${busy ? 'Saving…' : ({topup:'⬆️ Record top-up', expense:'🧾 Record expense', advance_given:'💸 Give advance', advance_returned:'↩️ Record recovery'})[txnType]}</button>
+          <p style="font-size:11px;color:var(--slate-500);margin:6px 0 0">Auto-numbered · cascades to All Hands chat · audit-trail kept.</p>
+        </form>
+      </div>
+    </div>
   `;
 }
 
