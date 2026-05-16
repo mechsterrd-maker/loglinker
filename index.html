@@ -2477,7 +2477,7 @@ function PartAliasesModal({ plant, me, part, onClose, onSaved }) {
 
 // ============= PART DETAIL =============
 function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
-  const [tab, setTab] = useState('route');
+  const [tab, setTab] = useState('production');
   const [route, setRoute] = useState(null);
   const [steps, setSteps] = useState([]);
   const [bom, setBom] = useState([]);
@@ -2489,15 +2489,34 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
   const [editTarget, setEditTarget] = useState(null);
   const [loading, setLoading] = useState(true);
 
+  const [stageRollup, setStageRollup] = useState({ pdc: null, stages: [] });
+
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [r, b, w, s, a] = await Promise.all([
+    const [r, b, w, s, a, shots, stages] = await Promise.all([
       sb.from('mcp_pdc_routes').select('*').eq('part_id', part.id).eq('is_active', true).maybeSingle(),
       sb.from('mcp_pdc_bom').select('*, child_part:child_part_id(part_number,name,revision), child_item:child_item_id(code,name,uom)').eq('parent_part_id', part.id),
       sb.from('v_bom_where_used').select('*').eq('part_id', part.id),
       sb.from('mcp_stocks_items').select('*').order('name'),
       sb.from('customer_part_aliases').select('*, mcp_sched_customers(name, code)').eq('internal_part_id', part.id),
+      sb.from('mcp_pdc_shots').select('pieces_good, pieces_rejected, shots_good, shots_rejected, cavities, recorded_at').eq('part_id', part.id),
+      sb.from('mcp_pdc_stage_log').select('stage, qty_good, qty_rejected, log_date').eq('part_id', part.id),
     ]);
+    // Compute stage rollups
+    const pdcGood = (shots.data || []).reduce((s, r) => s + (r.pieces_good ?? (r.shots_good||0) * (r.cavities||1)), 0);
+    const pdcRej  = (shots.data || []).reduce((s, r) => s + (r.pieces_rejected ?? (r.shots_rejected||0) * (r.cavities||1)), 0);
+    const byStage = {};
+    for (const sl of (stages.data || [])) {
+      const k = sl.stage || 'other';
+      if (!byStage[k]) byStage[k] = { stage: k, good: 0, rejected: 0, entries: 0 };
+      byStage[k].good     += parseFloat(sl.qty_good||0);
+      byStage[k].rejected += parseFloat(sl.qty_rejected||0);
+      byStage[k].entries  += 1;
+    }
+    setStageRollup({
+      pdc: { good: pdcGood, rejected: pdcRej, shots: (shots.data||[]).length },
+      stages: Object.values(byStage),
+    });
     setRoute(r.data);
     if (r.data) {
       const { data: stps } = await sb.from('mcp_pdc_route_steps').select('*, machines(code)').eq('route_id', r.data.id).order('seq');
@@ -2584,10 +2603,93 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
     })()}
 
     <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (tab === 'production' ? ' active' : '')} onClick=${() => setTab('production')}>📊 Production</button>
       <button class=${'auth-tab' + (tab === 'route' ? ' active' : '')} onClick=${() => setTab('route')}>Route</button>
       <button class=${'auth-tab' + (tab === 'bom' ? ' active' : '')} onClick=${() => setTab('bom')}>BOM</button>
       <button class=${'auth-tab' + (tab === 'whereused' ? ' active' : '')} onClick=${() => setTab('whereused')}>Where Used</button>
     </div>
+
+    ${tab === 'production' && html`
+      ${(() => {
+        // Order: PDC first, then stages in route order if defined, else alphabetical
+        const stageOrder = (steps || []).map(s => (s.op_name || s.op_type || '').toLowerCase()).filter(Boolean);
+        const sortedStages = stageRollup.stages.slice().sort((a, b) => {
+          const ai = stageOrder.findIndex(o => a.stage.toLowerCase().includes(o) || o.includes(a.stage.toLowerCase()));
+          const bi = stageOrder.findIndex(o => b.stage.toLowerCase().includes(o) || o.includes(b.stage.toLowerCase()));
+          if (ai === -1 && bi === -1) return a.stage.localeCompare(b.stage);
+          if (ai === -1) return 1; if (bi === -1) return -1;
+          return ai - bi;
+        });
+
+        const pdc = stageRollup.pdc || { good: 0, rejected: 0, shots: 0 };
+        const pdcTotal = pdc.good + pdc.rejected;
+        const pdcRejPct = pdcTotal > 0 ? (pdc.rejected / pdcTotal * 100).toFixed(2) : '0.00';
+        const totalProduced = pdc.good;
+        const totalConsumedDownstream = sortedStages.reduce((s, st) => Math.max(s, st.good + st.rejected), 0);
+        const wipEstimate = Math.max(0, totalProduced - totalConsumedDownstream);
+
+        return html`
+          <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:10px">
+            <div class="stat teal">
+              <div class="stat-num">${fmtNum(pdc.good)}</div>
+              <div class="stat-label">PDC Good (pcs)</div>
+            </div>
+            <div class=${'stat ' + (pdc.rejected > 0 ? 'amber' : 'teal')}>
+              <div class="stat-num">${fmtNum(pdc.rejected)}</div>
+              <div class="stat-label">PDC Reject (${pdcRejPct}%)</div>
+            </div>
+            <div class="stat teal">
+              <div class="stat-num">~${fmtNum(wipEstimate)}</div>
+              <div class="stat-label">WIP (PDC − next stage)</div>
+            </div>
+          </div>
+
+          <div class="section-h">Stage-by-stage rollup</div>
+
+          ${pdc.shots === 0 && sortedStages.length === 0 ? html`
+            <div class="card"><div class="empty"><div class="icon">📊</div><div style="font-size:13px">No production logged for this part yet. Log a shot or stage entry to see the rollup.</div></div></div>
+          ` : html`
+            <div class="card" style="padding:0;overflow:hidden">
+              <table style="width:100%;font-size:12px;border-collapse:collapse">
+                <thead>
+                  <tr style="background:var(--slate-100);border-bottom:1px solid var(--slate-200)">
+                    <th style="text-align:left;padding:8px 10px;font-weight:600;color:var(--slate-600);font-size:11px;text-transform:uppercase">Stage</th>
+                    <th style="text-align:right;padding:8px 10px;font-weight:600;color:var(--slate-600);font-size:11px;text-transform:uppercase">Good</th>
+                    <th style="text-align:right;padding:8px 10px;font-weight:600;color:var(--slate-600);font-size:11px;text-transform:uppercase">Reject</th>
+                    <th style="text-align:right;padding:8px 10px;font-weight:600;color:var(--slate-600);font-size:11px;text-transform:uppercase">Rej %</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${pdc.shots > 0 && html`
+                    <tr style="border-bottom:1px solid var(--slate-100);background:var(--teal-50)">
+                      <td style="padding:8px 10px;font-weight:600">🔥 PDC <span style="font-size:10px;color:var(--slate-500);font-weight:400">· ${pdc.shots} shot${pdc.shots===1?'':'s'}</span></td>
+                      <td style="text-align:right;padding:8px 10px;font-family:monospace;font-weight:600;color:var(--emerald-700)">${fmtNum(pdc.good)}</td>
+                      <td style="text-align:right;padding:8px 10px;font-family:monospace;color:${pdc.rejected>0?'var(--rose-600)':'var(--slate-500)'}">${fmtNum(pdc.rejected)}</td>
+                      <td style="text-align:right;padding:8px 10px;font-family:monospace;color:var(--slate-600)">${pdcRejPct}%</td>
+                    </tr>
+                  `}
+                  ${sortedStages.map(st => {
+                    const total = st.good + st.rejected;
+                    const pct = total > 0 ? (st.rejected / total * 100).toFixed(2) : '0.00';
+                    return html`
+                      <tr key=${st.stage} style="border-bottom:1px solid var(--slate-100)">
+                        <td style="padding:8px 10px">${st.stage} <span style="font-size:10px;color:var(--slate-500)">· ${st.entries} entr${st.entries===1?'y':'ies'}</span></td>
+                        <td style="text-align:right;padding:8px 10px;font-family:monospace;font-weight:600;color:var(--emerald-700)">${fmtNum(st.good)}</td>
+                        <td style="text-align:right;padding:8px 10px;font-family:monospace;color:${st.rejected>0?'var(--rose-600)':'var(--slate-500)'}">${fmtNum(st.rejected)}</td>
+                        <td style="text-align:right;padding:8px 10px;font-family:monospace;color:var(--slate-600)">${pct}%</td>
+                      </tr>
+                    `;
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:6px;padding:0 4px;line-height:1.5">
+              <strong>How to read this:</strong> PDC row sums every shot of this part × cavities. Downstream stages sum every <code>stage_log</code> entry where part_id matches. "WIP" is an estimate of pieces still at PDC waiting for the next stage; if the largest downstream stage is "trimming" with 1000 good, and PDC produced 1100, WIP ≈ 100.
+            </div>
+          `}
+        `;
+      })()}
+    `}
 
     ${tab === 'route' && html`
       ${!route ? html`
