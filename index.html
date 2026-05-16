@@ -2571,19 +2571,13 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
             ${linkedStock && html`<span style="font-size:10px;background:var(--emerald-700);color:white;padding:1px 6px;border-radius:3px;font-weight:600">linked</span>`}
           </div>
           ${linkedStock ? html`
-            <div style="display:flex;justify-content:space-between;align-items:center">
-              <div>
-                <div style="font-size:18px;font-weight:700;color:var(--emerald-800)">${fmtNum(linkedStock.current_qty)} <span style="font-size:12px;color:var(--slate-600);font-weight:500">${linkedStock.uom}</span></div>
-                <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${linkedStock.code} · reorder at ${fmtNum(linkedStock.reorder_level)}</div>
-              </div>
-              <div style="display:flex;gap:6px">
-                <button class="btn small" onClick=${() => { setEditTarget({ item: linkedStock, txn_type: 'receipt' }); setModal('stock_txn'); }} style="padding:5px 10px;font-size:12px">+ Receipt</button>
-                <button class="btn small ghost" onClick=${() => { setEditTarget({ item: linkedStock, txn_type: 'consumption' }); setModal('stock_txn'); }} style="padding:5px 10px;font-size:12px">− Issue</button>
-              </div>
+            <div>
+              <div style="font-size:18px;font-weight:700;color:var(--emerald-800)">${fmtNum(linkedStock.current_qty)} <span style="font-size:12px;color:var(--slate-600);font-weight:500">${linkedStock.uom}</span></div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${linkedStock.code} · reorder at ${fmtNum(linkedStock.reorder_level)}</div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:4px">↗ Manage stock in <strong>Stocks</strong> tab (Receive from doc / opening / adjustment)</div>
             </div>
           ` : html`
-            <div style="font-size:12px;color:var(--slate-600);margin-bottom:8px">No stock ledger for this part yet. Create one to track on-hand quantity (e.g. job-work returns, GRN-in, manual receipts).</div>
-            <button class="btn small" onClick=${() => { setEditTarget(part); setModal('track_stock'); }} style="font-size:12px">📦 Track stock for this part</button>
+            <div style="font-size:12px;color:var(--slate-600)">No stock ledger linked. Add one in <strong>Stocks → New Item + Opening</strong> (use code <code style="background:var(--slate-100);padding:1px 4px;border-radius:3px">${part.part_number}</code> for auto-link).</div>
           `}
         </div>
       `;
@@ -2676,17 +2670,84 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
     ${modal === 'step' && html`<${RouteStepModal} plant=${plant} route=${route} machines=${machines} editTarget=${editTarget} nextSeq=${steps.length > 0 ? Math.max(...steps.map(s => s.seq)) + 10 : 10} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'bom' && html`<${BomModal} plant=${plant} parentPart=${part} parts=${parts} stockItems=${stockItems} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'part' && html`<${PartModal} plant=${plant} me=${me} dies=${dies} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); onClose(); }} />`}
-    ${modal === 'track_stock' && html`<${TrackStockForPartModal} plant=${plant} me=${me} part=${part} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
-    ${modal === 'stock_txn' && html`<${PartStockTxnModal} plant=${plant} me=${me} item=${editTarget.item} txnType=${editTarget.txn_type} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${aliasModalOpen && html`<${PartAliasesModal} plant=${plant} me=${me} part=${part} onClose=${() => setAliasModalOpen(false)} onSaved=${() => { setAliasModalOpen(false); refresh(); }} />`}
   `;
 }
 
 // =================================================================
-// "Track stock for this part" — Path A shortcut:
-// creates a matching mcp_stocks_items row and optionally logs an
-// opening receipt in one step. Keeps part code = stock item code so
-// the PartDetail inventory card auto-links.
+// PickPartForStockModal — lists parts that don't yet have a linked
+// stock ledger (no matching stock item by code). User picks one →
+// caller opens TrackStockForPartModal for that part.
+// =================================================================
+function PickPartForStockModal({ plant, stockItems, onPick, onClose }) {
+  const [parts, setParts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [filterType, setFilterType] = useState('sub_assembly'); // most common first
+
+  useEffect(() => {
+    sb.from('mcp_pdc_parts').select('id, part_number, name, revision, part_type, customer').eq('plant_id', plant.id).eq('status', 'active').order('part_number').then(({ data }) => {
+      setParts(data || []);
+      setLoading(false);
+    });
+  }, [plant.id]);
+
+  const linkedCodes = new Set(stockItems.map(s => s.code));
+  let list = parts.filter(p => !linkedCodes.has(p.part_number)); // hide already-linked
+  if (filterType !== 'all') list = list.filter(p => p.part_type === filterType);
+  if (search.trim()) {
+    const q = search.trim().toLowerCase();
+    list = list.filter(p => (p.part_number + ' ' + (p.name||'')).toLowerCase().includes(q));
+  }
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header">
+          <div class="modal-title">🧩 Pick a part to stock</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div style="font-size:11px;color:var(--slate-600);background:var(--slate-50);padding:8px 10px;border-radius:6px;margin-bottom:10px;border-left:3px solid var(--teal-500)">
+          Parts already linked to a stock ledger are hidden. Pick a part below to create its stock entry + opening balance.
+        </div>
+        <div style="display:flex;gap:6px;margin-bottom:10px">
+          <input type="search" placeholder="Search part number / name…" value=${search} onChange=${e => setSearch(e.target.value)} style="flex:1;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />
+          <select value=${filterType} onChange=${e => setFilterType(e.target.value)} style="padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
+            <option value="all">All types</option>
+            <option value="sub_assembly">Sub-assembly</option>
+            <option value="component">Component</option>
+            <option value="finished">Finished</option>
+            <option value="raw_part">Raw part</option>
+          </select>
+        </div>
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+          list.length === 0 ? html`
+            <div class="empty" style="padding:20px"><div style="font-size:28px">✓</div><div style="font-size:13px;margin-top:8px;color:var(--slate-600)">${parts.length === 0 ? 'No parts in master yet — create some in Production → Parts.' : 'All parts of this type already have a stock ledger.'}</div></div>
+          ` : html`
+            <div style="max-height:50vh;overflow-y:auto">
+              ${list.map(p => html`
+                <div class="list-item" key=${p.id} onClick=${() => onPick(p)}>
+                  <div class="list-item-row">
+                    <div class="list-item-main">
+                      <div class="list-item-title">${p.part_number} · ${p.name||''}</div>
+                      <div class="list-item-sub">Rev ${p.revision||'?'} · <span class="badge teal" style="font-size:9px">${p.part_type}</span>${p.customer?' · '+p.customer:''}</div>
+                    </div>
+                    <span style="color:var(--slate-400);font-size:18px">›</span>
+                  </div>
+                </div>
+              `)}
+            </div>
+          `
+        }
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// TrackStockForPartModal — creates a stock-ledger row matching a
+// part. Used from the Stocks page (via PickPartForStockModal). Opening
+// qty becomes the single 'opening' txn the DB discipline allows.
 // =================================================================
 function TrackStockForPartModal({ plant, me, part, onClose, onSaved }) {
   const [form, setForm] = useState({
@@ -2718,16 +2779,16 @@ function TrackStockForPartModal({ plant, me, part, onClose, onSaved }) {
       }).select('id').single();
       if (error) throw error;
 
-      // Optionally log opening receipt
+      // Log opening receipt (txn_type='opening' is the only manual txn the DB discipline allows)
       const opening = parseFloat(form.opening_qty);
-      if (opening > 0) {
+      if (opening >= 0) {
         const { error: tErr } = await sb.from('mcp_stocks_transactions').insert({
           plant_id: plant.id,
           item_id: item.id,
-          txn_type: 'receipt',
+          txn_type: 'opening',
           qty: opening,
           reference: form.opening_reference || 'Opening balance',
-          notes: 'Auto-created when linking part ' + part.part_number + ' to stock ledger',
+          notes: 'Created from part ' + part.part_number + ' · ' + (me?.full_name || ''),
           performed_by: me.id,
         });
         if (tErr) throw tErr;
@@ -2784,51 +2845,8 @@ function TrackStockForPartModal({ plant, me, part, onClose, onSaved }) {
   `;
 }
 
-function PartStockTxnModal({ plant, me, item, txnType, onClose, onSaved }) {
-  const isInward = txnType === 'receipt';
-  const [form, setForm] = useState({ qty: '', reference: '', notes: '' });
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState('');
-
-  const submit = async (e) => {
-    e.preventDefault(); setErr(''); setLoading(true);
-    try {
-      const q = parseFloat(form.qty);
-      if (!q || q <= 0) throw new Error('Quantity must be > 0');
-      if (!isInward && q > parseFloat(item.current_qty || 0)) {
-        if (!confirm('Stock will go to ' + fmtNum(parseFloat(item.current_qty || 0) - q) + '. Continue?')) {
-          setLoading(false); return;
-        }
-      }
-      const { error } = await sb.from('mcp_stocks_transactions').insert({
-        plant_id: plant.id, item_id: item.id, txn_type: txnType, qty: q,
-        reference: form.reference || null, notes: form.notes || null, performed_by: me.id,
-      });
-      if (error) throw error;
-      showToast((isInward ? '+ ' : '− ') + fmtNum(q) + ' ' + item.uom);
-      onSaved();
-    } catch (e) { setErr(e.message); } finally { setLoading(false); }
-  };
-
-  return html`
-    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div class="modal">
-        <div class="modal-header">
-          <div class="modal-title">${isInward ? '+ Receipt' : '− Issue'} · ${item.code}</div>
-          <button class="close-btn" onClick=${onClose}>×</button>
-        </div>
-        <div style="font-size:12px;color:var(--slate-500);margin-bottom:10px">Current on-hand: <strong>${fmtNum(item.current_qty)} ${item.uom}</strong></div>
-        ${err && html`<div class="alert error">${err}</div>`}
-        <form onSubmit=${submit}>
-          <div class="field"><label>Qty *</label><input type="number" required min=${0.001} step="any" value=${form.qty} onChange=${e => setForm({...form, qty: e.target.value})} autoFocus /></div>
-          <div class="field"><label>Reference</label><input type="text" value=${form.reference} onChange=${e => setForm({...form, reference: e.target.value})} placeholder=${isInward ? 'GRN / vendor DC / job-work return' : 'consumed for / issued to'} /></div>
-          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
-          <button class="btn" disabled=${loading} style="width:100%">${loading ? 'Saving…' : (isInward ? '+ Add receipt' : '− Issue stock')}</button>
-        </form>
-      </div>
-    </div>
-  `;
-}
+// PartStockTxnModal removed — manual + Receipt / - Issue is no longer the path.
+// Use ReceiveFromDocPicker for inward, Sales DC for outward, or admin adjustment.
 
 // ============= ROUTE STEP MODAL =============
 function RouteStepModal({ plant, route, machines, editTarget, nextSeq, onClose, onSaved }) {
@@ -14991,12 +15009,17 @@ function Stocks({ plant, me }) {
             <button class="card" style="text-align:left;padding:14px;cursor:pointer;background:var(--slate-50);border-color:var(--slate-300)" onClick=${() => { setEditTarget(null); setModal('item'); }}>
               <div style="font-size:24px">➕</div>
               <div style="font-size:13px;font-weight:700;margin-top:4px;color:var(--slate-800)">New Item + Opening</div>
-              <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Create item with one-time opening balance</div>
+              <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Generic item (raw, consumable, etc.)</div>
+            </button>
+            <button class="card" style="text-align:left;padding:14px;cursor:pointer;background:var(--teal-50);border-color:var(--teal-300)" onClick=${() => setModal('pick_part_for_stock')}>
+              <div style="font-size:24px">🧩</div>
+              <div style="font-size:13px;font-weight:700;margin-top:4px;color:var(--teal-800)">For a Part (Sub-assembly)</div>
+              <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Track stock for a sub-assembly / finished part</div>
             </button>
             <button class="card" style="text-align:left;padding:14px;cursor:pointer" onClick=${() => setView('items')}>
               <div style="font-size:24px">📦</div>
               <div style="font-size:13px;font-weight:700;margin-top:4px">View All Items</div>
-              <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${items.length} items · category filter · search</div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${items.length} items · search</div>
             </button>
             <button class="card" style="text-align:left;padding:14px;cursor:pointer" onClick=${() => setView('transactions')}>
               <div style="font-size:24px">📋</div>
@@ -15189,6 +15212,8 @@ function Stocks({ plant, me }) {
     ${modal === 'item' && html`<${ItemModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'txn' && html`<${TxnModal} plant=${plant} me=${me} item=${editTarget} isAdmin=${isAdmin} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'receive_picker' && html`<${ReceiveFromDocPicker} plant=${plant} me=${me} pendingReceptions=${pendingReceptions} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
+    ${modal === 'pick_part_for_stock' && html`<${PickPartForStockModal} plant=${plant} stockItems=${items} onPick=${(p) => { setEditTarget(p); setModal('track_stock'); }} onClose=${() => setModal(null)} />`}
+    ${modal === 'track_stock' && editTarget && html`<${TrackStockForPartModal} plant=${plant} me=${me} part=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="stock_issue" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
   `;
 }
