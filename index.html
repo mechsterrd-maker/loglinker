@@ -14888,6 +14888,14 @@ function BreakdownModal({ plant, me, machines, users, editTarget, onClose, onSav
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [sparesModalOpen, setSparesModalOpen] = useState(false);
+  const [linkedAction, setLinkedAction] = useState(null);
+
+  // Find the auto-created action tied to this breakdown (if editing)
+  useEffect(() => {
+    if (!editTarget?.id) return;
+    sb.from('actions').select('id, title, owner_id, status').eq('source_id', editTarget.id).eq('source_type', 'breakdown').maybeSingle().then(({ data }) => setLinkedAction(data || null));
+  }, [editTarget?.id]);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -14966,7 +14974,124 @@ function BreakdownModal({ plant, me, machines, users, editTarget, onClose, onSav
           </div>
           <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Report')}</button>
         </form>
-        ${editTarget && html`<${EntityTimeline} entityType="breakdown" entityId=${editTarget.id} plant=${plant} me=${me} />`}
+        ${editTarget && html`
+          <div style="margin-top:14px;padding:10px 12px;background:var(--teal-50);border:1px solid var(--teal-200);border-radius:8px">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+              <div style="flex:1;min-width:0">
+                <div style="font-size:11px;font-weight:700;color:var(--teal-700);text-transform:uppercase;letter-spacing:0.5px">🛒 Need spares?</div>
+                <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Raise an approval request to admin / plant head before purchasing.</div>
+              </div>
+              <button type="button" class="btn small" onClick=${() => setSparesModalOpen(true)} style="padding:6px 12px;font-size:12px;white-space:nowrap" disabled=${!linkedAction}>${linkedAction ? 'Request approval →' : 'Loading…'}</button>
+            </div>
+          </div>
+          <${EntityTimeline} entityType="breakdown" entityId=${editTarget.id} plant=${plant} me=${me} />
+        `}
+        ${sparesModalOpen && linkedAction && html`<${SparePurchaseRequestModal} plant=${plant} me=${me} users=${users} parentAction=${linkedAction} machineId=${form.machine_id} breakdownDescription=${form.description} onClose=${() => setSparesModalOpen(false)} onSaved=${() => { setSparesModalOpen(false); showToast('🛒 Spare request sent for approval'); }} />`}
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// SparePurchaseRequestModal — itemised spares list + approver picker.
+// Submits via request_help_or_approval RPC with request_type='approval'.
+// The approver sees the request in their Action Hub.
+// =================================================================
+function SparePurchaseRequestModal({ plant, me, users, parentAction, machineId, breakdownDescription, onClose, onSaved }) {
+  const approvers = users.filter(u => u.role === 'admin' || u.role === 'plant_head');
+  const [items, setItems] = useState([{ name: '', qty: '', uom: 'nos', est_cost: '' }]);
+  const [vendor, setVendor] = useState('');
+  const [urgency, setUrgency] = useState('high');
+  const [approverId, setApproverId] = useState(approvers[0]?.id || '');
+  const [reason, setReason] = useState(breakdownDescription || '');
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+
+  const addItem = () => setItems(arr => [...arr, { name: '', qty: '', uom: 'nos', est_cost: '' }]);
+  const setItem = (i, patch) => setItems(arr => arr.map((x, idx) => idx === i ? { ...x, ...patch } : x));
+  const removeItem = (i) => setItems(arr => arr.length <= 1 ? arr : arr.filter((_, idx) => idx !== i));
+
+  const validItems = items.filter(it => it.name.trim() && parseFloat(it.qty) > 0);
+  const totalEstCost = validItems.reduce((s, it) => s + ((parseFloat(it.est_cost) || 0) * (parseFloat(it.qty) || 0)), 0);
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setLoading(true);
+    try {
+      if (!approverId) throw new Error('Pick an approver');
+      if (validItems.length === 0) throw new Error('Add at least one spare with name + qty');
+
+      const itemsBlock = validItems.map((it, i) => `  ${i+1}. ${it.name} — ${it.qty} ${it.uom}${it.est_cost?' @ ₹'+it.est_cost+'/'+it.uom+' = ₹'+((parseFloat(it.est_cost)||0)*(parseFloat(it.qty)||0)).toFixed(2):''}`).join('\n');
+      const message =
+        '🛒 SPARE PURCHASE REQUEST\n' +
+        '─────────────\n' +
+        'Urgency: ' + urgency.toUpperCase() + '\n' +
+        (vendor ? 'Preferred vendor: ' + vendor + '\n' : '') +
+        '\nSpares needed:\n' + itemsBlock + '\n' +
+        (totalEstCost > 0 ? '\nEstimated total: ₹' + totalEstCost.toFixed(2) + '\n' : '') +
+        '\nReason / breakdown context:\n' + reason +
+        '\n\nApprove to authorise purchase. The maintenance team will then place the order.';
+
+      const { data, error } = await sb.rpc('request_help_or_approval', {
+        p_parent_action_id: parentAction.id,
+        p_request_type: 'approval',
+        p_assignee_id: approverId,
+        p_message: message,
+        p_due_at: urgency === 'urgent' ? new Date(Date.now() + 4*60*60*1000).toISOString()
+                  : urgency === 'high'  ? new Date(Date.now() + 24*60*60*1000).toISOString()
+                  : new Date(Date.now() + 72*60*60*1000).toISOString(),
+      });
+      if (error) throw error;
+      if (!data?.success) throw new Error(data?.error || 'Failed to send request');
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header">
+          <div class="modal-title">🛒 Request spare purchase</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div style="font-size:11px;color:var(--slate-600);background:var(--slate-50);padding:8px 10px;border-radius:6px;margin-bottom:10px;border-left:3px solid var(--teal-500);line-height:1.5">
+          Approval lives in <strong>${approvers.length === 0 ? '(no admin/plant head found!)' : 'admin or plant head'}</strong>. Once approved, you can proceed to order the spares — the approval doc shows on the breakdown's action timeline.
+        </div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Spares needed *</label>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              ${items.map((it, idx) => html`
+                <div key=${idx} style="display:grid;grid-template-columns:1fr 60px 60px 80px 28px;gap:4px;align-items:center">
+                  <input type="text" placeholder="Part / spare name" value=${it.name} onChange=${e => setItem(idx, { name: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  <input type="number" placeholder="Qty" min=${0} step="any" value=${it.qty} onChange=${e => setItem(idx, { qty: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  <input type="text" placeholder="UoM" value=${it.uom} onChange=${e => setItem(idx, { uom: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  <input type="number" placeholder="Est ₹/unit" min=${0} step="any" value=${it.est_cost} onChange=${e => setItem(idx, { est_cost: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  ${items.length > 1 ? html`<button type="button" onClick=${() => removeItem(idx)} style="background:none;border:none;cursor:pointer;color:var(--rose-600);font-size:16px;padding:0">×</button>` : html`<span></span>`}
+                </div>
+              `)}
+            </div>
+            <button type="button" class="btn small ghost" onClick=${addItem} style="margin-top:6px;font-size:11px">+ Add another</button>
+            ${totalEstCost > 0 && html`<div style="font-size:11px;color:var(--slate-600);margin-top:6px;text-align:right">Estimated total: <strong>₹${totalEstCost.toFixed(2)}</strong></div>`}
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Urgency *</label>
+              <select value=${urgency} onChange=${e => setUrgency(e.target.value)}>
+                <option value="urgent">🔴 Urgent (machine down · 4h)</option>
+                <option value="high">🟠 High (within 24h)</option>
+                <option value="normal">🟢 Normal (within 3 days)</option>
+              </select>
+            </div>
+            <div class="field"><label>Preferred vendor</label><input type="text" value=${vendor} onChange=${e => setVendor(e.target.value)} placeholder="optional" /></div>
+          </div>
+          <div class="field"><label>Approver *</label>
+            <select required value=${approverId} onChange=${e => setApproverId(e.target.value)}>
+              ${approvers.length === 0 ? html`<option value="">— No admin / plant head available —</option>` :
+                approvers.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${u.role})</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Reason / context</label><textarea rows=${3} value=${reason} onChange=${e => setReason(e.target.value)} placeholder="What broke, why these spares, any alternatives"></textarea></div>
+          <button class="btn" disabled=${loading || approvers.length === 0} style="width:100%">${loading ? 'Sending…' : '✅ Send for approval'}</button>
+        </form>
       </div>
     </div>
   `;
