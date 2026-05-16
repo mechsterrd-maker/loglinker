@@ -1573,7 +1573,10 @@ function Production({ plant, me }) {
 
     ${(() => {
       const groups = [
-        { key:'overview', label:'📊 Overview',  items:[{ key:'overview', label:'Today' }] },
+        { key:'overview', label:'📊 Overview',  items:[
+            { key:'overview', label:'Today' },
+            { key:'flow',     label:'🌊 Flow' },
+        ]},
         { key:'entry',    label:'📥 Entry',     items:[
             { key:'stages', label:'📋 Stage Log' },
             { key:'shots',  label:'Shots' },
@@ -1606,6 +1609,7 @@ function Production({ plant, me }) {
       `;
     })()}
 
+    ${view === 'flow' && html`<${ProductionFlow} plant=${plant} parts=${parts} />`}
     ${view === 'stages' && html`<${StageLog} plant=${plant} me=${me} parts=${parts} machines=${machines} dies=${dies} units=${units} shifts=${shifts} users=${users} />`}
 
     ${view === 'overview' && html`
@@ -2477,7 +2481,7 @@ function PartAliasesModal({ plant, me, part, onClose, onSaved }) {
 
 // ============= PART DETAIL =============
 function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
-  const [tab, setTab] = useState('production');
+  const [tab, setTab] = useState('route');
   const [route, setRoute] = useState(null);
   const [steps, setSteps] = useState([]);
   const [bom, setBom] = useState([]);
@@ -2603,13 +2607,15 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
     })()}
 
     <div class="auth-tabs" style="margin-bottom:14px">
-      <button class=${'auth-tab' + (tab === 'production' ? ' active' : '')} onClick=${() => setTab('production')}>📊 Production</button>
       <button class=${'auth-tab' + (tab === 'route' ? ' active' : '')} onClick=${() => setTab('route')}>Route</button>
       <button class=${'auth-tab' + (tab === 'bom' ? ' active' : '')} onClick=${() => setTab('bom')}>BOM</button>
       <button class=${'auth-tab' + (tab === 'whereused' ? ' active' : '')} onClick=${() => setTab('whereused')}>Where Used</button>
     </div>
+    <div style="font-size:11px;color:var(--slate-500);margin-bottom:12px;padding:8px 10px;background:var(--slate-50);border-radius:6px;border-left:3px solid var(--teal-500)">
+      Looking for daily production / WIP / rejections for this part? Go to <strong>Production → 🌊 Flow</strong> and filter by this part.
+    </div>
 
-    ${tab === 'production' && html`
+    ${false && tab === 'production' && html`
       ${(() => {
         // Order: PDC first, then stages in route order if defined, else alphabetical
         const stageOrder = (steps || []).map(s => (s.op_name || s.op_type || '').toLowerCase()).filter(Boolean);
@@ -17262,6 +17268,244 @@ function VendorEditModal({ plant, me, vendor, onClose, onSaved }) {
 }
 
 // ============= STAGE LOG (per-stage daily log with reconciliation) =============
+// =================================================================
+// PRODUCTION FLOW — table view of WIP & throughput per part × stage.
+// Pulls from mcp_pdc_shots (PDC totals) + mcp_pdc_stage_log (downstream
+// stages). WIP is computed cumulatively: input from previous stage in
+// the route minus the qty processed at this stage. Period totals
+// (good, reject, reject %) are sliced by the date filter.
+// =================================================================
+const FLOW_STAGE_ORDER = ['pdc','trimming','deflashing','shot_blast','cnc','vmc','lathe','press','drilling','tapping','plating','painting','heat_treat','inspection','packing','dispatch','outsource','other'];
+
+function ProductionFlow({ plant, parts }) {
+  const [shots, setShots] = useState([]);
+  const [logs, setLogs] = useState([]);
+  const [routes, setRoutes] = useState({}); // part_id → ordered stage list
+  const [loading, setLoading] = useState(true);
+  // Filters
+  const [period, setPeriod] = useState('7'); // last N days for the period totals
+  const [filterPart, setFilterPart] = useState('all');
+  const [filterStage, setFilterStage] = useState('all');
+  const [sortBy, setSortBy] = useState('wip_desc'); // wip_desc | wip_asc | rej_desc | part | stage
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [s, l, r, rs] = await Promise.all([
+      sb.from('mcp_pdc_shots').select('part_id, pieces_good, pieces_rejected, shots_good, shots_rejected, cavities, recorded_at').eq('plant_id', plant.id),
+      sb.from('mcp_pdc_stage_log').select('part_id, stage, qty_good, qty_rejected, log_date, status').eq('plant_id', plant.id),
+      sb.from('mcp_pdc_routes').select('id, part_id').eq('plant_id', plant.id).eq('is_active', true),
+      sb.from('mcp_pdc_route_steps').select('route_id, seq, op_type, op_name').order('seq'),
+    ]);
+    // Build route map: part_id → ordered list of normalized stage names
+    const stepsByRoute = {};
+    for (const st of (rs.data || [])) {
+      if (!stepsByRoute[st.route_id]) stepsByRoute[st.route_id] = [];
+      stepsByRoute[st.route_id].push((st.op_type || st.op_name || 'other').toLowerCase().replace(/[^a-z0-9_]/g, ''));
+    }
+    const rMap = {};
+    for (const route of (r.data || [])) {
+      rMap[route.part_id] = stepsByRoute[route.id] || [];
+    }
+    setShots(s.data || []);
+    setLogs(l.data || []);
+    setRoutes(rMap);
+    setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  useEffect(() => {
+    if (!plant?.id) return;
+    const ch = sb.channel('flow-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_pdc_stage_log', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_pdc_shots', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => sb.removeChannel(ch);
+  }, [plant.id, refresh]);
+
+  // Compute period boundaries
+  const today = new Date(); const periodStart = new Date(today); periodStart.setDate(today.getDate() - parseInt(period));
+  const periodStartStr = periodStart.toISOString().slice(0,10);
+  const todayStr = today.toISOString().slice(0,10);
+
+  // Build (part × stage) rows
+  const partsMap = Object.fromEntries(parts.map(p => [p.id, p]));
+  const rows = [];
+  const partsWithActivity = new Set();
+  shots.forEach(s => s.part_id && partsWithActivity.add(s.part_id));
+  logs.forEach(l => l.part_id && partsWithActivity.add(l.part_id));
+
+  for (const partId of partsWithActivity) {
+    const part = partsMap[partId];
+    if (!part) continue;
+
+    // Collect the stages this part actually has data for + PDC if any shots
+    const stagesSeen = new Set();
+    if (shots.some(s => s.part_id === partId)) stagesSeen.add('pdc');
+    logs.forEach(l => { if (l.part_id === partId && l.stage) stagesSeen.add(l.stage); });
+
+    // Order them by route if defined, else by FLOW_STAGE_ORDER
+    const routeOrder = routes[partId] || [];
+    const sortedStages = Array.from(stagesSeen).sort((a, b) => {
+      const ai = routeOrder.indexOf(a); const bi = routeOrder.indexOf(b);
+      if (ai !== -1 && bi !== -1) return ai - bi;
+      if (ai !== -1) return -1; if (bi !== -1) return 1;
+      const ag = FLOW_STAGE_ORDER.indexOf(a); const bg = FLOW_STAGE_ORDER.indexOf(b);
+      return (ag === -1 ? 99 : ag) - (bg === -1 ? 99 : bg);
+    });
+
+    // Cumulative good output per stage (for input to the next)
+    const stageCumGood = {};
+    let prevGood = 0;
+    // For PDC, input is "all material consumed" — but we just need PDC's own good
+    // For each subsequent stage, input = previous stage's cumulative good.
+    sortedStages.forEach((stage, idx) => {
+      let cumGood = 0, cumRej = 0, periodGood = 0, periodRej = 0, lastDate = null;
+      if (stage === 'pdc') {
+        shots.filter(s => s.part_id === partId).forEach(s => {
+          const g = s.pieces_good ?? (s.shots_good||0) * (s.cavities||1);
+          const rj = s.pieces_rejected ?? (s.shots_rejected||0) * (s.cavities||1);
+          cumGood += g; cumRej += rj;
+          const dateStr = s.recorded_at?.slice(0,10);
+          if (dateStr && dateStr >= periodStartStr) { periodGood += g; periodRej += rj; }
+          if (!lastDate || (dateStr && dateStr > lastDate)) lastDate = dateStr;
+        });
+      } else {
+        logs.filter(l => l.part_id === partId && l.stage === stage).forEach(l => {
+          const g = parseFloat(l.qty_good||0); const rj = parseFloat(l.qty_rejected||0);
+          cumGood += g; cumRej += rj;
+          if (l.log_date >= periodStartStr) { periodGood += g; periodRej += rj; }
+          if (!lastDate || (l.log_date && l.log_date > lastDate)) lastDate = l.log_date;
+        });
+      }
+      const cumTotal = cumGood + cumRej;
+      const cumRejPct = cumTotal > 0 ? (cumRej / cumTotal * 100) : 0;
+      const periodTotal = periodGood + periodRej;
+      const periodRejPct = periodTotal > 0 ? (periodRej / periodTotal * 100) : 0;
+      // WIP for stage X = input - processed.
+      // input = previous stage's cumulative good (or this stage's own input for PDC).
+      // For PDC, input = cum produced (good + rej both came from raw material).
+      // For downstream, input = upstream cum good.
+      // WIP = input - processed = input - (cumGood + cumRej).
+      const input = idx === 0 ? cumTotal : prevGood;
+      const wip = Math.max(0, input - cumTotal);
+      stageCumGood[stage] = cumGood;
+      rows.push({
+        part_id: partId, part_number: part.part_number, part_name: part.name,
+        stage, stage_idx: idx, input, processed: cumTotal,
+        cum_good: cumGood, cum_rej: cumRej, cum_rej_pct: cumRejPct,
+        period_good: periodGood, period_rej: periodRej, period_rej_pct: periodRejPct,
+        wip, last_date: lastDate,
+      });
+      prevGood = cumGood;
+    });
+  }
+
+  // Apply filters
+  let filtered = rows;
+  if (filterPart !== 'all') filtered = filtered.filter(r => r.part_id === filterPart);
+  if (filterStage !== 'all') filtered = filtered.filter(r => r.stage === filterStage);
+  // Sort
+  const sortFn = {
+    wip_desc: (a,b) => b.wip - a.wip,
+    wip_asc:  (a,b) => a.wip - b.wip,
+    rej_desc: (a,b) => b.period_rej_pct - a.period_rej_pct,
+    part:     (a,b) => a.part_number.localeCompare(b.part_number) || a.stage_idx - b.stage_idx,
+    stage:    (a,b) => a.stage.localeCompare(b.stage) || a.part_number.localeCompare(b.part_number),
+  }[sortBy] || ((a,b) => 0);
+  filtered = filtered.slice().sort(sortFn);
+
+  // Rollups
+  const totalWip = filtered.reduce((s,r) => s + r.wip, 0);
+  const totalPeriodGood = filtered.reduce((s,r) => s + r.period_good, 0);
+  const totalPeriodRej = filtered.reduce((s,r) => s + r.period_rej, 0);
+
+  // Unique stages for filter dropdown
+  const uniqueStages = Array.from(new Set(rows.map(r => r.stage)));
+  const partsWithRows = Array.from(new Set(rows.map(r => r.part_id))).map(id => partsMap[id]).filter(Boolean);
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  return html`
+    <div style="margin-bottom:14px">
+      <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);gap:8px">
+        <div class="stat teal"><div class="stat-num">${fmtNum(totalWip)}</div><div class="stat-label">Total WIP (pcs)</div></div>
+        <div class="stat teal"><div class="stat-num">+${fmtNum(totalPeriodGood)}</div><div class="stat-label">Good · last ${period}d</div></div>
+        <div class=${'stat ' + (totalPeriodRej > 0 ? 'amber' : 'teal')}><div class="stat-num">${fmtNum(totalPeriodRej)}</div><div class="stat-label">Reject · last ${period}d</div></div>
+      </div>
+    </div>
+
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;align-items:center">
+      <select value=${period} onChange=${e => setPeriod(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
+        <option value="1">Last 1d</option>
+        <option value="7">Last 7d</option>
+        <option value="30">Last 30d</option>
+        <option value="90">Last 90d</option>
+        <option value="365">Last 12 mo</option>
+      </select>
+      <select value=${filterPart} onChange=${e => setFilterPart(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white;max-width:180px">
+        <option value="all">All parts</option>
+        ${partsWithRows.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number}</option>`)}
+      </select>
+      <select value=${filterStage} onChange=${e => setFilterStage(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
+        <option value="all">All stages</option>
+        ${uniqueStages.map(s => html`<option key=${s} value=${s}>${s}</option>`)}
+      </select>
+      <select value=${sortBy} onChange=${e => setSortBy(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
+        <option value="wip_desc">Sort: WIP ↓</option>
+        <option value="wip_asc">Sort: WIP ↑</option>
+        <option value="rej_desc">Sort: Reject % ↓</option>
+        <option value="part">Sort: Part</option>
+        <option value="stage">Sort: Stage</option>
+      </select>
+      ${(filterPart !== 'all' || filterStage !== 'all') && html`<button class="btn small ghost" onClick=${() => { setFilterPart('all'); setFilterStage('all'); }} style="font-size:11px">Clear</button>`}
+    </div>
+
+    ${filtered.length === 0 ? html`
+      <div class="card"><div class="empty"><div class="icon">🌊</div><div style="font-size:13px">No production flow data ${rows.length === 0 ? 'yet — log shots or stage entries to see WIP here' : 'matching current filters'}.</div></div></div>
+    ` : html`
+      <div class="card" style="padding:0;overflow:auto">
+        <table style="width:100%;font-size:11px;border-collapse:collapse;min-width:720px">
+          <thead>
+            <tr style="background:var(--slate-100);border-bottom:1px solid var(--slate-200);position:sticky;top:0;z-index:1">
+              <th style="text-align:left;padding:7px 9px;font-weight:600;color:var(--slate-700);font-size:10px;text-transform:uppercase">Part</th>
+              <th style="text-align:left;padding:7px 9px;font-weight:600;color:var(--slate-700);font-size:10px;text-transform:uppercase">Stage</th>
+              <th style="text-align:right;padding:7px 9px;font-weight:600;color:var(--slate-700);font-size:10px;text-transform:uppercase">WIP</th>
+              <th style="text-align:right;padding:7px 9px;font-weight:600;color:var(--slate-700);font-size:10px;text-transform:uppercase">Good (${period}d)</th>
+              <th style="text-align:right;padding:7px 9px;font-weight:600;color:var(--slate-700);font-size:10px;text-transform:uppercase">Rej (${period}d)</th>
+              <th style="text-align:right;padding:7px 9px;font-weight:600;color:var(--slate-700);font-size:10px;text-transform:uppercase">Rej %</th>
+              <th style="text-align:right;padding:7px 9px;font-weight:600;color:var(--slate-700);font-size:10px;text-transform:uppercase">Cum Good</th>
+              <th style="text-align:right;padding:7px 9px;font-weight:600;color:var(--slate-700);font-size:10px;text-transform:uppercase">Last</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${filtered.map((r, i) => {
+              const prevR = i > 0 ? filtered[i-1] : null;
+              const newPart = !prevR || prevR.part_number !== r.part_number;
+              const stagePill = r.stage === 'pdc' ? 'teal' : 'slate';
+              const rejHigh = r.period_rej_pct >= 5;
+              return html`
+                <tr key=${r.part_id+'-'+r.stage} style=${'border-bottom:1px solid var(--slate-100);' + (newPart && i > 0 ? 'border-top:2px solid var(--slate-200);' : '')}>
+                  <td style="padding:6px 9px;${newPart ? 'font-weight:600' : 'color:var(--slate-400)'}">${newPart ? r.part_number : '↳'}</td>
+                  <td style="padding:6px 9px"><span class=${'badge ' + stagePill} style="font-size:10px;text-transform:uppercase">${r.stage}</span></td>
+                  <td style="padding:6px 9px;text-align:right;font-family:monospace;font-weight:600;color:${r.wip > 0 ? 'var(--amber-700)' : 'var(--slate-400)'}">${fmtNum(r.wip)}</td>
+                  <td style="padding:6px 9px;text-align:right;font-family:monospace;color:var(--emerald-700)">${fmtNum(r.period_good)}</td>
+                  <td style="padding:6px 9px;text-align:right;font-family:monospace;color:${r.period_rej > 0 ? 'var(--rose-600)' : 'var(--slate-400)'}">${fmtNum(r.period_rej)}</td>
+                  <td style="padding:6px 9px;text-align:right;font-family:monospace;color:${rejHigh ? 'var(--rose-700)' : 'var(--slate-600)'};font-weight:${rejHigh ? '600' : '400'}">${r.period_rej_pct.toFixed(1)}%</td>
+                  <td style="padding:6px 9px;text-align:right;font-family:monospace;color:var(--slate-700)">${fmtNum(r.cum_good)}</td>
+                  <td style="padding:6px 9px;text-align:right;color:var(--slate-500)">${r.last_date || '—'}</td>
+                </tr>
+              `;
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div style="font-size:11px;color:var(--slate-500);margin-top:8px;padding:0 4px;line-height:1.6">
+        <strong>How to read this:</strong> One row per <em>(part × stage)</em>. <strong>WIP</strong> = pieces that arrived at this stage but haven't been processed yet (input from previous stage minus what this stage has done). Stage order follows the part's route if defined, else alphabetical. <strong>Cum Good</strong> is lifetime (not date-filtered). Reject % ≥ 5% is highlighted.
+      </div>
+    `}
+  `;
+}
+
 function StageLog({ plant, me, parts, machines, dies, units, shifts, users }) {
   const STAGES = ['pdc','trimming','cnc','vmc','lathe','press','drilling','tapping','deflashing','shot_blast','plating','painting','heat_treat','inspection','packing','dispatch','outsource','other'];
   const [logs, setLogs] = useState([]);
