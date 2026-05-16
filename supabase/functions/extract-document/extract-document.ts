@@ -20,7 +20,7 @@ const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-sonnet-4-20250514";
-const WORKER_VERSION = "v20";
+const WORKER_VERSION = "v21";
 
 // Tunables
 const VENDOR_CONTEXT_LIMIT = 60;   // top-N vendors fed to the model
@@ -300,14 +300,47 @@ A DC moves goods without invoicing money — that is the whole purpose of having
 DC and Invoice as separate documents. Never invent monetary values for a DC.
 
 ═══════════════════════════════════════════════════════════
-ARITHMETIC SELF-CHECK (when there ARE prices)
+INDIAN NUMBER FORMAT — comma rules (CRITICAL — this is where errors hide)
 ═══════════════════════════════════════════════════════════
-After listing items, verify:
-  sum(items[].amount) ≈ taxable_value   (tolerate ±1 for round-off)
-  total_value ≈ taxable_value + tax_amount
-If either check fails, add "arithmetic_mismatch" to flags[] and explain in
-validation_note. If the mismatch is large, prefer NULLING the less certain
-field over publishing inconsistent numbers.
+Indian invoices use LAKH-CRORE grouping, not Western thousands:
+  ✓ 1,02,714.60      means 1 02 714.60      = 102714.60
+  ✓ 12,33,327.00     means 12 33 327.00     = 1233327.00
+  ✓ 1,04,30,000.00   means 1 04 30 000.00   = 10430000.00 (one crore)
+  ✓ 58,060.00        means 58 060.00        =    58060.00
+  ✓ 10,43,514.60     means 10 43 514.60     =  1043514.60
+
+The first comma from the RIGHT separates the last 3 digits (hundreds-thousands).
+Every further comma to the left separates pairs of digits (lakhs, crores).
+NEVER read 1,02,714 as 1,027,140 or 102,7140.
+NEVER read 10,43,514 as 10,435,140.
+
+Self-check: if you read 1,02,714 and 10,43,514 in the same doc and they don't
+relate by a clean factor (qty × rate), you have probably misread one of them
+by a factor of 10. RE-READ BOTH NUMBERS DIGIT BY DIGIT before publishing.
+
+═══════════════════════════════════════════════════════════
+ARITHMETIC SELF-CHECK (when there ARE prices) — HARD STOP
+═══════════════════════════════════════════════════════════
+After listing items, verify ALL three of these:
+  CHECK A: sum(items[].amount) within ±2% of taxable_value
+  CHECK B: each items[i].qty × items[i].rate within ±1 of items[i].amount
+  CHECK C: total_value within ±2% of (taxable_value + tax_amount)
+
+If ANY check fails:
+  STEP 1 — RE-READ the misaligned numbers digit by digit. Check for:
+           • Indian-comma confusion (10× / 100× errors)
+           • A missed digit (8 misread as 88, or vice versa)
+           • Decimal point in wrong place
+           • A misread qty or rate
+  STEP 2 — If after re-reading the numbers STILL don't reconcile, you have a
+           genuine extraction problem. Add "arithmetic_mismatch" to flags[]
+           AND describe the gap precisely in validation_note (state the actual
+           numbers and the ratio between them — e.g. "items sum 102714 vs
+           taxable 1043514 → 10.16× gap, suggests Indian-comma misread on one
+           of these"). Do NOT publish numbers you don't believe.
+  STEP 3 — If genuinely ambiguous, prefer NULLING the less certain field over
+           publishing inconsistent numbers. A null is recoverable; a wrong
+           number that looks confident is dangerous.
 
 ═══════════════════════════════════════════════════════════
 DATES
@@ -894,6 +927,67 @@ async function processQueueRow(
 
     const docType = resolveDocType(parsed);
 
+    // ─── Server-side arithmetic sanity check ───────────────────────────────
+    // Catch the cases where the model claims success but the numbers don't
+    // reconcile (Indian-comma misread, missed digit, decimal place wrong).
+    // This runs INDEPENDENTLY of whatever the model put in flags[].
+    const items = Array.isArray(parsed.items) ? parsed.items : [];
+    const itemsSum = items.reduce((s: number, it: { amount?: number | null }) => {
+      const a = typeof it?.amount === "number" ? it.amount : 0;
+      return s + a;
+    }, 0);
+    const taxable = typeof parsed.taxable_value === "number" ? parsed.taxable_value : null;
+    const tax = typeof parsed.tax_amount === "number" ? parsed.tax_amount : 0;
+    const total = typeof parsed.total_value === "number" ? parsed.total_value : null;
+
+    const issues: string[] = [];
+
+    // Check A: items sum vs taxable
+    if (taxable && itemsSum > 0) {
+      const gap = Math.abs(itemsSum - taxable);
+      const tol = Math.max(1, taxable * 0.02);
+      if (gap > tol) {
+        const ratio = itemsSum > taxable ? itemsSum / taxable : taxable / itemsSum;
+        issues.push(`items sum ${itemsSum.toFixed(2)} vs taxable ${taxable.toFixed(2)} (gap ₹${gap.toFixed(2)}, ratio ${ratio.toFixed(2)}×)${ratio > 8 && ratio < 12 ? " — likely Indian-comma misread (10×)" : ""}`);
+      }
+    }
+
+    // Check B: per-line qty × rate vs amount
+    items.forEach((it: { qty?: number; rate?: number; amount?: number; name?: string }, idx: number) => {
+      if (typeof it?.qty === "number" && typeof it?.rate === "number" && typeof it?.amount === "number") {
+        const expected = it.qty * it.rate;
+        const gap = Math.abs(expected - it.amount);
+        if (gap > Math.max(1, it.amount * 0.02)) {
+          issues.push(`line ${idx + 1} (${it.name ?? "?"}): qty×rate=${expected.toFixed(2)} but amount=${it.amount.toFixed(2)}`);
+        }
+      }
+    });
+
+    // Check C: total vs taxable+tax
+    if (taxable && total) {
+      const expected = taxable + tax;
+      const gap = Math.abs(expected - total);
+      const tol = Math.max(1, total * 0.02);
+      if (gap > tol) {
+        issues.push(`total ${total.toFixed(2)} != taxable+tax ${expected.toFixed(2)} (gap ₹${gap.toFixed(2)})`);
+      }
+    }
+
+    const flagsList: string[] = Array.isArray(parsed.flags) ? [...parsed.flags] : [];
+    let validationNote = parsed.validation_note ?? null;
+
+    if (issues.length > 0) {
+      if (!flagsList.includes("arithmetic_mismatch")) flagsList.push("arithmetic_mismatch");
+      if (!flagsList.includes("needs_human_review")) flagsList.push("needs_human_review");
+      const auditTrail = "⚠ SERVER ARITHMETIC CHECK FAILED:\n  • " + issues.join("\n  • ") +
+        "\n→ Values held for human review. Verify each number before approving.";
+      validationNote = validationNote
+        ? auditTrail + "\n\nMODEL NOTE: " + validationNote
+        : auditTrail;
+      // Force confidence down if model said high but server disagrees
+      if (parsed.confidence === "high") parsed.confidence = "low";
+    }
+
     // Resolve vendor_id: trust the model's vendor_match_id only if it's a real uuid in our list.
     let resolvedVendorId: string | null = null;
     if (parsed.vendor_match_id && /^[0-9a-f-]{36}$/i.test(parsed.vendor_match_id)) {
@@ -906,13 +1000,16 @@ async function processQueueRow(
       if (v) resolvedVendorId = v.id;
     }
 
-    // Build raw_extraction blob (everything the model returned + our metadata)
+    // Build raw_extraction blob (everything the model returned + our metadata + server flags)
     const rawExtraction = {
       ...parsed,
+      flags: flagsList,
+      validation_note: validationNote,
       _worker_version: WORKER_VERSION,
       _model: MODEL,
       _resolved_doc_type: docType,
       _resolved_vendor_id: resolvedVendorId,
+      _server_arithmetic_issues: issues,
     };
 
     stage = "persist";
@@ -932,7 +1029,7 @@ async function processQueueRow(
         total_value: parsed.total_value ?? null,
         items: parsed.items ?? [],
         raw_extraction: rawExtraction,
-        validation_note: parsed.validation_note ?? null,
+        validation_note: validationNote,
         source_message_id: row.message_id,
         source_image_url: row.image_url,
         extracted_by_ai: true,
