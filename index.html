@@ -8508,6 +8508,19 @@ function PettyCashModule({ plant, me }) {
   const emoji = (t) => ({topup:'⬆️', expense:'🧾', advance_given:'💸', advance_returned:'↩️'}[t] || '💰');
   const txnLabel = (t) => ({topup:'Top-up', expense:'Expense', advance_given:'Advance', advance_returned:'Returned'}[t] || t);
 
+  // Admin-only mutations (matches DB RLS that locks writes to admin/plant_head)
+  const isAdmin = me?.role === 'admin' || me?.role === 'plant_head';
+  const [expandedTxnId, setExpandedTxnId] = useState(null);
+
+  const deleteTxn = async (t) => {
+    if (!isAdmin) return;
+    if (!confirm('Delete this transaction (' + t.txn_no + ', ₹' + fmtNum(t.amount) + ')? This cannot be undone.')) return;
+    const { error } = await sb.from('mcp_petty_cash_txns').delete().eq('id', t.id);
+    if (error) { alert('Delete failed: ' + error.message); return; }
+    showToast('🗑 Transaction deleted');
+    refresh();
+  };
+
   if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
 
   if (books.length === 0) {
@@ -8526,23 +8539,34 @@ function PettyCashModule({ plant, me }) {
       <div><h1>💰 Petty Cash</h1><div class="sub">${books.length} book${books.length>1?'s':''} · ₹${fmtNum(totalBalance.toFixed(0))} in hand · ₹${fmtNum(totalOutstanding.toFixed(0))} owed by team</div></div>
     </div>
 
-    <div class="card" style="margin-bottom:12px;padding:10px 12px;background:var(--teal-50);border-color:var(--teal-200)">
-      <div style="font-size:11px;font-weight:700;color:var(--teal-700);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">⚡ Quick entry</div>
-      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px">
-        ${[
-          { t:'expense', emoji:'🧾', label:'Expense' },
-          { t:'advance_given', emoji:'💸', label:'Advance' },
-          { t:'advance_returned', emoji:'↩️', label:'Return' },
-          { t:'topup', emoji:'⬆️', label:'Top-up' },
-        ].map(b => html`
-          <button key=${b.t} onClick=${() => setCreateTxnOpen({ type: b.t })}
-            style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:8px 4px;background:white;border:1px solid var(--slate-200);border-radius:8px;cursor:pointer;font-family:inherit">
-            <span style="font-size:18px">${b.emoji}</span>
-            <span style="font-size:11px;font-weight:600;color:var(--slate-700)">${b.label}</span>
-          </button>
-        `)}
+    ${isAdmin ? html`
+      <div class="card" style="margin-bottom:12px;padding:10px 12px;background:var(--teal-50);border-color:var(--teal-200)">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div style="font-size:11px;font-weight:700;color:var(--teal-700);text-transform:uppercase;letter-spacing:0.5px">⚡ Quick entry</div>
+          <span style="font-size:10px;background:var(--teal-700);color:white;padding:2px 8px;border-radius:4px;font-weight:600">🔒 Admin only</span>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px">
+          ${[
+            { t:'expense', emoji:'🧾', label:'Expense' },
+            { t:'advance_given', emoji:'💸', label:'Advance' },
+            { t:'advance_returned', emoji:'↩️', label:'Return' },
+            { t:'topup', emoji:'⬆️', label:'Top-up' },
+          ].map(b => html`
+            <button key=${b.t} onClick=${() => setCreateTxnOpen({ type: b.t })}
+              style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:8px 4px;background:white;border:1px solid var(--slate-200);border-radius:8px;cursor:pointer;font-family:inherit">
+              <span style="font-size:18px">${b.emoji}</span>
+              <span style="font-size:11px;font-weight:600;color:var(--slate-700)">${b.label}</span>
+            </button>
+          `)}
+        </div>
       </div>
-    </div>
+    ` : html`
+      <div class="card" style="margin-bottom:12px;padding:10px 12px;background:var(--slate-50);border-color:var(--slate-200)">
+        <div style="font-size:11px;color:var(--slate-600)">
+          <span style="font-weight:700;color:var(--slate-700)">🔒 Read-only</span> · Petty cash entries can be created or modified only by admin / plant head. Contact them to record a new expense or advance.
+        </div>
+      </div>
+    `}
 
     <div class="auth-tabs" style="margin-bottom:12px">
       <button class=${'auth-tab' + (tab==='summary'?' active':'')} onClick=${() => setTab('summary')}>Today</button>
@@ -8605,26 +8629,41 @@ function PettyCashModule({ plant, me }) {
         </select>
       </div>
       ${visibleTxns.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📜</div><div style="font-size:13px">No transactions in this window.</div></div></div>` :
-        visibleTxns.map(t => html`
-          <div class="card" key=${t.id} style="margin-bottom:4px;padding:9px 12px">
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
-              <div style="flex:1;min-width:0">
-                <div style="font-size:13px;font-weight:600">${emoji(t.txn_type)} ${t.description}</div>
-                <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
-                  ${t.txn_no} · ${t.txn_date} · ${txnLabel(t.txn_type)}
-                  ${t.party?.full_name ? ' · ' + t.party.full_name : (t.party_name ? ' · ' + t.party_name : '')}
-                  ${t.vendor_name ? ' · ' + t.vendor_name : ''}
-                  ${t.category ? ' · ' + t.category : ''}
+        visibleTxns.map(t => {
+          const hasAtt = (t.attachments && t.attachments.length > 0) || t.email_ref || t.bill_number;
+          const expanded = expandedTxnId === t.id;
+          return html`
+            <div class="card" key=${t.id} style="margin-bottom:4px;padding:9px 12px;cursor:pointer" onClick=${() => setExpandedTxnId(expanded ? null : t.id)}>
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:13px;font-weight:600">${emoji(t.txn_type)} ${t.description}</div>
+                  <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                    ${t.txn_no} · ${t.txn_date} · ${txnLabel(t.txn_type)}
+                    ${t.party?.full_name ? ' · ' + t.party.full_name : (t.party_name ? ' · ' + t.party_name : '')}
+                    ${t.vendor_name ? ' · ' + t.vendor_name : ''}
+                    ${t.category ? ' · ' + t.category : ''}
+                  </div>
+                  ${t.creator?.full_name && html`<div style="font-size:10px;color:var(--slate-400);margin-top:2px">by ${t.creator.full_name}</div>`}
+                  ${hasAtt && html`<div style="font-size:10px;color:var(--teal-600);margin-top:3px">${t.attachments?.length ? '📎 ' + t.attachments.length + ' · ' : ''}${expanded ? '▼ tap to collapse' : '▶ tap to view'}</div>`}
                 </div>
-                ${t.creator?.full_name && html`<div style="font-size:10px;color:var(--slate-400);margin-top:2px">by ${t.creator.full_name}</div>`}
-                ${(t.attachments && t.attachments.length > 0) && html`<div style="font-size:10px;color:var(--teal-600);margin-top:3px">📎 ${t.attachments.length} attachment${t.attachments.length>1?'s':''}</div>`}
+                <div style=${'font-size:15px;font-weight:700;color:'+(t.txn_type==='topup'||t.txn_type==='advance_returned'?'var(--emerald-600)':'var(--rose-600)')+';flex-shrink:0'}>
+                  ${t.txn_type==='topup'||t.txn_type==='advance_returned'?'+':'−'}₹${fmtNum(t.amount)}
+                </div>
               </div>
-              <div style=${'font-size:15px;font-weight:700;color:'+(t.txn_type==='topup'||t.txn_type==='advance_returned'?'var(--emerald-600)':'var(--rose-600)')+';flex-shrink:0'}>
-                ${t.txn_type==='topup'||t.txn_type==='advance_returned'?'+':'−'}₹${fmtNum(t.amount)}
-              </div>
+              ${expanded && html`
+                <div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--slate-200)" onClick=${e => e.stopPropagation()}>
+                  ${t.bill_number && html`<div style="font-size:11px;color:var(--slate-600);margin-bottom:6px">Bill # <strong>${t.bill_number}</strong></div>`}
+                  <${AttachmentsViewer} attachments=${t.attachments} emailRef=${t.email_ref} compact=${true} />
+                  ${isAdmin && html`
+                    <div style="display:flex;justify-content:flex-end;margin-top:8px">
+                      <button class="btn small danger" onClick=${() => deleteTxn(t)} style="padding:4px 10px;font-size:11px">🗑 Delete entry</button>
+                    </div>
+                  `}
+                </div>
+              `}
             </div>
-          </div>
-        `)
+          `;
+        })
       }
     `}
 
@@ -10681,6 +10720,39 @@ function PartPicker({ plant, value, onChange, placeholder, required, allowClear 
 // =================================================================
 // Drops into any entry form. Stores into JSONB attachments column on
 // the parent row + a text email_ref. Uses chat-attachments bucket.
+// =================================================================
+// VIEW-ONLY attachments display — drop into any detail/list card to surface
+// photos, voice notes, and file links that were uploaded via EntryAttachments.
+// =================================================================
+function AttachmentsViewer({ attachments, emailRef, compact = false }) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  if (list.length === 0 && !emailRef) return null;
+  const thumbSize = compact ? 56 : 80;
+  return html`
+    <div style=${'background:var(--slate-50);border:1px solid var(--slate-200);border-radius:8px;padding:'+(compact?'8px 10px':'10px 12px')+';margin-top:8px'}>
+      <div style="font-size:10px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px">📎 ${list.length} attachment${list.length===1?'':'s'}${emailRef?' · email ref':''}</div>
+      ${list.length > 0 && html`
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+          ${list.map((a, idx) => {
+            if (a.kind === 'photo' || (a.url && /\.(jpe?g|png|gif|webp|heic)(\?|$)/i.test(a.url))) {
+              return html`<a key=${idx} href=${a.url} target="_blank" rel="noopener" style="display:block"><img src=${a.url} style=${'width:'+thumbSize+'px;height:'+thumbSize+'px;border-radius:5px;object-fit:cover;border:1px solid var(--slate-200);display:block'} alt=${a.name||'photo'} /></a>`;
+            }
+            if (a.kind === 'voice' || (a.url && /\.(mp3|m4a|wav|ogg|webm)(\?|$)/i.test(a.url))) {
+              return html`<audio key=${idx} controls src=${a.url} style="height:32px;max-width:220px"></audio>`;
+            }
+            return html`<a key=${idx} href=${a.url} target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:4px;padding:6px 10px;background:white;border:1px solid var(--slate-200);border-radius:5px;font-size:11px;color:var(--slate-700);text-decoration:none">📄 ${a.name || 'file'}</a>`;
+          })}
+        </div>
+      `}
+      ${emailRef && html`
+        <div style=${'font-size:11px;color:var(--slate-600);margin-top:'+(list.length>0?'6':'0')+'px;word-break:break-all'}>
+          ${/^https?:\/\//.test(emailRef) ? html`<a href=${emailRef} target="_blank" rel="noopener" style="color:var(--teal-700)">📧 Open email thread ↗</a>` : html`<span style="font-family:monospace">📧 ${emailRef}</span>`}
+        </div>
+      `}
+    </div>
+  `;
+}
+
 function EntryAttachments({ plant, me, scope, value, onChange, showEmail = true }) {
   const [busy, setBusy] = useState(false);
   const [recording, setRecording] = useState(false);
