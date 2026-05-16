@@ -8958,6 +8958,7 @@ function SubContractingModule({ plant, me }) {
                     <div style="flex:1;min-width:0">
                       <div style="font-size:13px;font-weight:600">
                         ${l.part_number ? html`<span style="font-family:monospace">${l.part_number}</span> · ` : ''}${l.item_name}
+                        ${l.is_conversion && html` <span class="badge teal" style="font-size:9px">🔄 conv → ${l.yield_item_resolved_name || l.yield_item_name || '?'}</span>`}
                       </div>
                       <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
                         ${l.process ? l.process + ' · ' : ''}DC ${l.doc_number || '?'} · sent ${l.sent_date}
@@ -8970,8 +8971,14 @@ function SubContractingModule({ plant, me }) {
                       </div>
                     </div>
                     <div style="text-align:right">
-                      <div style="font-size:15px;font-weight:700;color:var(--teal-700)">${fmtNum(l.qty_pending)}</div>
-                      <div style="font-size:10px;color:var(--slate-500)">of ${fmtNum(l.qty_sent)} ${l.uom || ''}</div>
+                      ${l.is_conversion ? html`
+                        <div style="font-size:15px;font-weight:700;color:var(--teal-700)">${fmtNum(l.yield_qty_received || 0)}</div>
+                        <div style="font-size:10px;color:var(--slate-500)">${l.yield_uom || 'pcs'} yield</div>
+                        <div style="font-size:9px;color:var(--slate-400);margin-top:2px">${fmtNum(l.qty_pending)}/${fmtNum(l.qty_sent)} ${l.uom||''} mat left</div>
+                      ` : html`
+                        <div style="font-size:15px;font-weight:700;color:var(--teal-700)">${fmtNum(l.qty_pending)}</div>
+                        <div style="font-size:10px;color:var(--slate-500)">of ${fmtNum(l.qty_sent)} ${l.uom || ''}</div>
+                      `}
                     </div>
                   </div>
                 </div>
@@ -9014,13 +9021,21 @@ function JobworkSendModal({ plant, me, vendors, onClose, onSaved }) {
     expected_return_date: '',
     sla_days: 14,
     notes: '',
-    lines: [{ part_id: '', part_label: '', qty: '', uom: 'nos', rate: '' }],
+    lines: [{ part_id: '', part_label: '', qty: '', uom: 'nos', rate: '',
+              is_conversion: false, yield_stock_item_id: '', yield_item_name: '', yield_uom: 'nos', yield_ratio: '', conversion_charge_per_unit: '' }],
   });
+  const [stockItems, setStockItems] = useState([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
+  useEffect(() => {
+    sb.from('mcp_stocks_items').select('id, code, name, uom').eq('plant_id', plant.id).order('name')
+      .then(({ data }) => setStockItems(data || []));
+  }, [plant.id]);
+
   const setLine = (i, patch) => setForm(f => ({ ...f, lines: f.lines.map((l, idx) => idx === i ? { ...l, ...patch } : l) }));
-  const addLine = () => setForm(f => ({ ...f, lines: [...f.lines, { part_id: '', part_label: '', qty: '', uom: 'nos', rate: '' }] }));
+  const addLine = () => setForm(f => ({ ...f, lines: [...f.lines, { part_id: '', part_label: '', qty: '', uom: 'nos', rate: '',
+              is_conversion: false, yield_stock_item_id: '', yield_item_name: '', yield_uom: 'nos', yield_ratio: '', conversion_charge_per_unit: '' }] }));
   const removeLine = (i) => setForm(f => ({ ...f, lines: f.lines.length <= 1 ? f.lines : f.lines.filter((_, idx) => idx !== i) }));
 
   // Auto-fill expected_return_date from sla_days when sla_days changes
@@ -9065,12 +9080,25 @@ function JobworkSendModal({ plant, me, vendors, onClose, onSaved }) {
       }).select('id').single();
       if (error) throw error;
 
-      // The cascade trigger creates jobwork lines. Now patch SLA + expected return on those lines.
-      if (form.expected_return_date || form.sla_days) {
+      // The cascade trigger creates jobwork lines. Patch SLA + expected return + conversion details.
+      const { data: createdLines } = await sb.from('mcp_logistics_jobwork_lines')
+        .select('id, item_name')
+        .eq('doc_id', doc.id);
+
+      for (const cl of (createdLines || [])) {
+        // Match by item_name back to the form line to pick up conversion details
+        const formLine = valid.find(v => v.part_label.trim().toLowerCase() === (cl.item_name || '').toLowerCase());
+        const yieldItem = formLine?.yield_stock_item_id ? stockItems.find(s => s.id === formLine.yield_stock_item_id) : null;
         await sb.from('mcp_logistics_jobwork_lines').update({
           sla_days: form.sla_days ? parseInt(form.sla_days) : null,
           expected_return_date: form.expected_return_date || null,
-        }).eq('doc_id', doc.id);
+          is_conversion: !!formLine?.is_conversion,
+          yield_stock_item_id: formLine?.is_conversion ? (formLine.yield_stock_item_id || null) : null,
+          yield_item_name: formLine?.is_conversion ? (yieldItem?.name || formLine.yield_item_name || null) : null,
+          yield_uom: formLine?.is_conversion ? (yieldItem?.uom || formLine.yield_uom || 'nos') : null,
+          yield_ratio: formLine?.is_conversion && formLine.yield_ratio ? parseFloat(formLine.yield_ratio) : null,
+          conversion_charge_per_unit: formLine?.is_conversion && formLine.conversion_charge_per_unit ? parseFloat(formLine.conversion_charge_per_unit) : null,
+        }).eq('id', cl.id);
       }
 
       showToast('🏭 Sent to vendor · ' + valid.length + ' line' + (valid.length>1?'s':''));
@@ -9120,6 +9148,28 @@ function JobworkSendModal({ plant, me, vendors, onClose, onSaved }) {
                     <input type="text" value=${l.uom} onChange=${e => setLine(idx, { uom: e.target.value })} placeholder="UoM" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
                     <input type="number" step="any" min=${0} value=${l.rate} onChange=${e => setLine(idx, { rate: e.target.value })} placeholder="Rate ₹/pc (job-work)" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
                   </div>
+                  <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--slate-700);margin-top:8px;cursor:pointer">
+                    <input type="checkbox" checked=${l.is_conversion} onChange=${e => setLine(idx, { is_conversion: e.target.checked })} style="margin:0" />
+                    <strong>Conversion job-work</strong> — different item comes back (e.g. send ingot kg → receive insert pcs)
+                  </label>
+                  ${l.is_conversion && html`
+                    <div style="margin-top:6px;padding:8px;background:white;border:1px dashed var(--teal-300);border-radius:5px">
+                      <div style="font-size:11px;font-weight:600;color:var(--teal-700);margin-bottom:6px">Yield item (what comes back)</div>
+                      <select value=${l.yield_stock_item_id} onChange=${e => {
+                          const yi = stockItems.find(s => s.id === e.target.value);
+                          setLine(idx, { yield_stock_item_id: e.target.value, yield_item_name: yi?.name || '', yield_uom: yi?.uom || 'nos' });
+                        }} style="width:100%;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;box-sizing:border-box;margin-bottom:6px">
+                        <option value="">— Pick yield stock item —</option>
+                        ${stockItems.map(s => html`<option key=${s.id} value=${s.id}>${s.code ? s.code+' · ':''}${s.name} (${s.uom})</option>`)}
+                      </select>
+                      ${stockItems.length === 0 && html`<div style="font-size:10px;color:var(--amber-700);margin-bottom:6px">No stock items yet. Add the yield item to Stocks first.</div>`}
+                      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+                        <input type="number" step="any" min=${0} value=${l.yield_ratio} onChange=${e => setLine(idx, { yield_ratio: e.target.value })} placeholder="Ratio: sent ${l.uom||'?'} per 1 ${l.yield_uom||'pc'}" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                        <input type="number" step="any" min=${0} value=${l.conversion_charge_per_unit} onChange=${e => setLine(idx, { conversion_charge_per_unit: e.target.value })} placeholder="Conv. charge ₹/pc" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                      </div>
+                      <div style="font-size:10px;color:var(--slate-500);margin-top:4px">e.g. if 1.05 kg ingot makes 1 insert, ratio = 1.05. Leave blank if you'll close manually.</div>
+                    </div>
+                  `}
                 </div>
               `)}
               <button type="button" class="btn small ghost" onClick=${addLine} style="font-size:12px;align-self:flex-start">+ Add another part</button>
@@ -9137,12 +9187,19 @@ function JobworkSendModal({ plant, me, vendors, onClose, onSaved }) {
 }
 
 function JobworkReceiveModal({ plant, me, line, onClose, onSaved }) {
+  const isConv = !!line.is_conversion;
+  const yieldRemaining = isConv
+    ? (line.yield_ratio && line.yield_ratio > 0
+        ? Math.max(0, (parseFloat(line.qty_sent) - parseFloat(line.qty_received_back || 0)) / parseFloat(line.yield_ratio))
+        : null)
+    : null;
+
   const [form, setForm] = useState({
     doc_number: '',
     doc_date: new Date().toISOString().slice(0,10),
     qty_received: '',
     qty_scrap: '',
-    rate: line.rate || '',
+    rate: line.rate || (isConv ? (line.conversion_charge_per_unit || '') : ''),
     notes: '',
   });
   const [busy, setBusy] = useState(false);
@@ -9154,19 +9211,21 @@ function JobworkReceiveModal({ plant, me, line, onClose, onSaved }) {
       const recv = parseFloat(form.qty_received || 0);
       const scrap = parseFloat(form.qty_scrap || 0);
       if (recv <= 0 && scrap <= 0) throw new Error('Enter received or scrap qty');
-      if (recv > parseFloat(line.qty_pending)) throw new Error('Received cannot exceed pending (' + line.qty_pending + ')');
+      if (!isConv && recv > parseFloat(line.qty_pending)) throw new Error('Received cannot exceed pending (' + line.qty_pending + ')');
 
-      // 1. Create the DC-in document (cascade trigger updates jobwork_lines.qty_received_back automatically? Check.)
+      // Items array — name = yield item if conversion, original item otherwise.
+      // jobwork_line_id link tells the cascade trigger exactly which line to update.
       const items = [{
-        name: line.item_name,
+        name: isConv ? (line.yield_item_resolved_name || line.yield_item_name || line.item_name) : line.item_name,
+        stock_item_id: isConv ? (line.yield_stock_item_id || null) : null,
         part_id: line.part_id || null,
         qty: recv,
         scrap_qty: scrap || null,
-        uom: line.uom || 'nos',
+        uom: isConv ? (line.yield_uom || 'nos') : (line.uom || 'nos'),
         rate: form.rate ? parseFloat(form.rate) : null,
         process: line.process,
-        original_doc_id: line.doc_id,
-        original_line_id: line.id,
+        jobwork_line_id: line.id,
+        is_conversion_yield: isConv,
       }];
 
       const { error: derr } = await sb.from('mcp_logistics_documents').insert({
@@ -9184,21 +9243,15 @@ function JobworkReceiveModal({ plant, me, line, onClose, onSaved }) {
       });
       if (derr) throw derr;
 
-      // 2. Update the original jobwork_line with the received qty
-      const newReceived = parseFloat(line.qty_received_back || 0) + recv;
-      const fullyReceived = newReceived >= parseFloat(line.qty_sent);
-      const { error: uerr } = await sb.from('mcp_logistics_jobwork_lines').update({
-        qty_received_back: newReceived,
-        last_received_at: new Date().toISOString(),
-        status: fullyReceived ? 'closed' : 'partial',
-        closed_at: fullyReceived ? new Date().toISOString() : null,
-      }).eq('id', line.id);
-      if (uerr) throw uerr;
-
-      showToast(fullyReceived ? '✓ Line closed · all received' : '↩ ' + recv + ' received');
+      // Cascade trigger updates the jobwork line — no client-side update needed.
+      showToast(isConv ? '↩ ' + recv + ' ' + (line.yield_uom||'pcs') + ' received' : '↩ ' + recv + ' received');
       onSaved();
     } catch (e) { setErr(e.message); } finally { setBusy(false); }
   };
+
+  const allButton = isConv && yieldRemaining != null
+    ? yieldRemaining.toFixed(yieldRemaining % 1 === 0 ? 0 : 2)
+    : line.qty_pending;
 
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target===e.currentTarget) onClose(); }}>
@@ -9207,15 +9260,35 @@ function JobworkReceiveModal({ plant, me, line, onClose, onSaved }) {
         ${err && html`<div class="alert error">${err}</div>`}
 
         <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:10px">
-          <div style="font-size:13px;font-weight:600">${line.part_number ? line.part_number + ' · ' : ''}${line.item_name}</div>
-          <div style="font-size:11px;color:var(--slate-600);margin-top:3px">
-            DC ${line.doc_number || '?'} · sent ${line.sent_date} · ${line.process || 'no process'}
-          </div>
-          <div style="display:flex;gap:8px;margin-top:6px;font-size:11px">
-            <div>Sent: <strong>${fmtNum(line.qty_sent)}</strong></div>
-            <div>Received: <strong>${fmtNum(line.qty_received_back)}</strong></div>
-            <div style="color:var(--teal-700)">Pending: <strong>${fmtNum(line.qty_pending)}</strong> ${line.uom || ''}</div>
-          </div>
+          ${isConv ? html`
+            <div style="font-size:11px;font-weight:700;color:var(--teal-700);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">🔄 Conversion job-work</div>
+            <div style="font-size:13px;font-weight:600">
+              Sent: <span style="font-family:monospace">${line.item_name}</span> · ${fmtNum(line.qty_sent)} ${line.uom || ''}
+            </div>
+            <div style="font-size:13px;font-weight:600;margin-top:2px">
+              Yield: <span style="font-family:monospace">${line.yield_item_resolved_name || line.yield_item_name || '?'}</span>${line.yield_qty_received > 0 ? ' · ' + fmtNum(line.yield_qty_received) + ' received so far' : ''}
+            </div>
+            <div style="font-size:11px;color:var(--slate-600);margin-top:3px">
+              DC ${line.doc_number || '?'} · sent ${line.sent_date} · ${line.process || 'no process'}
+              ${line.yield_ratio ? ' · ratio ' + line.yield_ratio + ' ' + (line.uom||'') + '/' + (line.yield_uom||'pc') : ''}
+            </div>
+            ${yieldRemaining != null && html`
+              <div style="font-size:11px;margin-top:5px;color:var(--teal-700)">
+                Expected remaining yield: <strong>${fmtNum(yieldRemaining.toFixed(yieldRemaining%1===0?0:2))}</strong> ${line.yield_uom || ''}
+                (based on ${fmtNum(line.qty_sent - line.qty_received_back)} ${line.uom||''} of material left × yield ratio)
+              </div>
+            `}
+          ` : html`
+            <div style="font-size:13px;font-weight:600">${line.part_number ? line.part_number + ' · ' : ''}${line.item_name}</div>
+            <div style="font-size:11px;color:var(--slate-600);margin-top:3px">
+              DC ${line.doc_number || '?'} · sent ${line.sent_date} · ${line.process || 'no process'}
+            </div>
+            <div style="display:flex;gap:8px;margin-top:6px;font-size:11px">
+              <div>Sent: <strong>${fmtNum(line.qty_sent)}</strong></div>
+              <div>Received: <strong>${fmtNum(line.qty_received_back)}</strong></div>
+              <div style="color:var(--teal-700)">Pending: <strong>${fmtNum(line.qty_pending)}</strong> ${line.uom || ''}</div>
+            </div>
+          `}
           ${line.gst_180_breach && html`<div style="font-size:11px;color:var(--rose-600);margin-top:6px;font-weight:600">⚠ ${line.days_at_vendor} days at vendor · GST Sec 143 180-day breach</div>`}
         </div>
 
@@ -9225,20 +9298,20 @@ function JobworkReceiveModal({ plant, me, line, onClose, onSaved }) {
             <div class="field"><label>Received date *</label><input type="date" required value=${form.doc_date} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
           </div>
           <div class="field-row">
-            <div class="field"><label>Qty received *</label>
-              <input type="number" step="any" min=${0} max=${line.qty_pending} value=${form.qty_received} onChange=${e => setForm({...form, qty_received: e.target.value})} placeholder=${'max ' + line.qty_pending} required />
+            <div class="field"><label>${isConv ? 'Yield received (' + (line.yield_uom || 'pcs') + ') *' : 'Qty received *'}</label>
+              <input type="number" step="any" min=${0} value=${form.qty_received} onChange=${e => setForm({...form, qty_received: e.target.value})} placeholder=${isConv ? (yieldRemaining != null ? 'expected ~' + yieldRemaining.toFixed(0) : '0') : ('max ' + line.qty_pending)} required />
             </div>
             <div class="field"><label>Scrap / loss qty</label>
               <input type="number" step="any" min=${0} value=${form.qty_scrap} onChange=${e => setForm({...form, qty_scrap: e.target.value})} placeholder="0" />
             </div>
           </div>
-          <div class="field"><label>Processing rate ₹/pc</label>
-            <input type="number" step="any" min=${0} value=${form.rate} onChange=${e => setForm({...form, rate: e.target.value})} placeholder="Job-work rate per piece" />
+          <div class="field"><label>${isConv ? 'Conversion charge ₹/' + (line.yield_uom||'pc') : 'Processing rate ₹/pc'}</label>
+            <input type="number" step="any" min=${0} value=${form.rate} onChange=${e => setForm({...form, rate: e.target.value})} placeholder=${isConv ? 'Vendor conversion fee' : 'Job-work rate per piece'} />
           </div>
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})} placeholder="Quality remarks, rework notes, vendor remarks…"></textarea></div>
 
           <div style="display:flex;gap:6px">
-            <button type="button" class="btn ghost" onClick=${() => setForm({...form, qty_received: line.qty_pending})} style="flex:0 0 auto;padding:8px 12px;font-size:12px">All ${line.qty_pending}</button>
+            <button type="button" class="btn ghost" onClick=${() => setForm({...form, qty_received: allButton})} style="flex:0 0 auto;padding:8px 12px;font-size:12px">All ${allButton}</button>
             <button class="btn" style="flex:1" disabled=${busy || !form.qty_received}>${busy ? 'Saving…' : '↩ Receive & close'}</button>
           </div>
           <p style="font-size:11px;color:var(--slate-500);margin:6px 0 0">Creates DC-in · updates pending qty · adds to GRN · posts to All Hands. If everything is back, the line closes.</p>
