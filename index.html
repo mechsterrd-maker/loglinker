@@ -1075,11 +1075,10 @@ const MORE_GROUPS = [
   {
     key: 'setup',
     title: 'Setup & Masters',
-    icon: '🔧',
-    sub: 'Configure once · admin',
+    icon: '🗂',
+    sub: 'All master data in one tree',
     items: [
-      { key:'people',           icon:'👥', label:'People · Units, Team, Shifts', sub:'Manage team, units, shifts, unit access' },
-      { key:'rejection_types',  icon:'✗',  label:'Rejection Types',              sub:'Per-stage reject reason catalog' },
+      { key:'masters',          icon:'🗂', label:'Masters',                      sub:'People · Production · Inventory · Logistics · Quality — all in one tree' },
       { key:'scl',              icon:'★',  label:'Special Characteristics',      sub:'CC / SC / customer-designated features (IATF 8.3.3.3)' },
       { key:'csr',              icon:'📜', label:'Customer-Specific Reqs',       sub:'CSR rules per OEM (IATF 8.2.2)' },
     ],
@@ -1230,6 +1229,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
+      <${Page} active=${tab === 'masters'}><${MastersHub} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'calibration'}><${CalibrationModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'training'}><${TrainingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -1262,7 +1262,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
         <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr','scl','iap','pm_schedule','quality_objectives','risk_register','contingency','npd','tpm','rejection_types','iatf_docs','mom','customer_complaints'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${['more','masters','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr','scl','iap','pm_schedule','quality_objectives','risk_register','contingency','npd','tpm','rejection_types','iatf_docs','mom','customer_complaints'].includes(tab)} onClick=${() => setTab('more')} />
       </div>
 
       ${/* Logi chatbot + Siri voice agent hidden per user request. Components
@@ -4932,6 +4932,316 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
 }
 
 // ============= PEOPLE (Units, Users, Shifts) =============
+// =================================================================
+// MastersHub — one consolidated page for ALL master data.
+// Tree on the left (collapsible groups), active master's list on the right.
+// Reuses existing edit modals (PartModal, MachineModal, DieModal, etc.).
+// =================================================================
+const MASTERS_TREE = [
+  {
+    key: 'people', icon: '👥', label: 'People',
+    leaves: [
+      { key: 'units',     icon: '🏭', label: 'Units' },
+      { key: 'operators', icon: '👷', label: 'Operators' },
+      { key: 'shifts',    icon: '⏰', label: 'Shifts' },
+      { key: 'team',      icon: '🧑‍💼', label: 'Team (login users)' },
+    ],
+  },
+  {
+    key: 'production', icon: '🏭', label: 'Production',
+    leaves: [
+      { key: 'parts',    icon: '🧩', label: 'Parts' },
+      { key: 'machines', icon: '⚙️', label: 'Machines' },
+      { key: 'dies',     icon: '🔩', label: 'Dies' },
+      { key: 'tools',    icon: '🛠', label: 'Tools' },
+    ],
+  },
+  {
+    key: 'inventory', icon: '📦', label: 'Inventory',
+    leaves: [
+      { key: 'stock_items',     icon: '📦', label: 'Stock Items' },
+      { key: 'rejection_types', icon: '✗',  label: 'Rejection Types' },
+    ],
+  },
+  {
+    key: 'logistics', icon: '🚚', label: 'Logistics',
+    leaves: [
+      { key: 'vendors',   icon: '🏪', label: 'Vendors' },
+      { key: 'customers', icon: '🏢', label: 'Customers' },
+    ],
+  },
+];
+
+function MastersHub({ plant, me, setTab }) {
+  const [active, setActive] = useState('parts');
+  const [openGroups, setOpenGroups] = useState({ people:true, production:true, inventory:true, logistics:true });
+  const [search, setSearch] = useState('');
+  const [modal, setModal] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+
+  // Data state per master
+  const [units, setUnits] = useState([]);
+  const [operators, setOperators] = useState([]);
+  const [shifts, setShifts] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [parts, setParts] = useState([]);
+  const [machines, setMachines] = useState([]);
+  const [dies, setDies] = useState([]);
+  const [tools, setTools] = useState([]);
+  const [stockItems, setStockItems] = useState([]);
+  const [rejectionTypes, setRejectionTypes] = useState([]);
+  const [vendors, setVendors] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [un, op, sh, us, pa, ma, di, to, si, rt, ve, cu] = await Promise.all([
+      sb.from('units').select('*').eq('plant_id', plant.id).order('name'),
+      sb.from('users').select('*').eq('plant_id', plant.id).eq('role','operator').neq('status','removed').order('full_name'),
+      sb.from('shifts').select('*').eq('plant_id', plant.id).order('start_time'),
+      sb.from('users').select('*').eq('plant_id', plant.id).neq('role','operator').neq('status','removed').order('full_name'),
+      sb.from('mcp_pdc_parts').select('*').eq('plant_id', plant.id).order('part_number'),
+      sb.from('machines').select('*, units(name)').eq('plant_id', plant.id).order('code'),
+      sb.from('mcp_pdc_dies').select('*').eq('plant_id', plant.id).order('code'),
+      sb.from('tools_master').select('*').eq('plant_id', plant.id).order('code'),
+      sb.from('mcp_stocks_items').select('*').eq('plant_id', plant.id).order('code'),
+      sb.from('mcp_pdc_rejection_types').select('*').eq('plant_id', plant.id).order('stage,ord'),
+      sb.from('mcp_logistics_vendors').select('*').eq('plant_id', plant.id).order('name'),
+      sb.from('mcp_sched_customers').select('*').eq('plant_id', plant.id).order('name'),
+    ]);
+    setUnits(un.data||[]); setOperators(op.data||[]); setShifts(sh.data||[]); setUsers(us.data||[]);
+    setParts(pa.data||[]); setMachines(ma.data||[]); setDies(di.data||[]); setTools(to.data||[]);
+    setStockItems(si.data||[]); setRejectionTypes(rt.data||[]); setVendors(ve.data||[]); setCustomers(cu.data||[]);
+    setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  // Counts for tree badges
+  const counts = {
+    units: units.length, operators: operators.length, shifts: shifts.length, team: users.length,
+    parts: parts.length, machines: machines.length, dies: dies.length, tools: tools.length,
+    stock_items: stockItems.length, rejection_types: rejectionTypes.length,
+    vendors: vendors.length, customers: customers.length,
+  };
+
+  // Generic row click → open edit modal
+  const openEdit = (type, row) => { setEditTarget(row); setModal(type); };
+  const openAdd  = (type)       => { setEditTarget(null); setModal(type); };
+  const closeModal = () => { setModal(null); setEditTarget(null); };
+  const saveModal  = () => { closeModal(); refresh(); };
+
+  // Filter list by search term
+  const filterRows = (rows, fields) => {
+    if (!search.trim()) return rows;
+    const q = search.toLowerCase();
+    return rows.filter(r => fields.some(f => (r[f] || '').toString().toLowerCase().includes(q)));
+  };
+
+  // ROW RENDERER — minimal, click anywhere to edit
+  const Row = ({ title, sub, badge, badgeColor, onClick }) => html`
+    <div class="list-item" onClick=${onClick} style="cursor:pointer">
+      <div class="list-item-row">
+        <div class="list-item-main">
+          <div class="list-item-title">${title}</div>
+          ${sub && html`<div class="list-item-sub">${sub}</div>`}
+        </div>
+        ${badge && html`<span class=${'badge ' + (badgeColor||'')}>${badge}</span>`}
+      </div>
+    </div>
+  `;
+
+  // SECTION HEADER with + Add
+  const SectionHeader = ({ icon, title, n, onAdd, addLabel }) => html`
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--slate-200)">
+      <div>
+        <h2 style="font-size:18px;font-weight:700;margin:0">${icon} ${title}</h2>
+        <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${n} total</div>
+      </div>
+      ${onAdd && html`<button class="btn small" onClick=${onAdd}>${addLabel || '+ Add'}</button>`}
+    </div>
+  `;
+
+  // Empty state
+  const Empty = ({ icon, msg, addLabel, onAdd }) => html`
+    <div class="card"><div class="empty">
+      <div class="icon">${icon}</div>
+      <div style="font-size:13px;margin-top:6px">${msg}</div>
+      ${onAdd && html`<button class="btn small" onClick=${onAdd} style="margin-top:10px">${addLabel}</button>`}
+    </div></div>
+  `;
+
+  // === SECTION RENDERERS ===
+  const renderActive = () => {
+    if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+    switch (active) {
+      case 'units': {
+        const list = filterRows(units, ['name','address']);
+        return html`
+          <${SectionHeader} icon="🏭" title="Units" n=${units.length} onAdd=${() => openAdd('unit')} />
+          ${list.length === 0 ? Empty({ icon:'🏭', msg:'No units yet', addLabel:'+ Add unit', onAdd:() => openAdd('unit') }) :
+            list.map(u => Row({ title: u.name, sub: u.address || '—', onClick: () => openEdit('unit', u) }))}
+        `;
+      }
+      case 'operators': {
+        const list = filterRows(operators, ['full_name','employee_id','operator_category']);
+        return html`
+          <${SectionHeader} icon="👷" title="Operators" n=${operators.length} onAdd=${() => openAdd('operator')} />
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">No-login operators picked by supervisor when logging shots. <a onClick=${()=>setTab('people')} style="color:var(--teal-700);cursor:pointer">Open full People page →</a></div>
+          ${list.length === 0 ? Empty({ icon:'👷', msg:'No operators yet', addLabel:'+ Add operator', onAdd:() => openAdd('operator') }) :
+            list.map(o => Row({ title: o.full_name, sub: (o.employee_id?o.employee_id+' · ':'') + (o.operator_category||'uncategorized'), badge: o.operator_category||'', onClick: () => openEdit('operator', o) }))}
+        `;
+      }
+      case 'shifts': {
+        const list = filterRows(shifts, ['name']);
+        return html`
+          <${SectionHeader} icon="⏰" title="Shifts" n=${shifts.length} onAdd=${() => openAdd('shift')} />
+          ${list.length === 0 ? Empty({ icon:'⏰', msg:'No shifts yet', addLabel:'+ Add shift', onAdd:() => openAdd('shift') }) :
+            list.map(s => Row({ title: s.name, sub: (s.start_time||'?') + ' → ' + (s.end_time||'?'), onClick: () => openEdit('shift', s) }))}
+        `;
+      }
+      case 'team': {
+        const list = filterRows(users, ['full_name','phone','email','role']);
+        return html`
+          <${SectionHeader} icon="🧑‍💼" title="Team (login users)" n=${users.length} addLabel="+ Invite user" onAdd=${() => setTab('people')} />
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Login-enabled team members (admin, plant_head, supervisor, qa, store, etc.). To invite a new user, use the full People page.</div>
+          ${list.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🧑‍💼</div>No team members</div></div>` :
+            list.map(u => Row({ title: u.full_name, sub: u.phone + (u.email?' · '+u.email:''), badge: u.role, badgeColor: u.role==='admin'||u.role==='plant_head'?'teal':'', onClick: () => setTab('people') }))}
+        `;
+      }
+      case 'parts': {
+        const list = filterRows(parts, ['part_number','name','customer']);
+        return html`
+          <${SectionHeader} icon="🧩" title="Parts" n=${parts.length} onAdd=${() => openAdd('part')} />
+          ${list.length === 0 ? Empty({ icon:'🧩', msg:'No parts yet', addLabel:'+ Add part', onAdd:() => openAdd('part') }) :
+            list.map(p => Row({ title: p.part_number + ' · ' + (p.name||''), sub: 'Rev ' + (p.revision||'?') + ' · ' + p.part_type + (p.customer?' · '+p.customer:''), badge: p.status, badgeColor: p.status==='active'?'emerald':'', onClick: () => openEdit('part', p) }))}
+        `;
+      }
+      case 'machines': {
+        const list = filterRows(machines, ['code','display_name','make','category']);
+        return html`
+          <${SectionHeader} icon="⚙️" title="Machines" n=${machines.length} onAdd=${() => openAdd('machine')} />
+          ${list.length === 0 ? Empty({ icon:'⚙️', msg:'No machines yet', addLabel:'+ Add machine', onAdd:() => openAdd('machine') }) :
+            list.map(m => Row({ title: m.code + (m.display_name?' ('+m.display_name+')':'') + ' · ' + (m.make||'—'), sub: m.category + (m.tonnage?' · '+m.tonnage+'T':'') + (m.units?.name?' · '+m.units.name:''), badge: m.status, badgeColor: m.status==='running'?'emerald':m.status==='breakdown'?'rose':'', onClick: () => openEdit('machine', m) }))}
+        `;
+      }
+      case 'dies': {
+        const list = filterRows(dies, ['code','part_number','customer_name']);
+        return html`
+          <${SectionHeader} icon="🔩" title="Dies" n=${dies.length} onAdd=${() => openAdd('die')} />
+          ${list.length === 0 ? Empty({ icon:'🔩', msg:'No dies yet', addLabel:'+ Add die', onAdd:() => openAdd('die') }) :
+            list.map(d => Row({ title: d.code + ' · ' + (d.part_number||'—'), sub: (d.cavities||1) + '-cav · ' + (d.current_stroke_count||0) + '/' + d.max_strokes + ' strokes' + (d.customer_name?' · '+d.customer_name:''), badge: d.status, badgeColor: d.status==='active'?'emerald':'', onClick: () => openEdit('die', d) }))}
+        `;
+      }
+      case 'tools': {
+        const list = filterRows(tools, ['code','name','make','kind']);
+        return html`
+          <${SectionHeader} icon="🛠" title="Tools" n=${tools.length} onAdd=${() => openAdd('tool')} />
+          ${list.length === 0 ? Empty({ icon:'🛠', msg:'No tools yet', addLabel:'+ Add tool', onAdd:() => openAdd('tool') }) :
+            list.map(t => Row({ title: t.code + ' · ' + (t.name||''), sub: t.kind + (t.make?' · '+t.make:'') + (t.life_value?' · '+t.life_value+' '+(t.life_unit||''):''), onClick: () => openEdit('tool', t) }))}
+        `;
+      }
+      case 'stock_items': {
+        const list = filterRows(stockItems, ['code','name','category']);
+        return html`
+          <${SectionHeader} icon="📦" title="Stock Items" n=${stockItems.length} onAdd=${() => openAdd('stock_item')} />
+          ${list.length === 0 ? Empty({ icon:'📦', msg:'No items yet', addLabel:'+ New item + opening', onAdd:() => openAdd('stock_item') }) :
+            list.map(i => Row({ title: i.code + ' · ' + i.name, sub: (i.category||'general') + ' · ' + fmtNum(i.current_qty) + ' ' + i.uom + (i.reorder_level?' · reorder '+i.reorder_level:''), badge: !i.opening_recorded_at?'NO OPENING':'', badgeColor: !i.opening_recorded_at?'amber':'', onClick: () => openEdit('stock_item', i) }))}
+        `;
+      }
+      case 'rejection_types': {
+        const grouped = {};
+        for (const r of filterRows(rejectionTypes, ['code','label','category'])) {
+          if (!grouped[r.stage]) grouped[r.stage] = [];
+          grouped[r.stage].push(r);
+        }
+        return html`
+          <${SectionHeader} icon="✗" title="Rejection Types" n=${rejectionTypes.length} addLabel="Manage in full page" onAdd=${() => setTab('rejection_types')} />
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Stage-wise reject reason catalog. To add new types or reorder, use the full Rejection Types page.</div>
+          ${rejectionTypes.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✗</div>No rejection types configured</div></div>` :
+            Object.entries(grouped).map(([stage, list]) => html`
+              <div style="margin-bottom:10px">
+                <div style="font-size:11px;font-weight:700;color:var(--slate-600);text-transform:uppercase;margin-bottom:4px">${stage} · ${list.length}</div>
+                ${list.map(r => Row({ title: (r.code?r.code+' · ':'') + r.label, sub: r.category || '—', badge: r.severity || '', onClick: () => setTab('rejection_types') }))}
+              </div>
+            `)}
+        `;
+      }
+      case 'vendors': {
+        const list = filterRows(vendors, ['name','gstin','city']);
+        return html`
+          <${SectionHeader} icon="🏪" title="Vendors" n=${vendors.length} addLabel="Manage in Documents" onAdd=${() => setTab('documents')} />
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Vendors are auto-created from approved invoices. Manage manually via the Documents page.</div>
+          ${list.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🏪</div>No vendors yet — they appear automatically when invoices are approved.</div></div>` :
+            list.map(v => Row({ title: v.name + (v.is_jobwork_vendor?' · JW':''), sub: (v.gstin||'no gstin') + (v.city?' · '+v.city:''), onClick: () => setTab('documents') }))}
+        `;
+      }
+      case 'customers': {
+        const list = filterRows(customers, ['name','gstin','city','short_code']);
+        return html`
+          <${SectionHeader} icon="🏢" title="Customers" n=${customers.length} onAdd=${() => openAdd('customer')} />
+          ${list.length === 0 ? Empty({ icon:'🏢', msg:'No customers yet', addLabel:'+ Add customer', onAdd:() => openAdd('customer') }) :
+            list.map(c => Row({ title: c.name + (c.short_code?' ('+c.short_code+')':''), sub: (c.gstin||'no gstin') + (c.city?' · '+c.city:''), onClick: () => openEdit('customer', c) }))}
+        `;
+      }
+      default: return html`<div class="empty"><div class="icon">📭</div>Pick a master from the tree</div>`;
+    }
+  };
+
+  return html`
+    <div class="page-header"><div><h1>🗂 Masters</h1><div class="sub">All master data · grouped tree · single source of truth</div></div></div>
+
+    <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start">
+      <!-- TREE -->
+      <div class="card" style="flex:0 0 240px;max-width:100%;padding:8px 6px;max-height:80vh;overflow-y:auto;box-sizing:border-box">
+        ${MASTERS_TREE.map(group => {
+          const open = openGroups[group.key] !== false;
+          const hasActive = group.leaves.some(l => l.key === active);
+          return html`
+            <div key=${group.key} style=${'margin-bottom:'+(open?'6':'2')+'px'}>
+              <div onClick=${() => setOpenGroups(prev => ({...prev, [group.key]: !open}))} style=${'padding:6px 10px;cursor:pointer;display:flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:'+(hasActive?'var(--teal-700)':'var(--slate-700)')+';border-radius:5px;background:'+(hasActive?'var(--teal-50)':'transparent')}>
+                <span style="font-size:14px">${group.icon}</span>
+                <span style="flex:1">${group.label}</span>
+                <span style="font-size:10px;color:var(--slate-400)">${open?'▾':'▸'}</span>
+              </div>
+              ${open && html`<div style="margin-left:8px">
+                ${group.leaves.map(leaf => {
+                  const isActive = leaf.key === active;
+                  return html`
+                    <div key=${leaf.key} onClick=${() => setActive(leaf.key)} style=${'padding:5px 10px 5px 16px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:6px;border-left:2px solid '+(isActive?'var(--teal-600)':'transparent')+';background:'+(isActive?'var(--teal-50)':'transparent')+';color:'+(isActive?'var(--teal-800)':'var(--slate-700)')+';font-weight:'+(isActive?'600':'400')}>
+                      <span>${leaf.icon}</span>
+                      <span style="flex:1">${leaf.label}</span>
+                      <span style="font-size:10px;color:var(--slate-500);background:'+'${isActive?'white':'var(--slate-100)'};padding:1px 6px;border-radius:999px;font-weight:600">${counts[leaf.key] ?? 0}</span>
+                    </div>
+                  `;
+                })}
+              </div>`}
+            </div>
+          `;
+        })}
+      </div>
+
+      <!-- ACTIVE LIST -->
+      <div style="flex:1;min-width:280px">
+        <div style="margin-bottom:10px">
+          <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search this master…" style="width:100%;padding:8px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+        </div>
+        ${renderActive()}
+      </div>
+    </div>
+
+    ${modal === 'unit'       && html`<${UnitModal} plant=${plant} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'operator'   && html`<${OperatorModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'shift'      && html`<${ShiftModal} plant=${plant} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'part'       && html`<${PartModal} plant=${plant} me=${me} dies=${dies} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'machine'    && html`<${MachineModal} plant=${plant} units=${units} users=${[...users, ...operators]} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'die'        && html`<${DieModal} plant=${plant} me=${me} parts=${parts} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'tool'       && html`<${ToolModal} plant=${plant} me=${me} machines=${machines} stockItems=${stockItems} parts=${parts} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'stock_item' && html`<${ItemModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'customer'   && html`<${CustomerModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+  `;
+}
+
 function People({ plant, me }) {
   const [view, setView] = useState('units');
   const [units, setUnits] = useState([]);
