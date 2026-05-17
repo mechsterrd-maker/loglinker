@@ -4114,9 +4114,7 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
               placeholder="— None / unknown —" />
           </div>
           <div class="field"><label>Operator</label>
-            <select value=${form.operator_user_id} onChange=${e => setForm({...form, operator_user_id: e.target.value})}>
-              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
-            </select>
+            <${OperatorPicker} users=${users} value=${form.operator_user_id} onChange=${id => setForm({...form, operator_user_id: id})} machineCategory=${(machines.find(m => m.id === form.machine_id)||{}).category || 'pdc'} />
           </div>
           <div class="field-row">
             <div class="field"><label>Good shots *</label><input type="number" required min=${0} value=${form.shots_good} onChange=${e => setForm({...form, shots_good: e.target.value})} /></div>
@@ -4920,6 +4918,7 @@ function People({ plant, me }) {
     <div class="auth-tabs" style="margin-bottom:16px">
       <button class=${'auth-tab' + (view === 'units' ? ' active' : '')} onClick=${() => setView('units')}>Units</button>
       <button class=${'auth-tab' + (view === 'users' ? ' active' : '')} onClick=${() => setView('users')}>Team</button>
+      <button class=${'auth-tab' + (view === 'operators' ? ' active' : '')} onClick=${() => setView('operators')}>Operators</button>
       <button class=${'auth-tab' + (view === 'shifts' ? ' active' : '')} onClick=${() => setView('shifts')}>Shifts</button>
     </div>
 
@@ -4981,6 +4980,57 @@ function People({ plant, me }) {
       })}
     `}
 
+    ${view === 'operators' && (() => {
+      // Operators (role='operator'). Group by operator_category for easy scanning.
+      const operators = users.filter(u => u.role === 'operator');
+      const grouped = {};
+      operators.forEach(o => {
+        const k = o.operator_category || 'uncategorized';
+        if (!grouped[k]) grouped[k] = [];
+        grouped[k].push(o);
+      });
+      const CAT_LABELS = {
+        pdc:'PDC', cnc:'CNC', vmc:'VMC', lathe:'Lathe', press:'Press', trimming:'Trimming',
+        drilling:'Drilling', tapping:'Tapping', deflashing:'Deflashing', shot_blast:'Shot Blast',
+        grinding:'Grinding', heat_treatment:'Heat Treatment', injection_moulding:'Injection Mould',
+        rolling:'Rolling', forging:'Forging', welding:'Welding', assembly:'Assembly',
+        inspection:'Inspection', painting:'Painting', plating:'Plating', testing:'Testing',
+        packing:'Packing', dispatch:'Dispatch', uncategorized:'Uncategorized', other:'Other',
+      };
+      const sortedKeys = Object.keys(grouped).sort();
+      return html`
+        <div class="section-h">Operators · ${operators.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('operator'); }}>+ Add Operator</button></div>
+        <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);padding:8px 12px;margin-bottom:12px">
+          <div style="font-size:11px;color:var(--teal-800);line-height:1.5">
+            <strong>👷 No app access.</strong> Operators added here can't log in — they're names supervisors pick when logging shots, stage entries, etc. Grouped by skill / machine category so it's quick to find them.
+          </div>
+        </div>
+        ${operators.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">👷</div><div style="font-size:13px">No operators yet. Tap <strong>+ Add Operator</strong> above to add shop-floor operators.</div></div></div>` :
+          sortedKeys.map(k => html`
+            <details key=${k} open style="margin-bottom:8px">
+              <summary style="cursor:pointer;padding:8px 12px;background:var(--slate-100);border-radius:6px;font-weight:600;font-size:12px;display:flex;justify-content:space-between;align-items:center">
+                <span>${CAT_LABELS[k] || k}</span>
+                <span style="background:var(--teal-600);color:white;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px">${grouped[k].length}</span>
+              </summary>
+              <div style="margin-top:4px">
+                ${grouped[k].map(o => html`
+                  <div class="list-item" key=${o.id} onClick=${() => { setEditTarget(o); setModal('operator'); }} style="border-left:3px solid ${o.login_enabled === false ? 'var(--slate-400)' : 'var(--teal-400)'}">
+                    <div class="list-item-row">
+                      <div class="list-item-main">
+                        <div class="list-item-title">${o.full_name}${o.employee_id ? ' · ' + o.employee_id : ''}</div>
+                        <div class="list-item-sub">${o.login_enabled === false ? '🔒 No login' : '📱 ' + (o.phone || 'has login')}${o.status && o.status !== 'active' ? ' · ' + o.status : ''}</div>
+                      </div>
+                      <span style="color:var(--slate-400);font-size:18px">›</span>
+                    </div>
+                  </div>
+                `)}
+              </div>
+            </details>
+          `)
+        }
+      `;
+    })()}
+
     ${view === 'shifts' && html`
       <div class="section-h">Shifts · ${shifts.length}<button class="btn small ghost" onClick=${() => setModal('shift')}>+ Add</button></div>
       ${shifts.map(s => html`
@@ -5000,6 +5050,169 @@ function People({ plant, me }) {
     ${modal === 'shift' && html`<${ShiftModal} plant=${plant} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'invite' && html`<${InviteModal} plant=${plant} me=${me} units=${units} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'inviteView' && html`<${InviteViewModal} invite=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onCancel=${async () => { await sb.from('user_invites').delete().eq('id', editTarget.id); setModal(null); setEditTarget(null); refresh(); showToast('Invite cancelled'); }} />`}
+    ${modal === 'operator' && html`<${OperatorModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+  `;
+}
+
+// =================================================================
+// OperatorModal — quick add / edit a no-login operator.
+// Creates a users row with role='operator', login_enabled=false.
+// =================================================================
+// =================================================================
+// OperatorPicker — grouped operator dropdown.
+// Shows users with role='operator' first (grouped by operator_category),
+// then supervisors/plant_head/admin in a separate "Also can operate" group.
+// machineCategory boosts the matching category to the top.
+// =================================================================
+function OperatorPicker({ users, value, onChange, machineCategory, required }) {
+  const operators = users.filter(u => u.role === 'operator' && u.status !== 'removed');
+  const others    = users.filter(u => u.role !== 'operator' && ['supervisor','plant_head','admin','toolroom'].includes(u.role) && u.status !== 'removed');
+
+  // Group operators by category, with machineCategory at top
+  const byCat = {};
+  operators.forEach(o => {
+    const k = o.operator_category || 'uncategorized';
+    if (!byCat[k]) byCat[k] = [];
+    byCat[k].push(o);
+  });
+  const catKeys = Object.keys(byCat).sort((a, b) => {
+    if (a === machineCategory) return -1;
+    if (b === machineCategory) return 1;
+    if (a === 'uncategorized') return 1;
+    if (b === 'uncategorized') return -1;
+    return a.localeCompare(b);
+  });
+
+  return html`
+    <select required=${required} value=${value || ''} onChange=${e => onChange(e.target.value)}>
+      <option value="">— Pick operator —</option>
+      ${catKeys.map(k => html`
+        <optgroup key=${k} label=${(k === machineCategory ? '★ ' : '') + k.toUpperCase()}>
+          ${byCat[k].map(o => html`<option key=${o.id} value=${o.id}>${o.full_name}${o.employee_id ? ' · ' + o.employee_id : ''}</option>`)}
+        </optgroup>
+      `)}
+      ${others.length > 0 && html`
+        <optgroup label="Also available (supervisor / admin)">
+          ${others.map(o => html`<option key=${o.id} value=${o.id}>${o.full_name} · ${o.role}</option>`)}
+        </optgroup>
+      `}
+    </select>
+  `;
+}
+
+function OperatorModal({ plant, units, editTarget, onClose, onSaved }) {
+  const [form, setForm] = useState(editTarget ? {
+    full_name: editTarget.full_name || '',
+    employee_id: editTarget.employee_id || '',
+    operator_category: editTarget.operator_category || '',
+    primary_unit_id: editTarget.primary_unit_id || units[0]?.id || '',
+    phone: editTarget.phone || '',
+    login_enabled: editTarget.login_enabled !== false,
+    status: editTarget.status || 'active',
+  } : {
+    full_name: '', employee_id: '', operator_category: 'pdc',
+    primary_unit_id: units[0]?.id || '',
+    phone: '', login_enabled: false, status: 'active',
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const CATEGORIES = [
+    'pdc','cnc','vmc','lathe','press','trimming','drilling','tapping',
+    'deflashing','shot_blast','grinding','heat_treatment','injection_moulding',
+    'rolling','forging','welding','assembly','inspection','painting','plating',
+    'testing','packing','dispatch','other'
+  ];
+
+  const submit = async (e) => {
+    e.preventDefault(); setError(''); setLoading(true);
+    try {
+      if (!form.full_name.trim()) throw new Error('Name is required');
+      const payload = {
+        full_name: form.full_name.trim(),
+        employee_id: form.employee_id.trim() || null,
+        operator_category: form.operator_category || null,
+        primary_unit_id: form.primary_unit_id || null,
+        phone: form.phone.trim() || null,
+        login_enabled: !!form.login_enabled,
+        status: form.status,
+      };
+      if (editTarget) {
+        const { error } = await sb.from('users').update(payload).eq('id', editTarget.id);
+        if (error) throw error;
+      } else {
+        const { error } = await sb.from('users').insert({
+          plant_id: plant.id,
+          role: 'operator',
+          ...payload,
+        });
+        if (error) throw error;
+      }
+      showToast(editTarget ? '👷 Operator updated' : '👷 Operator added');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  const remove = async () => {
+    if (!editTarget) return;
+    if (!confirm('Remove ' + editTarget.full_name + '? They will no longer appear in operator pickers. Past records remain intact.')) return;
+    setLoading(true);
+    try {
+      const { error } = await sb.from('users').update({ status: 'removed', removed_from_plant_at: new Date().toISOString() }).eq('id', editTarget.id);
+      if (error) throw error;
+      showToast('Operator removed');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">${editTarget ? 'Edit operator' : '+ Add operator'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div style="font-size:11px;color:var(--slate-600);background:var(--slate-50);padding:8px 10px;border-radius:6px;margin-bottom:10px;border-left:3px solid var(--teal-500);line-height:1.5">
+          Operators don't get app access by default. Their name + category lets supervisors pick them when logging shots, stage entries, or assigning machine work.
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field"><label>Full name *</label><input type="text" required value=${form.full_name} onChange=${e => setForm({...form, full_name: e.target.value})} autoFocus placeholder="As per attendance register" /></div>
+          <div class="field-row">
+            <div class="field"><label>Employee ID</label><input type="text" value=${form.employee_id} onChange=${e => setForm({...form, employee_id: e.target.value})} placeholder="EMP-201" /></div>
+            <div class="field"><label>Category *</label>
+              <select required value=${form.operator_category} onChange=${e => setForm({...form, operator_category: e.target.value})}>
+                ${CATEGORIES.map(c => html`<option key=${c} value=${c}>${c.toUpperCase()}</option>`)}
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Primary unit</label>
+            <select value=${form.primary_unit_id} onChange=${e => setForm({...form, primary_unit_id: e.target.value})}>
+              <option value="">— None —</option>
+              ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Phone <span style="font-weight:400;color:var(--slate-500);font-size:11px">· only if they need app access later</span></label><input type="tel" value=${form.phone} onChange=${e => setForm({...form, phone: e.target.value})} placeholder="10 digit" /></div>
+          <div class="field">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input type="checkbox" checked=${form.login_enabled} onChange=${e => setForm({...form, login_enabled: e.target.checked})} />
+              <span>Enable app login (needs phone + PIN setup)</span>
+            </label>
+          </div>
+          ${editTarget && html`<div class="field"><label>Status</label>
+            <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
+              <option value="active">Active</option>
+              <option value="inactive">Inactive (kept for history)</option>
+            </select>
+          </div>`}
+          <div style="display:flex;gap:6px;margin-top:6px">
+            ${editTarget && html`<button type="button" class="btn ghost danger" onClick=${remove} style="font-size:12px">Remove</button>`}
+            <button type="button" class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
+            <button class="btn" disabled=${loading} style="flex:2">${loading ? 'Saving…' : (editTarget ? 'Update' : '+ Add operator')}</button>
+          </div>
+        </form>
+      </div>
+    </div>
   `;
 }
 
@@ -19064,10 +19277,7 @@ function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, 
             </div>
           `}
           <div class="field"><label>Operator * <span style="font-size:11px;color:var(--slate-500);font-weight:400">(person who ran the entry)</span></label>
-            <select required value=${form.operator_user_id} onChange=${e => setForm({...form, operator_user_id: e.target.value})}>
-              <option value="">— Select operator —</option>
-              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
-            </select>
+            <${OperatorPicker} users=${users} value=${form.operator_user_id} onChange=${id => setForm({...form, operator_user_id: id})} machineCategory=${form.stage} required=${true} />
           </div>
           ${(form.stage === 'pdc' || form.category_attrs?.show_op2 || form.category_attrs?.operator_2_user_id) && html`
             <div class="field"><label>2nd Operator (optional) <span style="font-size:11px;color:var(--slate-500);font-weight:400">${form.stage === 'pdc' ? '— PDC often runs with 2 operators' : ''}</span></label>
