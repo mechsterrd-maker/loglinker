@@ -4283,6 +4283,7 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
   const [groupSettingsTarget, setGroupSettingsTarget] = useState(null);
   const [newTaskInGroup, setNewTaskInGroup] = useState(false);
   const [meetingMenu, setMeetingMenu] = useState(false);
+  const [activeMeeting, setActiveMeeting] = useState(null); // url being joined inline
 
   useEffect(() => { loadGroups(); }, []);
   // Global plant-wide subscription — notifications work even when not on chat tab
@@ -4796,11 +4797,14 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
                                        meetMatch[1].includes('teams') ? 'Teams' :
                                        meetMatch[1].includes('whereby') ? 'Whereby' : 'Meeting';
                       const restOfBody = m.body.replace(url, '').trim();
+                      const isJitsi = provider === 'Jitsi';
                       return html`
                         <div style="background:white;border:1px solid var(--teal-300);border-radius:8px;padding:10px 12px;margin:2px 0;min-width:200px">
                           <div style="font-size:12px;color:var(--slate-700);font-weight:600;margin-bottom:6px">📹 ${restOfBody || 'Video meeting'}</div>
-                          <div style="font-size:10px;color:var(--slate-500);margin-bottom:8px">${provider} · tap to join in browser</div>
-                          <a href=${url} target="_blank" rel="noopener" style="display:inline-block;background:var(--teal-600);color:white;padding:7px 14px;border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">▶ Join now</a>
+                          <div style="font-size:10px;color:var(--slate-500);margin-bottom:8px">${provider} · ${isJitsi ? 'joins inside the app' : 'opens in a new tab'}</div>
+                          ${isJitsi
+                            ? html`<button onClick=${() => setActiveMeeting(url)} style="background:var(--teal-600);color:white;padding:7px 14px;border-radius:6px;font-size:13px;font-weight:600;border:none;cursor:pointer">▶ Join now</button>`
+                            : html`<a href=${url} target="_blank" rel="noopener" style="display:inline-block;background:var(--teal-600);color:white;padding:7px 14px;border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">▶ Join now</a>`}
                         </div>
                       `;
                     }
@@ -4854,7 +4858,8 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
         </div>
         ${taskFromMsg && html`<${AssignTaskFromMsgModal} plant=${plant} me=${me} message=${taskFromMsg} group=${activeGroup} onClose=${() => setTaskFromMsg(null)} onSaved=${() => setTaskFromMsg(null)} />`}
         ${newTaskInGroup && html`<${QuickTaskInGroupModal} plant=${plant} me=${me} group=${activeGroup} onClose=${() => setNewTaskInGroup(false)} onSaved=${() => setNewTaskInGroup(false)} />`}
-        ${meetingMenu && html`<${MeetingStartMenu} plant=${plant} onClose=${() => setMeetingMenu(false)} onStart=${(url, title) => { setMeetingMenu(false); postMeetingLink(url, title); }} />`}
+        ${meetingMenu && html`<${MeetingStartMenu} plant=${plant} onClose=${() => setMeetingMenu(false)} onStart=${(url, title) => { setMeetingMenu(false); postMeetingLink(url, title); if (url.includes('meet.jit.si')) setActiveMeeting(url); }} />`}
+        ${activeMeeting && html`<${EmbeddedJitsiMeeting} url=${activeMeeting} me=${me} onClose=${() => setActiveMeeting(null)} />`}
         ${msgMenu && html`<${MessageActionMenu}
           message=${msgMenu} me=${me} group=${activeGroup}
           onClose=${() => setMsgMenu(null)}
@@ -17228,6 +17233,85 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
 }
 
 // ============= ASSIGN TASK FROM CHAT MESSAGE =============
+// =================================================================
+// EmbeddedJitsiMeeting — loads the Jitsi IFrame API and renders the
+// meeting INSIDE Loglinker (no new tab). Faster perceived join because
+// the user doesn't lose context and the room loads in a controlled
+// iframe with pre-config.
+// =================================================================
+function EmbeddedJitsiMeeting({ url, me, onClose }) {
+  const containerRef = useRef(null);
+  const apiRef = useRef(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const roomMatch = url.match(/meet\.jit\.si\/([^\?#]+)/);
+    const room = roomMatch ? roomMatch[1] : 'loglinkr-quick';
+
+    const loadScript = () => new Promise((resolve, reject) => {
+      if (window.JitsiMeetExternalAPI) return resolve();
+      const s = document.createElement('script');
+      s.src = 'https://meet.jit.si/external_api.js';
+      s.async = true;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('Failed to load Jitsi script — check internet'));
+      document.head.appendChild(s);
+    });
+
+    let cancelled = false;
+    loadScript().then(() => {
+      if (cancelled || !containerRef.current) return;
+      try {
+        const api = new window.JitsiMeetExternalAPI('meet.jit.si', {
+          roomName: room,
+          parentNode: containerRef.current,
+          width: '100%',
+          height: '100%',
+          userInfo: { displayName: me?.full_name || 'Loglinker user' },
+          configOverwrite: {
+            prejoinPageEnabled: false,
+            disableDeepLinking: true,
+            enableWelcomePage: false,
+            startWithAudioMuted: false,
+            startWithVideoMuted: false,
+          },
+          interfaceConfigOverwrite: {
+            MOBILE_APP_PROMO: false,
+            SHOW_JITSI_WATERMARK: false,
+            SHOW_WATERMARK_FOR_GUESTS: false,
+            DEFAULT_BACKGROUND: '#0f172a',
+          },
+        });
+        apiRef.current = api;
+        api.addListener('videoConferenceJoined', () => setLoading(false));
+        api.addListener('readyToClose', () => onClose());
+      } catch (e) {
+        setError(e.message);
+      }
+    }).catch(e => setError(e.message));
+
+    return () => {
+      cancelled = true;
+      try { if (apiRef.current) apiRef.current.dispose(); } catch (_) {}
+      apiRef.current = null;
+    };
+  }, [url]);
+
+  return html`
+    <div style="position:fixed;inset:0;background:#0f172a;z-index:9999;display:flex;flex-direction:column">
+      <div style="background:#1e293b;color:white;padding:10px 16px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #334155">
+        <div>
+          <div style="font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px">📹 Video meeting${loading ? html` <span style="font-size:11px;color:#94a3b8;font-weight:400">· connecting…</span>` : ''}</div>
+          ${error && html`<div style="font-size:11px;color:#fca5a5;margin-top:2px">${error}</div>`}
+        </div>
+        <button onClick=${onClose} style="background:#dc2626;color:white;border:none;padding:8px 16px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer">⏻ Leave</button>
+      </div>
+      <div ref=${containerRef} style="flex:1;background:#0f172a"></div>
+    </div>
+  `;
+}
+
 // =================================================================
 // MeetingStartMenu — Jitsi (free) or paste a Zoom / Meet / Teams link.
 // Posts a chat message that renders with a "▶ Join now" button.
