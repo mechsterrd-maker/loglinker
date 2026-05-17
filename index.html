@@ -11940,6 +11940,111 @@ function TpmModule({ plant, me }) {
 }
 
 // ============= TPM DAILY CHECK SCREEN (operator) =============
+// =================================================================
+// TPM VISUAL GUIDE — operator reference images per check item
+// (Green / Yellow / Red sample to compare against the actual machine)
+// =================================================================
+async function uploadVisualGuideImage(file, plantId) {
+  const baseName = (file.name || '').replace(/[^\w.\-]+/g, '_');
+  const ext = baseName.includes('.') ? baseName.split('.').pop() : 'jpg';
+  const path = 'tpm_guide/' + plantId + '/' + crypto.randomUUID() + '.' + ext;
+  const { error } = await sb.storage.from('chat-attachments').upload(path, file, {
+    contentType: file.type || 'image/jpeg', cacheControl: '604800',
+  });
+  if (error) throw error;
+  return sb.storage.from('chat-attachments').getPublicUrl(path).data.publicUrl;
+}
+
+function TpmVisualGuideModal({ plant, item, onClose, onSaved }) {
+  const initial = item.visual_guide || {};
+  const [guide, setGuide] = useState({
+    green:  initial.green  || { url: '', label: 'Normal · safe to run' },
+    yellow: initial.yellow || { url: '', label: 'Caution · monitor closely' },
+    red:    initial.red    || { url: '', label: 'Stop · action needed' },
+    notes:  initial.notes  || '',
+  });
+  const [busy, setBusy] = useState(null); // 'green' | 'yellow' | 'red' | null
+  const [err, setErr] = useState('');
+
+  const upload = async (slot, file) => {
+    if (!file) return;
+    setBusy(slot); setErr('');
+    try {
+      const url = await uploadVisualGuideImage(file, plant.id);
+      setGuide(g => ({ ...g, [slot]: { ...g[slot], url } }));
+    } catch (e) { setErr(e.message); } finally { setBusy(null); }
+  };
+
+  const clear = (slot) => setGuide(g => ({ ...g, [slot]: { ...g[slot], url: '' } }));
+
+  const save = async () => {
+    setBusy('save'); setErr('');
+    try {
+      // Strip empty slots from payload
+      const payload = {};
+      ['green','yellow','red'].forEach(k => {
+        if (guide[k]?.url) payload[k] = { url: guide[k].url, label: (guide[k].label || '').trim() || null };
+      });
+      if (guide.notes?.trim()) payload.notes = guide.notes.trim();
+      const { error } = await sb.from('mcp_tpm_template_items').update({ visual_guide: payload }).eq('id', item.id);
+      if (error) throw error;
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(null); }
+  };
+
+  const slots = [
+    { key: 'green',  emoji: '🟢', color: 'emerald', label: 'GREEN — Normal' },
+    { key: 'yellow', emoji: '🟡', color: 'amber',   label: 'YELLOW — Caution' },
+    { key: 'red',    emoji: '🔴', color: 'rose',    label: 'RED — Stop' },
+  ];
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header">
+          <div class="modal-title">📷 Visual guide · ${item.label}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div style="font-size:11px;color:var(--slate-600);background:var(--slate-50);padding:8px 10px;border-radius:6px;margin-bottom:10px;border-left:3px solid var(--teal-500);line-height:1.5">
+          Upload sample photos showing how this indicator should look in each state. Operators see these alongside the check so they can compare visually before marking OK / Issue.
+        </div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div style="display:flex;flex-direction:column;gap:10px">
+          ${slots.map(s => html`
+            <div key=${s.key} class="card" style=${'padding:10px 12px;border-left:3px solid var(--'+s.color+'-500)'}>
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+                <span style="font-size:18px">${s.emoji}</span>
+                <div style="flex:1;font-size:12px;font-weight:700;color:var(--slate-800)">${s.label}</div>
+              </div>
+              ${guide[s.key]?.url ? html`
+                <div style="display:flex;gap:10px;align-items:flex-start">
+                  <a href=${guide[s.key].url} target="_blank" rel="noopener" style="flex-shrink:0"><img src=${guide[s.key].url} style="width:84px;height:84px;object-fit:cover;border-radius:5px;border:1px solid var(--slate-200)" /></a>
+                  <div style="flex:1;display:flex;flex-direction:column;gap:6px">
+                    <input type="text" value=${guide[s.key].label || ''} onChange=${e => setGuide(g => ({...g, [s.key]: {...g[s.key], label: e.target.value}}))} placeholder="What does this state mean?" style="padding:6px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px" />
+                    <div style="display:flex;gap:6px">
+                      <label class="btn small ghost" style="font-size:10px;padding:3px 8px;cursor:pointer">Replace<input type="file" accept="image/*" style="display:none" onChange=${e => upload(s.key, e.target.files?.[0])} /></label>
+                      <button class="btn small ghost" onClick=${() => clear(s.key)} style="font-size:10px;padding:3px 8px;color:var(--rose-600)">Remove</button>
+                    </div>
+                  </div>
+                </div>
+              ` : html`
+                <label style="display:flex;align-items:center;justify-content:center;height:60px;background:var(--slate-50);border:1px dashed var(--slate-300);border-radius:6px;font-size:11px;color:var(--slate-500);cursor:pointer;font-weight:500">
+                  ${busy === s.key ? 'Uploading…' : '📷 Upload sample photo'}
+                  <input type="file" accept="image/*" style="display:none" disabled=${busy === s.key} onChange=${e => upload(s.key, e.target.files?.[0])} />
+                </label>
+              `}
+            </div>
+          `)}
+          <div class="field" style="margin-top:4px"><label style="font-size:11px;font-weight:600;color:var(--slate-700)">Notes for operator (optional)</label>
+            <textarea rows=${2} value=${guide.notes} onChange=${e => setGuide(g => ({...g, notes: e.target.value}))} placeholder="What specifically should they look at? e.g. Mid-line between MIN and MAX, no foam at top"></textarea>
+          </div>
+          <button class="btn" onClick=${save} disabled=${!!busy} style="margin-top:4px">${busy === 'save' ? 'Saving…' : '✓ Save visual guide'}</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function TpmDailyCheck({ plant, me, machineId, onClose }) {
   const [machine, setMachine] = useState(null);
   const [template, setTemplate] = useState(null);
@@ -12057,6 +12162,8 @@ function TpmDailyCheck({ plant, me, machineId, onClose }) {
         const isIssue = r.status === 'issue';
         const isNa = r.status === 'na';
         const btnStyle = (active, color) => 'flex:1;padding:10px 6px;border:1px solid ' + (active ? color : 'var(--slate-200)') + ';background:' + (active ? color : 'white') + ';color:' + (active ? 'white' : 'var(--slate-700)') + ';font-size:13px;font-weight:600;border-radius:6px;cursor:pointer;transition:all 0.1s';
+        const vg = it.visual_guide || {};
+        const hasGuide = !!(vg.green?.url || vg.yellow?.url || vg.red?.url || vg.notes);
         return html`
           <div class="card" key=${it.id} style="margin-bottom:8px;padding:12px 14px">
             <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:10px">
@@ -12065,6 +12172,25 @@ function TpmDailyCheck({ plant, me, machineId, onClose }) {
                 ${it.expected_value && html`<div style="font-size:11px;color:var(--slate-500);margin-top:2px">Expected: ${it.expected_value}</div>`}
               </div>
             </div>
+            ${hasGuide && html`
+              <div style="background:var(--slate-50);border:1px solid var(--slate-200);border-radius:7px;padding:8px 10px;margin-bottom:10px">
+                <div style="font-size:10px;font-weight:700;color:var(--slate-600);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:6px">📷 Reference · tap to enlarge</div>
+                <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px">
+                  ${['green','yellow','red'].map(k => {
+                    const color = k === 'green' ? 'emerald' : k === 'yellow' ? 'amber' : 'rose';
+                    const emoji = k === 'green' ? '🟢' : k === 'yellow' ? '🟡' : '🔴';
+                    const slot = vg[k];
+                    if (!slot?.url) return html`<div key=${k} style="aspect-ratio:1;background:white;border:1px dashed var(--slate-200);border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:18px;color:var(--slate-300)">${emoji}</div>`;
+                    return html`<a key=${k} href=${slot.url} target="_blank" rel="noopener" style="display:block;position:relative">
+                      <img src=${slot.url} style=${'width:100%;aspect-ratio:1;object-fit:cover;border-radius:5px;border:2px solid var(--'+color+'-500);display:block'} />
+                      <span style=${'position:absolute;top:2px;left:2px;background:var(--'+color+'-600);color:white;font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px'}>${emoji}</span>
+                      ${slot.label && html`<div style="font-size:9px;color:var(--slate-600);margin-top:3px;text-align:center;line-height:1.2">${slot.label}</div>`}
+                    </a>`;
+                  })}
+                </div>
+                ${vg.notes && html`<div style="font-size:11px;color:var(--slate-600);margin-top:6px;padding-top:6px;border-top:1px dashed var(--slate-200);font-style:italic">${vg.notes}</div>`}
+              </div>
+            `}
             <div style="display:flex;gap:6px">
               <button onClick=${() => setItem(it.id, { status: 'ok' })} style=${btnStyle(isOk, 'var(--emerald-600)')}>✓ OK</button>
               <button onClick=${() => setItem(it.id, { status: 'issue' })} style=${btnStyle(isIssue, 'var(--rose-600)')}>⚠ Issue</button>
@@ -12148,6 +12274,7 @@ function TpmTemplateEditor({ plant, me, machineId, onClose }) {
   const [loading, setLoading] = useState(true);
   const [newItem, setNewItem] = useState({ label:'', item_type:'ok_issue', critical:false, expected_value:'', unit:'' });
   const [busy, setBusy] = useState(false);
+  const [guideTarget, setGuideTarget] = useState(null); // item being edited for visual guide
 
   const refresh = async () => {
     const [m, t] = await Promise.all([
@@ -12214,20 +12341,35 @@ function TpmTemplateEditor({ plant, me, machineId, onClose }) {
 
     ${items.length === 0 ? html`
       <div class="card"><div class="empty"><div style="font-size:13px">No items yet. Add the first check below.</div></div></div>
-    ` : items.map(it => html`
-      <div class="card" key=${it.id} style="margin-bottom:6px;padding:10px 12px">
-        <div style="display:flex;align-items:flex-start;gap:10px">
-          <div style="flex:1">
-            <div style="font-size:13px;font-weight:600">${it.ord}. ${it.label}${it.critical ? html` <span class="badge rose" style="font-size:9px;padding:1px 5px;margin-left:4px">CRITICAL</span>` : ''}</div>
-            <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
-              type: ${it.item_type}${it.expected_value ? ' · expected: ' + it.expected_value : ''}${it.unit ? ' · unit: ' + it.unit : ''}
+    ` : items.map(it => {
+      const vg = it.visual_guide || {};
+      const hasGuide = !!(vg.green?.url || vg.yellow?.url || vg.red?.url);
+      return html`
+        <div class="card" key=${it.id} style="margin-bottom:6px;padding:10px 12px">
+          <div style="display:flex;align-items:flex-start;gap:10px">
+            <div style="flex:1">
+              <div style="font-size:13px;font-weight:600">${it.ord}. ${it.label}${it.critical ? html` <span class="badge rose" style="font-size:9px;padding:1px 5px;margin-left:4px">CRITICAL</span>` : ''}</div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                type: ${it.item_type}${it.expected_value ? ' · expected: ' + it.expected_value : ''}${it.unit ? ' · unit: ' + it.unit : ''}
+              </div>
+              ${hasGuide && html`
+                <div style="display:flex;gap:4px;margin-top:6px;align-items:center">
+                  ${vg.green?.url  && html`<img src=${vg.green.url}  title="Green: ${vg.green.label||''}"  style="width:30px;height:30px;object-fit:cover;border-radius:4px;border:2px solid var(--emerald-500)" />`}
+                  ${vg.yellow?.url && html`<img src=${vg.yellow.url} title="Yellow: ${vg.yellow.label||''}" style="width:30px;height:30px;object-fit:cover;border-radius:4px;border:2px solid var(--amber-500)" />`}
+                  ${vg.red?.url    && html`<img src=${vg.red.url}    title="Red: ${vg.red.label||''}"    style="width:30px;height:30px;object-fit:cover;border-radius:4px;border:2px solid var(--rose-500)" />`}
+                  <span style="font-size:10px;color:var(--slate-500);margin-left:4px">visual guide</span>
+                </div>
+              `}
             </div>
+            <button class="btn small ghost" onClick=${() => setGuideTarget(it)} title="Reference images for operator" style="padding:4px 8px;font-size:11px">📷 ${hasGuide ? 'Edit' : 'Add'} guide</button>
+            <button class="btn small ghost" onClick=${() => toggleCritical(it)} title="Toggle critical" style="padding:4px 8px;font-size:11px">${it.critical ? '✓ Crit' : 'Crit'}</button>
+            <button class="btn small danger" onClick=${() => removeItem(it.id)} style="padding:4px 8px">×</button>
           </div>
-          <button class="btn small ghost" onClick=${() => toggleCritical(it)} title="Toggle critical">${it.critical ? '✓ Critical' : 'Mark critical'}</button>
-          <button class="btn small danger" onClick=${() => removeItem(it.id)} style="padding:4px 8px">×</button>
         </div>
-      </div>
-    `)}
+      `;
+    })}
+
+    ${guideTarget && html`<${TpmVisualGuideModal} plant=${plant} item=${guideTarget} onClose=${() => setGuideTarget(null)} onSaved=${() => { setGuideTarget(null); refresh(); }} />`}
 
     <div class="card" style="margin-top:14px">
       <div class="card-title">Add check item</div>
