@@ -15103,11 +15103,14 @@ function AuditLogViewer({ plant }) {
 
 // ============= QUALITY (NCRs) =============
 function Quality({ plant, me }) {
+  const [section, setSection] = useState('ncrs'); // ncrs | inspections
   const [ncrs, setNcrs] = useState([]);
+  const [inspections, setInspections] = useState([]);
   const [loading, setLoading] = useState(true);
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [filter, setFilter] = useState('open');
+  const [inspFilter, setInspFilter] = useState('pending');
   const [voiceOpen, setVoiceOpen] = useState(false);
 
   const refresh = useCallback(async () => {
@@ -15115,55 +15118,297 @@ function Quality({ plant, me }) {
     let q = sb.from('mcp_quality_ncrs').select('*, raised_by_user:raised_by(full_name), assigned_to_user:assigned_to(full_name)').order('created_at', { ascending:false });
     if (filter === 'open') q = q.neq('status', 'closed').neq('status', 'cancelled');
     else if (filter === 'closed') q = q.eq('status', 'closed');
-    const { data } = await q.limit(100);
-    setNcrs(data || []);
+    const [{ data: ncrData }, { data: inspData }] = await Promise.all([
+      q.limit(100),
+      sb.from('mcp_qa_inspections')
+        .select('*, part:part_id(part_number, name), inspector:inspector_user_id(full_name), signed_off:signed_off_by_user_id(full_name)')
+        .eq('plant_id', plant.id)
+        .order('created_at', { ascending: false })
+        .limit(200),
+    ]);
+    setNcrs(ncrData || []);
+    setInspections(inspData || []);
     setLoading(false);
-  }, [filter]);
+  }, [filter, plant.id]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
+  useEffect(() => {
+    if (!plant?.id) return;
+    const ch = sb.channel('qa-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_qa_inspections', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => sb.removeChannel(ch);
+  }, [plant.id, refresh]);
+
   const openCount = ncrs.filter(n => n.status !== 'closed' && n.status !== 'cancelled').length;
   const criticalCount = ncrs.filter(n => n.severity === 'critical' && n.status !== 'closed').length;
+  const pendingInsp = inspections.filter(i => i.result === 'pending').length;
+  const failedInsp7d = inspections.filter(i => i.result === 'fail' && (Date.now() - new Date(i.created_at) < 7*86400000)).length;
+  const totalInsp = inspections.length;
+  const passedInsp = inspections.filter(i => i.result === 'pass').length;
+  const passRate = totalInsp > 0 ? Math.round(passedInsp / totalInsp * 100) : 0;
 
   return html`
-    <div class="page-header"><div><h1>Quality</h1><div class="sub">NCRs and IATF records</div></div></div>
-
-    <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
-      <div class="stat ${openCount > 0 ? 'amber' : 'teal'}"><div class="stat-num">${openCount}</div><div class="stat-label">Open</div></div>
-      <div class="stat rose"><div class="stat-num">${criticalCount}</div><div class="stat-label">Critical</div></div>
-      <div class="stat teal"><div class="stat-num">${ncrs.filter(n => n.status === 'closed').length}</div><div class="stat-label">Closed</div></div>
-    </div>
+    <div class="page-header"><div><h1>Quality</h1><div class="sub">NCRs and inspections</div></div></div>
 
     <div class="auth-tabs" style="margin-bottom:14px">
-      <button class=${'auth-tab' + (filter === 'open' ? ' active' : '')} onClick=${() => setFilter('open')}>Open</button>
-      <button class=${'auth-tab' + (filter === 'closed' ? ' active' : '')} onClick=${() => setFilter('closed')}>Closed</button>
-      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
+      <button class=${'auth-tab' + (section === 'ncrs' ? ' active' : '')} onClick=${() => setSection('ncrs')}>📋 NCRs · ${openCount}</button>
+      <button class=${'auth-tab' + (section === 'inspections' ? ' active' : '')} onClick=${() => setSection('inspections')}>🔍 Inspections · ${pendingInsp}</button>
     </div>
 
-    <div class="section-h">NCRs · ${ncrs.length}<span style="display:flex;gap:6px">
-      <button class="btn small" style="background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white" onClick=${() => setVoiceOpen(true)} title="Voice entry — Tamil / Hindi / English">🎙️ Voice</button>
-      <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('ncr'); }}>+ Raise NCR</button>
-    </span></div>
-    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
-      ncrs.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✓</div>No NCRs in this filter</div></div>` :
-      ncrs.map(n => html`
-        <div class="list-item" key=${n.id} onClick=${() => { setEditTarget(n); setModal('ncr'); }}>
-          <div class="list-item-row">
-            <div class="list-item-main">
-              <div class="list-item-title">${n.ncr_number} · ${n.title}</div>
-              <div class="list-item-sub">${n.part_number || ''} ${n.qty_affected ? '· ' + n.qty_affected + ' pcs' : ''} · ${n.raised_by_user?.full_name || '?'}</div>
-            </div>
-            <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
-              <span class=${'badge ' + (n.severity === 'critical' ? 'rose' : n.severity === 'major' ? 'amber' : '')}>${n.severity}</span>
-              <span class=${'badge ' + (n.status === 'closed' ? 'emerald' : n.status === 'open' ? 'amber' : '')}>${n.status}</span>
+    ${section === 'ncrs' && html`
+      <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+        <div class="stat ${openCount > 0 ? 'amber' : 'teal'}"><div class="stat-num">${openCount}</div><div class="stat-label">Open</div></div>
+        <div class="stat rose"><div class="stat-num">${criticalCount}</div><div class="stat-label">Critical</div></div>
+        <div class="stat teal"><div class="stat-num">${ncrs.filter(n => n.status === 'closed').length}</div><div class="stat-label">Closed</div></div>
+      </div>
+
+      <div class="auth-tabs" style="margin-bottom:14px">
+        <button class=${'auth-tab' + (filter === 'open' ? ' active' : '')} onClick=${() => setFilter('open')}>Open</button>
+        <button class=${'auth-tab' + (filter === 'closed' ? ' active' : '')} onClick=${() => setFilter('closed')}>Closed</button>
+        <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
+      </div>
+
+      <div class="section-h">NCRs · ${ncrs.length}<span style="display:flex;gap:6px">
+        <button class="btn small" style="background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white" onClick=${() => setVoiceOpen(true)} title="Voice entry — Tamil / Hindi / English">🎙️ Voice</button>
+        <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('ncr'); }}>+ Raise NCR</button>
+      </span></div>
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        ncrs.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✓</div>No NCRs in this filter</div></div>` :
+        ncrs.map(n => html`
+          <div class="list-item" key=${n.id} onClick=${() => { setEditTarget(n); setModal('ncr'); }}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${n.ncr_number} · ${n.title}</div>
+                <div class="list-item-sub">${n.part_number || ''} ${n.qty_affected ? '· ' + n.qty_affected + ' pcs' : ''} · ${n.raised_by_user?.full_name || '?'}</div>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+                <span class=${'badge ' + (n.severity === 'critical' ? 'rose' : n.severity === 'major' ? 'amber' : '')}>${n.severity}</span>
+                <span class=${'badge ' + (n.status === 'closed' ? 'emerald' : n.status === 'open' ? 'amber' : '')}>${n.status}</span>
+              </div>
             </div>
           </div>
+        `)
+      }
+    `}
+
+    ${section === 'inspections' && html`
+      <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+        <div class=${'stat ' + (pendingInsp > 0 ? 'amber' : 'teal')}><div class="stat-num">${pendingInsp}</div><div class="stat-label">Pending</div></div>
+        <div class=${'stat ' + (failedInsp7d > 0 ? 'rose' : 'teal')}><div class="stat-num">${failedInsp7d}</div><div class="stat-label">Fail · 7d</div></div>
+        <div class="stat teal"><div class="stat-num">${passRate}%</div><div class="stat-label">Pass rate</div></div>
+      </div>
+
+      <div class="auth-tabs" style="margin-bottom:14px">
+        <button class=${'auth-tab' + (inspFilter === 'pending' ? ' active' : '')} onClick=${() => setInspFilter('pending')}>Pending · ${pendingInsp}</button>
+        <button class=${'auth-tab' + (inspFilter === 'fail' ? ' active' : '')} onClick=${() => setInspFilter('fail')}>Failed</button>
+        <button class=${'auth-tab' + (inspFilter === 'pass' ? ' active' : '')} onClick=${() => setInspFilter('pass')}>Passed</button>
+        <button class=${'auth-tab' + (inspFilter === 'all' ? ' active' : '')} onClick=${() => setInspFilter('all')}>All</button>
+      </div>
+
+      <div class="card" style="background:var(--slate-50);border-color:var(--slate-200);padding:8px 12px;margin-bottom:12px">
+        <div style="font-size:11px;color:var(--slate-600);line-height:1.5">
+          🔍 Inspections are auto-raised when a shot or stage entry hits a step with <strong>inspection required</strong>. Open a pending row, enter sample size + pass/fail counts + defects, sign off. Fail → escalate to NCR in one tap.
         </div>
-      `)
-    }
+      </div>
+
+      ${(() => {
+        let list = inspections;
+        if (inspFilter !== 'all') list = list.filter(i => i.result === inspFilter);
+        if (list.length === 0) return html`<div class="card"><div class="empty"><div class="icon">🔍</div><div style="font-size:13px">No inspections ${inspFilter === 'all' ? '' : 'in this filter'}.</div></div></div>`;
+        return list.map(i => {
+          const color = i.result === 'pass' ? 'emerald' : i.result === 'fail' ? 'rose' : i.result === 'partial' ? 'amber' : i.result === 'hold' ? 'amber' : 'slate';
+          return html`
+            <div class="list-item" key=${i.id} onClick=${() => { setEditTarget(i); setModal('inspection'); }}>
+              <div class="list-item-row">
+                <div class="list-item-main">
+                  <div class="list-item-title">🔍 ${i.part?.part_number || '?'} · ${(i.stage||'').toUpperCase()} · ${i.lot_qty} pcs</div>
+                  <div class="list-item-sub">
+                    ${i.result === 'pending' ? 'waiting · ' + fmtDate(i.created_at) :
+                      i.sample_size ? 'sampled ' + i.sample_size + ' · ✓ ' + i.n_pass + ' / ✗ ' + i.n_fail : ''}
+                    ${i.inspector?.full_name ? ' · by ' + i.inspector.full_name : ''}
+                    ${i.signed_off?.full_name ? ' · signed by ' + i.signed_off.full_name : ''}
+                  </div>
+                </div>
+                <span class=${'badge ' + color}>${i.result.toUpperCase()}</span>
+              </div>
+            </div>
+          `;
+        });
+      })()}
+    `}
 
     ${modal === 'ncr' && html`<${NcrModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'inspection' && html`<${InspectionModal} plant=${plant} me=${me} inspection=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="ncr_raise" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
+  `;
+}
+
+// =================================================================
+// InspectionModal — entry form for a pending inspection, or
+// read-only summary if already completed. On fail, offers one-tap
+// NCR escalation with prefilled context.
+// =================================================================
+function InspectionModal({ plant, me, inspection, onClose, onSaved }) {
+  const isCompleted = inspection.result !== 'pending';
+  const [form, setForm] = useState({
+    sample_size: inspection.sample_size || '',
+    n_pass: inspection.n_pass || '',
+    n_fail: inspection.n_fail || '',
+    defects: inspection.defects || [],
+    notes: inspection.notes || '',
+    attachments: inspection.attachments || [],
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [rejectionTypes, setRejectionTypes] = useState([]);
+  const [showNcrPrompt, setShowNcrPrompt] = useState(false);
+
+  useEffect(() => {
+    sb.from('mcp_pdc_rejection_types').select('id, code, label, category, severity').eq('plant_id', plant.id).eq('active', true).order('ord').then(({ data }) => setRejectionTypes(data || []));
+  }, [plant.id]);
+
+  const setDefectQty = (typeId, label, qty) => {
+    const next = (form.defects || []).filter(d => d.rejection_type_id !== typeId);
+    const n = parseInt(qty, 10);
+    if (n > 0) next.push({ rejection_type_id: typeId, label, qty: n });
+    setForm(f => ({ ...f, defects: next }));
+  };
+
+  const totalDefectQty = (form.defects || []).reduce((s, d) => s + (parseInt(d.qty, 10) || 0), 0);
+  const sample = parseInt(form.sample_size) || 0;
+  const nFail  = parseInt(form.n_fail) || 0;
+  const nPass  = parseInt(form.n_pass) || 0;
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      if (sample <= 0) throw new Error('Sample size must be > 0');
+      if (sample > inspection.lot_qty) throw new Error('Sample size (' + sample + ') > lot qty (' + inspection.lot_qty + ')');
+      if (nPass + nFail !== sample) throw new Error('Pass + Fail must equal sample size (' + sample + ', currently ' + (nPass+nFail) + ')');
+      if (nFail > 0 && totalDefectQty !== nFail) throw new Error('Defect breakdown total (' + totalDefectQty + ') must match Fail count (' + nFail + ')');
+
+      const result = nFail === 0 ? 'pass' : (nPass === 0 ? 'fail' : 'partial');
+      const { error } = await sb.from('mcp_qa_inspections').update({
+        sample_size: sample,
+        n_pass: nPass, n_fail: nFail,
+        defects: form.defects, notes: form.notes || null, attachments: form.attachments || [],
+        result, inspector_user_id: me.id, inspected_at: new Date().toISOString(),
+        signed_off_by_user_id: me.id, signed_off_at: new Date().toISOString(),
+      }).eq('id', inspection.id);
+      if (error) throw error;
+
+      // Close the linked action
+      if (inspection.action_id) {
+        await sb.from('actions').update({
+          status: 'completed', completed_at: new Date().toISOString(),
+          completion_evidence: { inspection_id: inspection.id, result, n_pass: nPass, n_fail: nFail }
+        }).eq('id', inspection.action_id);
+      }
+
+      showToast(result === 'pass' ? '✓ Inspection passed' : result === 'fail' ? '✗ Inspection failed' : '⚠ Partial pass');
+      if (result === 'fail' || result === 'partial') setShowNcrPrompt(true);
+      else onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  const escalateToNcr = async () => {
+    setBusy(true);
+    try {
+      const partNo = inspection.part?.part_number || 'unknown';
+      const defectLabels = (form.defects || []).map(d => d.label + '×' + d.qty).join(', ');
+      const { data: ncrId, error } = await sb.rpc('raise_ncr_from_inspection', {
+        p_inspection_id: inspection.id,
+      });
+      if (error) {
+        // Fallback: insert NCR directly if RPC doesn't exist yet
+        const { data: ncr, error: e2 } = await sb.from('mcp_quality_ncrs').insert({
+          plant_id: plant.id,
+          title: 'Inspection fail · ' + partNo + ' · ' + inspection.stage,
+          description: 'Auto-raised from inspection ' + inspection.id.slice(0,8) + '\nLot: ' + inspection.lot_qty + ' pcs · Sample: ' + sample + ' · Pass: ' + nPass + ' · Fail: ' + nFail + '\nDefects: ' + (defectLabels || '—'),
+          part_id: inspection.part_id, part_number: partNo,
+          qty_affected: nFail, severity: nFail >= (inspection.lot_qty * 0.05) ? 'major' : 'minor',
+          status: 'open', raised_by: me.id,
+        }).select('id').single();
+        if (e2) throw e2;
+        await sb.from('mcp_qa_inspections').update({ ncr_id: ncr.id }).eq('id', inspection.id);
+      }
+      showToast('📋 NCR raised from inspection');
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header">
+          <div class="modal-title">🔍 ${inspection.part?.part_number || 'Inspection'} · ${(inspection.stage||'').toUpperCase()}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+
+        <div class="card" style="background:var(--slate-50);padding:8px 12px;margin-bottom:12px">
+          <div class="card-row"><span class="label">Part</span><span class="value">${inspection.part?.part_number} · ${inspection.part?.name || ''}</span></div>
+          <div class="card-row"><span class="label">Stage</span><span class="value">${inspection.stage}</span></div>
+          <div class="card-row"><span class="label">Lot qty</span><span class="value mono">${inspection.lot_qty} pcs</span></div>
+          <div class="card-row"><span class="label">Triggered</span><span class="value">${fmtDate(inspection.created_at)}</span></div>
+          ${isCompleted && inspection.signed_off?.full_name && html`<div class="card-row"><span class="label">Signed by</span><span class="value">${inspection.signed_off.full_name}</span></div>`}
+        </div>
+
+        ${showNcrPrompt ? html`
+          <div class="card" style="background:var(--rose-50);border-color:var(--rose-200);padding:12px 14px">
+            <div style="font-size:13px;font-weight:600;color:var(--rose-800);margin-bottom:6px">⚠ Failure recorded</div>
+            <div style="font-size:12px;color:var(--rose-700);margin-bottom:10px;line-height:1.5">${nFail} of ${sample} pieces failed. Raise an NCR to start the 8D / containment workflow, or close without NCR if it was a one-off you've already fixed.</div>
+            <div style="display:flex;gap:6px">
+              <button class="btn" disabled=${busy} onClick=${escalateToNcr} style="flex:1;background:var(--rose-600)">${busy ? 'Raising…' : '📋 Raise NCR'}</button>
+              <button class="btn ghost" disabled=${busy} onClick=${onSaved} style="flex:1">Close without NCR</button>
+            </div>
+          </div>
+        ` : html`
+          ${err && html`<div class="alert error">${err}</div>`}
+          <form onSubmit=${submit}>
+            <div class="field-row">
+              <div class="field"><label>Sample size *</label><input type="number" min=${1} max=${inspection.lot_qty} required value=${form.sample_size} disabled=${isCompleted} onChange=${e => setForm({...form, sample_size: e.target.value})} placeholder="pcs to check" /></div>
+              <div class="field"><label>Pass *</label><input type="number" min=${0} max=${sample} required value=${form.n_pass} disabled=${isCompleted} onChange=${e => setForm({...form, n_pass: e.target.value})} /></div>
+              <div class="field"><label>Fail *</label><input type="number" min=${0} max=${sample} required value=${form.n_fail} disabled=${isCompleted} onChange=${e => setForm({...form, n_fail: e.target.value})} /></div>
+            </div>
+            ${sample > 0 && nPass + nFail > 0 && nPass + nFail !== sample && html`<div class="alert info" style="font-size:11px;padding:6px 10px">Pass + Fail = ${nPass+nFail}, needs to equal ${sample}.</div>`}
+
+            ${nFail > 0 && html`
+              <div class="field"><label>Defect breakdown · total must equal ${nFail}${totalDefectQty === nFail ? html` <span style="color:var(--emerald-700)">✓</span>` : html` <span style="color:var(--rose-700)">(currently ${totalDefectQty})</span>`}</label>
+                <div style="display:flex;flex-direction:column;gap:4px;border:1px solid var(--slate-200);border-radius:6px;padding:8px;background:white">
+                  ${rejectionTypes.length === 0 ? html`<div style="font-size:11px;color:var(--slate-500)">No rejection types configured. Add some in Setup → Rejection Types.</div>` :
+                    rejectionTypes.map(rt => {
+                      const cur = (form.defects||[]).find(d => d.rejection_type_id === rt.id);
+                      return html`
+                        <div key=${rt.id} style="display:flex;align-items:center;gap:8px">
+                          <div style="flex:1;font-size:12px">${rt.code ? html`<span style="font-family:monospace;color:var(--slate-500);font-size:11px;margin-right:6px">${rt.code}</span>` : ''}${rt.label}</div>
+                          <input type="number" min=${0} value=${cur?.qty || ''} placeholder="0" disabled=${isCompleted}
+                            onChange=${e => setDefectQty(rt.id, rt.label, e.target.value)}
+                            style="width:60px;padding:4px 8px;font-size:13px;border:1px solid ${cur ? 'var(--rose-300)' : 'var(--slate-200)'};border-radius:5px;text-align:right;background:${cur ? 'var(--rose-50)' : 'white'}" />
+                        </div>
+                      `;
+                    })
+                  }
+                </div>
+              </div>
+            `}
+
+            <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} disabled=${isCompleted} onChange=${e => setForm({...form, notes: e.target.value})} placeholder="What did the inspector see? What corrective action if any?"></textarea></div>
+
+            <div style="margin:10px 0">
+              <${EntryAttachments} plant=${plant} me=${me} scope="qa_inspection"
+                value=${{ attachments: form.attachments || [], email_ref: '' }}
+                onChange=${(v) => setForm({...form, attachments: v.attachments})} />
+            </div>
+
+            ${!isCompleted && html`
+              <button class="btn" disabled=${busy} style="width:100%">${busy ? 'Saving…' : '✓ Save & sign off'}</button>
+            `}
+          </form>
+        `}
+      </div>
+    </div>
   `;
 }
 
