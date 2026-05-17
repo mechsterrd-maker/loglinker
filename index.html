@@ -37,7 +37,7 @@
   --safe-bottom: env(safe-area-inset-bottom, 0px);
 }
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html{scroll-behavior:smooth}
+html{scroll-behavior:smooth;overscroll-behavior-x:contain}
 body{
   font-family:'Geist',system-ui,sans-serif;
   background:#fafaf9;
@@ -45,6 +45,7 @@ body{
   line-height:1.5;
   -webkit-font-smoothing:antialiased;
   overscroll-behavior:none;
+  overscroll-behavior-x:contain;
 }
 .display{font-family:'Bricolage Grotesque',sans-serif;letter-spacing:-0.02em}
 .mono{font-family:'Geist Mono',monospace}
@@ -927,6 +928,30 @@ function App() {
   const [pendingInvite, setPendingInvite] = useState(null);
   const [accessibleUnits, setAccessibleUnits] = useState([]);
   const [activeUnit, setActiveUnit] = useState(null);
+
+  // Swipe-back guard: if a modal is open and the user accidentally triggers
+  // back-navigation (trackpad swipe, mouse forward/back button, browser back),
+  // close the modal instead of leaving the page and losing form data.
+  useEffect(() => {
+    if (!window.history.state || window.history.state.loglinkr_sentinel !== true) {
+      window.history.pushState({ loglinkr_sentinel: true }, '');
+    }
+    const onPop = () => {
+      // Re-push the sentinel so further back attempts can still be intercepted.
+      window.history.pushState({ loglinkr_sentinel: true }, '');
+      // Find the topmost open modal-backdrop and dismiss it via its close button.
+      const modals = document.querySelectorAll('.modal-backdrop.active');
+      if (modals.length > 0) {
+        const top = modals[modals.length - 1];
+        const closeBtn = top.querySelector('.close-btn');
+        if (closeBtn) closeBtn.click();
+      }
+      // If no modal open, the back-press is swallowed silently — user stays on
+      // the current page (which is what they want when an accidental swipe fires).
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
 
   // Load accessible units after auth
   const loadUnits = useCallback(async () => {
@@ -8836,11 +8861,11 @@ function RejectionBreakdown({ plant, stage, value, onChange }) {
     return html`
       <div class="card" style="background:var(--amber-50);border-color:var(--amber-200);padding:10px 12px">
         <div style="font-size:12px;color:var(--amber-800);margin-bottom:6px">No rejection types configured for stage <b>${stage}</b>.</div>
-        <button class="btn small ghost" onClick=${() => setShowAddCustom(true)} style="padding:3px 10px;font-size:11px">+ Add custom reason for this entry</button>
+        <button type="button" class="btn small ghost" onClick=${() => setShowAddCustom(true)} style="padding:3px 10px;font-size:11px">+ Add custom reason for this entry</button>
         ${showAddCustom && html`
           <div style="display:flex;gap:6px;margin-top:8px">
             <input type="text" value=${customLabel} onChange=${e => setCustomLabel(e.target.value)} placeholder="Reason label" style="flex:1;padding:6px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px" autoFocus />
-            <button class="btn small" onClick=${addCustom}>Add</button>
+            <button type="button" class="btn small" onClick=${addCustom}>Add</button>
           </div>
         `}
       </div>
@@ -8873,7 +8898,7 @@ function RejectionBreakdown({ plant, stage, value, onChange }) {
           <div key=${'c'+idx} style="display:flex;align-items:center;gap:8px;padding:4px 0;background:var(--amber-50);border-radius:5px;padding-left:6px;padding-right:6px">
             <input type="text" value=${r.label_snapshot} onChange=${e => setCustom(idx, { label_snapshot: e.target.value })} style="flex:1;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px" placeholder="Custom reason" />
             <input type="number" min=${0} value=${r.qty || ''} onChange=${e => setCustom(idx, { qty: parseInt(e.target.value || 0) })} style="width:70px;padding:5px 8px;font-size:13px;border:1px solid var(--rose-300);border-radius:5px;text-align:right;background:white" />
-            <button class="btn small danger" onClick=${() => removeCustom(idx)} style="padding:2px 6px;font-size:11px">×</button>
+            <button type="button" class="btn small danger" onClick=${() => removeCustom(idx)} style="padding:2px 6px;font-size:11px">×</button>
           </div>
         `)}
       </div>
@@ -8881,11 +8906,11 @@ function RejectionBreakdown({ plant, stage, value, onChange }) {
         ${showAddCustom ? html`
           <div style="display:flex;gap:6px">
             <input type="text" value=${customLabel} onChange=${e => setCustomLabel(e.target.value)} placeholder="Custom reason label" style="flex:1;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px" autoFocus />
-            <button class="btn small" onClick=${addCustom}>Add</button>
-            <button class="btn small ghost" onClick=${() => { setShowAddCustom(false); setCustomLabel(''); }}>Cancel</button>
+            <button type="button" class="btn small" onClick=${addCustom}>Add</button>
+            <button type="button" class="btn small ghost" onClick=${() => { setShowAddCustom(false); setCustomLabel(''); }}>Cancel</button>
           </div>
         ` : html`
-          <button class="btn small ghost" onClick=${() => setShowAddCustom(true)} style="padding:3px 10px;font-size:11px">+ Other reason (one-off)</button>
+          <button type="button" class="btn small ghost" onClick=${() => setShowAddCustom(true)} style="padding:3px 10px;font-size:11px">+ Other reason (one-off)</button>
         `}
       </div>
     </div>
