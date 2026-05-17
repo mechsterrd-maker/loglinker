@@ -4282,6 +4282,7 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
   const [forwardMsgTarget, setForwardMsgTarget] = useState(null);
   const [groupSettingsTarget, setGroupSettingsTarget] = useState(null);
   const [newTaskInGroup, setNewTaskInGroup] = useState(false);
+  const [meetingMenu, setMeetingMenu] = useState(false);
 
   useEffect(() => { loadGroups(); }, []);
   // Global plant-wide subscription — notifications work even when not on chat tab
@@ -4595,6 +4596,27 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
     } catch (e) { alert(e.message); }
   };
 
+  const postMeetingLink = async (url, title) => {
+    if (!activeGroup) return;
+    const body = '📹 ' + title + '\n' + url;
+    const localId = 'local-' + Date.now();
+    const optimisticMsg = {
+      id: localId, plant_id: plant.id, group_id: activeGroup.id, sender_id: user.id,
+      body, attachments: [], users: { full_name: me.full_name },
+      created_at: new Date().toISOString(), _pending: true,
+    };
+    setMessages(prev => [...prev, optimisticMsg]);
+    setTimeout(() => { const wrap = document.getElementById('threadMessages'); if (wrap) wrap.scrollTop = wrap.scrollHeight; }, 30);
+    const { data: inserted, error } = await sb.from('chat_messages').insert({
+      plant_id: plant.id, group_id: activeGroup.id, sender_id: user.id, body, attachments: [],
+    }).select().single();
+    if (error) {
+      setMessages(prev => prev.map(m => m.id === localId ? { ...m, _failed: true, _pending: false } : m));
+      return;
+    }
+    setMessages(prev => prev.map(m => m.id === localId ? { ...inserted, users: { full_name: me.full_name } } : m));
+  };
+
   const send = async () => {
     if ((!input.trim() && !attachment) || !activeGroup || uploading) return;
     const body = input.trim();
@@ -4763,7 +4785,27 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
                 <div class=${'msg ' + (isOut ? 'out' : 'in')} key=${m.id}>
                   ${!isOut && html`<div class="who">${m.users?.full_name || '?'}</div>`}
                   ${m.forwarded_from_message_id && html`<div style="font-size:10px;opacity:0.7;font-style:italic">↪️ Forwarded</div>`}
-                  ${m.body && html`<div>${m.body}</div>`}
+                  ${m.body && (() => {
+                    // Detect meeting URLs and render with a Join CTA
+                    const meetMatch = m.body.match(/https?:\/\/(meet\.jit\.si|meet\.google\.com|[^\s]*zoom\.us|teams\.(?:microsoft|live)\.com|whereby\.com)[^\s]*/);
+                    if (meetMatch) {
+                      const url = meetMatch[0];
+                      const provider = meetMatch[1].includes('jit.si') ? 'Jitsi' :
+                                       meetMatch[1].includes('zoom') ? 'Zoom' :
+                                       meetMatch[1].includes('google') ? 'Google Meet' :
+                                       meetMatch[1].includes('teams') ? 'Teams' :
+                                       meetMatch[1].includes('whereby') ? 'Whereby' : 'Meeting';
+                      const restOfBody = m.body.replace(url, '').trim();
+                      return html`
+                        <div style="background:white;border:1px solid var(--teal-300);border-radius:8px;padding:10px 12px;margin:2px 0;min-width:200px">
+                          <div style="font-size:12px;color:var(--slate-700);font-weight:600;margin-bottom:6px">📹 ${restOfBody || 'Video meeting'}</div>
+                          <div style="font-size:10px;color:var(--slate-500);margin-bottom:8px">${provider} · tap to join in browser</div>
+                          <a href=${url} target="_blank" rel="noopener" style="display:inline-block;background:var(--teal-600);color:white;padding:7px 14px;border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">▶ Join now</a>
+                        </div>
+                      `;
+                    }
+                    return html`<div>${m.body}</div>`;
+                  })()}
                   ${atts.map((a, i) => a.isImage
                     ? html`<a href=${a.url} target="_blank" rel="noopener" key=${i}><img class="attached-img" src=${a.url} alt=${a.name || 'image'} /></a>`
                     : html`<a href=${a.url} target="_blank" rel="noopener" class="file-attached" key=${i}>📎 ${a.name || 'file'}</a>`
@@ -4806,11 +4848,13 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
           <button class="attach" onClick=${() => setNewTaskInGroup(true)} disabled=${uploading} title="Create task" style="background:var(--teal-50);color:var(--teal-700)">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
           </button>
+          <button class="attach" onClick=${() => setMeetingMenu(true)} disabled=${uploading} title="Start / share video meeting" style="background:var(--teal-50);color:var(--teal-700);font-size:14px">📹</button>
           <input type="text" value=${input} onChange=${e => setInput(e.target.value)} onKeyPress=${e => { if (e.key === 'Enter' && !e.shiftKey) send(); }} placeholder=${uploading ? 'Uploading…' : 'Message…'} disabled=${uploading} />
           <button onClick=${send} disabled=${uploading || (!input.trim() && !attachment)}>${uploading ? '…' : '→'}</button>
         </div>
         ${taskFromMsg && html`<${AssignTaskFromMsgModal} plant=${plant} me=${me} message=${taskFromMsg} group=${activeGroup} onClose=${() => setTaskFromMsg(null)} onSaved=${() => setTaskFromMsg(null)} />`}
         ${newTaskInGroup && html`<${QuickTaskInGroupModal} plant=${plant} me=${me} group=${activeGroup} onClose=${() => setNewTaskInGroup(false)} onSaved=${() => setNewTaskInGroup(false)} />`}
+        ${meetingMenu && html`<${MeetingStartMenu} plant=${plant} onClose=${() => setMeetingMenu(false)} onStart=${(url, title) => { setMeetingMenu(false); postMeetingLink(url, title); }} />`}
         ${msgMenu && html`<${MessageActionMenu}
           message=${msgMenu} me=${me} group=${activeGroup}
           onClose=${() => setMsgMenu(null)}
@@ -17184,6 +17228,66 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
 }
 
 // ============= ASSIGN TASK FROM CHAT MESSAGE =============
+// =================================================================
+// MeetingStartMenu — Jitsi (free) or paste a Zoom / Meet / Teams link.
+// Posts a chat message that renders with a "▶ Join now" button.
+// =================================================================
+function MeetingStartMenu({ plant, onClose, onStart }) {
+  const [mode, setMode] = useState('jitsi'); // 'jitsi' | 'paste'
+  const [pasteUrl, setPasteUrl] = useState('');
+  const [pasteTitle, setPasteTitle] = useState('');
+  const [jitsiTitle, setJitsiTitle] = useState('Quick meeting');
+
+  const startJitsi = () => {
+    const slug = ((plant.name || 'plant').toLowerCase().replace(/[^a-z0-9]+/g, '')).slice(0, 10) || 'plant';
+    const room = 'loglinkr-' + slug + '-' + crypto.randomUUID().slice(0, 8);
+    const url = 'https://meet.jit.si/' + room;
+    onStart(url, jitsiTitle.trim() || 'Quick meeting');
+  };
+
+  const submitPaste = () => {
+    const url = pasteUrl.trim();
+    if (!/^https?:\/\//.test(url)) { alert('Enter a valid meeting URL starting with https://'); return; }
+    onStart(url, pasteTitle.trim() || 'Video meeting');
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:460px">
+        <div class="modal-header">
+          <div class="modal-title">📹 Start a meeting</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="auth-tabs" style="margin-bottom:12px">
+          <button class=${'auth-tab' + (mode === 'jitsi' ? ' active' : '')} onClick=${() => setMode('jitsi')}>🆓 Jitsi (free)</button>
+          <button class=${'auth-tab' + (mode === 'paste' ? ' active' : '')} onClick=${() => setMode('paste')}>🔗 Paste a link</button>
+        </div>
+
+        ${mode === 'jitsi' && html`
+          <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);padding:10px 12px;margin-bottom:12px">
+            <div style="font-size:11px;color:var(--teal-800);line-height:1.5">
+              Creates a fresh <strong>meet.jit.si</strong> room and posts the link to this chat. Anyone in the group taps it and joins — no account or app install. Works on phones + browsers. Free, no recording.
+            </div>
+          </div>
+          <div class="field"><label>Meeting title (shows in chat)</label><input type="text" value=${jitsiTitle} onChange=${e => setJitsiTitle(e.target.value)} placeholder="Quick meeting" autoFocus /></div>
+          <button class="btn" onClick=${startJitsi} style="width:100%;background:linear-gradient(135deg,var(--teal-600),var(--teal-500))">📹 Start & share</button>
+        `}
+
+        ${mode === 'paste' && html`
+          <div class="card" style="background:var(--slate-50);border-color:var(--slate-200);padding:10px 12px;margin-bottom:12px">
+            <div style="font-size:11px;color:var(--slate-700);line-height:1.5">
+              Paste a meeting URL from Zoom, Google Meet, Microsoft Teams, or Whereby. Use when you need better video quality, recording, or a scheduled meeting. The link is shared with everyone in the group.
+            </div>
+          </div>
+          <div class="field"><label>Title (optional)</label><input type="text" value=${pasteTitle} onChange=${e => setPasteTitle(e.target.value)} placeholder="Daily standup · 3 pm" /></div>
+          <div class="field"><label>Meeting URL *</label><input type="url" required value=${pasteUrl} onChange=${e => setPasteUrl(e.target.value)} placeholder="https://zoom.us/j/123…" autoFocus /></div>
+          <button class="btn" onClick=${submitPaste} style="width:100%">🔗 Share in chat</button>
+        `}
+      </div>
+    </div>
+  `;
+}
+
 function AssignTaskFromMsgModal({ plant, me, message, group, onClose, onSaved }) {
   const messagePreview = message.body || (Array.isArray(message.attachments) && message.attachments.length ? '📎 ' + (message.attachments[0].name || 'attachment') : '(empty)');
   const [users, setUsers] = useState([]);
