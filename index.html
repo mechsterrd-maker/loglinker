@@ -1683,11 +1683,11 @@ function Production({ plant, me }) {
       </div>
       <div class="section-h">Recent Shots</div>
       ${shots.slice(0, 5).map(s => html`
-        <div class="list-item" key=${s.id}>
+        <div class="list-item" key=${s.id} onClick=${() => { setEditTarget(s); setModal('shot'); }} style="cursor:pointer">
           <div class="list-item-row">
             <div class="list-item-main">
               <div class="list-item-title">${s.mcp_pdc_dies?.code || '?'} on ${s.machines?.code || '?'} · ${(s.cavities||1) > 1 ? fmtNum(s.pieces_good||s.shots_good*(s.cavities||1)) + ' pcs (' + s.shots_good + '×' + s.cavities + ')' : fmtNum(s.shots_good) + ' good'}${s.shots_rejected > 0 ? ' / ' + ((s.cavities||1) > 1 ? (s.pieces_rejected||s.shots_rejected*(s.cavities||1)) + ' pcs rej' : s.shots_rejected + ' rej') : ''}</div>
-              <div class="list-item-sub">${s.units?.name} · ${s.shifts?.name} · ${s.users?.full_name || '?'}</div>
+              <div class="list-item-sub">${s.units?.name} · ${s.shifts?.name} · ${s.users?.full_name || '?'} · tap to edit</div>
             </div>
             <div class="list-item-meta">${fmtDate(s.recorded_at)}</div>
           </div>
@@ -1855,11 +1855,11 @@ function Production({ plant, me }) {
       </span></div>
       ${shots.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📊</div>No shots logged yet</div></div>` :
         shots.map(s => html`
-          <div class="list-item" key=${s.id}>
+          <div class="list-item" key=${s.id} onClick=${() => { setEditTarget(s); setModal('shot'); }} style="cursor:pointer">
             <div class="list-item-row">
               <div class="list-item-main">
                 <div class="list-item-title">${s.mcp_pdc_dies?.code || '?'} on ${s.machines?.code || '?'} · ${(s.cavities||1) > 1 ? fmtNum(s.pieces_good||s.shots_good*(s.cavities||1)) + ' pcs (' + s.shots_good + '×' + s.cavities + ')' : fmtNum(s.shots_good) + ' good'}${s.shots_rejected > 0 ? ' / ' + ((s.cavities||1) > 1 ? (s.pieces_rejected||s.shots_rejected*(s.cavities||1)) + ' pcs rej' : s.shots_rejected + ' rej') : ''}</div>
-                <div class="list-item-sub">${s.units?.name} · ${s.shifts?.name} · ${s.users?.full_name || '?'}</div>
+                <div class="list-item-sub">${s.units?.name} · ${s.shifts?.name} · ${s.users?.full_name || '?'} · tap to edit</div>
               </div>
               <div class="list-item-meta">${fmtDate(s.recorded_at)}</div>
             </div>
@@ -1874,7 +1874,7 @@ function Production({ plant, me }) {
     ${modal === 'die' && html`<${DieModal} plant=${plant} me=${me} parts=${parts} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'tool' && html`<${ToolModal} plant=${plant} me=${me} machines=${machines} stockItems=${stockItems} parts=${parts} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'tool_assign' && html`<${ToolAssignmentModal} plant=${plant} tool=${editTarget} parts=${parts} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
-    ${modal === 'shot' && html`<${ShotModal} plant=${plant} me=${me} units=${units} shifts=${shifts} machines=${machines} dies=${dies} parts=${parts} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
+    ${modal === 'shot' && html`<${ShotModal} plant=${plant} me=${me} units=${units} shifts=${shifts} machines=${machines} dies=${dies} parts=${parts} users=${users} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="shot_log" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
   `;
 }
@@ -3982,11 +3982,27 @@ function DieSpareReplaceModal({ plant, me, die, spare, onClose, onSaved }) {
 }
 
 // ============= SHOT MODAL =============
-function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onClose, onSaved }) {
+function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, editTarget, onClose, onSaved }) {
+  const isEdit = !!editTarget;
+  const isAdmin = me?.role === 'admin' || me?.role === 'plant_head';
   const defaultDie = dies[0];
   const defaultPartFromDie = defaultDie?.default_part_id || '';
 
-  const [form, setForm] = useState({
+  const [form, setForm] = useState(editTarget ? {
+    unit_id: editTarget.unit_id || '',
+    shift_id: editTarget.shift_id || '',
+    machine_id: editTarget.machine_id || '',
+    die_id: editTarget.die_id || '',
+    part_id: editTarget.part_id || '',
+    operator_user_id: editTarget.operator_user_id || me.id,
+    shots_good: editTarget.shots_good || 0,
+    shots_rejected: editTarget.shots_rejected || 0,
+    reject_reason: editTarget.reject_reason || '',
+    metal_alloy: editTarget.metal_alloy || 'ADC-12',
+    metal_consumed_kg: editTarget.metal_consumed_kg ?? '',
+    notes: editTarget.notes || '',
+    shot_date: (editTarget.recorded_at || new Date().toISOString()).slice(0,10),
+  } : {
     unit_id: units[0]?.id || '',
     shift_id: shifts[0]?.id || '',
     machine_id: machines[0]?.id || '',
@@ -4001,11 +4017,21 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
     notes: '',
     shot_date: new Date().toISOString().slice(0,10),
   });
-  // Structured rejection breakdown: array of { rejection_type_id, label_snapshot, qty }
   const [rejBreakdown, setRejBreakdown] = useState([]);
-  const [attach, setAttach] = useState({ attachments: [], email_ref: '' });
+  const [attach, setAttach] = useState({
+    attachments: editTarget?.attachments || [],
+    email_ref: editTarget?.email_ref || ''
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // Load existing rejection breakdown rows when editing
+  useEffect(() => {
+    if (!editTarget?.id) return;
+    sb.from('mcp_pdc_shot_rejections').select('rejection_type_id, label_snapshot, qty').eq('shot_id', editTarget.id).then(({ data }) => {
+      setRejBreakdown((data || []).map(r => ({ ...r })));
+    });
+  }, [editTarget?.id]);
 
   // Total rejected is the SUM of breakdown rows (rollup is also handled by DB trigger)
   const totalRejected = rejBreakdown.reduce((s, r) => s + (parseInt(r.qty, 10) || 0), 0);
@@ -4052,15 +4078,25 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
         attachments: attach.attachments || [],
         email_ref: attach.email_ref || null,
       };
-      const { data: inserted, error } = await sb.from('mcp_pdc_shots').insert(payload).select('id').single();
-      if (error) throw error;
+      let shotId;
+      if (isEdit) {
+        const { error: uErr } = await sb.from('mcp_pdc_shots').update(payload).eq('id', editTarget.id);
+        if (uErr) throw uErr;
+        shotId = editTarget.id;
+        // Wipe old rejection breakdown rows so we can re-insert clean
+        await sb.from('mcp_pdc_shot_rejections').delete().eq('shot_id', shotId);
+      } else {
+        const { data: inserted, error } = await sb.from('mcp_pdc_shots').insert(payload).select('id').single();
+        if (error) throw error;
+        shotId = inserted.id;
+      }
 
       // Persist the breakdown children
       const breakdownRows = rejBreakdown
         .filter(r => parseInt(r.qty, 10) > 0)
         .map(r => ({
           plant_id: plant.id,
-          shot_id: inserted.id,
+          shot_id: shotId,
           rejection_type_id: r.rejection_type_id || null,
           label_snapshot: r.label_snapshot,
           qty: parseInt(r.qty, 10),
@@ -4070,7 +4106,9 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
         if (rErr) console.warn('shot rejection breakdown insert failed:', rErr);
       }
 
-      const msg = form.part_id ? 'Shot logged · die strokes + BOM stock updated' : 'Shot logged · die strokes updated (no part linked, no BOM consumed)';
+      const msg = isEdit ? '✏ Shot updated · BOM consumption re-applied' :
+                  form.part_id ? 'Shot logged · die strokes + BOM stock updated' :
+                  'Shot logged · die strokes updated (no part linked, no BOM consumed)';
       showToast(msg);
       onSaved();
     } catch (err) {
@@ -4080,11 +4118,24 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
     }
   };
 
+  const deleteShot = async () => {
+    if (!editTarget) return;
+    if (!confirm('Delete this shot entry (' + editTarget.shots_good + ' shots · ' + (editTarget.pieces_good || editTarget.shots_good) + ' pcs)?\n\nLinked BOM consumption rows will also be reversed (stock restored).')) return;
+    setLoading(true); setError('');
+    try {
+      // ON DELETE CASCADE on source_shot_id cleans up linked stock txns
+      const { error } = await sb.from('mcp_pdc_shots').delete().eq('id', editTarget.id);
+      if (error) throw error;
+      showToast('🗑 Shot deleted · stock reconciled');
+      onSaved();
+    } catch (e) { setError(e.message); } finally { setLoading(false); }
+  };
+
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal">
         <div class="modal-header">
-          <div class="modal-title">Log PDC Shot</div>
+          <div class="modal-title">${isEdit ? '✏ Edit PDC Shot' : 'Log PDC Shot'}</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
@@ -4143,7 +4194,15 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, onC
           </div>
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
           <div style="margin:10px 0"><${EntryAttachments} plant=${plant} me=${me} scope="shot" value=${attach} onChange=${setAttach} /></div>
-          <button class="btn" disabled=${loading}>${loading ? 'Logging…' : 'Submit'}</button>
+          ${isEdit ? html`
+            <div style="display:flex;gap:6px">
+              ${isAdmin && html`<button type="button" class="btn ghost" onClick=${deleteShot} disabled=${loading} style="color:var(--rose-600)">🗑 Delete</button>`}
+              <button type="button" class="btn ghost" onClick=${onClose} disabled=${loading} style="flex:1">Cancel</button>
+              <button class="btn" disabled=${loading} style="flex:2">${loading ? 'Saving…' : '✓ Save changes'}</button>
+            </div>
+          ` : html`
+            <button class="btn" disabled=${loading}>${loading ? 'Logging…' : 'Submit'}</button>
+          `}
         </form>
       </div>
     </div>
