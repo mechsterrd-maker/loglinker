@@ -4527,11 +4527,13 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
   };
 
   const loadMessages = async (groupId) => {
-    // Load messages WITHOUT the join to avoid RLS-on-users blocking the read
+    // Load the most recent 100 messages (was loading the OLDEST 100 — when a
+    // busy group like All Hands has >100 messages, the latest ones never
+    // appeared in-thread even though they showed in the list preview).
     const { data: msgs, error: msgErr } = await sb.from('chat_messages')
       .select('*')
       .eq('group_id', groupId)
-      .order('created_at')
+      .order('created_at', { ascending: false })
       .limit(100);
 
     if (msgErr) {
@@ -4539,7 +4541,8 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
       setMessages([]);
       return;
     }
-    const messages = msgs || [];
+    // Reverse so render order is oldest → newest (newest at bottom)
+    const messages = (msgs || []).slice().reverse();
 
     // Manually fetch sender names (only from active users in our plant)
     const senderIds = [...new Set(messages.map(m => m.sender_id).filter(Boolean))];
