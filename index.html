@@ -1114,7 +1114,7 @@ const MORE_GROUPS = [
       { key:'maintenance',   icon:'🔧', label:'Maintenance',          sub:'Breakdowns log, machine status' },
       { key:'petty_cash',    icon:'💰', label:'Petty Cash',           sub:'Expenses · advances · recollection · who owes how much' },
       { key:'jobwork',       icon:'🏭', label:'Sub-Contracting',      sub:'Send / receive parts at job-work vendors · 180-day GST clock' },
-      { key:'supplier_chase',icon:'🛒', label:'Supplier Chase',       sub:'Raw material runway vs upcoming schedule · auto-alerts which vendor to chase' },
+      { key:'supplier_chase',icon:'🛒', label:'Supplier Chase', mfg:true, sub:'Raw material runway vs upcoming schedule · auto-alerts which vendor to chase' },
     ],
   },
   {
@@ -1133,7 +1133,7 @@ const MORE_GROUPS = [
       { key:'pm_schedule',         icon:'🔧', label:'Preventive Maintenance',    sub:'PM execution log + due dates (IATF 8.5.1.5)' },
       { key:'lpa',                 icon:'📋', label:'Layered Process Audits', iatf:true, sub:'L1 / L2 / L3 daily walks (IATF 9.2.2.3)' },
       { key:'mgmt_review',         icon:'🏛', label:'Management Reviews', iatf:true, sub:'MR minutes + action items (IATF 9.3)' },
-      { key:'machine_prod',        icon:'📊', label:'Machine Production · OEE',  sub:'Per-machine runtime · idle · MTBF · MTTR · availability' },
+      { key:'machine_prod',        icon:'📊', label:'Machine Production · OEE', mfg:true, sub:'Per-machine runtime · idle · MTBF · MTTR · availability' },
     ],
   },
   {
@@ -1177,13 +1177,21 @@ const MORE_GROUPS = [
 ];
 const MORE_FLAT_KEYS = MORE_GROUPS.flatMap(g => g.items.map(i => i.key));
 
-// Returns MORE_GROUPS with IATF-only items stripped out when the plant
-// has show_iatf_modules = false. Empty groups are dropped too.
+// Fabrication & site-works plants don't run PDC casting — they get Projects,
+// commercial docs and expenses instead of the manufacturing/casting surface.
+// Legacy plants (business_type = null, e.g. krishnas fittings) are unaffected.
+const isFab = (plant) => plant?.business_type === 'fabrication';
+
+// Returns MORE_GROUPS filtered for the plant's business type:
+//  - IATF compliance items (iatf:true) are stripped when show_iatf_modules = false
+//  - PDC/manufacturing-only items (mfg:true) are stripped for fabrication plants
+// Empty groups are dropped too.
 function visibleMoreGroups(plant) {
   const showIatf = plant?.show_iatf_modules !== false;
-  if (showIatf) return MORE_GROUPS;
+  const fab = isFab(plant);
+  if (showIatf && !fab) return MORE_GROUPS;
   return MORE_GROUPS
-    .map(g => ({ ...g, items: g.items.filter(it => !it.iatf) }))
+    .map(g => ({ ...g, items: g.items.filter(it => (showIatf || !it.iatf) && (!fab || !it.mfg)) }))
     .filter(g => g.items.length > 0);
 }
 
@@ -1221,6 +1229,11 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
     const interval = setInterval(recalcUnread, 5000);
     return () => { sb.removeChannel(channel); clearInterval(interval); };
   }, [plant?.id, recalcUnread]);
+
+  const fab = isFab(plant);
+  // Primary mobile tabs (the rest live behind "More"). Fabrication swaps the
+  // PDC Production tab for Projects.
+  const mobilePrimaryKeys = fab ? ['home','projects','quality','chat'] : ['home','production','quality','chat'];
 
   return html`
     <div class="app">
@@ -1294,10 +1307,12 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
 
       <div class="tabbar">
         <${TabBtn} icon="home" label="Home" active=${tab === 'home'} onClick=${() => setTab('home')} />
-        <${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />
+        ${fab
+          ? html`<${TabBtn} icon="production" label="Projects" active=${tab === 'projects'} onClick=${() => setTab('projects')} />`
+          : html`<${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />`}
         <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
         <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
-        <${TabBtn} icon="more" label="More" active=${['more','masters','maintenance','stocks','actions','people','documents','schedules','reports','movements','trace','iatf','calibration','training','ppap','pfmea','lpa','mgmt_review','csr','scl','iap','pm_schedule','quality_objectives','risk_register','contingency','npd','tpm','rejection_types','iatf_docs','mom','customer_complaints','sales_docs','projects','expenses'].includes(tab)} onClick=${() => setTab('more')} />
+        <${TabBtn} icon="more" label="More" active=${!mobilePrimaryKeys.includes(tab)} onClick=${() => setTab('more')} />
       </div>
 
       ${/* Logi chatbot + Siri voice agent hidden per user request. Components
@@ -1311,19 +1326,32 @@ function TopNavDesktop({ plant, me, initials, tab, setTab, logout, unreadCount, 
   const [moreOpen, setMoreOpen] = useState(false);
   const [navOpenGroups, setNavOpenGroups] = useState({});
   const toggleNavGroup = (key) => setNavOpenGroups(prev => ({ ...prev, [key]: !prev[key] }));
-  // Top-level tabs always visible in desktop nav
-  const tabs = [
-    { key:'home', label:'Home', icon:'home' },
-    { key:'production', label:'Production', icon:'production' },
-    { key:'quality', label:'Quality', icon:'quality' },
-    { key:'maintenance', label:'Maintenance', icon:'maintenance' },
-    { key:'stocks', label:'Stocks', icon:'stocks' },
-    { key:'actions', label:'Tasks', icon:'actions' },
-    { key:'documents', label:'Documents', icon:'documents' },
-    { key:'schedules', label:'Schedules', icon:'schedules' },
-    { key:'reports', label:'Reports', icon:'documents' },
-    { key:'chat', label:'Chat', icon:'chat' },
-  ];
+  // Top-level tabs always visible in desktop nav. Fabrication plants get Projects
+  // in place of the PDC Production/Schedules surface.
+  const tabs = isFab(plant)
+    ? [
+        { key:'home', label:'Home', icon:'home' },
+        { key:'projects', label:'Projects', icon:'production' },
+        { key:'quality', label:'Quality', icon:'quality' },
+        { key:'maintenance', label:'Maintenance', icon:'maintenance' },
+        { key:'stocks', label:'Stocks', icon:'stocks' },
+        { key:'actions', label:'Tasks', icon:'actions' },
+        { key:'documents', label:'Documents', icon:'documents' },
+        { key:'reports', label:'Reports', icon:'documents' },
+        { key:'chat', label:'Chat', icon:'chat' },
+      ]
+    : [
+        { key:'home', label:'Home', icon:'home' },
+        { key:'production', label:'Production', icon:'production' },
+        { key:'quality', label:'Quality', icon:'quality' },
+        { key:'maintenance', label:'Maintenance', icon:'maintenance' },
+        { key:'stocks', label:'Stocks', icon:'stocks' },
+        { key:'actions', label:'Tasks', icon:'actions' },
+        { key:'documents', label:'Documents', icon:'documents' },
+        { key:'schedules', label:'Schedules', icon:'schedules' },
+        { key:'reports', label:'Reports', icon:'documents' },
+        { key:'chat', label:'Chat', icon:'chat' },
+      ];
   // Everything else lives in the More dropdown — IATF modules + secondary routes
   const inMore = MORE_FLAT_KEYS.includes(tab) && !tabs.some(t => t.key === tab);
   const icons = {
@@ -1440,6 +1468,7 @@ function TabBtn({ icon, label, active, onClick, badge }) {
 function Home({ plant, me, setTab, reload }) {
   const [stats, setStats] = useState({ units: 0, users: 1, machines: 0, dies: 0, shotsToday: 0, openActions: 0, openNcrs: 0, openBreakdowns: 0, lowStock: 0 });
   const [loading, setLoading] = useState(true);
+  const fab = isFab(plant);
 
   useEffect(() => { loadStats(); }, []);
 
@@ -1485,9 +1514,13 @@ function Home({ plant, me, setTab, reload }) {
 
     <div class="pulse-card">
       <div class="pulse-label">Plant Pulse · Today</div>
-      <div class="pulse-num">${stats.shotsToday > 0 ? '🟢 Active' : (stats.units > 0 ? '⏸ Idle' : '⚙️ Setup')}</div>
+      <div class="pulse-num">${fab
+        ? (stats.openActions > 0 ? '🟢 Active' : (stats.units > 0 ? '⏸ Idle' : '⚙️ Setup'))
+        : (stats.shotsToday > 0 ? '🟢 Active' : (stats.units > 0 ? '⏸ Idle' : '⚙️ Setup'))}</div>
       <div class="pulse-grid">
-        <div class="pulse-stat"><div class="pulse-stat-num">${stats.shotsToday}</div><div class="pulse-stat-label">Shots Today</div></div>
+        ${fab
+          ? html`<div class="pulse-stat"><div class="pulse-stat-num">${stats.openActions}</div><div class="pulse-stat-label">Open Tasks</div></div>`
+          : html`<div class="pulse-stat"><div class="pulse-stat-num">${stats.shotsToday}</div><div class="pulse-stat-label">Shots Today</div></div>`}
         <div class="pulse-stat"><div class="pulse-stat-num">${stats.machines}</div><div class="pulse-stat-label">Machines</div></div>
         <div class="pulse-stat"><div class="pulse-stat-num">${alerts}</div><div class="pulse-stat-label">Alerts</div></div>
       </div>
@@ -1496,14 +1529,21 @@ function Home({ plant, me, setTab, reload }) {
     <div class="card" style="margin-bottom:14px;padding:12px 14px">
       <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px">⚡ Quick Entry · daily workflow</div>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(78px,1fr));gap:6px">
-        ${[
+        ${(fab ? [
+          { tab:'projects',   emoji:'📐', label:'Project' },
+          { tab:'sales_docs', emoji:'📤', label:'DC / Invoice' },
+          { tab:'documents',  emoji:'📄', label:'Bill / DC' },
+          { tab:'expenses',   emoji:'💸', label:'Expense' },
+          { tab:'stocks',     emoji:'📦', label:'Stocks' },
+          { tab:'actions',    emoji:'✓',  label:'Task' },
+        ] : [
           { tab:'production',  emoji:'📋', label:'Log Shot' },
           { tab:'quality',     emoji:'⚠️', label:'NCR' },
           { tab:'maintenance', emoji:'🔧', label:'Breakdown' },
           { tab:'tpm',         emoji:'🛠', label:'TPM Check' },
           { tab:'stocks',      emoji:'📦', label:'Stocks' },
           { tab:'documents',   emoji:'📄', label:'Bill / DC' },
-        ].map(b => html`
+        ]).map(b => html`
           <button key=${b.tab} onClick=${() => setTab(b.tab)}
             style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:10px 4px;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:8px;cursor:pointer;font-family:inherit;transition:all 0.1s"
             onMouseOver=${e => { e.currentTarget.style.background = 'var(--teal-50)'; e.currentTarget.style.borderColor = 'var(--teal-300)'; }}
@@ -1520,16 +1560,16 @@ function Home({ plant, me, setTab, reload }) {
     <div class="dashboard-grid">
       <div class="dashboard-col-main">
         <${DailyDigest} me=${me} setTab=${setTab} />
-        <${TodaysProductionCard} plant=${plant} setTab=${setTab} />
-        <${ScheduleStatusCard} plant=${plant} setTab=${setTab} />
-        <${StagePendingBanner} plant=${plant} me=${me} setTab=${setTab} />
+        ${!fab && html`<${TodaysProductionCard} plant=${plant} setTab=${setTab} />`}
+        ${!fab && html`<${ScheduleStatusCard} plant=${plant} setTab=${setTab} />`}
+        ${!fab && html`<${StagePendingBanner} plant=${plant} me=${me} setTab=${setTab} />`}
       </div>
 
       <div class="dashboard-col-side">
         <${TopConcernsCard} plant=${plant} setTab=${setTab} />
-        <${SupplierChaseBanner} plant=${plant} setTab=${setTab} />
-        <${MaterialBurnRateCard} plant=${plant} setTab=${setTab} />
-        <${StageLagCard} plant=${plant} me=${me} setTab=${setTab} />
+        ${!fab && html`<${SupplierChaseBanner} plant=${plant} setTab=${setTab} />`}
+        ${!fab && html`<${MaterialBurnRateCard} plant=${plant} setTab=${setTab} />`}
+        ${!fab && html`<${StageLagCard} plant=${plant} me=${me} setTab=${setTab} />`}
         <${StockAlerts} plant=${plant} setTab=${setTab} />
 
         ${alerts > 0 && html`
@@ -1580,7 +1620,9 @@ function Home({ plant, me, setTab, reload }) {
       <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.units}</div><div class="stat-label" style="font-size:10px">Units</div></div>
       <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.users}</div><div class="stat-label" style="font-size:10px">Team</div></div>
       <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.machines}</div><div class="stat-label" style="font-size:10px">Machines</div></div>
-      <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.dies}</div><div class="stat-label" style="font-size:10px">Dies</div></div>
+      ${fab
+        ? html`<div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.openActions}</div><div class="stat-label" style="font-size:10px">Open Tasks</div></div>`
+        : html`<div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.dies}</div><div class="stat-label" style="font-size:10px">Dies</div></div>`}
     </div>
   `;
 }
