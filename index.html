@@ -1128,8 +1128,8 @@ const MORE_GROUPS = [
       { key:'quality_objectives',  icon:'🎯', label:'Quality Objectives', iatf:true, sub:'KPI targets per function (IATF 6.2)' },
       { key:'risk_register',       icon:'⚠️', label:'Risk Register',      iatf:true, sub:'L×I scoring, mitigation owners (IATF 6.1)' },
       { key:'contingency',         icon:'⛑️', label:'Contingency Plans',  iatf:true, sub:'Disruption playbooks + drill log (IATF 6.1.2.3)' },
-      { key:'calibration',         icon:'📏', label:'Calibration Register',      sub:'Instruments + due/overdue log (IATF 7.1.5.2)' },
-      { key:'training',            icon:'🎓', label:'Training Matrix',           sub:'Skills + training records (IATF 7.2)' },
+      { key:'calibration',         icon:'📏', label:'Calibration Register', mfg:true, sub:'Instruments + due/overdue log (IATF 7.1.5.2)' },
+      { key:'training',            icon:'🎓', label:'Training Matrix', mfg:true, sub:'Skills + training records (IATF 7.2)' },
       { key:'pm_schedule',         icon:'🔧', label:'Preventive Maintenance',    sub:'PM execution log + due dates (IATF 8.5.1.5)' },
       { key:'lpa',                 icon:'📋', label:'Layered Process Audits', iatf:true, sub:'L1 / L2 / L3 daily walks (IATF 9.2.2.3)' },
       { key:'mgmt_review',         icon:'🏛', label:'Management Reviews', iatf:true, sub:'MR minutes + action items (IATF 9.3)' },
@@ -24676,6 +24676,7 @@ function AIAuditor({ plant, me }) {
   const [error, setError] = useState('');
   const [confirmType, setConfirmType] = useState(null);  // 'quick' | 'weekly' | 'pre_iatf'
   const [activeRun, setActiveRun] = useState(null);
+  const fab = isFab(plant);
 
   const refresh = async () => {
     const { data } = await sb.from('ai_audit_runs').select('*').order('created_at', { ascending: false }).limit(20);
@@ -24754,7 +24755,7 @@ function AIAuditor({ plant, me }) {
 
     <div class="section-h">RUN AN AUDIT</div>
     <div class="grid-cards" style="margin-bottom:18px">
-      ${Object.entries(AUDIT_TYPES).map(([key, cfg]) => {
+      ${Object.entries(AUDIT_TYPES).filter(([key]) => !(fab && key === 'pre_iatf')).map(([key, cfg]) => {
         const last = lastByType[key];
         return html`
           <div key=${key} class="list-item" style="cursor:pointer" onClick=${() => !running && setConfirmType(key)}>
@@ -25819,12 +25820,15 @@ function Reports({ plant, me, setTab }) {
   const [clauseFilter, setClauseFilter] = useState('all');
   const [freqFilter, setFreqFilter] = useState('all');
   const [activeReport, setActiveReport] = useState(null);
+  const fab = isFab(plant);
+  // Fabrication plants don't need the IATF-specific report batch (id prefixed "iatf_").
+  const visibleCatalog = fab ? REPORT_CATALOG.filter(r => !r.id.startsWith('iatf_')) : REPORT_CATALOG;
 
   // All unique clauses for filter dropdown
-  const allClauses = [...new Set(REPORT_CATALOG.flatMap(r => r.clauses))].sort();
+  const allClauses = [...new Set(visibleCatalog.flatMap(r => r.clauses))].sort();
 
   // Filter logic
-  let filtered = REPORT_CATALOG;
+  let filtered = visibleCatalog;
   if (deptFilter !== 'all') filtered = filtered.filter(r => r.dept === deptFilter);
   if (clauseFilter !== 'all') filtered = filtered.filter(r => r.clauses.includes(clauseFilter));
   if (freqFilter !== 'all') filtered = filtered.filter(r => r.frequency === freqFilter);
@@ -25889,14 +25893,14 @@ function Reports({ plant, me, setTab }) {
   return html`
     <div class="page-header">
       <div>
-        <h1>📑 Reports & IATF Documents</h1>
-        <div class="sub">${builtCount} live · ${totalRecords - builtCount} planned · ${totalRecords} total · ${overallCoverage.toFixed(0)}% coverage</div>
+        <h1>📑 Reports${fab ? '' : ' & IATF Documents'}</h1>
+        <div class="sub">${fab ? `${visibleCatalog.length} reports · generated live from your data` : `${builtCount} live · ${totalRecords - builtCount} planned · ${totalRecords} total · ${overallCoverage.toFixed(0)}% coverage`}</div>
       </div>
     </div>
 
     <div class="auth-tabs" style="margin-bottom:16px">
-      <button class=${'auth-tab' + (view === 'catalog' ? ' active' : '')} onClick=${() => setView('catalog')}>📋 Active Reports (${REPORT_CATALOG.length})</button>
-      <button class=${'auth-tab' + (view === 'coverage' ? ' active' : '')} onClick=${() => setView('coverage')}>🗺️ IATF Coverage Map (${totalRecords})</button>
+      <button class=${'auth-tab' + (view === 'catalog' ? ' active' : '')} onClick=${() => setView('catalog')}>📋 Active Reports (${visibleCatalog.length})</button>
+      ${!fab && html`<button class=${'auth-tab' + (view === 'coverage' ? ' active' : '')} onClick=${() => setView('coverage')}>🗺️ IATF Coverage Map (${totalRecords})</button>`}
       <button class=${'auth-tab' + (view === 'docnums' ? ' active' : '')} onClick=${() => setView('docnums')}>🔖 Document Numbers</button>
       <button class=${'auth-tab' + (view === 'ai_audit' ? ' active' : '')} onClick=${() => setView('ai_audit')}>🤖 AI Auditor</button>
     </div>
@@ -26045,16 +26049,16 @@ function Reports({ plant, me, setTab }) {
     ` : html`
       <!-- =================== ACTIVE CATALOG VIEW (existing) =================== -->
       <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">
-        <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search by name, description, IATF clause…" style="padding:9px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+        <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder=${fab ? 'Search reports by name or department…' : 'Search by name, description, IATF clause…'} style="padding:9px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
         <div style="display:flex;gap:6px;flex-wrap:wrap">
           <select value=${deptFilter} onChange=${e => setDeptFilter(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
             <option value="all">All departments</option>
             ${Object.entries(DEPT_LABELS).map(([k, v]) => html`<option key=${k} value=${k}>${v}</option>`)}
           </select>
-          <select value=${clauseFilter} onChange=${e => setClauseFilter(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
+          ${!fab && html`<select value=${clauseFilter} onChange=${e => setClauseFilter(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
             <option value="all">All IATF clauses</option>
             ${allClauses.map(c => html`<option key=${c} value=${c}>Clause ${c}</option>`)}
-          </select>
+          </select>`}
           <select value=${freqFilter} onChange=${e => setFreqFilter(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
             <option value="all">All frequencies</option>
             ${Object.entries(FREQ_LABELS).map(([k, v]) => html`<option key=${k} value=${k}>${v}</option>`)}
@@ -26063,7 +26067,7 @@ function Reports({ plant, me, setTab }) {
             <button class="btn small ghost" onClick=${() => { setSearch(''); setDeptFilter('all'); setClauseFilter('all'); setFreqFilter('all'); }} style="padding:7px 12px;font-size:12px">Clear</button>
           `}
         </div>
-        <div style="font-size:11px;color:var(--slate-500)">${filtered.length} of ${REPORT_CATALOG.length} active reports</div>
+        <div style="font-size:11px;color:var(--slate-500)">${filtered.length} of ${visibleCatalog.length} active reports</div>
       </div>
 
       ${filtered.length === 0 ? html`<div class="card"><div class="empty"><div style="font-size:13px">No reports match these filters</div></div></div>` :
