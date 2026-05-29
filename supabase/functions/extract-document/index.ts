@@ -1,4 +1,4 @@
-// extract-document/index.ts — v23 (OCR + AI cost metering + arithmetic auto-correction of ×10/×100 Indian-comma misreads)
+// extract-document/index.ts — v24 (cost-tuned: no hi-res retry for arithmetic; terser model notes)
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { Image } from "https://deno.land/x/imagescript@1.2.17/mod.ts";
@@ -8,7 +8,7 @@ const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-sonnet-4-20250514";
-const WORKER_VERSION = "v23";
+const WORKER_VERSION = "v24";
 // Claude Sonnet 4 pricing (USD per token). Update here if the model/pricing changes.
 const PRICE_IN_PER_TOK  = 3 / 1_000_000;
 const PRICE_OUT_PER_TOK = 15 / 1_000_000;
@@ -81,7 +81,11 @@ function deriveHiresUrl(url: string): string {
 function shouldEscalateToHires(parsed: ExtractionPayload): boolean {
   if (parsed.confidence === "low") return true;
   const flags = parsed.flags ?? [];
-  const recoverableFlags = new Set(["doc_number_unreadable","date_unreadable","vendor_name_illegible","low_quality_image","arithmetic_mismatch"]);
+  // arithmetic_mismatch is intentionally NOT a trigger: the server auto-corrects
+  // ×10/×100 Indian-comma scale misreads and flags the rest for human review, so a
+  // second full-resolution pass (which ~doubles the per-image cost) just to re-check
+  // maths is wasteful. Reserve the expensive hi-res retry for genuinely unreadable text.
+  const recoverableFlags = new Set(["doc_number_unreadable","date_unreadable","vendor_name_illegible","low_quality_image"]);
   if (flags.some(f => recoverableFlags.has(f))) return true;
   if (parsed.is_document) {
     let nullCount = 0;
