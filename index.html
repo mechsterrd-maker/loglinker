@@ -1203,7 +1203,13 @@ function visibleMoreGroups(plant) {
   const fab = isFab(plant);
   if (showIatf && !fab) return MORE_GROUPS;
   return MORE_GROUPS
-    .map(g => ({ ...g, items: g.items.filter(it => (showIatf || !it.iatf) && (!fab || !it.mfg)) }))
+    .map(g => ({
+      ...g,
+      // Drop the "& IATF" framing from the Quality group for fabrication plants.
+      title: fab && g.key === 'quality' ? 'Quality' : g.title,
+      sub: fab && g.key === 'quality' ? 'Quality records · complaints · maintenance' : g.sub,
+      items: g.items.filter(it => (showIatf || !it.iatf) && (!fab || !it.mfg)),
+    }))
     .filter(g => g.items.length > 0);
 }
 
@@ -25834,7 +25840,16 @@ function Reports({ plant, me, setTab }) {
   const [activeReport, setActiveReport] = useState(null);
   const fab = isFab(plant);
   // Fabrication plants don't need the IATF-specific report batch (id prefixed "iatf_").
-  const visibleCatalog = fab ? REPORT_CATALOG.filter(r => !r.id.startsWith('iatf_')) : REPORT_CATALOG;
+  // Fabrication plants don't need the IATF-specific report batch (id "iatf_*")
+  // nor the PDC casting / production-schedule reports.
+  const PDC_ONLY_REPORTS = new Set([
+    'daily_production','stage_summary','operator_performance','per_unit_dashboard','shift_segment_log',
+    'tool_life_consumption','tool_change_frequency','tool_demand_forecast','tool_assignment_matrix',
+    'schedule_attainment','otd_report','plan_vs_supply','part_attainment_rollup',
+  ]);
+  const visibleCatalog = fab
+    ? REPORT_CATALOG.filter(r => !r.id.startsWith('iatf_') && !PDC_ONLY_REPORTS.has(r.id))
+    : REPORT_CATALOG;
 
   // All unique clauses for filter dropdown
   const allClauses = [...new Set(visibleCatalog.flatMap(r => r.clauses))].sort();
@@ -26095,7 +26110,7 @@ function Reports({ plant, me, setTab }) {
                       <div style="font-weight:600;color:var(--slate-900);font-size:14px;line-height:1.3">${r.title}</div>
                       <div style="font-size:11px;color:var(--slate-500);margin-top:3px;line-height:1.4">${r.desc}</div>
                       <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">
-                        ${r.clauses.map(c => html`<span style="background:var(--teal-50);color:var(--teal-700);font-size:10px;padding:2px 6px;border-radius:4px;font-weight:600">Clause ${c}</span>`)}
+                        ${!fab && r.clauses.map(c => html`<span style="background:var(--teal-50);color:var(--teal-700);font-size:10px;padding:2px 6px;border-radius:4px;font-weight:600">Clause ${c}</span>`)}
                         <span style="background:var(--slate-100);color:var(--slate-600);font-size:10px;padding:2px 6px;border-radius:4px">${FREQ_LABELS[r.frequency]}</span>
                       </div>
                     </div>
