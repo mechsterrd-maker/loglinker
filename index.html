@@ -721,9 +721,19 @@ function Wizard({ user, pendingInvite, onDone }) {
     address: '', city: 'Chennai', state: 'Tamil Nadu', pincode: '',
     iatf: false,
     business_type: 'manufacturing',
+    plan_code: '',
     your_name: user.email ? user.email.split('@')[0] : '',
     your_phone: ''
   });
+  const [plans, setPlans] = useState([]);
+  useEffect(() => {
+    sb.from('plans').select('*').eq('is_public', true).eq('is_active', true).order('sort_order')
+      .then(({ data }) => {
+        const list = data || [];
+        setPlans(list);
+        if (list[0]) setForm(f => f.plan_code ? f : { ...f, plan_code: list[0].code });
+      });
+  }, []);
   const [joinForm, setJoinForm] = useState({
     code: pendingInvite?.invite_code || '',
     full_name: pendingInvite?.full_name || (user.email ? user.email.split('@')[0] : ''),
@@ -750,6 +760,7 @@ function Wizard({ user, pendingInvite, onDone }) {
         p_phone: '+91' + form.your_phone,
         p_iatf_certified: form.business_type === 'auto_iatf' || form.iatf,
         p_business_type: form.business_type,
+        p_plan_code: form.plan_code || 'pro',
       });
       if (rpcErr) throw rpcErr;
       if (!data?.success) throw new Error(data?.error || 'Could not create plant');
@@ -915,6 +926,28 @@ function Wizard({ user, pendingInvite, onDone }) {
               `)}
             </div>
           </div>
+          ${plans.length > 0 && html`
+            <div class="field" style="margin-top:6px">
+              <label>Your plan *</label>
+              <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">Pick the plan you've signed up for. You can change it later.</div>
+              <div style="display:flex;flex-direction:column;gap:8px">
+                ${plans.map(pl => html`
+                  <div key=${pl.code} onClick=${() => update('plan_code', pl.code)}
+                    style=${'border:2px solid '+(form.plan_code===pl.code?'var(--teal-500)':'var(--slate-200)')+';background:'+(form.plan_code===pl.code?'var(--teal-50)':'white')+';border-radius:10px;padding:11px 13px;cursor:pointer;display:flex;gap:10px;align-items:flex-start'}>
+                    <div style="flex:1;min-width:0">
+                      <div style="display:flex;align-items:baseline;gap:8px">
+                        <div style=${'font-size:14px;font-weight:700;color:'+(form.plan_code===pl.code?'var(--teal-800)':'var(--slate-800)')}>${pl.name}</div>
+                        <div style="font-size:13px;font-weight:700;color:var(--slate-700)">₹${(pl.price_inr||0).toLocaleString('en-IN')}<span style="font-size:11px;font-weight:500;color:var(--slate-500)">/mo</span></div>
+                      </div>
+                      ${pl.blurb && html`<div style="font-size:11px;color:var(--slate-500);margin-top:2px;line-height:1.4">${pl.blurb}</div>`}
+                      <div style="font-size:11px;color:var(--slate-600);margin-top:4px;font-weight:600">${pl.max_ocr_per_month == null ? 'Unlimited' : pl.max_ocr_per_month} bills/mo · ${pl.max_users == null ? 'Unlimited' : pl.max_users} users</div>
+                    </div>
+                    ${form.plan_code===pl.code && html`<span style="color:var(--teal-600);font-size:16px;flex-shrink:0">✓</span>`}
+                  </div>
+                `)}
+              </div>
+            </div>
+          `}
           <button class="btn" style="margin-top:18px" disabled=${loading}>${loading ? 'Creating…' : 'Create plant'}</button>
           <button type="button" class="btn ghost" style="margin-top:8px;width:100%" onClick=${() => setPath('choose')}>← Back</button>
         </form>
