@@ -385,10 +385,22 @@ const VAPID_PUBLIC_KEY = 'BMckC21eZxtDc1NotXRz706Zj9fiPo_P6daPfJny9Ypp4xuJfj4Y4u
 // Service worker registration (PWA + push)
 let swRegistration = null;
 if ('serviceWorker' in navigator) {
+  // When a new service worker takes control, reload once so the fresh app shell loads.
+  let swReloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (swReloaded) return;
+    swReloaded = true;
+    window.location.reload();
+  });
   navigator.serviceWorker.register('/sw.js').then(reg => {
     swRegistration = reg;
+    reg.update().catch(() => {});          // force an immediate update check on load
     console.log('[SW] registered');
   }).catch(err => console.warn('[SW] register failed:', err));
+  // Re-check for a new deploy periodically so long-lived sessions don't go stale.
+  setInterval(() => {
+    navigator.serviceWorker.getRegistration().then(r => r && r.update().catch(() => {}));
+  }, 60000);
 }
 
 // Convert VAPID key (base64url) to Uint8Array
