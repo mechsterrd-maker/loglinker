@@ -1,7 +1,7 @@
 // sw.js — Loglinkr Service Worker
 // Handles: PWA install, offline shell, Web Push notifications, click routing
 
-const CACHE_NAME = 'loglinkr-v9';
+const CACHE_NAME = 'loglinkr-v10';
 const APP_SHELL = ['/', '/index.html'];
 
 // Install: cache app shell
