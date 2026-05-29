@@ -1043,14 +1043,25 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    // Failsafe: never let the splash spinner hang forever. On a flaky mobile
+    // connection getSession()/profile queries can stall and never resolve — in
+    // that case finally{} alone can't fire, so this hard cap clears the spinner
+    // and falls through to the auth/app screen instead of a permanent blank page.
+    const failsafe = setTimeout(() => { if (!cancelled) setLoading(false); }, 12000);
     (async () => {
-      const { data: { session } } = await sb.auth.getSession();
-      if (session) {
-        setUser(session.user);
-        await detectInvite(session.user);
-        await loadProfile(session.user);
+      try {
+        const { data: { session } } = await sb.auth.getSession();
+        if (session) {
+          setUser(session.user);
+          await detectInvite(session.user);
+          await loadProfile(session.user);
+        }
+      } catch (e) {
+        console.warn('[Loglinkr] bootstrap failed:', e);
+      } finally {
+        if (!cancelled) { clearTimeout(failsafe); setLoading(false); }
       }
-      setLoading(false);
     })();
 
     const { data: { subscription } } = sb.auth.onAuthStateChange(async (event, session) => {
@@ -1058,7 +1069,7 @@ function App() {
         setUser(null); setPlant(null); setMe(null); setPendingInvite(null);
       }
     });
-    return () => subscription.unsubscribe();
+    return () => { cancelled = true; clearTimeout(failsafe); subscription.unsubscribe(); };
   }, []);
 
   // Look for any pending invite that matches: URL code OR user's email
@@ -4836,10 +4847,16 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
         const ext = attachment.name.split('.').pop().toLowerCase();
         const ts = Date.now();
         const path = plant.id + '/' + activeGroup.id + '/' + user.id + '-' + ts + '.' + ext;
-        const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, attachment.file, {
-          cacheControl: '3600',
-          upsert: false
-        });
+        // Race the upload against a timeout so a stalled connection can't hang the
+        // send button forever — on timeout this rejects into the catch below, which
+        // resets `uploading` and tells the user to retry.
+        const { error: upErr } = await Promise.race([
+          sb.storage.from('chat-attachments').upload(path, attachment.file, {
+            cacheControl: '3600',
+            upsert: false
+          }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('Upload timed out — check your connection and try again')), 45000)),
+        ]);
         if (upErr) {
           alert('Upload failed: ' + upErr.message);
           setUploading(false);
@@ -4855,10 +4872,19 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
         if (attachment.hiresFile) {
           const origExt = (attachment.hiresFile.name?.split('.').pop().toLowerCase()) || ext;
           const hiresPath = plant.id + '/' + activeGroup.id + '/' + user.id + '-' + ts + '.orig.' + origExt;
-          const { error: hUpErr } = await sb.storage.from('chat-attachments').upload(hiresPath, attachment.hiresFile, {
-            cacheControl: '3600',
-            upsert: false
-          });
+          // Hi-res is a nice-to-have fallback, never worth hanging the send: cap it
+          // with a timeout and treat any failure/timeout as "no hi-res available".
+          let hUpErr = null;
+          try {
+            const res = await Promise.race([
+              sb.storage.from('chat-attachments').upload(hiresPath, attachment.hiresFile, {
+                cacheControl: '3600',
+                upsert: false
+              }),
+              new Promise((_, rej) => setTimeout(() => rej(new Error('hi-res upload timed out')), 45000)),
+            ]);
+            hUpErr = res.error;
+          } catch (e) { hUpErr = e; }
           if (!hUpErr) {
             hiresUrl = sb.storage.from('chat-attachments').getPublicUrl(hiresPath).data.publicUrl;
           } else {
