@@ -1,4 +1,4 @@
-// extract-document/index.ts — v22 (OCR + per-extraction AI cost metering)
+// extract-document/index.ts — v23 (OCR + AI cost metering + arithmetic auto-correction of ×10/×100 Indian-comma misreads)
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { Image } from "https://deno.land/x/imagescript@1.2.17/mod.ts";
@@ -8,7 +8,7 @@ const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-sonnet-4-20250514";
-const WORKER_VERSION = "v22";
+const WORKER_VERSION = "v23";
 // Claude Sonnet 4 pricing (USD per token). Update here if the model/pricing changes.
 const PRICE_IN_PER_TOK  = 3 / 1_000_000;
 const PRICE_OUT_PER_TOK = 15 / 1_000_000;
@@ -286,9 +286,43 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
     }
     const docType = resolveDocType(parsed);
 
-    // Server-side arithmetic sanity check — catches Indian-comma misreads etc.
+    // ── Server-side arithmetic reconciliation ────────────────────────────────
+    // Line items are the most trustworthy signal (qty × rate is self-checking), so
+    // their sum is used to detect AND CORRECT order-of-magnitude header misreads —
+    // the classic Indian-comma "1,10,418.50 → 11,04,185" (10×/100×) failure — rather
+    // than merely flagging them. Corrected numbers are what the user sees; the raw
+    // originals are preserved in the audit trail and debug payload.
     const items = Array.isArray(parsed.items) ? parsed.items : [];
     const itemsSum = items.reduce((s: number, it: { amount?: number | null }) => s + (typeof it?.amount === "number" ? it.amount : 0), 0);
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+    const cleanPow10 = (r: number): number | null => {
+      for (const p of [10, 100, 1000]) { if (r >= p * 0.9 && r <= p * 1.1) return p; }
+      return null;
+    };
+    const inr = (n: number | null | undefined) => typeof n === "number" ? n.toLocaleString("en-IN", { maximumFractionDigits: 2 }) : "—";
+
+    // Auto-correct a clean ×10/×100 inflation of the printed totals. Guards: real
+    // line items present, header clearly larger than their sum, the ratio is a tight
+    // power of 10, and de-scaling lands within 5% of the independent line-item sum.
+    let scaleNote: string | null = null;
+    {
+      const rawTaxable = typeof parsed.taxable_value === "number" ? parsed.taxable_value : null;
+      if (items.length >= 2 && itemsSum > 0 && rawTaxable && rawTaxable > itemsSum * 1.5) {
+        const factor = cleanPow10(rawTaxable / itemsSum);
+        if (factor && Math.abs(rawTaxable / factor - itemsSum) <= itemsSum * 0.05) {
+          const from = { t: parsed.taxable_value ?? null, x: parsed.tax_amount ?? null, g: parsed.total_value ?? null };
+          parsed.taxable_value = round2(rawTaxable / factor);
+          if (typeof parsed.tax_amount === "number") parsed.tax_amount = round2(parsed.tax_amount / factor);
+          if (typeof parsed.total_value === "number") parsed.total_value = round2(parsed.total_value / factor);
+          scaleNote = `AUTO-CORRECTED ₹ scale (÷${factor}, Indian-comma misread vs line-item sum ₹${inr(round2(itemsSum))}): ` +
+            `taxable ₹${inr(from.t)}→₹${inr(parsed.taxable_value)}` +
+            (from.x != null ? `, tax ₹${inr(from.x)}→₹${inr(parsed.tax_amount)}` : "") +
+            (from.g != null ? `, total ₹${inr(from.g)}→₹${inr(parsed.total_value)}` : "") + ".";
+        }
+      }
+    }
+
+    // Re-read the (possibly corrected) header values, then run the validation checks.
     const taxable = typeof parsed.taxable_value === "number" ? parsed.taxable_value : null;
     const tax = typeof parsed.tax_amount === "number" ? parsed.tax_amount : 0;
     const total = typeof parsed.total_value === "number" ? parsed.total_value : null;
@@ -316,19 +350,29 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
     }
     const flagsList: string[] = Array.isArray(parsed.flags) ? [...parsed.flags] : [];
     let validationNote = parsed.validation_note ?? null;
+    const noteParts: string[] = [];
+    if (scaleNote) {
+      if (!flagsList.includes("auto_corrected_scale")) flagsList.push("auto_corrected_scale");
+      if (!flagsList.includes("needs_human_review")) flagsList.push("needs_human_review");
+      if (parsed.confidence === "high") parsed.confidence = "medium";
+      noteParts.push("✔ " + scaleNote + " Auto-corrected — please confirm against the document.");
+    }
     if (issues.length > 0) {
       if (!flagsList.includes("arithmetic_mismatch")) flagsList.push("arithmetic_mismatch");
       if (!flagsList.includes("needs_human_review")) flagsList.push("needs_human_review");
-      const auditTrail = "⚠ SERVER ARITHMETIC CHECK FAILED:\n  • " + issues.join("\n  • ") + "\n→ Values held for human review. Verify each number before approving.";
-      validationNote = validationNote ? auditTrail + "\n\nMODEL NOTE: " + validationNote : auditTrail;
+      noteParts.push("⚠ SERVER ARITHMETIC CHECK FAILED:\n  • " + issues.join("\n  • ") + "\n→ Remaining values held for human review. Verify each number before approving.");
       if (parsed.confidence === "high") parsed.confidence = "low";
+    }
+    if (noteParts.length > 0) {
+      const audit = noteParts.join("\n\n");
+      validationNote = validationNote ? audit + "\n\nMODEL NOTE: " + validationNote : audit;
     }
     let resolvedVendorId: string | null = null;
     if (parsed.vendor_match_id && /^[0-9a-f-]{36}$/i.test(parsed.vendor_match_id)) {
       const { data: v } = await supabase.from("mcp_logistics_vendors").select("id").eq("id", parsed.vendor_match_id).eq("plant_id", row.plant_id).maybeSingle();
       if (v) resolvedVendorId = v.id;
     }
-    const rawExtraction = { ...parsed, flags: flagsList, validation_note: validationNote, _worker_version: WORKER_VERSION, _model: MODEL, _resolved_doc_type: docType, _resolved_vendor_id: resolvedVendorId, _server_arithmetic_issues: issues };
+    const rawExtraction = { ...parsed, flags: flagsList, validation_note: validationNote, _worker_version: WORKER_VERSION, _model: MODEL, _resolved_doc_type: docType, _resolved_vendor_id: resolvedVendorId, _server_arithmetic_issues: issues, _scale_correction: scaleNote };
     stage = "persist";
     const { data: doc, error: docErr } = await supabase.from("mcp_logistics_documents").insert({
       plant_id: row.plant_id, doc_type: docType, doc_number: parsed.doc_number ?? null, doc_date: parsed.doc_date ?? null, due_date: parsed.due_date ?? null,
@@ -348,7 +392,7 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
     await supabase.from("mcp_logistics_extraction_queue").update({
       status: "completed", result_doc_id: doc.id, classification: "document", processed_at: new Date().toISOString(), extraction_ms: Date.now() - startedAt, error_message: null,
       raw_response: keepRawForDebug ? lastRawResponse?.slice(0, 8192) ?? null : null,
-      debug_payload: { worker_version: WORKER_VERSION, model: MODEL, confidence: parsed.confidence ?? null, flags: flagsList, direction: parsed.direction ?? null, resolved_doc_type: docType, vendor_match_id: resolvedVendorId, auto_rotated_deg: totalRotationDeg, auto_rotated_iterations: rotationLog.length, auto_rotated_log: rotationLog, escalated_to_hires: escalated, image_source: escalated ? "hires" : "compressed", image_url_used: attempt.imageUrl, direction_override: directionCheck.overridden, direction_reason: directionCheck.reason, server_seller_is_us: directionCheck.computed_seller_is_us, server_buyer_is_us: directionCheck.computed_buyer_is_us, server_arithmetic_issues: issues },
+      debug_payload: { worker_version: WORKER_VERSION, model: MODEL, confidence: parsed.confidence ?? null, flags: flagsList, direction: parsed.direction ?? null, resolved_doc_type: docType, vendor_match_id: resolvedVendorId, auto_rotated_deg: totalRotationDeg, auto_rotated_iterations: rotationLog.length, auto_rotated_log: rotationLog, escalated_to_hires: escalated, image_source: escalated ? "hires" : "compressed", image_url_used: attempt.imageUrl, direction_override: directionCheck.overridden, direction_reason: directionCheck.reason, server_seller_is_us: directionCheck.computed_seller_is_us, server_buyer_is_us: directionCheck.computed_buyer_is_us, server_arithmetic_issues: issues, scale_correction: scaleNote },
     }).eq("id", row.id);
     return { ok: true, queue_id: row.id, doc_id: doc.id, doc_type: docType, direction: parsed.direction, confidence: parsed.confidence, flags: flagsList, auto_rotated_deg: totalRotationDeg, auto_rotated_log: rotationLog, escalated_to_hires: escalated };
   } catch (err) {
