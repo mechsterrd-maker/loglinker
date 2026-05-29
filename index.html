@@ -1599,6 +1599,7 @@ function Home({ plant, me, setTab, reload }) {
           { tab:'expenses',   emoji:'💸', label:'Expense' },
           { tab:'stocks',     emoji:'📦', label:'Stocks' },
           { tab:'actions',    emoji:'✓',  label:'Task' },
+          { tab:'masters',    emoji:'🗂', label:'Masters' },
         ] : [
           { tab:'production',  emoji:'📋', label:'Log Shot' },
           { tab:'quality',     emoji:'⚠️', label:'NCR' },
@@ -1606,6 +1607,7 @@ function Home({ plant, me, setTab, reload }) {
           { tab:'tpm',         emoji:'🛠', label:'TPM Check' },
           { tab:'stocks',      emoji:'📦', label:'Stocks' },
           { tab:'documents',   emoji:'📄', label:'Bill / DC' },
+          { tab:'masters',     emoji:'🗂', label:'Masters' },
         ]).map(b => html`
           <button key=${b.tab} onClick=${() => setTab(b.tab)}
             style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:10px 4px;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:8px;cursor:pointer;font-family:inherit;transition:all 0.1s"
@@ -1678,14 +1680,17 @@ function Home({ plant, me, setTab, reload }) {
       </div>
     </div>
 
-    <div class="section-h" style="margin-top:24px">Setup snapshot</div>
+    <div class="section-h" style="margin-top:24px;display:flex;justify-content:space-between;align-items:center">
+      <span>Setup snapshot</span>
+      <button class="btn small ghost" onClick=${() => setTab('masters')} style="font-size:11px;padding:4px 10px">🗂 Manage masters →</button>
+    </div>
     <div class="stat-grid stats-4-wide" style="grid-template-columns:repeat(4,1fr);gap:8px">
-      <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.units}</div><div class="stat-label" style="font-size:10px">Units</div></div>
-      <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.users}</div><div class="stat-label" style="font-size:10px">Team</div></div>
-      <div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.machines}</div><div class="stat-label" style="font-size:10px">Machines</div></div>
+      <div class="stat" style="padding:8px;cursor:pointer" onClick=${() => setTab('masters')}><div class="stat-num" style="font-size:16px">${stats.units}</div><div class="stat-label" style="font-size:10px">Units</div></div>
+      <div class="stat" style="padding:8px;cursor:pointer" onClick=${() => setTab('masters')}><div class="stat-num" style="font-size:16px">${stats.users}</div><div class="stat-label" style="font-size:10px">Team</div></div>
+      <div class="stat" style="padding:8px;cursor:pointer" onClick=${() => setTab('masters')}><div class="stat-num" style="font-size:16px">${stats.machines}</div><div class="stat-label" style="font-size:10px">Machines</div></div>
       ${fab
-        ? html`<div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.openActions}</div><div class="stat-label" style="font-size:10px">Open Tasks</div></div>`
-        : html`<div class="stat" style="padding:8px"><div class="stat-num" style="font-size:16px">${stats.dies}</div><div class="stat-label" style="font-size:10px">Dies</div></div>`}
+        ? html`<div class="stat" style="padding:8px;cursor:pointer" onClick=${() => setTab('actions')}><div class="stat-num" style="font-size:16px">${stats.openActions}</div><div class="stat-label" style="font-size:10px">Open Tasks</div></div>`
+        : html`<div class="stat" style="padding:8px;cursor:pointer" onClick=${() => setTab('masters')}><div class="stat-num" style="font-size:16px">${stats.dies}</div><div class="stat-label" style="font-size:10px">Dies</div></div>`}
     </div>
   `;
 }
@@ -5196,6 +5201,16 @@ function MastersHub({ plant, me, setTab }) {
   const [customers, setCustomers] = useState([]);
   const [loading, setLoading] = useState(true);
 
+  // Mobile: show the master tree first, then drill into one master as a full page.
+  const [isMobile, setIsMobile] = useState(typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches);
+  const [mobileOpen, setMobileOpen] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 767px)');
+    const onChange = (e) => setIsMobile(e.matches);
+    mq.addEventListener ? mq.addEventListener('change', onChange) : mq.addListener(onChange);
+    return () => { mq.removeEventListener ? mq.removeEventListener('change', onChange) : mq.removeListener(onChange); };
+  }, []);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     const [un, op, sh, us, pa, ma, di, to, si, rt, ve, cu] = await Promise.all([
@@ -5390,47 +5405,64 @@ function MastersHub({ plant, me, setTab }) {
     }
   };
 
+  // Tree of master groups/leaves. On mobile, tapping a leaf drills into a full page.
+  const treeCard = (fullWidth) => html`
+    <div class="card" style=${(fullWidth ? 'width:100%;' : 'flex:0 0 240px;max-height:80vh;overflow-y:auto;') + 'max-width:100%;padding:8px 6px;box-sizing:border-box'}>
+      ${MASTERS_TREE.map(group => {
+        const open = openGroups[group.key] !== false;
+        const hasActive = !isMobile && group.leaves.some(l => l.key === active);
+        return html`
+          <div key=${group.key} style=${'margin-bottom:'+(open?'6':'2')+'px'}>
+            <div onClick=${() => setOpenGroups(prev => ({...prev, [group.key]: !open}))} style=${'padding:'+(fullWidth?'10':'6')+'px 10px;cursor:pointer;display:flex;align-items:center;gap:6px;font-size:'+(fullWidth?'14':'12')+'px;font-weight:700;color:'+(hasActive?'var(--teal-700)':'var(--slate-700)')+';border-radius:5px;background:'+(hasActive?'var(--teal-50)':'transparent')}>
+              <span style="font-size:15px">${group.icon}</span>
+              <span style="flex:1">${group.label}</span>
+              <span style="font-size:10px;color:var(--slate-400)">${open?'▾':'▸'}</span>
+            </div>
+            ${open && html`<div style="margin-left:8px">
+              ${group.leaves.map(leaf => {
+                const isActive = !isMobile && leaf.key === active;
+                return html`
+                  <div key=${leaf.key} onClick=${() => { setActive(leaf.key); setMobileOpen(true); }} style=${'padding:'+(fullWidth?'11':'5')+'px 10px '+(fullWidth?'11':'5')+'px 16px;cursor:pointer;font-size:'+(fullWidth?'14':'12')+'px;display:flex;align-items:center;gap:8px;border-left:2px solid '+(isActive?'var(--teal-600)':'transparent')+';background:'+(isActive?'var(--teal-50)':'transparent')+';color:'+(isActive?'var(--teal-800)':'var(--slate-700)')+';font-weight:'+(isActive?'600':'400')}>
+                    <span>${leaf.icon}</span>
+                    <span style="flex:1">${leaf.label}</span>
+                    <span style=${'font-size:10px;color:var(--slate-500);background:'+(isActive?'white':'var(--slate-100)')+';padding:1px 6px;border-radius:999px;font-weight:600'}>${counts[leaf.key] ?? 0}</span>
+                    ${isMobile && html`<span style="color:var(--slate-300);font-size:16px">›</span>`}
+                  </div>
+                `;
+              })}
+            </div>`}
+          </div>
+        `;
+      })}
+    </div>
+  `;
+
+  const searchBar = html`
+    <div style="margin-bottom:10px">
+      <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search this master…" style="width:100%;padding:8px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+    </div>
+  `;
+
   return html`
     <div class="page-header"><div><h1>🗂 Masters</h1><div class="sub">All master data · grouped tree · single source of truth</div></div></div>
 
-    <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start">
-      <!-- TREE -->
-      <div class="card" style="flex:0 0 240px;max-width:100%;padding:8px 6px;max-height:80vh;overflow-y:auto;box-sizing:border-box">
-        ${MASTERS_TREE.map(group => {
-          const open = openGroups[group.key] !== false;
-          const hasActive = group.leaves.some(l => l.key === active);
-          return html`
-            <div key=${group.key} style=${'margin-bottom:'+(open?'6':'2')+'px'}>
-              <div onClick=${() => setOpenGroups(prev => ({...prev, [group.key]: !open}))} style=${'padding:6px 10px;cursor:pointer;display:flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:'+(hasActive?'var(--teal-700)':'var(--slate-700)')+';border-radius:5px;background:'+(hasActive?'var(--teal-50)':'transparent')}>
-                <span style="font-size:14px">${group.icon}</span>
-                <span style="flex:1">${group.label}</span>
-                <span style="font-size:10px;color:var(--slate-400)">${open?'▾':'▸'}</span>
-              </div>
-              ${open && html`<div style="margin-left:8px">
-                ${group.leaves.map(leaf => {
-                  const isActive = leaf.key === active;
-                  return html`
-                    <div key=${leaf.key} onClick=${() => setActive(leaf.key)} style=${'padding:5px 10px 5px 16px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:6px;border-left:2px solid '+(isActive?'var(--teal-600)':'transparent')+';background:'+(isActive?'var(--teal-50)':'transparent')+';color:'+(isActive?'var(--teal-800)':'var(--slate-700)')+';font-weight:'+(isActive?'600':'400')}>
-                      <span>${leaf.icon}</span>
-                      <span style="flex:1">${leaf.label}</span>
-                      <span style="font-size:10px;color:var(--slate-500);background:'+'${isActive?'white':'var(--slate-100)'};padding:1px 6px;border-radius:999px;font-weight:600">${counts[leaf.key] ?? 0}</span>
-                    </div>
-                  `;
-                })}
-              </div>`}
-            </div>
-          `;
-        })}
-      </div>
-
-      <!-- ACTIVE LIST -->
-      <div style="flex:1;min-width:280px">
-        <div style="margin-bottom:10px">
-          <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search this master…" style="width:100%;padding:8px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+    ${isMobile
+      ? (mobileOpen
+          ? html`
+            <button class="btn small ghost" onClick=${() => setMobileOpen(false)} style="margin-bottom:12px">← Back to Masters</button>
+            ${searchBar}
+            ${renderActive()}
+          `
+          : treeCard(true))
+      : html`
+        <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start">
+          ${treeCard(false)}
+          <div style="flex:1;min-width:280px">
+            ${searchBar}
+            ${renderActive()}
+          </div>
         </div>
-        ${renderActive()}
-      </div>
-    </div>
+      `}
 
     ${modal === 'unit'       && html`<${UnitModal} plant=${plant} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'operator'   && html`<${OperatorModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
