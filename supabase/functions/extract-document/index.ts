@@ -211,8 +211,21 @@ async function hiresAvailable(hiresUrl: string): Promise<boolean> {
   try { const r = await fetch(hiresUrl, { method: "HEAD" }); return r.ok; } catch { return false; }
 }
 
-async function processQueueRow(supabase: ReturnType<typeof createClient>, row: QueueRow, forceHires = false) {
+async function processQueueRow(supabase: ReturnType<typeof createClient>, row: QueueRow, forceHires = false, countTowardCap = true) {
   const startedAt = Date.now();
+  // Plan cap gate — skip the expensive vision call when the plant is over its monthly OCR limit.
+  if (countTowardCap) {
+    const { data: usage } = await supabase.rpc("ocr_usage_state", { p_plant_id: row.plant_id });
+    if (usage && usage.cap !== null && usage.cap !== undefined && usage.used >= usage.cap) {
+      await supabase.from("mcp_logistics_extraction_queue").update({
+        status: "skipped",
+        error_message: `monthly_ocr_limit_reached: ${usage.used}/${usage.cap} for ${usage.period}`,
+        processed_at: new Date().toISOString(),
+        debug_payload: { worker_version: WORKER_VERSION, blocked: "ocr_monthly_cap", cap: usage.cap, used: usage.used, period: usage.period },
+      }).eq("id", row.id);
+      return { ok: false, queue_id: row.id, blocked: "ocr_monthly_cap", cap: usage.cap, used: usage.used, period: usage.period };
+    }
+  }
   const newAttempts = row.attempts + 1;
   await supabase.from("mcp_logistics_extraction_queue").update({ status: "processing", attempts: newAttempts, last_attempted_at: new Date().toISOString() }).eq("id", row.id);
   let stage = "init";
@@ -306,6 +319,10 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
       extracted_by_ai: true, extraction_status: "completed", status: "pending",
     }).select("id").single();
     if (docErr) throw docErr;
+    // Count this bill toward the plant's monthly OCR allowance (new uploads only, not re-extracts).
+    if (countTowardCap) {
+      try { await supabase.rpc("increment_ocr_usage", { p_plant_id: row.plant_id }); } catch (_e) { /* metering must never block a successful extract */ }
+    }
     const keepRawForDebug = parsed.confidence !== "high" || (parsed.flags && parsed.flags.length > 0);
     await supabase.from("mcp_logistics_extraction_queue").update({
       status: "completed", result_doc_id: doc.id, classification: "document", processed_at: new Date().toISOString(), extraction_ms: Date.now() - startedAt, error_message: null,
@@ -331,6 +348,8 @@ Deno.serve(async (req: Request) => {
     let body: { queue_id?: string; batch_size?: number; reextract_doc_id?: string; force_hires?: boolean } = {};
     try { body = await req.json(); } catch {}
     const forceHires = body.force_hires === true;
+    // Re-extracts (corrections of an existing bill) do not consume the monthly OCR allowance.
+    const countTowardCap = !body.reextract_doc_id;
     let rows: QueueRow[];
     if (body.reextract_doc_id) {
       const { data: srcDoc, error: srcErr } = await supabase.from("mcp_logistics_documents").select("id, plant_id, source_message_id, source_image_url").eq("id", body.reextract_doc_id).maybeSingle();
@@ -351,7 +370,7 @@ Deno.serve(async (req: Request) => {
       rows = (data ?? []) as QueueRow[];
     }
     const results = [];
-    for (const row of rows) results.push(await processQueueRow(supabase, row, forceHires));
+    for (const row of rows) results.push(await processQueueRow(supabase, row, forceHires, countTowardCap));
     const success = results.length > 0 && results.every(r => r.ok);
     return new Response(JSON.stringify({ success, processed: results.length, results, worker_version: WORKER_VERSION }, null, 2), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
   } catch (err) {

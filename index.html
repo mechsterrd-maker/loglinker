@@ -5457,6 +5457,19 @@ function People({ plant, me }) {
     `}
 
     ${view === 'users' && html`
+      ${plant.max_users != null && (() => {
+        const seatsUsed = users.filter(u => u.status === 'active' && (u.login_enabled === null || u.login_enabled === undefined || u.login_enabled === true)).length + invites.length;
+        const atCap = seatsUsed >= plant.max_users;
+        return html`<div style=${'display:flex;align-items:center;gap:12px;border-radius:10px;padding:10px 12px;margin-bottom:12px;border:1px solid ' + (atCap ? 'var(--rose-200);background:var(--rose-50)' : 'var(--slate-200);background:var(--slate-50)')}>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:12px;font-weight:600;color:var(--slate-700)">👤 User seats · ${seatsUsed} / ${plant.max_users}<span style="font-weight:400;color:var(--slate-500)"> (login users + pending invites)</span></div>
+            <div style="height:6px;background:var(--slate-200);border-radius:3px;margin-top:6px;overflow:hidden">
+              <div style=${'height:100%;border-radius:3px;width:' + Math.min(100, Math.round(seatsUsed / plant.max_users * 100)) + '%;background:' + (atCap ? 'var(--rose-500)' : seatsUsed / plant.max_users >= 0.85 ? 'var(--amber-500)' : 'var(--teal-500)')}></div>
+            </div>
+          </div>
+          ${atCap ? html`<span style="font-size:11px;color:var(--rose-700);font-weight:600;white-space:nowrap">Seat limit reached</span>` : html`<span style="font-size:11px;color:var(--slate-500);white-space:nowrap">${plant.max_users - seatsUsed} left</span>`}
+        </div>`;
+      })()}
       ${invites.length > 0 && html`
         <div class="section-h">Pending Invites · ${invites.length}</div>
         ${invites.map(i => html`
@@ -5843,6 +5856,19 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
     e.preventDefault();
     setError(''); setLoading(true);
     try {
+      // Plan seat cap — block over-issuing invites past the plant's user limit (login users + pending invites).
+      if (plant.max_users != null) {
+        const [seatsRes, pendingRes] = await Promise.all([
+          sb.from('users').select('id', { count:'exact', head:true }).eq('plant_id', plant.id).eq('status','active').or('login_enabled.is.null,login_enabled.eq.true'),
+          sb.from('user_invites').select('id', { count:'exact', head:true }).eq('plant_id', plant.id).eq('status','pending'),
+        ]);
+        const used = (seatsRes.count || 0) + (pendingRes.count || 0);
+        if (used >= plant.max_users) {
+          setError(`User limit reached (${plant.max_users} seats, including pending invites). Upgrade the plan to add more users.`);
+          setLoading(false);
+          return;
+        }
+      }
       const code = generateInviteCode();
       const { data, error } = await sb.from('user_invites').insert({
         plant_id: plant.id,
@@ -18573,10 +18599,11 @@ function Documents({ plant, me }) {
   const [activeDoc, setActiveDoc] = useState(null);
   const [activeVendor, setActiveVendor] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [ocrUsage, setOcrUsage] = useState(null); // { cap, used, period } — null cap = unlimited
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [d, v, jw, r, iu] = await Promise.all([
+    const [d, v, jw, r, iu, o] = await Promise.all([
       sb.from('mcp_logistics_documents')
         .select('*, mcp_logistics_vendors(name, gstin, payment_terms_days)')
         .order('doc_date', { ascending: false, nullsFirst: false })
@@ -18585,12 +18612,14 @@ function Documents({ plant, me }) {
       sb.from('v_vendor_jobwork_stock').select('*').eq('plant_id', plant.id).order('vendor_name'),
       sb.from('v_returnables_open').select('*').eq('plant_id', plant.id).limit(500),
       sb.from('interunit_transfers').select('*, from_unit:from_unit_id(name), to_unit:to_unit_id(name), out_doc:out_doc_id(doc_number, doc_date), in_doc:in_doc_id(doc_number, doc_date)').eq('plant_id', plant.id).order('created_at', { ascending: false }).limit(200),
+      sb.rpc('ocr_usage_state', { p_plant_id: plant.id }),
     ]);
     setDocs(d.data || []);
     setVendors(v.data || []);
     setJobworkStock(jw.data || []);
     setReturnables(r.data || []);
     setInterunits(iu.data || []);
+    setOcrUsage(o.data || null);
     setLoading(false);
   }, []);
 
@@ -18646,6 +18675,20 @@ function Documents({ plant, me }) {
 
   return html`
     <div class="page-header"><div><h1>Documents</h1><div class="sub">Bills, DCs, payments · auto-extracted from chat</div></div></div>
+
+    ${ocrUsage && ocrUsage.cap != null && html`
+      <div style=${'display:flex;align-items:center;gap:12px;border-radius:10px;padding:10px 12px;margin-bottom:12px;border:1px solid ' + (ocrUsage.used >= ocrUsage.cap ? 'var(--rose-200);background:var(--rose-50)' : 'var(--slate-200);background:var(--slate-50)')}>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;font-weight:600;color:var(--slate-700)">📄 OCR bills this month · ${ocrUsage.used} / ${ocrUsage.cap}</div>
+          <div style="height:6px;background:var(--slate-200);border-radius:3px;margin-top:6px;overflow:hidden">
+            <div style=${'height:100%;border-radius:3px;width:' + Math.min(100, Math.round(ocrUsage.used / ocrUsage.cap * 100)) + '%;background:' + (ocrUsage.used >= ocrUsage.cap ? 'var(--rose-500)' : ocrUsage.used / ocrUsage.cap >= 0.85 ? 'var(--amber-500)' : 'var(--teal-500)')}></div>
+          </div>
+        </div>
+        ${ocrUsage.used >= ocrUsage.cap
+          ? html`<span style="font-size:11px;color:var(--rose-700);font-weight:600;text-align:right">Monthly limit reached — new bills won't auto-extract until ${ocrUsage.period === new Date().toISOString().slice(0,7) ? 'next month' : 'the cap resets'}</span>`
+          : html`<span style="font-size:11px;color:var(--slate-500);white-space:nowrap">${ocrUsage.cap - ocrUsage.used} left</span>`}
+      </div>
+    `}
 
     <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
       <button class=${'auth-tab' + (view === 'dashboard' ? ' active' : '')} onClick=${() => setView('dashboard')}>Documents</button>
@@ -25847,6 +25890,7 @@ function Reports({ plant, me, setTab }) {
     'daily_production','stage_summary','operator_performance','per_unit_dashboard','shift_segment_log',
     'tool_life_consumption','tool_change_frequency','tool_demand_forecast','tool_assignment_matrix',
     'schedule_attainment','otd_report','plan_vs_supply','part_attainment_rollup',
+    'ai_audit_history',
   ]);
   const visibleCatalog = fab
     ? REPORT_CATALOG.filter(r => !r.id.startsWith('iatf_') && !PDC_ONLY_REPORTS.has(r.id))
@@ -25930,7 +25974,7 @@ function Reports({ plant, me, setTab }) {
       <button class=${'auth-tab' + (view === 'catalog' ? ' active' : '')} onClick=${() => setView('catalog')}>📋 Active Reports (${visibleCatalog.length})</button>
       ${!fab && html`<button class=${'auth-tab' + (view === 'coverage' ? ' active' : '')} onClick=${() => setView('coverage')}>🗺️ IATF Coverage Map (${totalRecords})</button>`}
       <button class=${'auth-tab' + (view === 'docnums' ? ' active' : '')} onClick=${() => setView('docnums')}>🔖 Document Numbers</button>
-      <button class=${'auth-tab' + (view === 'ai_audit' ? ' active' : '')} onClick=${() => setView('ai_audit')}>🤖 AI Auditor</button>
+      ${!fab && html`<button class=${'auth-tab' + (view === 'ai_audit' ? ' active' : '')} onClick=${() => setView('ai_audit')}>🤖 AI Auditor</button>`}
     </div>
 
     ${view === 'coverage' ? html`
