@@ -104,6 +104,15 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 const inr = (n) => '₹' + (Number(n) || 0).toLocaleString('en-IN');
 const num = (n) => (Number(n) || 0).toLocaleString('en-IN');
+const USD_INR = 86; // approx FX, only for showing AI cost (billed in USD) in ₹ terms
+const usd = (n) => '$' + (Number(n) || 0).toFixed(2);
+const usdInr = (n) => '≈₹' + Math.round((Number(n) || 0) * USD_INR).toLocaleString('en-IN');
+const SUB = {
+  active:    { label: 'Active',    bg: 'var(--emerald-50)', fg: 'var(--emerald-700)', bd: 'var(--emerald-500)' },
+  trialing:  { label: 'Trial',     bg: 'var(--teal-50)',    fg: 'var(--teal-800)',    bd: 'var(--teal-500)' },
+  past_due:  { label: 'Past due',  bg: 'var(--amber-50)',   fg: 'var(--amber-700)',   bd: 'var(--amber-500)' },
+  cancelled: { label: 'Cancelled', bg: 'var(--rose-50)',    fg: 'var(--rose-700)',    bd: 'var(--rose-500)' },
+};
 const fmtDate = (s) => s ? new Date(s).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '—';
 const ago = (s) => {
   if (!s) return 'never';
@@ -165,6 +174,8 @@ function OrgDrawer({ org, plans, onClose, onChanged }) {
   const [plan, setPlan] = useState(org.plan_code || 'pro');
   const [ocrCap, setOcrCap] = useState(org.max_ocr_per_month == null ? '' : String(org.max_ocr_per_month));
   const [userCap, setUserCap] = useState(org.max_users == null ? '' : String(org.max_users));
+  const [subStatus, setSubStatus] = useState(org.subscription_status || 'active');
+  const [paidUntil, setPaidUntil] = useState(org.paid_until || '');
   const [busy, setBusy] = useState('');
   const [err, setErr] = useState('');
 
@@ -186,6 +197,7 @@ function OrgDrawer({ org, plans, onClose, onChanged }) {
     p_max_ocr: ocrCap === '' ? null : parseInt(ocrCap, 10),
     p_max_users: userCap === '' ? null : parseInt(userCap, 10),
   }));
+  const saveSub = () => run('sub', () => sb.rpc('admin_set_subscription', { p_plant_id: org.id, p_status: subStatus, p_paid_until: paidUntil || null }));
   const toggleSuspend = async () => {
     const next = !org.suspended;
     let reason = null;
@@ -207,6 +219,17 @@ function OrgDrawer({ org, plans, onClose, onChanged }) {
           <${Meter} label="User seats" used=${org.users_used} cap=${org.max_users} />
         </div>
 
+        <div class="section">
+          <div class="section-h">AI consumption cost</div>
+          ${!detail ? html`<div class="hint">Loading…</div>` : html`
+            <div style="display:flex;gap:18px;flex-wrap:wrap">
+              <div><div style="font-size:20px;font-weight:700">${usd(detail.ai.cost_month_usd)}</div><div class="hint">this month · ${usdInr(detail.ai.cost_month_usd)}</div></div>
+              <div><div style="font-size:20px;font-weight:700">${usd(detail.ai.cost_total_usd)}</div><div class="hint">lifetime · ${usdInr(detail.ai.cost_total_usd)}</div></div>
+              <div><div style="font-size:20px;font-weight:700">${num(detail.ai.calls_month)}</div><div class="hint">extractions this month</div></div>
+            </div>
+            ${org.price_inr ? html`<div class="hint" style="margin-top:8px">Plan ${inr(org.price_inr)}/mo vs AI ${usdInr(detail.ai.cost_month_usd)} so far this month.</div>` : ''}`}
+        </div>
+
         ${err && html`<div class="alert err" style="margin-top:14px">${err}</div>`}
 
         <div class="section">
@@ -220,6 +243,24 @@ function OrgDrawer({ org, plans, onClose, onChanged }) {
             <button class="btn" disabled=${busy === 'plan' || plan === org.plan_code} onClick=${savePlan}>${busy === 'plan' ? '…' : 'Apply'}</button>
           </div>
           <div class="hint">Applying a plan resets caps to that plan's limits.</div>
+        </div>
+
+        <div class="section">
+          <div class="section-h">Subscription status</div>
+          <div class="row2">
+            <div class="field" style="margin:0">
+              <label>Status</label>
+              <select value=${subStatus} onChange=${e => setSubStatus(e.target.value)}>
+                <option value="active">Active (paid)</option>
+                <option value="trialing">Trial</option>
+                <option value="past_due">Past due</option>
+                <option value="cancelled">Cancelled</option>
+              </select>
+            </div>
+            <div class="field" style="margin:0"><label>Paid until (optional)</label><input type="date" value=${paidUntil || ''} onInput=${e => setPaidUntil(e.target.value)} /></div>
+          </div>
+          <button class="btn sm" style="margin-top:9px" disabled=${busy === 'sub' || (subStatus === (org.subscription_status || 'active') && (paidUntil || '') === (org.paid_until || ''))} onClick=${saveSub}>${busy === 'sub' ? 'Saving…' : 'Save status'}</button>
+          <div class="hint">Manual for now. When you add Razorpay, payments will set this automatically.</div>
         </div>
 
         <div class="section">
@@ -286,6 +327,7 @@ function Console({ me }) {
       paying: list.filter(o => (o.price_inr || 0) > 0 && !o.suspended).length,
       mrr: list.filter(o => !o.suspended).reduce((s, o) => s + (o.price_inr || 0), 0),
       ocr: list.reduce((s, o) => s + (o.ocr_used || 0), 0),
+      aiUsd: list.reduce((s, o) => s + (Number(o.ai_cost_usd) || 0), 0),
       users: list.reduce((s, o) => s + (o.users_used || 0), 0),
       suspended: list.filter(o => o.suspended).length,
     };
@@ -313,6 +355,7 @@ function Console({ me }) {
           <div class="stat"><div class="n">${stats.total}</div><div class="l">Companies</div></div>
           <div class="stat"><div class="n">${stats.paying}</div><div class="l">Paying</div></div>
           <div class="stat"><div class="n">${inr(stats.mrr)}</div><div class="l">MRR</div></div>
+          <div class="stat"><div class="n">${usd(stats.aiUsd)}</div><div class="l">AI cost · this month</div></div>
           <div class="stat"><div class="n">${num(stats.ocr)}</div><div class="l">OCR this month</div></div>
           <div class="stat"><div class="n">${num(stats.users)}</div><div class="l">Active users</div></div>
           <div class="stat"><div class="n" style=${stats.suspended ? 'color:var(--rose-600)' : ''}>${stats.suspended}</div><div class="l">Suspended</div></div>
@@ -332,6 +375,7 @@ function Console({ me }) {
             <div class="org-top">
               <span class="org-name">${o.name}</span>
               <span class=${'badge ' + (o.plan_code || 'unlimited')}>${o.plan_code || 'none'}</span>
+              ${(() => { const s = SUB[o.subscription_status] || SUB.active; return html`<span class="badge" style=${'background:' + s.bg + ';color:' + s.fg}>${s.label}</span>`; })()}
               ${isCustom(o) && html`<span class="badge custom">custom</span>`}
               ${o.suspended && html`<span class="badge susp">Suspended</span>`}
               <div class="spacer" style="flex:1"></div>
@@ -343,6 +387,7 @@ function Console({ me }) {
             </div>
             <div class="org-sub">
               <span>${BIZ[o.business_type] || o.business_type || 'Unspecified'}</span>
+              <span>AI ${usd(o.ai_cost_usd)}/mo</span>
               <span>${num(o.doc_count)} docs</span>
               <span>last bill ${ago(o.last_doc_at)}</span>
               <span>joined ${fmtDate(o.created_at)}</span>
