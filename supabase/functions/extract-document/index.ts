@@ -1,4 +1,4 @@
-// extract-document/index.ts — v21 (hardened OCR with Indian-comma + server arithmetic check)
+// extract-document/index.ts — v22 (OCR + per-extraction AI cost metering)
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { Image } from "https://deno.land/x/imagescript@1.2.17/mod.ts";
@@ -8,7 +8,10 @@ const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-sonnet-4-20250514";
-const WORKER_VERSION = "v21";
+const WORKER_VERSION = "v22";
+// Claude Sonnet 4 pricing (USD per token). Update here if the model/pricing changes.
+const PRICE_IN_PER_TOK  = 3 / 1_000_000;
+const PRICE_OUT_PER_TOK = 15 / 1_000_000;
 const VENDOR_CONTEXT_LIMIT = 60;
 const ITEM_CONTEXT_LIMIT   = 80;
 
@@ -33,7 +36,7 @@ const DIRECTION_TO_DOC_TYPE: Record<string,string> = { "in":"dc_in","out":"dc_ou
 
 const ROTATION_PROMPT = `A document was photographed and may be rotated. To make text read upright, how many degrees CLOCKWISE should the photo be rotated? Answer with EXACTLY one number from: 0, 90, 180, 270. No words, no punctuation.`;
 
-async function detectRotationDeg(imgB64: string, mediaType: string): Promise<number> {
+async function detectRotationDeg(imgB64: string, mediaType: string): Promise<{ deg: number; inTok: number; outTok: number }> {
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -43,13 +46,13 @@ async function detectRotationDeg(imgB64: string, mediaType: string): Promise<num
         { type: "text", text: ROTATION_PROMPT },
       ] }] }),
     });
-    if (!res.ok) return 0;
+    if (!res.ok) return { deg: 0, inTok: 0, outTok: 0 };
     const data = await res.json();
     const text = (data.content?.filter((b: { type: string }) => b.type === "text")?.map((b: { text: string }) => b.text)?.join("") ?? "").trim();
     const m = text.match(/\b(0|90|180|270)\b/);
     const deg = m ? parseInt(m[1], 10) : 0;
-    return [0,90,180,270].includes(deg) ? deg : 0;
-  } catch { return 0; }
+    return { deg: [0,90,180,270].includes(deg) ? deg : 0, inTok: data.usage?.input_tokens ?? 0, outTok: data.usage?.output_tokens ?? 0 };
+  } catch { return { deg: 0, inTok: 0, outTok: 0 }; }
 }
 
 async function rotateImageBytes(bytes: Uint8Array, deg: number): Promise<{ bytes: Uint8Array; mediaType: string } | null> {
@@ -171,7 +174,7 @@ async function fetchPlantContext(supabase: ReturnType<typeof createClient>, plan
   return { plantName: plant?.name ?? "(unknown)", plantLegalName: plant?.legal_name ?? null, plantGstin: plant?.gstin ?? null, units: units ?? [], vendors: vendors ?? [], stockItems: items ?? [] };
 }
 
-interface AttemptResult { parsed: ExtractionPayload; rawResponse: string; rotationLog: number[]; totalRotationDeg: number; imageUrl: string; bytesLen: number; }
+interface AttemptResult { parsed: ExtractionPayload; rawResponse: string; rotationLog: number[]; totalRotationDeg: number; imageUrl: string; bytesLen: number; inTok: number; outTok: number; }
 
 async function attemptExtraction(url: string, prompt: string): Promise<AttemptResult> {
   const imgRes = await fetch(url);
@@ -183,11 +186,13 @@ async function attemptExtraction(url: string, prompt: string): Promise<AttemptRe
   if (mediaType.includes(";")) mediaType = mediaType.split(";")[0].trim();
   if (!["image/jpeg","image/png","image/webp","image/gif"].includes(mediaType)) mediaType = "image/jpeg";
   const rotationLog: number[] = [];
+  let rotIn = 0, rotOut = 0;
   {
-    const deg = await detectRotationDeg(imgB64, mediaType);
-    if (deg !== 0) {
-      const rotated = await rotateImageBytes(bytes, deg);
-      if (rotated) { bytes = rotated.bytes; mediaType = rotated.mediaType; imgB64 = bytesToBase64(bytes); rotationLog.push(deg); }
+    const rot = await detectRotationDeg(imgB64, mediaType);
+    rotIn = rot.inTok; rotOut = rot.outTok;
+    if (rot.deg !== 0) {
+      const rotated = await rotateImageBytes(bytes, rot.deg);
+      if (rotated) { bytes = rotated.bytes; mediaType = rotated.mediaType; imgB64 = bytesToBase64(bytes); rotationLog.push(rot.deg); }
     }
   }
   const totalRotationDeg = rotationLog.reduce((s, d) => s + d, 0) % 360;
@@ -204,7 +209,8 @@ async function attemptExtraction(url: string, prompt: string): Promise<AttemptRe
   const rawResponse = visionData.content?.filter((b: { type: string }) => b.type === "text")?.map((b: { text: string }) => b.text)?.join("\n") ?? "";
   const parsed = safeJsonParse(rawResponse) as ExtractionPayload;
   if (typeof parsed.is_document !== "boolean") throw new Error("Missing is_document boolean in extraction");
-  return { parsed, rawResponse, rotationLog, totalRotationDeg, imageUrl: url, bytesLen: bytes.length };
+  return { parsed, rawResponse, rotationLog, totalRotationDeg, imageUrl: url, bytesLen: bytes.length,
+           inTok: rotIn + (visionData.usage?.input_tokens ?? 0), outTok: rotOut + (visionData.usage?.output_tokens ?? 0) };
 }
 
 async function hiresAvailable(hiresUrl: string): Promise<boolean> {
@@ -213,6 +219,17 @@ async function hiresAvailable(hiresUrl: string): Promise<boolean> {
 
 async function processQueueRow(supabase: ReturnType<typeof createClient>, row: QueueRow, forceHires = false, countTowardCap = true) {
   const startedAt = Date.now();
+  // AI cost metering — accumulate tokens across rotation + vision + hi-res, logged on every exit.
+  let aiIn = 0, aiOut = 0;
+  const periodIst = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 7);
+  const logAi = async (docId: string | null) => {
+    if (aiIn === 0 && aiOut === 0) return;
+    const cost = aiIn * PRICE_IN_PER_TOK + aiOut * PRICE_OUT_PER_TOK;
+    try {
+      await supabase.from("ai_usage").insert({ plant_id: row.plant_id, kind: "ocr_extract", model: MODEL,
+        input_tokens: aiIn, output_tokens: aiOut, cost_usd: cost, queue_id: row.id, doc_id: docId, period: periodIst });
+    } catch (_e) { /* metering must never block a successful extract */ }
+  };
   // Plan cap gate — skip the expensive vision call when the plant is over its monthly OCR limit.
   if (countTowardCap) {
     const { data: usage } = await supabase.rpc("ocr_usage_state", { p_plant_id: row.plant_id });
@@ -236,6 +253,7 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
     const prompt = buildPrompt(ctx);
     stage = "extract_compressed";
     let attempt = await attemptExtraction(row.image_url, prompt);
+    aiIn += attempt.inTok; aiOut += attempt.outTok;
     lastRawResponse = attempt.rawResponse;
     let escalated = false;
     if (attempt.parsed.is_document) {
@@ -245,6 +263,7 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
         stage = "extract_hires";
         try {
           const hiresAttempt = await attemptExtraction(hiresUrl, prompt);
+          aiIn += hiresAttempt.inTok; aiOut += hiresAttempt.outTok;
           if (hiresAttempt.parsed.is_document) { attempt = hiresAttempt; lastRawResponse = hiresAttempt.rawResponse; escalated = true; }
         } catch (hErr) { console.warn(`hires retry failed: ${(hErr as Error).message}`); }
       }
@@ -261,6 +280,7 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
       else if (buyerIsUs && !sellerIsUs && parsed.seller_name) { parsed.vendor_name = parsed.seller_name; parsed.vendor_gstin = parsed.seller_gstin ?? null; }
     }
     if (!parsed.is_document) {
+      await logAi(null);
       await supabase.from("mcp_logistics_extraction_queue").update({ status: "skipped", classification: "non_document", processed_at: new Date().toISOString(), extraction_ms: Date.now() - startedAt, error_message: null, raw_response: null, debug_payload: { worker_version: WORKER_VERSION, escalated_to_hires: escalated } }).eq("id", row.id);
       return { ok: true, queue_id: row.id, skipped: true };
     }
@@ -323,6 +343,7 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
     if (countTowardCap) {
       try { await supabase.rpc("increment_ocr_usage", { p_plant_id: row.plant_id }); } catch (_e) { /* metering must never block a successful extract */ }
     }
+    await logAi(doc.id);
     const keepRawForDebug = parsed.confidence !== "high" || (parsed.flags && parsed.flags.length > 0);
     await supabase.from("mcp_logistics_extraction_queue").update({
       status: "completed", result_doc_id: doc.id, classification: "document", processed_at: new Date().toISOString(), extraction_ms: Date.now() - startedAt, error_message: null,
@@ -332,6 +353,7 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
     return { ok: true, queue_id: row.id, doc_id: doc.id, doc_type: docType, direction: parsed.direction, confidence: parsed.confidence, flags: flagsList, auto_rotated_deg: totalRotationDeg, auto_rotated_log: rotationLog, escalated_to_hires: escalated };
   } catch (err) {
     const e = err as Error;
+    await logAi(null);
     await supabase.from("mcp_logistics_extraction_queue").update({
       status: "failed", raw_response: lastRawResponse?.slice(0, 8192) ?? null, error_message: `${stage}: ${e.message}`.slice(0, 500),
       debug_payload: { stage, exception_type: e.name, exception_message: e.message, stack: e.stack?.slice(0, 2000), model_used: MODEL, attempt_number: newAttempts, worker_version: WORKER_VERSION },
