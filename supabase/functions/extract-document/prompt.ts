@@ -1,5 +1,6 @@
-// prompt.ts — Loglinkr OCR extraction prompt (v22)
-// Indian number-format rules + arithmetic self-check + output brevity (cost control).
+// prompt.ts — Loglinkr OCR extraction prompt (v23)
+// Split into a STATIC system block (identical every call → prompt-cacheable at 0.1×
+// input cost) and a per-plant CONTEXT block that rides in the user message.
 
 export interface PromptContext {
   plantName: string;
@@ -10,36 +11,12 @@ export interface PromptContext {
   stockItems: Array<{ id: string; code: string; name: string }>;
 }
 
-export function buildPrompt(ctx: PromptContext): string {
-  const unitLines = ctx.units.length
-    ? ctx.units.map((u, i) => `  ${i + 1}. ${u.name}${u.address ? ` — ${u.address}` : ""}`).join("\n")
-    : "  (none configured)";
+// ── STATIC INSTRUCTIONS ──────────────────────────────────────────────────────
+// No interpolation — byte-for-byte identical across every plant and call so the
+// Anthropic API can cache it. Sent as the system prompt with cache_control.
+export const SYSTEM_PROMPT = `You are an extraction worker for Loglinkr — an audit-ready ERP for an Indian SME manufacturer. You read ONE photo or scan of a logistics document (delivery challan / invoice / PO / bill / job-work DC) and return ONE strict JSON object.
 
-  const vendorLines = ctx.vendors.length
-    ? ctx.vendors.map(v =>
-        `  - id=${v.id} | name="${v.name}"${v.legal_name && v.legal_name !== v.name ? ` (legal: "${v.legal_name}")` : ""}${v.gstin ? ` | GSTIN ${v.gstin}` : ""}${v.is_jobwork_vendor ? " | JOB-WORK" : ""}`
-      ).join("\n")
-    : "  (none yet — first time vendor will be created on confirm)";
-
-  const itemLines = ctx.stockItems.length
-    ? ctx.stockItems.map(i => `  - ${i.code}: ${i.name}`).join("\n")
-    : "  (none)";
-
-  return `You are an extraction worker for Loglinkr — an audit-ready ERP for an Indian SME manufacturer. You will read ONE photo or scan of a logistics document (delivery challan / invoice / PO / bill / job-work DC) and return ONE strict JSON object.
-
-PLANT IDENTITY (this is "us" — figure out which side of the doc we are on)
-Name:        ${ctx.plantName}
-Legal name:  ${ctx.plantLegalName ?? "(same)"}
-GSTIN:       ${ctx.plantGstin ?? "(unknown)"}
-
-UNITS we own:
-${unitLines}
-
-KNOWN VENDORS / CUSTOMERS:
-${vendorLines}
-
-KNOWN STOCK ITEMS:
-${itemLines}
+The user message contains: the document image, then a "CONTEXT" block describing the plant (this is "us"), its units, known vendors/customers and known stock items. Use that context for identity matching and vendor_match_id.
 
 DIRECTION — MANDATORY TWO-STEP PROCESS
 STEP 1 — Identify both parties as raw text:
@@ -165,4 +142,39 @@ OUTPUT FORMAT — RETURN ONLY THIS JSON, NO PROSE, NO MARKDOWN FENCES:
 
 If image is not a logistics document (selfie, screenshot, random photo):
   is_document = false, classification = "non_document", other fields null/[].`;
+
+// ── PER-PLANT CONTEXT ────────────────────────────────────────────────────────
+// Dynamic; rides in the user message after the image.
+export function buildContext(ctx: PromptContext): string {
+  const unitLines = ctx.units.length
+    ? ctx.units.map((u, i) => `  ${i + 1}. ${u.name}${u.address ? ` — ${u.address}` : ""}`).join("\n")
+    : "  (none configured)";
+
+  const vendorLines = ctx.vendors.length
+    ? ctx.vendors.map(v =>
+        `  - id=${v.id} | name="${v.name}"${v.legal_name && v.legal_name !== v.name ? ` (legal: "${v.legal_name}")` : ""}${v.gstin ? ` | GSTIN ${v.gstin}` : ""}${v.is_jobwork_vendor ? " | JOB-WORK" : ""}`
+      ).join("\n")
+    : "  (none yet — first time vendor will be created on confirm)";
+
+  const itemLines = ctx.stockItems.length
+    ? ctx.stockItems.map(i => `  - ${i.code}: ${i.name}`).join("\n")
+    : "  (none)";
+
+  return `CONTEXT FOR THIS DOCUMENT
+
+PLANT IDENTITY (this is "us" — figure out which side of the doc we are on)
+Name:        ${ctx.plantName}
+Legal name:  ${ctx.plantLegalName ?? "(same)"}
+GSTIN:       ${ctx.plantGstin ?? "(unknown)"}
+
+UNITS we own:
+${unitLines}
+
+KNOWN VENDORS / CUSTOMERS:
+${vendorLines}
+
+KNOWN STOCK ITEMS:
+${itemLines}
+
+Now read the image above and return ONLY the JSON object specified.`;
 }

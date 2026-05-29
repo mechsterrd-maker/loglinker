@@ -1,17 +1,20 @@
-// extract-document/index.ts — v24 (cost-tuned: no hi-res retry for arithmetic; terser model notes)
+// extract-document/index.ts — v25 (prompt caching: static instructions cached at 0.1× input)
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { Image } from "https://deno.land/x/imagescript@1.2.17/mod.ts";
-import { buildPrompt } from "./prompt.ts";
+import { SYSTEM_PROMPT, buildContext } from "./prompt.ts";
 
 const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-sonnet-4-20250514";
-const WORKER_VERSION = "v24";
+const WORKER_VERSION = "v25";
 // Claude Sonnet 4 pricing (USD per token). Update here if the model/pricing changes.
 const PRICE_IN_PER_TOK  = 3 / 1_000_000;
 const PRICE_OUT_PER_TOK = 15 / 1_000_000;
+// Prompt-cache multipliers: writing the cache costs 1.25× input, reading it 0.1×.
+const CACHE_WRITE_MULT = 1.25;
+const CACHE_READ_MULT  = 0.10;
 const VENDOR_CONTEXT_LIMIT = 60;
 const ITEM_CONTEXT_LIMIT   = 80;
 
@@ -178,9 +181,9 @@ async function fetchPlantContext(supabase: ReturnType<typeof createClient>, plan
   return { plantName: plant?.name ?? "(unknown)", plantLegalName: plant?.legal_name ?? null, plantGstin: plant?.gstin ?? null, units: units ?? [], vendors: vendors ?? [], stockItems: items ?? [] };
 }
 
-interface AttemptResult { parsed: ExtractionPayload; rawResponse: string; rotationLog: number[]; totalRotationDeg: number; imageUrl: string; bytesLen: number; inTok: number; outTok: number; }
+interface AttemptResult { parsed: ExtractionPayload; rawResponse: string; rotationLog: number[]; totalRotationDeg: number; imageUrl: string; bytesLen: number; inTok: number; outTok: number; cacheWriteTok: number; cacheReadTok: number; }
 
-async function attemptExtraction(url: string, prompt: string): Promise<AttemptResult> {
+async function attemptExtraction(url: string, contextText: string): Promise<AttemptResult> {
   const imgRes = await fetch(url);
   if (!imgRes.ok) throw new Error(`Image fetch ${imgRes.status} on ${url}`);
   const imgBuf = await imgRes.arrayBuffer();
@@ -200,21 +203,26 @@ async function attemptExtraction(url: string, prompt: string): Promise<AttemptRe
     }
   }
   const totalRotationDeg = rotationLog.reduce((s, d) => s + d, 0) % 360;
+  // Static rules ride in the cacheable system prompt; only the image + per-plant context vary.
   const visionRes = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model: MODEL, max_tokens: 3072, messages: [{ role: "user", content: [
-      { type: "image", source: { type: "base64", media_type: mediaType, data: imgB64 } },
-      { type: "text", text: prompt },
-    ] }] }),
+    body: JSON.stringify({ model: MODEL, max_tokens: 3072,
+      system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+      messages: [{ role: "user", content: [
+        { type: "image", source: { type: "base64", media_type: mediaType, data: imgB64 } },
+        { type: "text", text: contextText },
+      ] }] }),
   });
   if (!visionRes.ok) throw new Error(`Vision API ${visionRes.status}: ${(await visionRes.text()).slice(0, 500)}`);
   const visionData = await visionRes.json();
   const rawResponse = visionData.content?.filter((b: { type: string }) => b.type === "text")?.map((b: { text: string }) => b.text)?.join("\n") ?? "";
   const parsed = safeJsonParse(rawResponse) as ExtractionPayload;
   if (typeof parsed.is_document !== "boolean") throw new Error("Missing is_document boolean in extraction");
+  const u = visionData.usage ?? {};
   return { parsed, rawResponse, rotationLog, totalRotationDeg, imageUrl: url, bytesLen: bytes.length,
-           inTok: rotIn + (visionData.usage?.input_tokens ?? 0), outTok: rotOut + (visionData.usage?.output_tokens ?? 0) };
+           inTok: rotIn + (u.input_tokens ?? 0), outTok: rotOut + (u.output_tokens ?? 0),
+           cacheWriteTok: u.cache_creation_input_tokens ?? 0, cacheReadTok: u.cache_read_input_tokens ?? 0 };
 }
 
 async function hiresAvailable(hiresUrl: string): Promise<boolean> {
@@ -224,14 +232,18 @@ async function hiresAvailable(hiresUrl: string): Promise<boolean> {
 async function processQueueRow(supabase: ReturnType<typeof createClient>, row: QueueRow, forceHires = false, countTowardCap = true) {
   const startedAt = Date.now();
   // AI cost metering — accumulate tokens across rotation + vision + hi-res, logged on every exit.
-  let aiIn = 0, aiOut = 0;
+  // Cache reads (0.1×) and writes (1.25×) are priced separately from fresh input.
+  let aiIn = 0, aiOut = 0, aiCacheWrite = 0, aiCacheRead = 0;
   const periodIst = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 7);
   const logAi = async (docId: string | null) => {
-    if (aiIn === 0 && aiOut === 0) return;
-    const cost = aiIn * PRICE_IN_PER_TOK + aiOut * PRICE_OUT_PER_TOK;
+    if (aiIn === 0 && aiOut === 0 && aiCacheWrite === 0 && aiCacheRead === 0) return;
+    const cost = aiIn * PRICE_IN_PER_TOK
+               + aiCacheWrite * PRICE_IN_PER_TOK * CACHE_WRITE_MULT
+               + aiCacheRead * PRICE_IN_PER_TOK * CACHE_READ_MULT
+               + aiOut * PRICE_OUT_PER_TOK;
     try {
       await supabase.from("ai_usage").insert({ plant_id: row.plant_id, kind: "ocr_extract", model: MODEL,
-        input_tokens: aiIn, output_tokens: aiOut, cost_usd: cost, queue_id: row.id, doc_id: docId, period: periodIst });
+        input_tokens: aiIn + aiCacheWrite + aiCacheRead, output_tokens: aiOut, cost_usd: cost, queue_id: row.id, doc_id: docId, period: periodIst });
     } catch (_e) { /* metering must never block a successful extract */ }
   };
   // Plan cap gate — skip the expensive vision call when the plant is over its monthly OCR limit.
@@ -254,10 +266,10 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
   try {
     stage = "fetch_context";
     const ctx = await fetchPlantContext(supabase, row.plant_id);
-    const prompt = buildPrompt(ctx);
+    const contextText = buildContext(ctx);
     stage = "extract_compressed";
-    let attempt = await attemptExtraction(row.image_url, prompt);
-    aiIn += attempt.inTok; aiOut += attempt.outTok;
+    let attempt = await attemptExtraction(row.image_url, contextText);
+    aiIn += attempt.inTok; aiOut += attempt.outTok; aiCacheWrite += attempt.cacheWriteTok; aiCacheRead += attempt.cacheReadTok;
     lastRawResponse = attempt.rawResponse;
     let escalated = false;
     if (attempt.parsed.is_document) {
@@ -266,8 +278,8 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
       if (wantsRetry && hiresUrl !== row.image_url && await hiresAvailable(hiresUrl)) {
         stage = "extract_hires";
         try {
-          const hiresAttempt = await attemptExtraction(hiresUrl, prompt);
-          aiIn += hiresAttempt.inTok; aiOut += hiresAttempt.outTok;
+          const hiresAttempt = await attemptExtraction(hiresUrl, contextText);
+          aiIn += hiresAttempt.inTok; aiOut += hiresAttempt.outTok; aiCacheWrite += hiresAttempt.cacheWriteTok; aiCacheRead += hiresAttempt.cacheReadTok;
           if (hiresAttempt.parsed.is_document) { attempt = hiresAttempt; lastRawResponse = hiresAttempt.rawResponse; escalated = true; }
         } catch (hErr) { console.warn(`hires retry failed: ${(hErr as Error).message}`); }
       }
