@@ -1,5 +1,5 @@
-// prompt.ts — Loglinkr OCR extraction prompt (v21)
-// Hardened with Indian number format rules and aggressive arithmetic self-check.
+// prompt.ts — Loglinkr OCR extraction prompt (v22)
+// Indian number-format rules + arithmetic self-check + output brevity (cost control).
 
 export interface PromptContext {
   plantName: string;
@@ -128,6 +128,10 @@ If illegible → null + flag "date_unreadable". Never guess from context.
 CONFIDENCE: high (sharp, balances), medium (minor ambiguity), low (blurry/handwritten).
 When low, prefer nulls over fabrications.
 
+BREVITY (saves cost — output tokens are billed 5× input): validation_note must be
+ONE short line, ≤20 words. Only describe a specific gap when a check genuinely fails;
+otherwise a brief "ok" is enough. Never restate the document or your reasoning.
+
 OUTPUT FORMAT — RETURN ONLY THIS JSON, NO PROSE, NO MARKDOWN FENCES:
 {
   "is_document": boolean,
@@ -154,7 +158,7 @@ OUTPUT FORMAT — RETURN ONLY THIS JSON, NO PROSE, NO MARKDOWN FENCES:
   "tax_amount": number | null,
   "total_value": number | null,
   "items": [{"name":"...","hsn":null,"qty":0,"uom":null,"rate":null,"amount":null,"process":""}],
-  "validation_note": "show your work",
+  "validation_note": "one short line, ≤20 words",
   "confidence": "high" | "medium" | "low",
   "flags": []
 }
