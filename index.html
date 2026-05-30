@@ -637,6 +637,29 @@
 </div>
 
 <script>
+  // PWA launch detection: if the user opened this from their installed app icon,
+  // they expect the app, not the marketing page. Forward immediately. This also
+  // self-heals old installs whose manifest still had start_url:"/".
+  (() => {
+    const isStandalone =
+      (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
+      window.navigator.standalone === true || // iOS Safari
+      document.referrer.startsWith('android-app://');
+    if (isStandalone) {
+      window.location.replace('/app' + window.location.search + window.location.hash);
+      return;
+    }
+    // Returning logged-in user (Supabase auth token in localStorage) → skip marketing.
+    // Honour ?stay=1 so the user can deliberately view the landing page if they want to.
+    try {
+      const stay = new URLSearchParams(window.location.search).get('stay') === '1';
+      const hasSession = Object.keys(localStorage).some(k => /^sb-.*-auth-token$/.test(k));
+      if (hasSession && !stay) {
+        window.location.replace('/app' + window.location.search + window.location.hash);
+      }
+    } catch (_) { /* localStorage may throw in private mode — ignore */ }
+  })();
+
   // Sticky nav shadow on scroll
   const nav = document.getElementById('nav');
   const onScroll = () => nav.classList.toggle('scrolled', window.scrollY > 8);
