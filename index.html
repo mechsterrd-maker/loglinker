@@ -3,6 +3,35 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<script>
+  // Run BEFORE anything else paints. Two redirect cases that must not flash:
+  //   1. PWA/standalone launch (installed icon) — must land in /app, no URL bar.
+  //   2. A returning logged-in user opening the bare domain in a browser tab —
+  //      send straight to the app, not the marketing splash.
+  // Honour ?stay=1 so the landing page is reachable for screenshots / previews.
+  (function () {
+    try {
+      var stay = /[?&]stay=1\b/.test(location.search);
+      if (stay) return;
+      var standalone =
+        (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
+        window.navigator.standalone === true ||
+        document.referrer.indexOf('android-app://') === 0;
+      var loggedIn = false;
+      try {
+        for (var i = 0; i < localStorage.length; i++) {
+          var k = localStorage.key(i);
+          if (k && /^sb-.*-auth-token$/.test(k)) { loggedIn = true; break; }
+        }
+      } catch (_) {}
+      if (standalone || loggedIn) {
+        location.replace('/app' + location.search + location.hash);
+      }
+    } catch (_) { /* never break the page if anything throws */ }
+  })();
+</script>
+
 <title>Loglinkr — Run your whole plant from your phone</title>
 <meta name="description" content="Snap a vendor bill, the stock updates itself. Production, quality, billing and material control for Indian SME manufacturers — built by a Plant Head, run from your phone.">
 <meta name="theme-color" content="#0d9488">
@@ -637,29 +666,6 @@
 </div>
 
 <script>
-  // PWA launch detection: if the user opened this from their installed app icon,
-  // they expect the app, not the marketing page. Forward immediately. This also
-  // self-heals old installs whose manifest still had start_url:"/".
-  (() => {
-    const isStandalone =
-      (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
-      window.navigator.standalone === true || // iOS Safari
-      document.referrer.startsWith('android-app://');
-    if (isStandalone) {
-      window.location.replace('/app' + window.location.search + window.location.hash);
-      return;
-    }
-    // Returning logged-in user (Supabase auth token in localStorage) → skip marketing.
-    // Honour ?stay=1 so the user can deliberately view the landing page if they want to.
-    try {
-      const stay = new URLSearchParams(window.location.search).get('stay') === '1';
-      const hasSession = Object.keys(localStorage).some(k => /^sb-.*-auth-token$/.test(k));
-      if (hasSession && !stay) {
-        window.location.replace('/app' + window.location.search + window.location.hash);
-      }
-    } catch (_) { /* localStorage may throw in private mode — ignore */ }
-  })();
-
   // Sticky nav shadow on scroll
   const nav = document.getElementById('nav');
   const onScroll = () => nav.classList.toggle('scrolled', window.scrollY > 8);
