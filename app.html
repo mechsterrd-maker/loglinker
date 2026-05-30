@@ -1578,6 +1578,7 @@ function Home({ plant, me, setTab, reload }) {
   const alerts = stats.openNcrs + stats.openBreakdowns + stats.lowStock;
 
   return html`
+    <${HomeInstallBanner} />
     <div class="page-header">
       <div>
         <h1>Hi, ${greeting}</h1>
@@ -16232,6 +16233,75 @@ function PushNotifSetting({ me, plant }) {
         <button class=${'btn small ' + (subscribed ? 'danger' : '')} onClick=${toggle} disabled=${busy}>${subscribed ? 'Disable' : 'Enable'}</button>
       </div>
     </div>
+  `;
+}
+
+// ============= HOME INSTALL BANNER =============
+// Dismissible banner shown on Home when the app is running in a browser tab
+// instead of as an installed PWA. Most users live on Home, so this is where
+// install conversion actually happens — the InstallAppCard in More is a
+// fallback for users who go looking.
+function HomeInstallBanner() {
+  const isStandalone = () =>
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
+    window.navigator.standalone === true ||
+    (document.referrer || '').indexOf('android-app://') === 0;
+  const isIos = () =>
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  // Re-show 14 days after a dismiss — install matters too much to silence forever.
+  const dismissedRecently = () => {
+    try {
+      const t = parseInt(localStorage.getItem('loglinkr_install_dismissed_at') || '0', 10);
+      return t && (Date.now() - t) < 14 * 24 * 3600 * 1000;
+    } catch (_) { return false; }
+  };
+
+  const [hidden, setHidden] = useState(() => isStandalone() || dismissedRecently());
+  const [showIosHelp, setShowIosHelp] = useState(false);
+
+  const onInstall = async () => {
+    if (isIos()) { setShowIosHelp(true); return; }
+    if (deferredInstallPrompt) {
+      const ok = await promptInstallApp();
+      if (ok) setHidden(true);
+      return;
+    }
+    // No install event yet (browser hasn't fired beforeinstallprompt, or it's
+    // a non-Chromium browser) — fall back to the standalone install guide.
+    window.open('/install', '_blank', 'noopener');
+  };
+  const onDismiss = () => {
+    try { localStorage.setItem('loglinkr_install_dismissed_at', String(Date.now())); } catch (_) {}
+    setHidden(true);
+  };
+
+  if (hidden) return null;
+  return html`
+    <div style="background:linear-gradient(135deg,var(--teal-600),var(--teal-700));color:#fff;border-radius:14px;padding:14px 16px;margin-bottom:14px;display:flex;align-items:center;gap:12px;box-shadow:0 10px 24px -12px rgba(13,148,136,.5)">
+      <div style="font-size:22px;flex-shrink:0">📲</div>
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:600;font-size:14px;line-height:1.3">Install Loglinkr on this phone</div>
+        <div style="font-size:11.5px;opacity:.85;margin-top:2px">Faster open · push alerts · works offline · no browser bar</div>
+      </div>
+      <button onClick=${onInstall} style="background:#fff;color:var(--teal-700);border:0;border-radius:9px;padding:8px 14px;font-weight:600;font-size:13px;cursor:pointer;flex-shrink:0">Install</button>
+      <button onClick=${onDismiss} aria-label="Dismiss" style="background:transparent;color:#fff;border:0;font-size:18px;cursor:pointer;opacity:.7;padding:4px 6px;line-height:1;flex-shrink:0">×</button>
+    </div>
+    ${showIosHelp && html`
+      <div style="background:#fff;border:1px solid var(--teal-200);border-radius:14px;padding:14px 16px;margin-bottom:14px;font-size:13px;line-height:1.55;color:var(--slate-700)">
+        <div style="font-weight:600;color:var(--slate-900);margin-bottom:8px">Installing on iPhone / iPad</div>
+        <ol style="padding-left:18px;margin:0 0 10px;display:flex;flex-direction:column;gap:5px">
+          <li>Open this page in <b>Safari</b> (Chrome on iOS can't install PWAs).</li>
+          <li>Tap the <b>Share</b> button (square with up-arrow, bottom of screen).</li>
+          <li>Scroll down and tap <b>Add to Home Screen</b> → <b>Add</b>.</li>
+        </ol>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <a href="/install" target="_blank" rel="noopener" style="color:var(--teal-700);font-weight:600;text-decoration:none">Full guide →</a>
+          <button onClick=${() => setShowIosHelp(false)} style="margin-left:auto;background:transparent;border:0;color:var(--slate-500);font-size:12px;cursor:pointer">Close</button>
+        </div>
+      </div>
+    `}
   `;
 }
 
