@@ -1,8 +1,8 @@
 // sw.js — Loglinkr Service Worker
 // Handles: PWA install, offline shell, Web Push notifications, click routing
 
-const CACHE_NAME = 'loglinkr-v10';
-const APP_SHELL = ['/', '/index.html'];
+const CACHE_NAME = 'loglinkr-v11';
+const APP_SHELL = ['/app'];
 
 // Install: cache app shell
 self.addEventListener('install', (event) => {
@@ -34,13 +34,13 @@ self.addEventListener('fetch', (event) => {
         }
         return res;
       })
-      .catch(() => caches.match(event.request).then(r => r || caches.match('/')))
+      .catch(() => caches.match(event.request).then(r => r || caches.match('/app')))
   );
 });
 
-// Push: show notification
+// Push: show notification. Default deep-link is /app (root is now the marketing landing page).
 self.addEventListener('push', (event) => {
-  let data = { title: 'Loglinkr', body: 'You have a new notification', data: { url: '/' } };
+  let data = { title: 'Loglinkr', body: 'You have a new notification', data: { url: '/app' } };
   try {
     if (event.data) data = event.data.json();
   } catch (e) {
@@ -62,7 +62,11 @@ self.addEventListener('push', (event) => {
 // Click: focus or open the app
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const url = event.notification.data?.url || '/';
+  // Normalise legacy '/' push payloads to /app, and bare deep-link slugs (/chat, /tasks, …) to
+  // /app/<slug>, so a notification never strands the user on the marketing landing page.
+  let url = event.notification.data?.url || '/app';
+  if (url === '/' || url === '') url = '/app';
+  else if (/^\/(chat|tasks|actions|schedules|documents|quality|maintenance|production)(\b|\/|\?)/.test(url)) url = '/app' + url;
   event.waitUntil(
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
       for (const c of list) {
