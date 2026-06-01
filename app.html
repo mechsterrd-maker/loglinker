@@ -1560,11 +1560,14 @@ function TopNavDesktop({ plant, me, initials, tab, setTab, logout, unreadCount, 
     more: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>`,
   };
 
-  // Close dropdown on outside click
+  // Close dropdown on outside click. The dropdown itself is now portal-style
+  // (position:fixed, outside .nav-more-wrap), so we also check data-more-dropdown.
   useEffect(() => {
     if (!moreOpen) return;
     const close = (e) => {
-      if (!e.target.closest('.nav-more-wrap')) setMoreOpen(false);
+      if (e.target.closest('.nav-more-wrap')) return;
+      if (e.target.closest('[data-more-dropdown]')) return;
+      setMoreOpen(false);
     };
     document.addEventListener('click', close);
     return () => document.removeEventListener('click', close);
@@ -1594,34 +1597,11 @@ function TopNavDesktop({ plant, me, initials, tab, setTab, logout, unreadCount, 
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:10px;height:10px;margin-left:2px"><polyline points="6 9 12 15 18 9"/></svg>
           </button>
           ${moreOpen && html`
-            <div style="position:absolute;top:100%;right:0;margin-top:6px;background:white;border:1px solid var(--slate-200);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.12);min-width:340px;max-height:80vh;overflow-y:auto;z-index:9999;padding:4px 0">
-              ${visibleMoreGroups(plant).map((group, gi) => {
-                const activeChild = group.items.some(i => i.key === tab);
-                const open = navOpenGroups[group.key] === true || activeChild;
-                return html`
-                  <div key=${group.key}>
-                    <div onClick=${() => toggleNavGroup(group.key)}
-                         style=${'padding:8px 14px;cursor:pointer;display:flex;align-items:center;gap:8px;background:' + (activeChild?'var(--teal-50)':'transparent') + ';border-top:'+(gi>0?'1px solid var(--slate-100)':'none')}>
-                      <span style="font-size:14px">${group.icon}</span>
-                      <div style="flex:1;min-width:0">
-                        <div style=${'font-size:11px;font-weight:700;color:'+(activeChild?'var(--teal-800)':'var(--slate-700)')+';text-transform:uppercase;letter-spacing:0.6px'}>${group.title}</div>
-                      </div>
-                      <span style="font-size:10px;color:var(--slate-500);background:var(--slate-50);padding:1px 6px;border-radius:999px;border:1px solid var(--slate-200);font-weight:600">${group.items.length}</span>
-                      <span style="color:var(--slate-400);font-size:11px">${open ? '▾' : '▸'}</span>
-                    </div>
-                    ${open && group.items.map(it => html`
-                      <button key=${it.key} onClick=${() => { setTab(it.key); setMoreOpen(false); }}
-                        style=${'width:100%;text-align:left;padding:7px 14px 7px 32px;background:' + (tab === it.key ? 'var(--teal-50)' : 'transparent') + ';color:' + (tab === it.key ? 'var(--teal-700)' : 'var(--slate-700)') + ';border:none;font-size:13px;cursor:pointer;display:flex;align-items:center;gap:10px;font-weight:' + (tab === it.key ? '600' : '500') + ';border-left:'+(tab === it.key ? '3px solid var(--teal-600)' : '3px solid transparent')}
-                        onMouseOver=${e => { if (tab !== it.key) e.currentTarget.style.background = 'var(--slate-50)'; }}
-                        onMouseOut=${e => { if (tab !== it.key) e.currentTarget.style.background = 'transparent'; }}>
-                        <span style="font-size:14px;width:18px;text-align:center">${it.icon}</span>
-                        <span>${it.label}</span>
-                      </button>
-                    `)}
-                  </div>
-                `;
-              })}
-            </div>
+            <${MoreDropdown}
+              plant=${plant} tab=${tab}
+              navOpenGroups=${navOpenGroups} toggleNavGroup=${toggleNavGroup}
+              onPick=${k => { setTab(k); setMoreOpen(false); }}
+              onClose=${() => setMoreOpen(false)} />
           `}
         </div>
       </div>
@@ -1636,6 +1616,72 @@ function TopNavDesktop({ plant, me, initials, tab, setTab, logout, unreadCount, 
         <span style="font-size:11px;color:var(--rose-600);padding:5px 10px;background:var(--rose-50);border-radius:6px;margin-right:10px;border:1px solid var(--rose-200)" title="No unit access — run recovery-multiunit.sql">⚠ No unit access</span>
       `}
       <div class="user-avatar" onClick=${logout} title=${'Log out (' + (me.full_name || me.email) + ')'}>${initials}</div>
+    </div>
+  `;
+}
+
+// Viewport-anchored "More" dropdown. The previous version used position:absolute
+// + right:0 + max-height:80vh, which on shorter desktop windows let the bottom
+// of the menu disappear under the fold (users couldn't reach the last groups).
+// This one positions itself off the trigger's bounding rect and clamps to the
+// actual visible viewport — so it can't escape the screen on either axis.
+function MoreDropdown({ plant, tab, navOpenGroups, toggleNavGroup, onPick, onClose }) {
+  const [pos, setPos] = useState(null); // {top, right, maxHeight, width}
+  useEffect(() => {
+    const place = () => {
+      // The trigger is the previous sibling button inside .nav-more-wrap.
+      const wrap = document.querySelector('.nav-more-wrap');
+      const btn  = wrap?.querySelector('button.nav-tab');
+      if (!btn) return;
+      const r = btn.getBoundingClientRect();
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const gap = 6, margin = 8;
+      // Width: 340 if it fits, else clamp to visible width.
+      const width = Math.min(360, vw - margin * 2);
+      // Right anchor: trigger's right edge, clamped so the LEFT edge stays on-screen.
+      let right = Math.max(margin, vw - r.right);
+      if (right + width > vw - margin) right = Math.max(margin, vw - margin - width);
+      // Vertical: below trigger; if not enough room, leave a margin and let it scroll.
+      const top = Math.round(r.bottom + gap);
+      const maxHeight = Math.max(220, vh - top - margin);
+      setPos({ top, right, width, maxHeight });
+    };
+    place();
+    const onResize = () => place();
+    window.addEventListener('resize', onResize);
+    window.addEventListener('scroll', onResize, true);
+    return () => { window.removeEventListener('resize', onResize); window.removeEventListener('scroll', onResize, true); };
+  }, []);
+  if (!pos) return null;
+
+  return html`
+    <div data-more-dropdown style=${'position:fixed;top:'+pos.top+'px;right:'+pos.right+'px;width:'+pos.width+'px;max-height:'+pos.maxHeight+'px;background:white;border:1px solid var(--slate-200);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.12);overflow-y:auto;overflow-x:hidden;z-index:9999;padding:4px 0;overscroll-behavior:contain'}>
+      ${visibleMoreGroups(plant).map((group, gi) => {
+        const activeChild = group.items.some(i => i.key === tab);
+        const open = navOpenGroups[group.key] === true || activeChild;
+        return html`
+          <div key=${group.key}>
+            <div onClick=${() => toggleNavGroup(group.key)}
+                 style=${'padding:8px 14px;cursor:pointer;display:flex;align-items:center;gap:8px;background:' + (activeChild?'var(--teal-50)':'transparent') + ';border-top:'+(gi>0?'1px solid var(--slate-100)':'none')}>
+              <span style="font-size:14px">${group.icon}</span>
+              <div style="flex:1;min-width:0">
+                <div style=${'font-size:11px;font-weight:700;color:'+(activeChild?'var(--teal-800)':'var(--slate-700)')+';text-transform:uppercase;letter-spacing:0.6px'}>${group.title}</div>
+              </div>
+              <span style="font-size:10px;color:var(--slate-500);background:var(--slate-50);padding:1px 6px;border-radius:999px;border:1px solid var(--slate-200);font-weight:600">${group.items.length}</span>
+              <span style="color:var(--slate-400);font-size:11px">${open ? '▾' : '▸'}</span>
+            </div>
+            ${open && group.items.map(it => html`
+              <button key=${it.key} onClick=${() => onPick(it.key)}
+                style=${'width:100%;text-align:left;padding:7px 14px 7px 32px;background:' + (tab === it.key ? 'var(--teal-50)' : 'transparent') + ';color:' + (tab === it.key ? 'var(--teal-700)' : 'var(--slate-700)') + ';border:none;font-size:13px;cursor:pointer;display:flex;align-items:center;gap:10px;font-weight:' + (tab === it.key ? '600' : '500') + ';border-left:'+(tab === it.key ? '3px solid var(--teal-600)' : '3px solid transparent')}
+                onMouseOver=${e => { if (tab !== it.key) e.currentTarget.style.background = 'var(--slate-50)'; }}
+                onMouseOut=${e => { if (tab !== it.key) e.currentTarget.style.background = 'transparent'; }}>
+                <span style="font-size:14px;width:18px;text-align:center">${it.icon}</span>
+                <span>${it.label}</span>
+              </button>
+            `)}
+          </div>
+        `;
+      })}
     </div>
   `;
 }
