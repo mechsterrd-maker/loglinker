@@ -16493,28 +16493,66 @@ function CadNexaEmbed({ plant, me, user }) {
     return '/cadnexa?' + qs;
   }, [plant?.id, me?.full_name, user?.email]);
 
+  // Fullscreen-overlay mode: the iframe pops out over Loglinkr's whole UI
+  // (fixed position, top of z-stack) so the 3D canvas gets the full phone
+  // screen — bottom nav, headers and the "heads-up" banner are all hidden.
+  // Escape key closes it; on mobile the floating × button does the same.
+  const [full, setFull] = useState(false);
+  useEffect(() => {
+    if (!full) return;
+    const onKey = (e) => { if (e.key === 'Escape') setFull(false); };
+    window.addEventListener('keydown', onKey);
+    // Lock body scroll while in fullscreen so iOS Safari doesn't rubber-band.
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { window.removeEventListener('keydown', onKey); document.body.style.overflow = prev; };
+  }, [full]);
+
+  const overlayStyle = 'position:fixed;inset:0;z-index:9999;background:#0e1118;display:flex;flex-direction:column';
+  const inlineStyle  = 'position:relative;border:1px solid var(--slate-200);border-radius:10px;overflow:hidden;background:#0e1118;height:calc(100vh - 220px);min-height:480px';
+
   return html`
-    <div>
-      <div class="page-header">
-        <div>
-          <h1>🧊 3D Models · CadNexa</h1>
-          <div class="sub">View, measure &amp; estimate STEP / STL / GLB / FBX parts directly in the plant</div>
+    ${!full && html`
+      <div>
+        <div class="page-header">
+          <div>
+            <h1>🧊 3D Models · CadNexa</h1>
+            <div class="sub">View, measure &amp; estimate STEP / STL / GLB / FBX parts directly in the plant</div>
+          </div>
+          <button class="btn small" onClick=${() => setFull(true)} title="Open viewer fullscreen">⛶ Fullscreen</button>
+        </div>
+        <div style="background:var(--amber-50);border:1px solid var(--amber-200);border-radius:8px;padding:9px 12px;margin-bottom:10px;font-size:11.5px;color:var(--amber-800);line-height:1.45">
+          <strong>Heads-up:</strong> CadNexa runs as a connected tool — files you upload here live in CadNexa's own storage,
+          not in Loglinkr's documents. Use it for viewing &amp; measuring 3D parts; attach the final drawing/PDF to a Project or NPD record back in Loglinkr.
+        </div>
+        <div style=${inlineStyle}>
+          <iframe
+            src=${src}
+            title="CadNexa 3D Viewer"
+            allow="fullscreen; clipboard-write; camera; microphone"
+            allowFullScreen
+            style="border:0;width:100%;height:100%;display:block;background:#0e1118"
+          ></iframe>
         </div>
       </div>
-      <div style="background:var(--amber-50);border:1px solid var(--amber-200);border-radius:8px;padding:9px 12px;margin-bottom:10px;font-size:11.5px;color:var(--amber-800);line-height:1.45">
-        <strong>Heads-up:</strong> CadNexa runs as a connected tool — files you upload here live in CadNexa's own storage,
-        not in Loglinkr's documents. Use it for viewing &amp; measuring 3D parts; attach the final drawing/PDF to a Project or NPD record back in Loglinkr.
-      </div>
-      <div style="position:relative;border:1px solid var(--slate-200);border-radius:10px;overflow:hidden;background:#0e1118;height:calc(100vh - 220px);min-height:480px">
+    `}
+    ${full && html`
+      <div style=${overlayStyle}>
         <iframe
           src=${src}
           title="CadNexa 3D Viewer"
           allow="fullscreen; clipboard-write; camera; microphone"
           allowFullScreen
-          style="border:0;width:100%;height:100%;display:block;background:#0e1118"
+          style="border:0;flex:1;width:100%;display:block;background:#0e1118"
         ></iframe>
+        <!-- Floating exit: top-right, big enough for thumbs, doesn't cover the canvas centre. -->
+        <button
+          onClick=${() => setFull(false)}
+          aria-label="Close fullscreen"
+          style="position:absolute;top:max(12px,env(safe-area-inset-top));right:max(12px,env(safe-area-inset-right));z-index:10000;width:44px;height:44px;border-radius:50%;border:0;background:rgba(15,23,42,.78);color:#fff;font-size:22px;font-weight:600;cursor:pointer;backdrop-filter:blur(8px);box-shadow:0 4px 14px rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;line-height:1"
+        >×</button>
       </div>
-    </div>
+    `}
   `;
 }
 
