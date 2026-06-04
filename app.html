@@ -1100,6 +1100,12 @@ function App() {
   const [tab, setTab] = useState(DEEP_LINK?.tab || 'home');
   const [loading, setLoading] = useState(true);
   const [pendingInvite, setPendingInvite] = useState(null);
+  // RBAC Phase 1: my permissions in the current plant. Set after loadProfile.
+  // Shape: { plant_id, rbac_enforced, roles:[{id,slug,display_name}],
+  //          permissions:[{module_key, action, filter}] }
+  // null until loaded — components must treat null as "still loading, allow nothing yet"
+  // or "rbac not in effect for this plant" (we disambiguate via rbac_enforced).
+  const [myPerms, setMyPerms] = useState(null);
   const [accessibleUnits, setAccessibleUnits] = useState([]);
   const [activeUnit, setActiveUnit] = useState(null);
 
@@ -1227,6 +1233,14 @@ function App() {
     setMe(userRow);
     // Load accessible units once profile is set
     await loadUnits();
+    // RBAC Phase 1: fetch my permissions. Non-blocking — if the RPC ever fails
+    // we fall back to the legacy users.role behavior so the app never bricks.
+    try {
+      const { data: perms } = await sb.rpc('my_permissions');
+      setMyPerms(perms || { rbac_enforced: false, permissions: [], roles: [] });
+    } catch (_e) {
+      setMyPerms({ rbac_enforced: false, permissions: [], roles: [] });
+    }
     // Clear URL params on successful load
     if (window.location.search) {
       window.history.replaceState({}, '', window.location.pathname);
@@ -1262,7 +1276,7 @@ function App() {
       </div>
     </div>`;
 
-  return html`<${Shell} user=${user} plant=${plant} me=${me} tab=${tab} setTab=${setTab} logout=${logout} reload=${() => loadProfile(user)} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />`;
+  return html`<${Shell} user=${user} plant=${plant} me=${me} myPerms=${myPerms} tab=${tab} setTab=${setTab} logout=${logout} reload=${() => loadProfile(user)} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />`;
 }
 
 // ============= APP SHELL =============
@@ -1371,22 +1385,56 @@ const isFab = (plant) => plant?.business_type === 'fabrication';
 //  - IATF compliance items (iatf:true) are stripped when show_iatf_modules = false
 //  - PDC/manufacturing-only items (mfg:true) are stripped for fabrication plants
 // Empty groups are dropped too.
-function visibleMoreGroups(plant) {
+//
+// RBAC Phase 1 (additive): when myPerms is provided AND its rbac_enforced flag
+// is true (auto for fabrication plants), modules the caller can't `view` get
+// filtered out. plant_head/admin keep '*' on everything so this is a no-op for
+// them. Pass myPerms = null to preserve legacy behavior unconditionally.
+function visibleMoreGroups(plant, myPerms) {
   const showIatf = plant?.show_iatf_modules !== false;
   const fab = isFab(plant);
-  if (showIatf && !fab) return MORE_GROUPS;
-  return MORE_GROUPS
+  // First pass: existing business-type + IATF filtering (unchanged).
+  let groups = (showIatf && !fab) ? MORE_GROUPS : MORE_GROUPS
     .map(g => ({
       ...g,
-      // Drop the "& IATF" framing from the Quality group for fabrication plants.
       title: fab && g.key === 'quality' ? 'Quality' : g.title,
       sub: fab && g.key === 'quality' ? 'Quality records · complaints · maintenance' : g.sub,
       items: g.items.filter(it => (showIatf || !it.iatf) && (!fab || !it.mfg)),
     }))
     .filter(g => g.items.length > 0);
+  // Second pass: RBAC filtering (only when enforced on this plant).
+  if (myPerms && myPerms.rbac_enforced) {
+    const canView = makeCanViewModule(myPerms);
+    groups = groups
+      .map(g => ({ ...g, items: g.items.filter(it => canView(it.key)) }))
+      .filter(g => g.items.length > 0);
+  }
+  return groups;
 }
 
-function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, activeUnit, switchUnit }) {
+// Build a fast lookup: does this user's perms grant view (or '*') on a given module key?
+// Used by visibleMoreGroups AND by the can(module, action) hook below.
+function makeCanViewModule(myPerms) {
+  const set = new Set();
+  for (const p of (myPerms?.permissions || [])) {
+    if (p.action === 'view' || p.action === '*') set.add(p.module_key);
+  }
+  return (key) => set.has(key);
+}
+
+// Generic permission check used by individual components/buttons.
+// Treats '*' as covering every action on a module.
+function canDo(myPerms, moduleKey, action) {
+  if (!myPerms) return true;                  // null = perms not loaded; don't block UI
+  if (!myPerms.rbac_enforced) return true;    // RBAC off for this plant — legacy behavior
+  for (const p of (myPerms.permissions || [])) {
+    if (p.module_key !== moduleKey) continue;
+    if (p.action === '*' || p.action === action) return true;
+  }
+  return false;
+}
+
+function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessibleUnits, activeUnit, switchUnit }) {
   const initials = (me.full_name || user.email).split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
   const [unreadCount, setUnreadCount] = useState(0);
 
@@ -1428,7 +1476,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
 
   return html`
     <div class="app">
-      <${TopNavDesktop} plant=${plant} me=${me} initials=${initials} tab=${tab} setTab=${setTab} logout=${logout} unreadCount=${unreadCount} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />
+      <${TopNavDesktop} plant=${plant} me=${me} myPerms=${myPerms} initials=${initials} tab=${tab} setTab=${setTab} logout=${logout} unreadCount=${unreadCount} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />
 
       <div class="topbar">
         <div class="topbar-left">
@@ -1465,7 +1513,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'trace'}><${TracePage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} setTab=${setTab} /></${Page}>
-      <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
+      <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} myPerms=${myPerms} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
       <${Page} active=${tab === 'masters'}><${MastersHub} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'calibration'}><${CalibrationModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -1495,7 +1543,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
       <${Page} active=${tab === 'machine_prod'}><${MachineProductionModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'petty_cash'}><${PettyCashModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
+      <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
 
       <div class="tabbar">
         <${TabBtn} icon="home" label="Home" active=${tab === 'home'} onClick=${() => setTab('home')} />
@@ -1514,7 +1562,7 @@ function Shell({ user, plant, me, tab, setTab, logout, reload, accessibleUnits, 
   `;
 }
 
-function TopNavDesktop({ plant, me, initials, tab, setTab, logout, unreadCount, accessibleUnits, activeUnit, switchUnit }) {
+function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, unreadCount, accessibleUnits, activeUnit, switchUnit }) {
   const [moreOpen, setMoreOpen] = useState(false);
   const [navOpenGroups, setNavOpenGroups] = useState({});
   const toggleNavGroup = (key) => setNavOpenGroups(prev => ({ ...prev, [key]: !prev[key] }));
@@ -1598,7 +1646,7 @@ function TopNavDesktop({ plant, me, initials, tab, setTab, logout, unreadCount, 
           </button>
           ${moreOpen && html`
             <${MoreDropdown}
-              plant=${plant} tab=${tab}
+              plant=${plant} myPerms=${myPerms} tab=${tab}
               navOpenGroups=${navOpenGroups} toggleNavGroup=${toggleNavGroup}
               onPick=${k => { setTab(k); setMoreOpen(false); }}
               onClose=${() => setMoreOpen(false)} />
@@ -1625,7 +1673,7 @@ function TopNavDesktop({ plant, me, initials, tab, setTab, logout, unreadCount, 
 // of the menu disappear under the fold (users couldn't reach the last groups).
 // This one positions itself off the trigger's bounding rect and clamps to the
 // actual visible viewport — so it can't escape the screen on either axis.
-function MoreDropdown({ plant, tab, navOpenGroups, toggleNavGroup, onPick, onClose }) {
+function MoreDropdown({ plant, myPerms, tab, navOpenGroups, toggleNavGroup, onPick, onClose }) {
   const [pos, setPos] = useState(null); // {top, right, maxHeight, width}
   useEffect(() => {
     const place = () => {
@@ -1656,7 +1704,7 @@ function MoreDropdown({ plant, tab, navOpenGroups, toggleNavGroup, onPick, onClo
 
   return html`
     <div data-more-dropdown style=${'position:fixed;top:'+pos.top+'px;right:'+pos.right+'px;width:'+pos.width+'px;max-height:'+pos.maxHeight+'px;background:white;border:1px solid var(--slate-200);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.12);overflow-y:auto;overflow-x:hidden;z-index:9999;padding:4px 0;overscroll-behavior:contain'}>
-      ${visibleMoreGroups(plant).map((group, gi) => {
+      ${visibleMoreGroups(plant, myPerms).map((group, gi) => {
         const activeChild = group.items.some(i => i.key === tab);
         const open = navOpenGroups[group.key] === true || activeChild;
         return html`
@@ -5669,7 +5717,7 @@ function MastersHub({ plant, me, setTab }) {
   `;
 }
 
-function People({ plant, me }) {
+function People({ plant, me, myPerms }) {
   const [view, setView] = useState('units');
   const [units, setUnits] = useState([]);
   const [users, setUsers] = useState([]);
@@ -5679,6 +5727,7 @@ function People({ plant, me }) {
   const [editTarget, setEditTarget] = useState(null);
   const [loading, setLoading] = useState(true);
   const [resetShare, setResetShare] = useState(null); // { user, token, expires_at } when a reset link is freshly issued
+  const [rolesTarget, setRolesTarget] = useState(null); // RBAC Phase 1: opens UserRolesModal for the picked user
 
   const refresh = async () => {
     setLoading(true);
@@ -5702,12 +5751,16 @@ function People({ plant, me }) {
   return html`
     <div class="page-header"><div><h1>People</h1><div class="sub">Units, team, shifts</div></div></div>
 
-    <div class="auth-tabs" style="margin-bottom:16px">
+    <div class="auth-tabs" style="margin-bottom:16px;flex-wrap:wrap">
       <button class=${'auth-tab' + (view === 'units' ? ' active' : '')} onClick=${() => setView('units')}>Units</button>
       <button class=${'auth-tab' + (view === 'users' ? ' active' : '')} onClick=${() => setView('users')}>Team</button>
       <button class=${'auth-tab' + (view === 'operators' ? ' active' : '')} onClick=${() => setView('operators')}>Operators</button>
       <button class=${'auth-tab' + (view === 'shifts' ? ' active' : '')} onClick=${() => setView('shifts')}>Shifts</button>
+      ${myPerms?.rbac_enforced && (me.role === 'plant_head' || me.role === 'admin') && html`
+        <button class=${'auth-tab' + (view === 'roles' ? ' active' : '')} onClick=${() => setView('roles')}>Roles</button>
+      `}
     </div>
+    ${view === 'roles' && html`<${RolesTab} plant=${plant} me=${me} />`}
 
     ${view === 'units' && html`
       <div class="section-h">Units · ${units.length}<button class="btn small ghost" onClick=${() => setModal('unit')}>+ Add</button></div>
@@ -5758,6 +5811,7 @@ function People({ plant, me }) {
         const canManage = ['plant_head','admin','manager'].includes(me.role);
         const canRemove = (me.role === 'plant_head' || me.role === 'admin') && u.id !== me.id && u.status !== 'inactive';
         const canReset  = canManage && u.id !== me.id && u.status !== 'inactive' && u.login_enabled !== false;
+        const canAssignRoles = myPerms?.rbac_enforced && (me.role === 'plant_head' || me.role === 'admin') && u.status !== 'inactive' && u.login_enabled !== false;
         return html`
           <div class="list-item" key=${u.id}>
             <div class="list-item-row">
@@ -5767,6 +5821,7 @@ function People({ plant, me }) {
               </div>
               <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
                 <span class=${'badge ' + (u.role === 'plant_head' ? 'teal' : u.status === 'inactive' ? '' : '')}>${u.role}</span>
+                ${canAssignRoles && html`<button class="btn small ghost" title="Manage the roles assigned to this user" onClick=${() => setRolesTarget(u)}>👥 Roles</button>`}
                 ${canReset && html`<button class="btn small ghost" title="Issue a one-tap link they can use to set a new password" onClick=${async () => {
                   const { data, error } = await sb.rpc('issue_password_reset', { p_target_user_id: u.id });
                   if (error || !data?.token) { alert(error?.message || 'Could not generate reset link'); return; }
@@ -5859,6 +5914,7 @@ function People({ plant, me }) {
     ${modal === 'inviteView' && html`<${InviteViewModal} invite=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onCancel=${async () => { await sb.from('user_invites').delete().eq('id', editTarget.id); setModal(null); setEditTarget(null); refresh(); showToast('Invite cancelled'); }} />`}
     ${modal === 'operator' && html`<${OperatorModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${resetShare && html`<${ResetShareModal} plant=${plant} resetShare=${resetShare} onClose=${() => setResetShare(null)} />`}
+    ${rolesTarget && html`<${UserRolesModal} plant=${plant} user=${rolesTarget} onClose=${() => setRolesTarget(null)} onSaved=${() => setRolesTarget(null)} />`}
   `;
 }
 
@@ -6118,6 +6174,335 @@ function ShiftModal({ plant, editTarget, onClose, onSaved }) {
           <button class="btn" style="margin-top:12px" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
           ${editTarget && html`<button class="btn danger" type="button" style="margin-top:8px" onClick=${remove}>Delete</button>`}
         </form>
+      </div>
+    </div>
+  `;
+}
+
+// ============= RBAC: PEOPLE → ROLES TAB =============
+// Phase 1 — UI-level visibility only. The honest yellow banner inside makes
+// that boundary clear. Lists every plant role with member counts; admins can
+// create custom roles and edit non-builtin role permissions.
+
+// The full module list shown in the permission grid, kept in step with the
+// seed_builtin_roles_for_plant function on the SQL side. If a module is added
+// to MORE_GROUPS later, also add it here AND in the SQL seed function so
+// builtins automatically get '*' on it.
+const RBAC_MODULES = [
+  { key:'home', label:'Home', group:'core' },
+  { key:'chat', label:'Chat', group:'core' },
+  { key:'people', label:'People', group:'core' },
+  { key:'masters', label:'Masters', group:'core' },
+  { key:'production', label:'Production', group:'ops' },
+  { key:'quality', label:'Quality', group:'ops' },
+  { key:'maintenance', label:'Maintenance', group:'ops' },
+  { key:'stocks', label:'Stocks', group:'ops' },
+  { key:'tpm', label:'TPM Checks', group:'ops' },
+  { key:'machine_prod', label:'Machine OEE', group:'ops' },
+  { key:'actions', label:'Action Hub / Tasks', group:'projects' },
+  { key:'projects', label:'Projects', group:'projects' },
+  { key:'schedules', label:'Schedules', group:'projects' },
+  { key:'cad3d', label:'3D Models · CadNexa', group:'projects' },
+  { key:'npd', label:'NPD Projects', group:'projects' },
+  { key:'mom', label:'Minutes of Meeting', group:'projects' },
+  { key:'documents', label:'Documents · Bills', group:'commercial' },
+  { key:'sales_docs', label:'Make Documents (DC/Invoice/PO)', group:'commercial' },
+  { key:'movements', label:'Material Movements', group:'commercial' },
+  { key:'expenses', label:'Expense Ledger', group:'commercial' },
+  { key:'petty_cash', label:'Petty Cash', group:'commercial' },
+  { key:'jobwork', label:'Sub-Contracting', group:'commercial' },
+  { key:'supplier_chase', label:'Supplier Chase', group:'commercial' },
+  { key:'customer_complaints', label:'Customer Complaints', group:'quality' },
+  { key:'reports', label:'Reports', group:'audit' },
+  { key:'trace', label:'Trace / Audit Investigation', group:'audit' },
+];
+const RBAC_MODULE_GROUPS = {
+  core: 'Core & Communication',
+  ops: 'Shop Floor & Quality',
+  projects: 'Projects · Tasks · CAD',
+  commercial: 'Commercial · Bills · Money',
+  quality: 'Customer & Quality Feedback',
+  audit: 'Reports & Audit',
+};
+const RBAC_ACTIONS = ['view','create','edit','delete','approve','export'];
+const RBAC_ACTION_LABELS = { view:'View', create:'Create', edit:'Edit', delete:'Delete', approve:'Approve', export:'Export' };
+
+function RolesTab({ plant, me }) {
+  const [roles, setRoles] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+  const [creating, setCreating] = useState(false);
+  const [err, setErr] = useState('');
+
+  const refresh = useCallback(async () => {
+    setErr('');
+    const { data, error } = await sb.rpc('list_plant_roles', { p_plant_id: plant.id });
+    if (error) { setErr(error.message); setRoles([]); return; }
+    setRoles(data || []);
+  }, [plant.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  if (roles === null) return html`<div class="loader"><div class="spinner"></div></div>`;
+  const builtins = roles.filter(r => r.is_builtin);
+  const customs  = roles.filter(r => !r.is_builtin);
+
+  return html`
+    <div class="card" style="background:var(--amber-50);border-color:var(--amber-200);padding:10px 14px;margin-bottom:12px">
+      <div style="font-size:12px;color:var(--amber-800);line-height:1.55">
+        <strong>⚡ Phase 1 — visibility only.</strong> Hidden modules disappear from the menu, but backend enforcement
+        (RPC + database) ships in Phase 2. Until then, a determined user with browser tools could still call APIs directly.
+        Use this for layout / day-to-day clarity, not yet as a security boundary.
+      </div>
+    </div>
+    ${err && html`<div class="alert error">${err}</div>`}
+
+    <div class="section-h">Built-in roles${builtins.length ? ' · ' + builtins.length : ''}</div>
+    ${builtins.map(r => html`
+      <div class="list-item" key=${r.id}>
+        <div class="list-item-row">
+          <div class="list-item-main">
+            <div class="list-item-title">${r.display_name} <span style="color:var(--slate-400);font-weight:400;font-size:12px">· ${r.slug}</span></div>
+            <div class="list-item-sub">${r.description || ''} · ${r.member_count} user${r.member_count === 1 ? '' : 's'} · ${r.permissions.length} permission${r.permissions.length === 1 ? '' : 's'}</div>
+          </div>
+          <button class="btn small ghost" onClick=${() => setEditTarget(r)}>View</button>
+        </div>
+      </div>
+    `)}
+
+    <div class="section-h" style="margin-top:18px">Custom roles${customs.length ? ' · ' + customs.length : ''}<button class="btn small" onClick=${() => setCreating(true)}>+ New role</button></div>
+    ${customs.length === 0 && html`
+      <div class="card" style="text-align:center;color:var(--slate-500);font-size:13px;padding:18px">
+        No custom roles yet. Built-in roles cover most plants — add a custom one only when you need a finer slice
+        (e.g. <strong>Purchase Officer</strong> who can input bills but not see Sales).
+      </div>
+    `}
+    ${customs.map(r => html`
+      <div class="list-item" key=${r.id}>
+        <div class="list-item-row">
+          <div class="list-item-main">
+            <div class="list-item-title">${r.display_name} <span style="color:var(--slate-400);font-weight:400;font-size:12px">· ${r.slug}</span></div>
+            <div class="list-item-sub">${r.description || ''} · ${r.member_count} user${r.member_count === 1 ? '' : 's'} · ${r.permissions.length} permission${r.permissions.length === 1 ? '' : 's'}</div>
+          </div>
+          <button class="btn small" onClick=${() => setEditTarget(r)}>Edit</button>
+        </div>
+      </div>
+    `)}
+
+    ${creating && html`<${RoleCreateModal} plant=${plant} onClose=${() => setCreating(false)} onSaved=${async () => { setCreating(false); await refresh(); }} />`}
+    ${editTarget && html`<${RoleEditModal} plant=${plant} role=${editTarget} onClose=${() => setEditTarget(null)} onSaved=${async () => { setEditTarget(null); await refresh(); }} />`}
+  `;
+}
+
+function RoleCreateModal({ plant, onClose, onSaved }) {
+  const [name, setName] = useState('');
+  const [slug, setSlug] = useState('');
+  const [desc, setDesc] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  // Derive a default slug from the display name so users don't have to think about it.
+  useEffect(() => {
+    setSlug(name.toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'').slice(0, 32));
+  }, [name]);
+  const create = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    const { error } = await sb.rpc('create_plant_role', { p_plant_id: plant.id, p_slug: slug, p_display_name: name, p_description: desc });
+    setBusy(false);
+    if (error) { setErr(error.message); return; }
+    onSaved();
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Create a custom role</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <form onSubmit=${create}>
+          <div class="field"><label>Display name *</label><input type="text" required autoFocus value=${name} onInput=${e => setName(e.target.value)} placeholder="Purchase Officer" /></div>
+          <div class="field"><label>Slug <span style="color:var(--slate-400);font-size:11px">· internal id, lowercase</span></label><input type="text" required value=${slug} onInput=${e => setSlug(e.target.value)} placeholder="purchase_officer" /></div>
+          <div class="field"><label>Description</label><input type="text" value=${desc} onInput=${e => setDesc(e.target.value)} placeholder="Handles incoming vendor bills and stock receipts" /></div>
+          <button class="btn" type="submit" disabled=${busy} style="width:100%;margin-top:4px">${busy ? 'Creating…' : 'Create role'}</button>
+          <p style="font-size:11px;color:var(--slate-500);margin-top:10px;line-height:1.5">
+            After creating, you'll edit which modules + actions this role can access.
+          </p>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function RoleEditModal({ plant, role, onClose, onSaved }) {
+  // Build a quick set from role.permissions for fast (key, action) lookups
+  const buildSet = (perms) => {
+    const s = new Set();
+    for (const p of (perms || [])) s.add(p.module_key + '|' + p.action);
+    return s;
+  };
+  const [perms, setPerms] = useState(() => buildSet(role.permissions));
+  const [displayName, setDisplayName] = useState(role.display_name);
+  const [desc, setDesc] = useState(role.description || '');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const readOnly = role.is_builtin && (role.slug === 'plant_head' || role.slug === 'admin');
+  const renameLocked = role.is_builtin;
+
+  const toggle = (modKey, action) => {
+    if (readOnly) return;
+    const k = modKey + '|' + action;
+    const next = new Set(perms);
+    if (next.has(k)) next.delete(k); else next.add(k);
+    setPerms(next);
+  };
+  const allFor = (modKey, on) => {
+    if (readOnly) return;
+    const next = new Set(perms);
+    for (const a of RBAC_ACTIONS) {
+      const k = modKey + '|' + a;
+      if (on) next.add(k); else next.delete(k);
+    }
+    setPerms(next);
+  };
+  const save = async () => {
+    setErr(''); setBusy(true);
+    try {
+      if (!renameLocked) {
+        const { error } = await sb.rpc('update_plant_role', { p_role_id: role.id, p_display_name: displayName, p_description: desc, p_is_active: true });
+        if (error) throw error;
+      }
+      if (!readOnly) {
+        // Wildcard '*' on a module shrinks to one row. For simplicity Phase 1 doesn't emit '*' from the editor —
+        // a row with all 6 individual actions is equivalent for the permission-check logic.
+        const list = Array.from(perms).map(k => { const [mk, a] = k.split('|'); return { module_key: mk, action: a, filter: null }; });
+        const { error } = await sb.rpc('set_role_permissions', { p_role_id: role.id, p_permissions: list });
+        if (error) throw error;
+      }
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  // Group modules for readability
+  const byGroup = {};
+  for (const m of RBAC_MODULES) {
+    (byGroup[m.group] ||= []).push(m);
+  }
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:760px;width:96vw;max-height:92vh;overflow-y:auto">
+        <div class="modal-header">
+          <div class="modal-title">${role.is_builtin ? 'View' : 'Edit'} role: ${role.display_name}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        ${readOnly && html`
+          <div class="card" style="background:var(--slate-50);padding:10px 14px;font-size:12px;color:var(--slate-600);margin-bottom:10px">
+            🔒 The Plant Head and Admin roles always have full access — that's deliberate, so you can't accidentally lock yourself out.
+          </div>
+        `}
+        ${role.is_builtin && !readOnly && html`
+          <div class="card" style="background:var(--slate-50);padding:10px 14px;font-size:12px;color:var(--slate-600);margin-bottom:10px">
+            ℹ️ This is a built-in role. The name is fixed; permissions are editable.
+          </div>
+        `}
+        <div class="field"><label>Display name</label><input type="text" value=${displayName} onInput=${e => setDisplayName(e.target.value)} disabled=${renameLocked} /></div>
+        <div class="field"><label>Description</label><input type="text" value=${desc} onInput=${e => setDesc(e.target.value)} /></div>
+
+        <div class="section-h" style="margin-top:14px">Permissions</div>
+        <div style="overflow-x:auto;border:1px solid var(--slate-200);border-radius:8px">
+          <table style="width:100%;border-collapse:collapse;font-size:12px">
+            <thead>
+              <tr style="background:var(--slate-50);text-align:left">
+                <th style="padding:8px 10px;font-weight:600;color:var(--slate-600);position:sticky;left:0;background:var(--slate-50);min-width:170px">Module</th>
+                ${RBAC_ACTIONS.map(a => html`<th key=${a} style="padding:8px 6px;font-weight:600;color:var(--slate-600);text-align:center;min-width:62px">${RBAC_ACTION_LABELS[a]}</th>`)}
+                <th style="padding:8px 6px;text-align:center">All</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${Object.keys(byGroup).map(gk => html`
+                <tr key=${'h-'+gk}>
+                  <td colSpan=${RBAC_ACTIONS.length + 2} style="padding:8px 10px;background:var(--slate-50);font-weight:600;font-size:11px;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.04em">${RBAC_MODULE_GROUPS[gk]}</td>
+                </tr>
+                ${byGroup[gk].map(m => {
+                  const allOn = RBAC_ACTIONS.every(a => perms.has(m.key + '|' + a));
+                  return html`
+                    <tr key=${m.key} style="border-top:1px solid var(--slate-100)">
+                      <td style="padding:8px 10px;position:sticky;left:0;background:white">${m.label}</td>
+                      ${RBAC_ACTIONS.map(a => html`
+                        <td key=${a} style="padding:6px;text-align:center">
+                          <input type="checkbox" disabled=${readOnly}
+                            checked=${perms.has(m.key + '|' + a)}
+                            onChange=${() => toggle(m.key, a)} />
+                        </td>
+                      `)}
+                      <td style="padding:6px;text-align:center">
+                        <input type="checkbox" disabled=${readOnly} checked=${allOn} onChange=${() => allFor(m.key, !allOn)} />
+                      </td>
+                    </tr>
+                  `;
+                })}
+              `)}
+            </tbody>
+          </table>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <button class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
+          <button class="btn" onClick=${save} disabled=${busy || readOnly} style="flex:2">${busy ? 'Saving…' : (readOnly ? 'Read-only' : 'Save changes')}</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// User row → role assignment modal (opened from People → Team → "Roles" button)
+function UserRolesModal({ plant, user, onClose, onSaved }) {
+  const [roles, setRoles] = useState(null);
+  const [selected, setSelected] = useState(new Set());
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  useEffect(() => {
+    (async () => {
+      const { data, error } = await sb.rpc('list_plant_roles', { p_plant_id: plant.id });
+      if (error) { setErr(error.message); setRoles([]); return; }
+      setRoles(data || []);
+      // Determine current assignments
+      const { data: links } = await sb.from('user_plant_roles').select('role_id').eq('user_id', user.id);
+      setSelected(new Set((links || []).map(l => l.role_id)));
+    })();
+  }, [plant.id, user.id]);
+  const toggle = (id) => { const n = new Set(selected); if (n.has(id)) n.delete(id); else n.add(id); setSelected(n); };
+  const save = async () => {
+    setBusy(true); setErr('');
+    const { error } = await sb.rpc('assign_user_roles', { p_user_id: user.id, p_role_ids: Array.from(selected) });
+    setBusy(false);
+    if (error) { setErr(error.message); return; }
+    onSaved();
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Roles for ${user.full_name}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        ${roles === null ? html`<div class="loader"><div class="spinner"></div></div>` : html`
+          <p style="font-size:13px;color:var(--slate-600);margin-bottom:10px;line-height:1.5">
+            Pick one or more roles. The user gets the union of permissions across all selected roles.
+          </p>
+          ${roles.map(r => html`
+            <label key=${r.id} style="display:flex;align-items:center;gap:10px;padding:9px 4px;border-bottom:1px solid var(--slate-100);cursor:pointer">
+              <input type="checkbox" checked=${selected.has(r.id)} onChange=${() => toggle(r.id)} />
+              <div style="flex:1;min-width:0">
+                <div style="font-weight:600">${r.display_name}${r.is_builtin ? html` <span style="font-size:10px;color:var(--slate-400);font-weight:400">· built-in</span>` : ''}</div>
+                <div style="font-size:11px;color:var(--slate-500)">${r.description || ''}</div>
+              </div>
+            </label>
+          `)}
+          <div style="display:flex;gap:8px;margin-top:14px">
+            <button class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
+            <button class="btn" onClick=${save} disabled=${busy} style="flex:2">${busy ? 'Saving…' : 'Save roles'}</button>
+          </div>
+        `}
       </div>
     </div>
   `;
@@ -7333,7 +7718,7 @@ function UnitAccessModal({ plant, me, onClose }) {
 }
 
 // ============= MORE =============
-function More({ plant, me, user, logout, setTab, activeUnit, accessibleUnits, tab }) {
+function More({ plant, me, myPerms, user, logout, setTab, activeUnit, accessibleUnits, tab }) {
   const [unitAccessOpen, setUnitAccessOpen] = useState(false);
   const [openGroups, setOpenGroups] = useState(() => {
     try { return JSON.parse(localStorage.getItem('more_groups_open') || '{}'); }
@@ -7373,7 +7758,7 @@ function More({ plant, me, user, logout, setTab, activeUnit, accessibleUnits, ta
         <button class="btn small ghost" onClick=${collapseAll} style="font-size:11px;padding:3px 8px">Collapse</button>
       </span>
     </div>
-    ${visibleMoreGroups(plant).map(group => {
+    ${visibleMoreGroups(plant, myPerms).map(group => {
       const open = groupOpen(group.key);
       const activeChild = group.items.some(i => i.key === tab);
       return html`
