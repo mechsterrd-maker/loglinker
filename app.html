@@ -4766,6 +4766,9 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
   // RBAC: tag an OCR-eligible attachment to a project. Required for project-
   // restricted users (supervisors); optional for admins (NULL = plant-wide).
   const [attachmentProject, setAttachmentProject] = useState('');
+  // Per-stage tagging: when the upload was launched from a specific stage on
+  // Project Detail, stage_id rides along too so the bill lands on that stage.
+  const [attachmentStage, setAttachmentStage] = useState('');
   const [projects, setProjects] = useState([]); // active projects in this plant
   const [uploading, setUploading] = useState(false);
   const [notifPerm, setNotifPerm] = useState(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
@@ -4794,16 +4797,24 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
       .order('created_at', { ascending: false })
       .then(({ data }) => setProjects(data || []));
   }, [plant?.id]);
-  // Project Detail's "Upload bill" shortcut: it stashes the project id and
-  // navigates here. Once the user picks a file, pre-tag the attachment to that
-  // project so they don't have to find it in the dropdown.
+  // Project Detail's "Upload bill" shortcut: it stashes the project id (and
+  // optionally a stage id). Once the user picks a file here, pre-tag the
+  // attachment to that project + stage so they don't have to find them in the
+  // dropdown.
   useEffect(() => {
     if (!attachment) return;
-    let stashed = '';
-    try { stashed = sessionStorage.getItem('loglinkr_upload_project_id') || ''; } catch(e){}
-    if (!stashed) return;
-    if (projects.some(p => p.id === stashed)) setAttachmentProject(stashed);
-    try { sessionStorage.removeItem('loglinkr_upload_project_id'); } catch(e){}
+    let stashedProject = '', stashedStage = '';
+    try {
+      stashedProject = sessionStorage.getItem('loglinkr_upload_project_id') || '';
+      stashedStage = sessionStorage.getItem('loglinkr_upload_stage_id') || '';
+    } catch(e){}
+    if (!stashedProject) return;
+    if (projects.some(p => p.id === stashedProject)) setAttachmentProject(stashedProject);
+    if (stashedStage) setAttachmentStage(stashedStage);
+    try {
+      sessionStorage.removeItem('loglinkr_upload_project_id');
+      sessionStorage.removeItem('loglinkr_upload_stage_id');
+    } catch(e){}
   }, [attachment, projects]);
   // Global plant-wide subscription — notifications work even when not on chat tab
   useEffect(() => {
@@ -5239,8 +5250,9 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
     setMessages(prev => [...prev, optimisticMsg]);
     setInput('');
     setAttachment(null);
-    // RBAC: clear the project tag so the picker doesn't carry into the next bill
+    // RBAC: clear the project + stage tags so they don't carry into the next bill
     setAttachmentProject('');
+    setAttachmentStage('');
     setTimeout(() => {
       const wrap = document.getElementById('threadMessages');
       if (wrap) wrap.scrollTop = wrap.scrollHeight;
@@ -5274,6 +5286,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
           p_group_id: activeGroup.id,
           p_image_url: attachments[0].url,
           p_project_id: attachmentProject || null,
+          p_stage_id: attachmentStage || null,
         });
         if (queueId && !enqErr) {
           // Fire-and-forget call to Edge Function
@@ -5393,16 +5406,22 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
           <div class="thread-attach-preview">
             ${attachment.previewUrl ? html`<img src=${attachment.previewUrl} />` : html`<span>📎</span>`}
             <span>${attachment.name}</span>
-            <button onClick=${() => { setAttachment(null); setAttachmentProject(''); }}>×</button>
+            <button onClick=${() => { setAttachment(null); setAttachmentProject(''); setAttachmentStage(''); }}>×</button>
           </div>
           ${attachment.type?.startsWith('image/') && activeGroup?.ai_logistics_enabled && myPerms?.rbac_enforced && html`
-            <div style="padding:8px 12px;background:var(--teal-50);border-top:1px solid var(--teal-100);display:flex;align-items:center;gap:10px;font-size:12px">
+            <div style="padding:8px 12px;background:var(--teal-50);border-top:1px solid var(--teal-100);display:flex;align-items:center;gap:10px;font-size:12px;flex-wrap:wrap">
               <span style="color:var(--teal-800);font-weight:600">📐 Tag this bill to:</span>
-              <select value=${attachmentProject} onChange=${e => setAttachmentProject(e.target.value)}
+              <select value=${attachmentProject} onChange=${e => { setAttachmentProject(e.target.value); setAttachmentStage(''); }}
                 style="flex:1;padding:6px 8px;border:1px solid var(--teal-200);border-radius:6px;font-size:12px;background:white">
                 <option value="">— ${isProjectRestricted(myPerms) ? 'Required: pick a project' : 'Plant-wide (no project)'} —</option>
                 ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.name}</option>`)}
               </select>
+              ${attachmentStage && html`
+                <span style="font-size:11px;background:white;border:1px solid var(--teal-200);padding:3px 8px;border-radius:10px;color:var(--teal-800);display:inline-flex;align-items:center;gap:4px">
+                  Stage pre-tagged
+                  <button onClick=${() => setAttachmentStage('')} style="background:none;border:0;color:var(--slate-500);cursor:pointer;font-size:12px;padding:0;line-height:1">×</button>
+                </span>
+              `}
             </div>
           `}
         `}
@@ -11507,6 +11526,10 @@ function ProjectModal({ plant, me, customers, users, editTarget, onClose, onSave
   });
   const [milestones, setMilestones] = useState([]);
   const [newMs, setNewMs] = useState('');
+  // For NEW project: collect stage names in memory; they're inserted after the
+  // project row is created so we have a project_id for the FK.
+  const [pendingStages, setPendingStages] = useState([]);
+  const [newStageDraft, setNewStageDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
@@ -11529,8 +11552,18 @@ function ProjectModal({ plant, me, customers, users, editTarget, onClose, onSave
         progress_pct: parseInt(form.progress_pct)||0, owner_user_id: form.owner_user_id||null, notes: form.notes||null,
       };
       if (form.status === 'completed' && !form.completed_date) payload.completed_date = new Date().toISOString().slice(0,10);
-      if (editTarget) { const {error}=await sb.from('mcp_projects').update(payload).eq('id',editTarget.id); if(error)throw error; }
-      else { payload.created_by = me.id; const {error}=await sb.from('mcp_projects').insert(payload); if(error)throw error; }
+      if (editTarget) {
+        const {error}=await sb.from('mcp_projects').update(payload).eq('id',editTarget.id);
+        if(error)throw error;
+      } else {
+        payload.created_by = me.id;
+        const {data: created, error}=await sb.from('mcp_projects').insert(payload).select('id').single();
+        if(error)throw error;
+        if (created?.id && pendingStages.length > 0) {
+          const rows = pendingStages.map((name, i) => ({ plant_id: plant.id, project_id: created.id, seq: i+1, name }));
+          await sb.from('mcp_project_milestones').insert(rows);
+        }
+      }
       showToast(editTarget?'Project updated':'Project created');
       onSaved();
     } catch(e){ setErr(e.message); } finally { setBusy(false); }
@@ -11578,6 +11611,27 @@ function ProjectModal({ plant, me, customers, users, editTarget, onClose, onSave
           </div>
           <div class="field"><label>Progress: ${form.progress_pct||0}%</label><input type="range" min=${0} max=${100} step=${5} value=${form.progress_pct||0} onChange=${e=>setForm({...form,progress_pct:e.target.value})} style="width:100%" /></div>
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes||''} onChange=${e=>setForm({...form,notes:e.target.value})}></textarea></div>
+          ${!editTarget && html`
+            <div class="field">
+              <label>Stages · optional, add sub-stages later</label>
+              <div style="display:flex;gap:6px;margin-bottom:6px">
+                <input type="text" value=${newStageDraft} onChange=${e=>setNewStageDraft(e.target.value)} placeholder="e.g. Design · Material · Fabrication" style="flex:1;padding:6px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px"
+                  onKeyDown=${e=>{ if(e.key==='Enter'){ e.preventDefault(); if(newStageDraft.trim()){ setPendingStages([...pendingStages, newStageDraft.trim()]); setNewStageDraft(''); } } }} />
+                <button type="button" class="btn small" onClick=${()=>{ if(newStageDraft.trim()){ setPendingStages([...pendingStages, newStageDraft.trim()]); setNewStageDraft(''); } }}>+ Add</button>
+              </div>
+              ${pendingStages.length>0 && html`
+                <div style="display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--slate-700)">
+                  ${pendingStages.map((s,i)=>html`
+                    <div key=${i} style="display:flex;align-items:center;gap:8px;padding:4px 8px;background:var(--slate-50);border-radius:4px">
+                      <span style="color:var(--slate-400);font-size:11px">${i+1}.</span>
+                      <span style="flex:1">${s}</span>
+                      <button type="button" onClick=${()=>setPendingStages(pendingStages.filter((_,j)=>j!==i))} style="background:none;border:0;color:var(--slate-400);cursor:pointer;font-size:14px">×</button>
+                    </div>
+                  `)}
+                </div>
+              `}
+            </div>
+          `}
           <button class="btn" disabled=${busy} style="width:100%">${busy?'Saving…':(editTarget?'Update project':'Create project')}</button>
         </form>
         ${editTarget && html`
@@ -11601,28 +11655,38 @@ function ProjectModal({ plant, me, customers, users, editTarget, onClose, onSave
   `;
 }
 
-// Project Detail — opened when a card is tapped. Operational workspace for
-// supervisors / team leads / managers: see project info, update the fields they
-// own (status, progress, weight, milestones), see the bills tagged to this
-// project, and shortcut into Chat with this project pre-tagged for OCR upload.
-// Full edit (name/code/customer/order value) lives behind the pencil button and
-// reuses ProjectModal — intended for managers / admin / plant head.
+// Project Detail — opened when a card is tapped. Operational workspace for the
+// assigned team: see project info, update the operational fields, walk the
+// stages tree, upload bills tied to a specific stage, and raise approvals or
+// queries to the project group. Full edit (name/code/customer/order value)
+// lives behind the pencil button -- intended for manager / admin / plant head.
 function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit, onChanged }) {
   const STATUS = { planning:{c:'',l:'Planning'}, in_progress:{c:'amber',l:'In progress'}, on_hold:{c:'rose',l:'On hold'}, completed:{c:'emerald',l:'Completed'}, cancelled:{c:'',l:'Cancelled'} };
-  const [milestones, setMilestones] = useState([]);
-  const [bills, setBills] = useState([]);
-  const [newMs, setNewMs] = useState('');
+  const [stages, setStages] = useState([]);     // milestones with parent_id null
+  const [subs, setSubs] = useState({});         // parentId -> [substages]
+  const [bills, setBills] = useState([]);       // recent bills tagged to project
+  const [newStageDraft, setNewStageDraft] = useState('');
+  const [newSubDrafts, setNewSubDrafts] = useState({}); // stageId -> draft
+  const [expanded, setExpanded] = useState({}); // stageId -> bool
   const [savingField, setSavingField] = useState('');
   const [progressDraft, setProgressDraft] = useState(project.progress_pct||0);
   const [weightDraft, setWeightDraft] = useState(project.actual_weight_kg||'');
+  const [askModal, setAskModal] = useState(null); // { kind:'approval'|'query', stage }
   const restricted = isProjectRestricted(myPerms);
 
   const reload = useCallback(async () => {
     const [m, d] = await Promise.all([
       sb.from('mcp_project_milestones').select('*').eq('project_id', project.id).order('seq'),
-      sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name, total_amount, created_at').eq('project_id', project.id).order('created_at',{ascending:false}).limit(20),
+      sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, total_value, stage_id, created_at').eq('project_id', project.id).order('created_at',{ascending:false}).limit(40),
     ]);
-    setMilestones(m.data || []);
+    const all = m.data || [];
+    const tops = all.filter(x => !x.parent_id);
+    const childMap = {};
+    for (const x of all.filter(y => y.parent_id)) {
+      (childMap[x.parent_id] ||= []).push(x);
+    }
+    setStages(tops);
+    setSubs(childMap);
     setBills(d.data || []);
   }, [project.id]);
   useEffect(()=>{ reload(); }, [reload]);
@@ -11638,25 +11702,42 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
     showToast('Saved');
     onChanged && onChanged();
   };
-  const cycleMs = async (m) => {
+  const cycleStage = async (m) => {
     const next = m.status==='pending'?'in_progress':m.status==='in_progress'?'done':'pending';
-    await sb.from('mcp_project_milestones').update({ status:next, done_date: next==='done'?new Date().toISOString().slice(0,10):null }).eq('id',m.id);
+    const { error } = await sb.from('mcp_project_milestones').update({ status:next, done_date: next==='done'?new Date().toISOString().slice(0,10):null }).eq('id',m.id);
+    if (error) { alert('Could not update: ' + error.message); return; }
     reload();
   };
-  const addMilestone = async () => {
-    if (!newMs.trim()) return;
-    await sb.from('mcp_project_milestones').insert({ plant_id:plant.id, project_id:project.id, seq:milestones.length+1, name:newMs.trim() });
-    setNewMs('');
+  const addStage = async () => {
+    if (!newStageDraft.trim()) return;
+    const { error } = await sb.from('mcp_project_milestones').insert({ plant_id:plant.id, project_id:project.id, seq:stages.length+1, name:newStageDraft.trim() });
+    if (error) { alert('Could not add stage: ' + error.message); return; }
+    setNewStageDraft('');
     reload();
   };
-  const uploadBill = () => {
-    try { sessionStorage.setItem('loglinkr_upload_project_id', project.id); } catch(e){}
+  const addSubStage = async (parentStage) => {
+    const draft = (newSubDrafts[parentStage.id]||'').trim();
+    if (!draft) return;
+    const childCount = (subs[parentStage.id]||[]).length;
+    const { error } = await sb.from('mcp_project_milestones').insert({ plant_id:plant.id, project_id:project.id, parent_id:parentStage.id, seq:childCount+1, name:draft });
+    if (error) { alert('Could not add sub-stage: ' + error.message); return; }
+    setNewSubDrafts({ ...newSubDrafts, [parentStage.id]: '' });
+    reload();
+  };
+  const uploadBill = (stage) => {
+    try {
+      sessionStorage.setItem('loglinkr_upload_project_id', project.id);
+      if (stage) sessionStorage.setItem('loglinkr_upload_stage_id', stage.id);
+      else sessionStorage.removeItem('loglinkr_upload_stage_id');
+    } catch(e){}
     if (go) go('chat', 'upload_bill');
   };
 
   const st = STATUS[project.status] || { c:'', l: project.status };
   const owner = users.find(u => u.id === project.owner_user_id);
-  const totalBilled = bills.reduce((s,b)=>s+parseFloat(b.total_amount||0),0);
+  const totalBilled = bills.reduce((s,b)=>s+parseFloat(b.total_value||0),0);
+  const billsByStage = bills.reduce((acc,b)=>{ const k=b.stage_id||'_'; (acc[k]||=[]).push(b); return acc; }, {});
+  const stageStatusIcon = (s) => s==='done'?'✅':s==='in_progress'?'🔄':'⬜';
 
   return html`
     <div class="page-header" style="display:flex;align-items:center;gap:10px">
@@ -11705,41 +11786,86 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
 
     <div class="card" style="padding:14px;margin-bottom:10px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <div style="font-size:12px;font-weight:700;color:var(--slate-600)">Milestones · ${milestones.length}</div>
-        <div style="font-size:10px;color:var(--slate-400)">tap to advance</div>
+        <div style="font-size:12px;font-weight:700;color:var(--slate-600)">Stages · ${stages.length}</div>
+        <div style="font-size:10px;color:var(--slate-400)">tap status to advance · expand for actions</div>
       </div>
-      ${milestones.length===0 && html`<div style="font-size:12px;color:var(--slate-400);padding:6px 0">No milestones yet. Add the first one below.</div>`}
-      ${milestones.map(m => html`
-        <div key=${m.id} onClick=${()=>cycleMs(m)} style="display:flex;align-items:center;gap:8px;padding:6px 0;cursor:pointer">
-          <span style="font-size:15px">${m.status==='done'?'✅':m.status==='in_progress'?'🔄':'⬜'}</span>
-          <span style=${'flex:1;font-size:13px;'+(m.status==='done'?'text-decoration:line-through;color:var(--slate-400)':'')}>${m.name}</span>
-          ${m.done_date && html`<span style="font-size:10px;color:var(--slate-400)">${m.done_date}</span>`}
-        </div>
-      `)}
+      ${stages.length===0 && html`<div style="font-size:12px;color:var(--slate-400);padding:6px 0">No stages yet. Add the first one below — sub-stages can be added inside any stage.</div>`}
+      ${stages.map(s => {
+        const isOpen = !!expanded[s.id];
+        const children = subs[s.id] || [];
+        const stageBills = billsByStage[s.id] || [];
+        const stageTotal = stageBills.reduce((sum,b)=>sum+parseFloat(b.total_value||0),0);
+        return html`
+          <div key=${s.id} style="border:1px solid var(--slate-100);border-radius:6px;margin-bottom:6px;background:white">
+            <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:pointer" onClick=${()=>setExpanded({...expanded,[s.id]:!isOpen})}>
+              <span onClick=${(e)=>{ e.stopPropagation(); cycleStage(s); }} style="font-size:15px" title="Tap to advance status">${stageStatusIcon(s.status)}</span>
+              <span style=${'flex:1;font-size:13px;font-weight:600;'+(s.status==='done'?'text-decoration:line-through;color:var(--slate-400)':'')}>${s.name}</span>
+              ${children.length>0 && html`<span style="font-size:10px;color:var(--slate-500);background:var(--slate-50);padding:2px 6px;border-radius:8px">${children.filter(c=>c.status==='done').length}/${children.length}</span>`}
+              ${stageBills.length>0 && html`<span style="font-size:10px;color:var(--teal-700);background:var(--teal-50);padding:2px 6px;border-radius:8px">${stageBills.length} bill${stageBills.length===1?'':'s'} · ₹${fmtNum(stageTotal)}</span>`}
+              <span style="font-size:11px;color:var(--slate-400)">${isOpen?'▼':'▶'}</span>
+            </div>
+            ${isOpen && html`
+              <div style="padding:6px 10px 10px 28px;border-top:1px solid var(--slate-100)">
+                ${children.length>0 && children.map(c => html`
+                  <div key=${c.id} onClick=${()=>cycleStage(c)} style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer">
+                    <span style="font-size:14px">${stageStatusIcon(c.status)}</span>
+                    <span style=${'flex:1;font-size:12px;'+(c.status==='done'?'text-decoration:line-through;color:var(--slate-400)':'')}>${c.name}</span>
+                    ${c.done_date && html`<span style="font-size:10px;color:var(--slate-400)">${c.done_date}</span>`}
+                  </div>
+                `)}
+                <div style="display:flex;gap:6px;margin-top:6px">
+                  <input type="text" value=${newSubDrafts[s.id]||''} onChange=${e=>setNewSubDrafts({...newSubDrafts,[s.id]:e.target.value})} placeholder="+ Sub-stage" style="flex:1;padding:5px 8px;font-size:11px;border:1px solid var(--slate-200);border-radius:5px"
+                    onKeyDown=${e=>{ if(e.key==='Enter'){ e.preventDefault(); addSubStage(s); } }} />
+                  <button type="button" class="btn small ghost" onClick=${()=>addSubStage(s)} style="padding:4px 10px;font-size:11px">+ Add</button>
+                </div>
+                <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
+                  <button class="btn small" onClick=${()=>uploadBill(s)} style="padding:4px 10px;font-size:11px">📷 Upload bill</button>
+                  <button class="btn small ghost" onClick=${()=>setAskModal({kind:'approval', stage:s})} style="padding:4px 10px;font-size:11px">📋 Raise approval</button>
+                  <button class="btn small ghost" onClick=${()=>setAskModal({kind:'query', stage:s})} style="padding:4px 10px;font-size:11px">💬 Ask query</button>
+                </div>
+                ${stageBills.length>0 && html`
+                  <div style="margin-top:8px;border-top:1px dashed var(--slate-100);padding-top:6px">
+                    ${stageBills.slice(0,5).map(b => html`
+                      <div key=${b.id} style="display:flex;justify-content:space-between;padding:3px 0;font-size:11px">
+                        <span style="color:var(--slate-600)">${b.doc_type||'doc'}${b.doc_number?' · '+b.doc_number:''} · ${b.vendor_name_raw||'—'}</span>
+                        ${b.total_value && html`<span style="font-weight:600">₹${fmtNum(b.total_value)}</span>`}
+                      </div>
+                    `)}
+                  </div>
+                `}
+              </div>
+            `}
+          </div>
+        `;
+      })}
       <div style="display:flex;gap:6px;margin-top:8px">
-        <input type="text" value=${newMs} onChange=${e=>setNewMs(e.target.value)} placeholder="Add milestone (e.g. Fabrication done)" style="flex:1;padding:6px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px" />
-        <button type="button" class="btn small" onClick=${addMilestone}>+ Add</button>
+        <input type="text" value=${newStageDraft} onChange=${e=>setNewStageDraft(e.target.value)} placeholder="+ New stage (e.g. Fabrication)" style="flex:1;padding:6px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px"
+          onKeyDown=${e=>{ if(e.key==='Enter'){ e.preventDefault(); addStage(); } }} />
+        <button type="button" class="btn small" onClick=${addStage}>+ Add</button>
       </div>
     </div>
 
     <div class="card" style="padding:14px;margin-bottom:10px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
         <div>
-          <div style="font-size:12px;font-weight:700;color:var(--slate-600)">Bills on this project · ${bills.length}</div>
+          <div style="font-size:12px;font-weight:700;color:var(--slate-600)">All bills on this project · ${bills.length}</div>
           ${bills.length>0 && html`<div style="font-size:10px;color:var(--slate-500);margin-top:2px">Total ₹${fmtNum(totalBilled)}</div>`}
         </div>
-        <button class="btn small" onClick=${uploadBill} style="padding:6px 10px">📷 Upload bill</button>
+        <button class="btn small" onClick=${()=>uploadBill(null)} style="padding:6px 10px">📷 Upload bill</button>
       </div>
-      ${bills.length===0 ? html`<div style="font-size:12px;color:var(--slate-400);padding:6px 0">No bills tagged to this project yet. Tap "Upload bill" to add one from chat — the project will be pre-tagged.</div>` :
-        bills.map(b => html`
+      ${bills.length===0 ? html`<div style="font-size:12px;color:var(--slate-400);padding:6px 0">No bills tagged to this project yet. Tap "Upload bill" on a stage to pre-tag the stage too.</div>` :
+        bills.slice(0,10).map(b => {
+          const stageName = stages.find(s=>s.id===b.stage_id)?.name
+            || Object.values(subs).flat().find(c=>c.id===b.stage_id)?.name;
+          return html`
           <div key=${b.id} style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-top:1px solid var(--slate-100);font-size:12px">
             <div style="min-width:0;flex:1">
               <div style="font-weight:600">${b.doc_type||'doc'}${b.doc_number?' · '+b.doc_number:''}</div>
-              <div style="color:var(--slate-500);font-size:11px">${b.vendor_name||'—'}${b.doc_date?' · '+b.doc_date:''}</div>
+              <div style="color:var(--slate-500);font-size:11px">${b.vendor_name_raw||'—'}${b.doc_date?' · '+b.doc_date:''}${stageName?' · '+stageName:''}</div>
             </div>
-            ${b.total_amount && html`<div style="font-weight:700">₹${fmtNum(b.total_amount)}</div>`}
+            ${b.total_value && html`<div style="font-weight:700">₹${fmtNum(b.total_value)}</div>`}
           </div>
-        `)
+        `;})
       }
     </div>
 
@@ -11749,6 +11875,70 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
         <div style="font-size:12px;color:var(--slate-700);white-space:pre-wrap">${project.notes}</div>
       </div>
     `}
+
+    ${askModal && html`<${StageAskModal} plant=${plant} me=${me} project=${project} stage=${askModal.stage} kind=${askModal.kind} onClose=${()=>setAskModal(null)} onSent=${()=>setAskModal(null)} />`}
+  `;
+}
+
+// Stage Ask modal — supervisor raises an approval or query on a specific stage.
+// Posts a chat message to a group they pick (only groups they're a member of),
+// pre-filled with project + stage context and a [Approval needed] / [Query]
+// prefix so PMs can spot it in the group. The parsed_intent JSONB carries
+// project_id, stage_id, and kind for future workflow features.
+function StageAskModal({ plant, me, project, stage, kind, onClose, onSent }) {
+  const [groups, setGroups] = useState([]);
+  const [groupId, setGroupId] = useState('');
+  const [body, setBody] = useState('');
+  const [busy, setBusy] = useState(false);
+  const isApproval = kind === 'approval';
+  const prefix = isApproval ? '[Approval needed]' : '[Query]';
+  const title = isApproval ? 'Raise approval' : 'Ask query';
+  const placeholder = isApproval
+    ? 'What needs approval? e.g. "Material received, please approve to start fabrication."'
+    : 'What is the question? e.g. "Drawing rev mismatch on column C4 — which one is final?"';
+
+  useEffect(() => {
+    sb.from('chat_groups').select('id, name, members').eq('plant_id', plant.id).contains('members', [me.id]).order('name').then(({data})=>{
+      setGroups(data||[]);
+      if ((data||[]).length === 1) setGroupId(data[0].id);
+    });
+  }, [plant.id, me.id]);
+
+  const send = async () => {
+    if (!groupId) { alert('Pick a group to post in.'); return; }
+    if (!body.trim()) { alert('Type the ' + (isApproval?'approval request':'query') + '.'); return; }
+    setBusy(true);
+    const context = `${prefix} ${project.code?project.code+' · ':''}${project.name} · ${stage.name}\n\n${body.trim()}`;
+    const intent = { kind: isApproval?'project_approval':'project_query', project_id: project.id, stage_id: stage.id };
+    const { error } = await sb.from('chat_messages').insert({
+      plant_id: plant.id, group_id: groupId, sender_id: me.id, body: context, parsed_intent: intent,
+    });
+    setBusy(false);
+    if (error) { alert('Could not send: ' + error.message); return; }
+    showToast(isApproval ? 'Approval request sent' : 'Query sent');
+    onSent && onSent();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div class="modal" style="max-width:460px">
+        <div class="modal-header"><div class="modal-title">${title}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">On <b>${project.name}</b> · stage <b>${stage.name}</b></div>
+        <div class="field">
+          <label>Send to group</label>
+          <select value=${groupId} onChange=${e=>setGroupId(e.target.value)}>
+            <option value="">— pick a group —</option>
+            ${groups.map(g=>html`<option key=${g.id} value=${g.id}>${g.name}</option>`)}
+          </select>
+          ${groups.length===0 && html`<div style="font-size:11px;color:var(--rose-600);margin-top:4px">You aren't in any chat group yet. Ask admin to add you.</div>`}
+        </div>
+        <div class="field">
+          <label>Message</label>
+          <textarea rows=${4} value=${body} onChange=${e=>setBody(e.target.value)} placeholder=${placeholder}></textarea>
+        </div>
+        <button class="btn" disabled=${busy || !groupId || !body.trim()} style="width:100%" onClick=${send}>${busy?'Sending…':('Send '+(isApproval?'approval':'query'))}</button>
+      </div>
+    </div>
   `;
 }
 
