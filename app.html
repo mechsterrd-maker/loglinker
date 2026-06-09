@@ -1443,6 +1443,18 @@ function canDo(myPerms, moduleKey, action) {
   return false;
 }
 
+// Frontend mirror of the SQL is_project_restricted(): a user on an rbac_enforced
+// plant who is NOT plant_head/admin/manager is restricted to their assigned
+// projects' data. Used to require a project tag on OCR uploads, to filter the
+// Documents list, and to flip 'project-scoped' UI hints. Kept in sync with the
+// SQL function (rbac_phase2_foundation migration).
+function isProjectRestricted(myPerms) {
+  if (!myPerms || !myPerms.rbac_enforced) return false;
+  const slugs = new Set((myPerms.roles || []).map(r => r.slug));
+  if (slugs.has('plant_head') || slugs.has('admin') || slugs.has('manager')) return false;
+  return true;
+}
+
 function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessibleUnits, activeUnit, switchUnit }) {
   const initials = (me.full_name || user.email).split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
   const [unreadCount, setUnreadCount] = useState(0);
@@ -1527,7 +1539,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${tab === 'movements'}><${MovementsPage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'trace'}><${TracePage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} /></${Page}>
-      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} navAction=${navAction} setTab=${setTab} /></${Page}>
+      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} myPerms=${myPerms} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} navAction=${navAction} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} myPerms=${myPerms} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
       <${Page} active=${tab === 'masters'}><${MastersHub} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
@@ -4732,7 +4744,7 @@ function PendingTasksPanel({ plant, setTab }) {
 }
 
 // ============= CHAT =============
-function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, navAction, setTab }) {
+function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAction, setTab }) {
   const [groups, setGroups] = useState([]);
   const [activeGroup, setActiveGroup] = useState(null);
   // Home "Upload Bill" shortcut: if a chat group is already open, pop the file
@@ -4751,6 +4763,10 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, navAction, set
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
   const [attachment, setAttachment] = useState(null); // { file, previewUrl, type }
+  // RBAC: tag an OCR-eligible attachment to a project. Required for project-
+  // restricted users (supervisors); optional for admins (NULL = plant-wide).
+  const [attachmentProject, setAttachmentProject] = useState('');
+  const [projects, setProjects] = useState([]); // active projects in this plant
   const [uploading, setUploading] = useState(false);
   const [notifPerm, setNotifPerm] = useState(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
   const [taskFromMsg, setTaskFromMsg] = useState(null);
@@ -4764,6 +4780,20 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, navAction, set
   const [activeMeeting, setActiveMeeting] = useState(null); // url being joined inline
 
   useEffect(() => { loadGroups(); }, []);
+
+  // RBAC: load the plant's active projects for the attachment "Tag to project"
+  // picker. Cheap, runs once per Chat mount. Does nothing on non-fab / non-RBAC
+  // plants because we only use the list when myPerms.rbac_enforced is true,
+  // but loading anyway keeps the logic simple.
+  useEffect(() => {
+    if (!plant?.id) return;
+    sb.from('mcp_projects')
+      .select('id, name, status')
+      .eq('plant_id', plant.id)
+      .neq('status', 'completed')
+      .order('created_at', { ascending: false })
+      .then(({ data }) => setProjects(data || []));
+  }, [plant?.id]);
   // Global plant-wide subscription — notifications work even when not on chat tab
   useEffect(() => {
     if (!plant?.id) return;
@@ -5101,6 +5131,16 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, navAction, set
 
   const send = async () => {
     if ((!input.trim() && !attachment) || !activeGroup || uploading) return;
+    // RBAC: a project-restricted user uploading an OCR-eligible image MUST pick
+    // a project — otherwise the bill they upload would be invisible to themselves
+    // (NULL project_id, but they can only see their own projects via RLS).
+    if (attachment && attachment.type?.startsWith('image/')
+        && activeGroup?.ai_logistics_enabled
+        && isProjectRestricted(myPerms)
+        && !attachmentProject) {
+      alert('Please tag this bill to a project before sending.');
+      return;
+    }
     const body = input.trim();
     let attachments = [];
 
@@ -5188,6 +5228,8 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, navAction, set
     setMessages(prev => [...prev, optimisticMsg]);
     setInput('');
     setAttachment(null);
+    // RBAC: clear the project tag so the picker doesn't carry into the next bill
+    setAttachmentProject('');
     setTimeout(() => {
       const wrap = document.getElementById('threadMessages');
       if (wrap) wrap.scrollTop = wrap.scrollHeight;
@@ -5214,10 +5256,13 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, navAction, set
     // Auto-extract documents — ONLY in groups with AI flag enabled (saves API cost)
     if (inserted && attachments.length > 0 && attachments[0].isImage && activeGroup?.ai_logistics_enabled) {
       try {
+        // RBAC: pass the project_id chosen in the attach preview. NULL = plant-wide
+        // (visible to everyone in the plant who isn't project-restricted).
         const { data: queueId, error: enqErr } = await sb.rpc('enqueue_chat_image_for_extraction', {
           p_message_id: inserted.id,
           p_group_id: activeGroup.id,
           p_image_url: attachments[0].url,
+          p_project_id: attachmentProject || null,
         });
         if (queueId && !enqErr) {
           // Fire-and-forget call to Edge Function
@@ -5337,8 +5382,18 @@ function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, navAction, set
           <div class="thread-attach-preview">
             ${attachment.previewUrl ? html`<img src=${attachment.previewUrl} />` : html`<span>📎</span>`}
             <span>${attachment.name}</span>
-            <button onClick=${() => setAttachment(null)}>×</button>
+            <button onClick=${() => { setAttachment(null); setAttachmentProject(''); }}>×</button>
           </div>
+          ${attachment.type?.startsWith('image/') && activeGroup?.ai_logistics_enabled && myPerms?.rbac_enforced && html`
+            <div style="padding:8px 12px;background:var(--teal-50);border-top:1px solid var(--teal-100);display:flex;align-items:center;gap:10px;font-size:12px">
+              <span style="color:var(--teal-800);font-weight:600">📐 Tag this bill to:</span>
+              <select value=${attachmentProject} onChange=${e => setAttachmentProject(e.target.value)}
+                style="flex:1;padding:6px 8px;border:1px solid var(--teal-200);border-radius:6px;font-size:12px;background:white">
+                <option value="">— ${isProjectRestricted(myPerms) ? 'Required: pick a project' : 'Plant-wide (no project)'} —</option>
+                ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.name}</option>`)}
+              </select>
+            </div>
+          `}
         `}
         <div class="thread-input">
           <input type="file" id="chatFileInput" accept="image/*,video/*,audio/*,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip,.rar,.dwg,.dxf,.step,.stp,.iges,.igs,.stl" style="display:none" onChange=${onPickFile} />
