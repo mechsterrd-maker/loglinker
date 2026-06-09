@@ -1565,7 +1565,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${tab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} /></${Page}>
-      <${Page} active=${tab === 'projects'}><${ProjectTracker} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'projects'}><${ProjectTracker} plant=${plant} me=${me} myPerms=${myPerms} go=${go} /></${Page}>
       <${Page} active=${tab === 'expenses'}><${ExpenseLedger} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'machine_prod'}><${MachineProductionModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
@@ -4794,6 +4794,17 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
       .order('created_at', { ascending: false })
       .then(({ data }) => setProjects(data || []));
   }, [plant?.id]);
+  // Project Detail's "Upload bill" shortcut: it stashes the project id and
+  // navigates here. Once the user picks a file, pre-tag the attachment to that
+  // project so they don't have to find it in the dropdown.
+  useEffect(() => {
+    if (!attachment) return;
+    let stashed = '';
+    try { stashed = sessionStorage.getItem('loglinkr_upload_project_id') || ''; } catch(e){}
+    if (!stashed) return;
+    if (projects.some(p => p.id === stashed)) setAttachmentProject(stashed);
+    try { sessionStorage.removeItem('loglinkr_upload_project_id'); } catch(e){}
+  }, [attachment, projects]);
   // Global plant-wide subscription — notifications work even when not on chat tab
   useEffect(() => {
     if (!plant?.id) return;
@@ -11404,13 +11415,14 @@ function IdleLogModal({ plant, me, machine, shifts, onClose, onSaved }) {
 // =================================================================
 // PROJECT TRACKER — fabrication / site-work jobs with progress + milestones
 // =================================================================
-function ProjectTracker({ plant, me }) {
+function ProjectTracker({ plant, me, myPerms, go }) {
   const [projects, setProjects] = useState([]);
   const [customers, setCustomers] = useState([]);
   const [users, setUsers] = useState([]);
   const [filter, setFilter] = useState('active');
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
+  const [activeProject, setActiveProject] = useState(null);
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
@@ -11422,6 +11434,7 @@ function ProjectTracker({ plant, me }) {
     ]);
     setProjects(p.data || []); setCustomers(c.data || []); setUsers(u.data || []);
     setLoading(false);
+    setActiveProject(prev => prev ? (p.data || []).find(x => x.id === prev.id) || prev : prev);
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => {
@@ -11439,6 +11452,14 @@ function ProjectTracker({ plant, me }) {
   const STATUS = { planning:{c:'',l:'Planning'}, in_progress:{c:'amber',l:'In progress'}, on_hold:{c:'rose',l:'On hold'}, completed:{c:'emerald',l:'Completed'}, cancelled:{c:'',l:'Cancelled'} };
   const totalValue = active.reduce((s,p)=>s+parseFloat(p.order_value||0),0);
 
+  if (activeProject) {
+    return html`<${ProjectDetail} plant=${plant} me=${me} myPerms=${myPerms} project=${activeProject} users=${users} go=${go}
+      onBack=${()=>setActiveProject(null)}
+      onEdit=${()=>{setEditTarget(activeProject);setModal('project');}}
+      onChanged=${refresh} />
+      ${modal==='project' && html`<${ProjectModal} plant=${plant} me=${me} customers=${customers} users=${users} editTarget=${editTarget} onClose=${()=>{setModal(null);setEditTarget(null);}} onSaved=${()=>{setModal(null);setEditTarget(null);refresh();}} />`}`;
+  }
+
   return html`
     <div class="page-header"><div><h1>📐 Projects</h1><div class="sub">Fabrication & site-work jobs · progress, weight, milestones</div></div></div>
     <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
@@ -11455,7 +11476,7 @@ function ProjectTracker({ plant, me }) {
     ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
       list.length===0 ? html`<div class="card"><div class="empty"><div class="icon">📐</div><div style="font-size:13px">No projects ${filter==='all'?'yet':'in this filter'}. Tap + New project.</div></div></div>` :
       list.map(p => { const st = STATUS[p.status]||{c:'',l:p.status}; return html`
-        <div class="card" key=${p.id} onClick=${()=>{setEditTarget(p);setModal('project');}} style="margin-bottom:6px;padding:12px 14px;cursor:pointer">
+        <div class="card" key=${p.id} onClick=${()=>setActiveProject(p)} style="margin-bottom:6px;padding:12px 14px;cursor:pointer">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
             <div style="flex:1;min-width:0">
               <div style="font-size:13px;font-weight:600">${p.code?p.code+' · ':''}${p.name}</div>
@@ -11577,6 +11598,157 @@ function ProjectModal({ plant, me, customers, users, editTarget, onClose, onSave
         `}
       </div>
     </div>
+  `;
+}
+
+// Project Detail — opened when a card is tapped. Operational workspace for
+// supervisors / team leads / managers: see project info, update the fields they
+// own (status, progress, weight, milestones), see the bills tagged to this
+// project, and shortcut into Chat with this project pre-tagged for OCR upload.
+// Full edit (name/code/customer/order value) lives behind the pencil button and
+// reuses ProjectModal — intended for managers / admin / plant head.
+function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit, onChanged }) {
+  const STATUS = { planning:{c:'',l:'Planning'}, in_progress:{c:'amber',l:'In progress'}, on_hold:{c:'rose',l:'On hold'}, completed:{c:'emerald',l:'Completed'}, cancelled:{c:'',l:'Cancelled'} };
+  const [milestones, setMilestones] = useState([]);
+  const [bills, setBills] = useState([]);
+  const [newMs, setNewMs] = useState('');
+  const [savingField, setSavingField] = useState('');
+  const [progressDraft, setProgressDraft] = useState(project.progress_pct||0);
+  const [weightDraft, setWeightDraft] = useState(project.actual_weight_kg||'');
+  const restricted = isProjectRestricted(myPerms);
+
+  const reload = useCallback(async () => {
+    const [m, d] = await Promise.all([
+      sb.from('mcp_project_milestones').select('*').eq('project_id', project.id).order('seq'),
+      sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name, total_amount, created_at').eq('project_id', project.id).order('created_at',{ascending:false}).limit(20),
+    ]);
+    setMilestones(m.data || []);
+    setBills(d.data || []);
+  }, [project.id]);
+  useEffect(()=>{ reload(); }, [reload]);
+  useEffect(()=>{ setProgressDraft(project.progress_pct||0); setWeightDraft(project.actual_weight_kg||''); }, [project.id]);
+
+  const saveField = async (field, value) => {
+    setSavingField(field);
+    const payload = { [field]: value };
+    if (field === 'status' && value === 'completed') payload.completed_date = new Date().toISOString().slice(0,10);
+    const { error } = await sb.from('mcp_projects').update(payload).eq('id', project.id);
+    setSavingField('');
+    if (error) { alert('Could not save: ' + error.message); return; }
+    showToast('Saved');
+    onChanged && onChanged();
+  };
+  const cycleMs = async (m) => {
+    const next = m.status==='pending'?'in_progress':m.status==='in_progress'?'done':'pending';
+    await sb.from('mcp_project_milestones').update({ status:next, done_date: next==='done'?new Date().toISOString().slice(0,10):null }).eq('id',m.id);
+    reload();
+  };
+  const addMilestone = async () => {
+    if (!newMs.trim()) return;
+    await sb.from('mcp_project_milestones').insert({ plant_id:plant.id, project_id:project.id, seq:milestones.length+1, name:newMs.trim() });
+    setNewMs('');
+    reload();
+  };
+  const uploadBill = () => {
+    try { sessionStorage.setItem('loglinkr_upload_project_id', project.id); } catch(e){}
+    if (go) go('chat', 'upload_bill');
+  };
+
+  const st = STATUS[project.status] || { c:'', l: project.status };
+  const owner = users.find(u => u.id === project.owner_user_id);
+  const totalBilled = bills.reduce((s,b)=>s+parseFloat(b.total_amount||0),0);
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn small ghost" onClick=${onBack} style="padding:6px 10px">← Back</button>
+      <div style="flex:1;min-width:0">
+        <h1 style="font-size:17px;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${project.code?project.code+' · ':''}${project.name}</h1>
+        <div class="sub">${project.customer?.name||project.customer_name||'—'}${project.site_location?' · '+project.site_location:''}${project.target_date?' · due '+project.target_date:''}</div>
+      </div>
+      ${!restricted && html`<button class="btn small ghost" onClick=${onEdit} title="Edit project details" style="padding:6px 10px">✏️ Edit</button>`}
+    </div>
+
+    <div class="card" style="padding:14px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <span class=${'badge '+st.c} style="font-size:11px">${st.l}</span>
+        <div style="text-align:right">
+          <div style="font-size:20px;font-weight:700">${project.progress_pct||0}%</div>
+          ${project.order_value && html`<div style="font-size:11px;color:var(--slate-500)">Order ₹${fmtNum(project.order_value)}</div>`}
+        </div>
+      </div>
+      <div style="height:8px;background:var(--slate-100);border-radius:4px;overflow:hidden">
+        <div style=${'height:100%;width:'+(project.progress_pct||0)+'%;background:'+(project.progress_pct>=100?'var(--emerald-500)':'var(--teal-500)')}></div>
+      </div>
+      ${owner && html`<div style="font-size:11px;color:var(--slate-500);margin-top:8px">Owner · ${owner.full_name}</div>`}
+    </div>
+
+    <div class="card" style="padding:14px;margin-bottom:10px">
+      <div style="font-size:12px;font-weight:700;color:var(--slate-600);margin-bottom:10px">Quick update</div>
+      <div class="field-row">
+        <div class="field"><label>Status${savingField==='status'?' · saving…':''}</label>
+          <select value=${project.status||'planning'} onChange=${e=>saveField('status', e.target.value)}>
+            <option value="planning">Planning</option><option value="in_progress">In progress</option><option value="on_hold">On hold</option><option value="completed">Completed</option><option value="cancelled">Cancelled</option>
+          </select>
+        </div>
+        <div class="field"><label>Actual weight (kg)${savingField==='actual_weight_kg'?' · saving…':''}</label>
+          <input type="number" step="any" value=${weightDraft} onChange=${e=>setWeightDraft(e.target.value)} onBlur=${()=>{ if(String(weightDraft)!==String(project.actual_weight_kg||'')) saveField('actual_weight_kg', weightDraft===''?null:parseFloat(weightDraft)); }} />
+        </div>
+      </div>
+      <div class="field"><label>Progress: ${progressDraft}%${savingField==='progress_pct'?' · saving…':''}</label>
+        <input type="range" min=${0} max=${100} step=${5} value=${progressDraft}
+          onChange=${e=>setProgressDraft(parseInt(e.target.value))}
+          onMouseUp=${()=>{ if(parseInt(progressDraft)!==parseInt(project.progress_pct||0)) saveField('progress_pct', parseInt(progressDraft)); }}
+          onTouchEnd=${()=>{ if(parseInt(progressDraft)!==parseInt(project.progress_pct||0)) saveField('progress_pct', parseInt(progressDraft)); }}
+          style="width:100%" />
+      </div>
+    </div>
+
+    <div class="card" style="padding:14px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div style="font-size:12px;font-weight:700;color:var(--slate-600)">Milestones · ${milestones.length}</div>
+        <div style="font-size:10px;color:var(--slate-400)">tap to advance</div>
+      </div>
+      ${milestones.length===0 && html`<div style="font-size:12px;color:var(--slate-400);padding:6px 0">No milestones yet. Add the first one below.</div>`}
+      ${milestones.map(m => html`
+        <div key=${m.id} onClick=${()=>cycleMs(m)} style="display:flex;align-items:center;gap:8px;padding:6px 0;cursor:pointer">
+          <span style="font-size:15px">${m.status==='done'?'✅':m.status==='in_progress'?'🔄':'⬜'}</span>
+          <span style=${'flex:1;font-size:13px;'+(m.status==='done'?'text-decoration:line-through;color:var(--slate-400)':'')}>${m.name}</span>
+          ${m.done_date && html`<span style="font-size:10px;color:var(--slate-400)">${m.done_date}</span>`}
+        </div>
+      `)}
+      <div style="display:flex;gap:6px;margin-top:8px">
+        <input type="text" value=${newMs} onChange=${e=>setNewMs(e.target.value)} placeholder="Add milestone (e.g. Fabrication done)" style="flex:1;padding:6px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px" />
+        <button type="button" class="btn small" onClick=${addMilestone}>+ Add</button>
+      </div>
+    </div>
+
+    <div class="card" style="padding:14px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div>
+          <div style="font-size:12px;font-weight:700;color:var(--slate-600)">Bills on this project · ${bills.length}</div>
+          ${bills.length>0 && html`<div style="font-size:10px;color:var(--slate-500);margin-top:2px">Total ₹${fmtNum(totalBilled)}</div>`}
+        </div>
+        <button class="btn small" onClick=${uploadBill} style="padding:6px 10px">📷 Upload bill</button>
+      </div>
+      ${bills.length===0 ? html`<div style="font-size:12px;color:var(--slate-400);padding:6px 0">No bills tagged to this project yet. Tap "Upload bill" to add one from chat — the project will be pre-tagged.</div>` :
+        bills.map(b => html`
+          <div key=${b.id} style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-top:1px solid var(--slate-100);font-size:12px">
+            <div style="min-width:0;flex:1">
+              <div style="font-weight:600">${b.doc_type||'doc'}${b.doc_number?' · '+b.doc_number:''}</div>
+              <div style="color:var(--slate-500);font-size:11px">${b.vendor_name||'—'}${b.doc_date?' · '+b.doc_date:''}</div>
+            </div>
+            ${b.total_amount && html`<div style="font-weight:700">₹${fmtNum(b.total_amount)}</div>`}
+          </div>
+        `)
+      }
+    </div>
+
+    ${project.notes && html`
+      <div class="card" style="padding:14px;margin-bottom:10px">
+        <div style="font-size:12px;font-weight:700;color:var(--slate-600);margin-bottom:6px">Notes</div>
+        <div style="font-size:12px;color:var(--slate-700);white-space:pre-wrap">${project.notes}</div>
+      </div>
+    `}
   `;
 }
 
