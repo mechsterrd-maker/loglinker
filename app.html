@@ -11735,7 +11735,7 @@ function SalesDocMakerModule({ plant, me, navAction }) {
       sb.from('mcp_logistics_documents')
         .select('id, doc_type, doc_number, doc_date, vendor_name_raw, taxable_value, tax_amount, total_value, items, status, notes, raw_extraction, created_at')
         .eq('plant_id', plant.id)
-        .in('doc_type', ['invoice_out','dc_out','po','packing_list'])
+        .in('doc_type', ['invoice_out','dc_out','dc_out_returnable','po','packing_list'])
         .eq('extracted_by_ai', false)
         .order('created_at', { ascending: false })
         .limit(100),
@@ -11757,7 +11757,12 @@ function SalesDocMakerModule({ plant, me, navAction }) {
     return () => sb.removeChannel(ch);
   }, [plant.id, refresh]);
 
-  const TAB_KIND = { new_dc:'dc', new_invoice:'invoice', new_po:'po', new_packing:'packing' };
+  const TAB_KIND = { new_dc:'dc', new_rdc:'rdc', new_invoice:'invoice', new_po:'po', new_packing:'packing' };
+  // Fabrication plants typically don't issue tax invoices from this module
+  // (they bill separately or use DCs only). Marvel asked for it explicitly.
+  // Per session decision: hide the Tax Invoice option for all fab plants.
+  const fab = isFab(plant);
+  const showInvoice = !fab;
   useEffect(() => {
     const kind = TAB_KIND[tab];
     if (kind) {
@@ -11769,10 +11774,11 @@ function SalesDocMakerModule({ plant, me, navAction }) {
   if (view) return html`<${SalesDocPreview} doc=${view} plant=${plant} customers=${customers} vendors=${vendors} onClose=${() => setView(null)} />`;
 
   const META = {
-    invoice_out:   { ico:'🧾', label:'Tax Invoice' },
-    dc_out:        { ico:'📦', label:'Delivery Challan' },
-    po:            { ico:'🛒', label:'Purchase Order' },
-    packing_list:  { ico:'📋', label:'Packing List' },
+    invoice_out:           { ico:'🧾', label:'Tax Invoice' },
+    dc_out:                { ico:'📦', label:'Delivery Challan' },
+    dc_out_returnable:     { ico:'🔁', label:'Returnable DC' },
+    po:                    { ico:'🛒', label:'Purchase Order' },
+    packing_list:          { ico:'📋', label:'Packing List' },
   };
 
   return html`
@@ -11783,13 +11789,20 @@ function SalesDocMakerModule({ plant, me, navAction }) {
     <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap">
       <button class=${'auth-tab' + (tab==='list'?' active':'')} onClick=${() => setTab('list')}>📃 Recent · ${recent.length}</button>
       <button class=${'auth-tab' + (tab==='new_dc'?' active':'')} onClick=${() => setTab('new_dc')}>+ DC</button>
-      <button class=${'auth-tab' + (tab==='new_invoice'?' active':'')} onClick=${() => setTab('new_invoice')}>+ Invoice</button>
+      <button class=${'auth-tab' + (tab==='new_rdc'?' active':'')} onClick=${() => setTab('new_rdc')} title="Returnable Delivery Challan — separate number series">+ RDC</button>
+      ${showInvoice && html`<button class=${'auth-tab' + (tab==='new_invoice'?' active':'')} onClick=${() => setTab('new_invoice')}>+ Invoice</button>`}
       <button class=${'auth-tab' + (tab==='new_po'?' active':'')} onClick=${() => setTab('new_po')}>+ PO</button>
       <button class=${'auth-tab' + (tab==='new_packing'?' active':'')} onClick=${() => setTab('new_packing')}>+ Packing</button>
     </div>
 
-    ${(tab === 'new_dc' || tab === 'new_invoice') && html`
+    ${(tab === 'new_dc' || tab === 'new_rdc' || tab === 'new_invoice') && html`
       <${SalesDocCreateForm} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber} customers=${customers}
+        onCounterChanged=${() => {
+          // The "Set starting number" panel inside the form just bumped the
+          // counter; refetch the peek so the displayed number reflects it.
+          sb.rpc('peek_next_logistics_doc_number', { p_plant_id: plant.id, p_doc_kind: docKind })
+            .then(({ data }) => setPreviewNumber(data || '—'));
+        }}
         onSaved=${(doc) => { setTab('list'); refresh(); setView(doc); }} onCancel=${() => setTab('list')} />
     `}
 
@@ -11968,8 +11981,54 @@ function PoPackingForm({ plant, me, kind, previewNumber, customers, vendors, onS
 }
 
 
-function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onSaved, onCancel }) {
+// Admin-only collapsible panel for setting the starting number of a series.
+// Use case: a customer migrating from paper books to Loglinkr already has e.g.
+// DC #2346 issued; this lets the plant_head/admin set "next DC = 2347" so the
+// numbering continues cleanly instead of restarting from 1.
+function SetStartingNumberPanel({ plant, kind, onChanged }) {
+  const [open, setOpen] = useState(false);
+  const [val, setVal] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+  const label = kind === 'rdc' ? 'RDC' : (kind === 'invoice' ? 'Invoice' : kind === 'dc' ? 'DC' : kind.toUpperCase());
+  const apply = async () => {
+    setMsg(''); setBusy(true);
+    const n = parseInt(val, 10);
+    if (!Number.isFinite(n) || n < 1) { setMsg('Enter a positive whole number.'); setBusy(false); return; }
+    if (!confirm(`Set next ${label} number to ${n}? This affects every future ${label} you issue this financial year.`)) { setBusy(false); return; }
+    const { data, error } = await sb.rpc('set_logistics_doc_counter', { p_plant_id: plant.id, p_doc_kind: kind, p_next_seq: n });
+    setBusy(false);
+    if (error) { setMsg(error.message); return; }
+    setMsg('✓ Next number is now ' + (data || n));
+    setVal('');
+    onChanged && onChanged();
+  };
+  return html`
+    <div style="margin-top:10px;border-top:1px dashed var(--teal-300);padding-top:8px">
+      <button onClick=${() => setOpen(o => !o)}
+        style="background:none;border:none;color:var(--teal-700);font-size:11px;font-weight:600;cursor:pointer;padding:0">
+        ${open ? '▾' : '▸'} Set starting number for ${label}
+      </button>
+      ${open && html`
+        <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+          <div style="font-size:11px;color:var(--slate-600);line-height:1.5">
+            Use this if you're continuing a series from paper books. The number you enter will be the
+            <strong>next ${label}</strong> issued. The previous ${label} should be one less than this.
+          </div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="number" min="1" value=${val} onInput=${e => setVal(e.target.value)}
+              placeholder="Next ${label} number" style="flex:1;padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />
+            <button onClick=${apply} disabled=${busy} class="btn small">${busy ? '…' : 'Apply'}</button>
+          </div>
+          ${msg && html`<div style="font-size:11px;color:${msg.startsWith('✓') ? 'var(--emerald-700)' : 'var(--rose-700)'}">${msg}</div>`}
+        </div>
+      `}
+    </div>`;
+}
+
+function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCounterChanged, onSaved, onCancel }) {
   const isInvoice = kind === 'invoice';
+  const isReturnable = kind === 'rdc';
   const [form, setForm] = useState({
     doc_date: new Date().toISOString().slice(0,10),
     customer_id: '',
@@ -12030,7 +12089,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onSaved
 
       const { data: doc, error } = await sb.from('mcp_logistics_documents').insert({
         plant_id: plant.id,
-        doc_type: isInvoice ? 'invoice_out' : 'dc_out',
+        doc_type: isInvoice ? 'invoice_out' : (isReturnable ? 'dc_out_returnable' : 'dc_out'),
         doc_number: docNo,
         doc_date: form.doc_date,
         vendor_id: form.customer_id,
@@ -12063,9 +12122,10 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onSaved
 
   return html`
     <div class="card" style="margin-bottom:14px;padding:14px;background:var(--teal-50);border-color:var(--teal-200)">
-      <div style="font-size:11px;font-weight:700;color:var(--teal-700);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">${isInvoice ? '🧾 New tax invoice' : '📦 New delivery challan'}</div>
+      <div style="font-size:11px;font-weight:700;color:var(--teal-700);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">${isInvoice ? '🧾 New tax invoice' : (isReturnable ? '🔁 New returnable DC' : '📦 New delivery challan')}</div>
       <div style="font-size:18px;font-weight:700;color:var(--slate-900);font-family:monospace">${previewNumber}</div>
       <div style="font-size:11px;color:var(--slate-500);margin-top:2px">Next number — assigned atomically when you save. Continuous per plant per financial year.</div>
+      ${(me?.role === 'plant_head' || me?.role === 'admin') && html`<${SetStartingNumberPanel} plant=${plant} kind=${kind} onChanged=${onCounterChanged} />`}
     </div>
 
     ${err && html`<div class="alert error">${err}</div>`}
