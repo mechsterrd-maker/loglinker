@@ -395,3 +395,58 @@ If this design is approved:
 - [ ] **End-of-Phase-1: demo build to Marvel**, get feedback before starting Phase 2
 
 If not approved: tell me what to change. Better to spend two more days on this doc than two weeks on the wrong implementation.
+
+---
+
+## 14. Phase 3 addendum — per-project bill/expense isolation + project-aware OCR
+
+Added after Marvel asked specifically: *"a supervisor assigned to a project cannot see other projects' bills or expenses, and how does he update bills via OCR?"*
+
+### 14.1 The blocker found in the schema (2026-06)
+
+| Table | `project_id` today? |
+|---|---|
+| `mcp_expenses` | ✅ yes |
+| `mcp_logistics_documents` (bills/DCs) | ❌ **no** |
+| `mcp_logistics_extraction_queue` (OCR) | ❌ **no** |
+
+So bills currently have **no project link at all** — per-project bill isolation is impossible to enforce until that's added. This is the single biggest piece of Phase 3.
+
+### 14.2 The build, in order
+
+1. **Schema:** add `project_id uuid references mcp_projects(id)` to
+   `mcp_logistics_documents` AND `mcp_logistics_extraction_queue`. Backfill
+   existing rows to NULL (plant-wide, owner-visible).
+2. **OCR attribution — "inferred + fallback picker" (decided):**
+   - When a project-scoped supervisor uploads a bill, the system looks at
+     their `project_members` rows.
+     - Exactly **one** project → the queue row + resulting document auto-tag
+       to that project. Zero extra taps — they snap the bill in chat exactly
+       as today.
+     - **Multiple** projects → a "Which project?" picker appears at upload
+       time (one tap), written into the queue row.
+     - Plant_head / admin / unassigned users → bill stays plant-wide
+       (`project_id = NULL`), visible to all, as today.
+   - `enqueue_chat_image_for_extraction` gains a `p_project_id` arg; the
+     edge function copies it from the queue row onto the created document.
+3. **Enforcement (depends on Phase 2 RLS):** RLS policy on
+   `mcp_logistics_documents` and `mcp_expenses` —
+   `project_id is null OR project_visible_to(auth.uid(), project_id)` where
+   `project_visible_to` checks `project_members`. Owners bypass.
+4. **UI:** Documents + Expenses lists filter by accessible projects; a
+   project-scoped supervisor simply never receives other projects' rows from
+   the DB (not just hidden — never sent).
+
+### 14.3 Hard dependency
+
+This **cannot ship securely before Phase 2** (RLS enforcement). Until the DB
+enforces permissions, "hiding" project B's bills in the UI is cosmetic — a
+determined user could still query them. Sequence is firm: **Phase 2 (RLS) →
+Phase 3 (project scoping + project-aware OCR).** Estimate 3–5 weeks combined.
+
+### 14.4 Decisions locked for Phase 3
+
+- Project access default: **closed** (supervisor sees no project until added) — §10 / earlier.
+- OCR attribution: **inferred from single project membership, picker when multiple**.
+- Owners (plant_head/admin): **never project-filtered**.
+- Expenses: reuse the existing `mcp_expenses.project_id`; only add the RLS gate.

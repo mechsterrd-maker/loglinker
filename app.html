@@ -1446,6 +1446,12 @@ function canDo(myPerms, moduleKey, action) {
 function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessibleUnits, activeUnit, switchUnit }) {
   const initials = (me.full_name || user.email).split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
   const [unreadCount, setUnreadCount] = useState(0);
+  // navAction: a one-shot deep-link signal so Home shortcuts can land a user on
+  // a specific sub-screen (e.g. Make Documents → New PO), not just a tab. Pages
+  // stay mounted (hidden via CSS), so target components react via useEffect on
+  // navAction.ts rather than a mount-time read. { tab, sub, ts }.
+  const [navAction, setNavAction] = useState(null);
+  const go = (tabKey, sub) => { setTab(tabKey); setNavAction(sub ? { tab: tabKey, sub, ts: Date.now() } : null); };
 
   const recalcUnread = useCallback(async () => {
     if (!plant?.id) return;
@@ -1510,7 +1516,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
         </div>
       </div>
 
-      <${Page} active=${tab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} reload=${reload} /></${Page}>
+      <${Page} active=${tab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} /></${Page}>
       <${Page} active=${tab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'quality'}><${Quality} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'maintenance'}><${Maintenance} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -1521,7 +1527,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${tab === 'movements'}><${MovementsPage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'trace'}><${TracePage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} /></${Page}>
-      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} setTab=${setTab} /></${Page}>
+      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} navAction=${navAction} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} myPerms=${myPerms} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
       <${Page} active=${tab === 'masters'}><${MastersHub} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
@@ -1546,7 +1552,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${tab === 'mom'}><${MomModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} /></${Page}>
       <${Page} active=${tab === 'projects'}><${ProjectTracker} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'expenses'}><${ExpenseLedger} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'machine_prod'}><${MachineProductionModule} plant=${plant} me=${me} /></${Page}>
@@ -1760,7 +1766,9 @@ function TabBtn({ icon, label, active, onClick, badge }) {
 }
 
 // ============= HOME =============
-function Home({ plant, me, setTab, reload }) {
+function Home({ plant, me, setTab, go, reload }) {
+  // Fallback so Home still works if rendered without `go` (e.g. older callers).
+  const navTo = go || ((t) => setTab(t));
   const [stats, setStats] = useState({ units: 0, users: 1, machines: 0, dies: 0, shotsToday: 0, openActions: 0, openNcrs: 0, openBreakdowns: 0, lowStock: 0 });
   const [loading, setLoading] = useState(true);
   const fab = isFab(plant);
@@ -1826,10 +1834,12 @@ function Home({ plant, me, setTab, reload }) {
       <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px">⚡ Quick Entry · daily workflow</div>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(78px,1fr));gap:6px">
         ${(fab ? [
+          { tab:'sales_docs', sub:'new_dc', emoji:'📦', label:'DC' },
+          { tab:'sales_docs', sub:'new_po', emoji:'🛒', label:'PO' },
+          { tab:'chat',       sub:'upload_bill', emoji:'📄', label:'Upload Bill' },
+          { tab:'chat',       emoji:'💬', label:'Chat' },
           { tab:'projects',   emoji:'📐', label:'Project' },
-          { tab:'sales_docs', emoji:'📤', label:'DC / Invoice' },
           { tab:'jobwork',    emoji:'🏭', label:'Sub-Contract' },
-          { tab:'documents',  emoji:'📄', label:'Bill / DC' },
           { tab:'expenses',   emoji:'💸', label:'Expense' },
           { tab:'stocks',     emoji:'📦', label:'Stocks' },
           { tab:'actions',    emoji:'✓',  label:'Task' },
@@ -1839,11 +1849,12 @@ function Home({ plant, me, setTab, reload }) {
           { tab:'quality',     emoji:'⚠️', label:'NCR' },
           { tab:'maintenance', emoji:'🔧', label:'Breakdown' },
           { tab:'tpm',         emoji:'🛠', label:'TPM Check' },
+          { tab:'documents',   emoji:'📄', label:'Upload Bill' },
+          { tab:'chat',        emoji:'💬', label:'Chat' },
           { tab:'stocks',      emoji:'📦', label:'Stocks' },
-          { tab:'documents',   emoji:'📄', label:'Bill / DC' },
           { tab:'masters',     emoji:'🗂', label:'Masters' },
-        ]).map(b => html`
-          <button key=${b.tab} onClick=${() => setTab(b.tab)}
+        ]).map((b, i) => html`
+          <button key=${b.tab + (b.sub||'') + i} onClick=${() => navTo(b.tab, b.sub)}
             style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:10px 4px;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:8px;cursor:pointer;font-family:inherit;transition:all 0.1s"
             onMouseOver=${e => { e.currentTarget.style.background = 'var(--teal-50)'; e.currentTarget.style.borderColor = 'var(--teal-300)'; }}
             onMouseOut=${e => { e.currentTarget.style.background = 'var(--slate-50)'; e.currentTarget.style.borderColor = 'var(--slate-200)'; }}>
@@ -4703,9 +4714,20 @@ function PendingTasksPanel({ plant, setTab }) {
 }
 
 // ============= CHAT =============
-function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, setTab }) {
+function Chat({ plant, me, user, onUnreadChange, deepLinkGroupId, navAction, setTab }) {
   const [groups, setGroups] = useState([]);
   const [activeGroup, setActiveGroup] = useState(null);
+  // Home "Upload Bill" shortcut: if a chat group is already open, pop the file
+  // picker so they can snap a bill immediately. If none is open, land on the
+  // chat list and let them pick a group first (graceful fallback).
+  useEffect(() => {
+    if (navAction?.sub !== 'upload_bill') return;
+    const t = setTimeout(() => {
+      const inp = document.getElementById('chatFileInput');
+      if (inp) inp.click();
+    }, 300);
+    return () => clearTimeout(t);
+  }, [navAction?.ts]);
   const deepLinkAppliedRef = useRef(false);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -11619,8 +11641,13 @@ function ExpenseModal({ plant, me, vendors, projects, editTarget, onClose, onSav
   `;
 }
 
-function SalesDocMakerModule({ plant, me }) {
+function SalesDocMakerModule({ plant, me, navAction }) {
   const [tab, setTab] = useState('list'); // list | new_dc | new_invoice | new_po | new_packing
+  // Home shortcuts (DC / PO) deep-link straight to the right sub-tab. Pages stay
+  // mounted, so react to the one-shot navAction signal whenever its ts changes.
+  useEffect(() => {
+    if (navAction && navAction.tab === 'sales_docs' && navAction.sub) setTab(navAction.sub);
+  }, [navAction?.ts]);
   const [docKind, setDocKind] = useState('dc');
   const [recent, setRecent] = useState([]);
   const [previewNumber, setPreviewNumber] = useState('—');
