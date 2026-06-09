@@ -1403,11 +1403,20 @@ function visibleMoreGroups(plant, myPerms) {
     }))
     .filter(g => g.items.length > 0);
   // Second pass: RBAC filtering (only when enforced on this plant).
+  // Safety net: a plant_head / admin is NEVER filtered, even if their role
+  // link is somehow missing — owners must never get locked into an empty menu.
   if (myPerms && myPerms.rbac_enforced) {
-    const canView = makeCanViewModule(myPerms);
-    groups = groups
-      .map(g => ({ ...g, items: g.items.filter(it => canView(it.key)) }))
-      .filter(g => g.items.length > 0);
+    const isOwner = (myPerms.roles || []).some(r => r.slug === 'plant_head' || r.slug === 'admin');
+    const hasAnyPerm = (myPerms.permissions || []).length > 0;
+    if (!isOwner && hasAnyPerm) {
+      const canView = makeCanViewModule(myPerms);
+      groups = groups
+        .map(g => ({ ...g, items: g.items.filter(it => canView(it.key)) }))
+        .filter(g => g.items.length > 0);
+    }
+    // If !hasAnyPerm we intentionally do NOT filter — a user with zero
+    // permissions (e.g. mid-migration) keeps the legacy menu rather than an
+    // empty one. Real restriction requires at least one explicit grant.
   }
   return groups;
 }
