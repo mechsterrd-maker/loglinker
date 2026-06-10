@@ -12611,35 +12611,76 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
     ${result?.ok && result.stats.barsUsed > 0 && html`
       <div class="card" style="padding:14px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-          <div style="font-weight:700;font-size:13px">Cutting list · for shop floor</div>
+          <div style="font-weight:700;font-size:13px">Cutting list · bar-by-bar breakup</div>
           <button class="btn small ghost" onClick=${() => window.print()} style="padding:4px 10px;font-size:11px">🖨 Print</button>
         </div>
         ${result.groups.filter(g => g.ok && g.bars.length > 0).map(g => {
           const color = cutMaterialColor(g.material.id);
           const label = cutFormatMaterialLabel(g.material.type, g.material.spec);
+          // Aggregate stock usage per length: how many of each bar length we need.
+          const stockBuckets = new Map();
+          for (const b of g.bars) {
+            const k = b.stockLength;
+            if (!stockBuckets.has(k)) stockBuckets.set(k, { lengthMm: k, count: 0, unitCost: b.unitCost || 0 });
+            stockBuckets.get(k).count += 1;
+          }
+          const stockSummary = Array.from(stockBuckets.values()).sort((a, b) => b.lengthMm - a.lengthMm);
+          const totalStockKg = g.kgPerM > 0 ? (g.stats.totalStockMm / 1000) * g.kgPerM : 0;
           return html`
-            <div key=${'cl-'+g.material.id} style="margin-bottom:12px">
-              <div style="display:flex;align-items:center;gap:6px;font-size:11px;font-weight:700;color:var(--slate-700);margin-bottom:6px;padding-left:4px;border-left:4px solid ${color}">
-                <span style="padding-left:6px">${label}</span>
-              </div>
-              ${g.bars.map(b => html`
-                <div key=${'b-'+g.material.id+'-'+b.index} style=${'border:1px solid var(--slate-100);border-left:4px solid '+color+';border-radius:6px;padding:8px 10px;margin-bottom:6px'}>
-                  <div style="display:flex;justify-content:space-between;font-size:12px;font-weight:700">
-                    <span>Bar #${b.index} · ${(b.stockLength / 1000).toFixed(2)}m</span>
-                    <span style=${'color:' + (b.wasteMm > b.stockLength * 0.15 ? 'var(--rose-600)' : 'var(--slate-500)')}>${b.wasteMm}mm scrap · ${(b.wasteMm / b.stockLength * 100).toFixed(1)}%</span>
-                  </div>
-                  <div style="font-size:11px;color:var(--slate-600);margin-top:4px">
-                    ${b.cuts.map(c => c.label + ' · ' + c.length + 'mm').join('  ·  ')}
-                    ${b.kerfsInBar > 0 ? html`<span style="color:var(--slate-400)"> · ${b.cuts.length - 1} saw cut${b.cuts.length - 1 === 1 ? '' : 's'} (${b.kerfsInBar}mm kerf)</span>` : null}
-                  </div>
-                  ${b.suggestions && b.suggestions.length > 0 && html`
-                    <div style="font-size:10px;color:var(--slate-500);margin-top:6px;padding-top:6px;border-top:1px dashed var(--slate-200);display:flex;flex-wrap:wrap;gap:6px;align-items:center">
-                      <span style="font-weight:700;color:var(--amber-700)">Could still fit:</span>
-                      ${b.suggestions.map(s => html`<span style="display:inline-block;padding:1px 6px;border-radius:999px;background:var(--amber-50);color:var(--amber-700);font-weight:600">${s.n}× ${s.label || s.length+'mm'}</span>`)}
-                    </div>
-                  `}
+            <div key=${'cl-'+g.material.id} style="margin-bottom:14px;border-top:2px solid ${color};border-radius:6px;padding-top:8px">
+              <div style="display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:6px;margin-bottom:8px">
+                <div style="font-weight:800;font-size:13px;color:var(--slate-800);display:flex;align-items:center;gap:6px">
+                  <span style=${'display:inline-block;width:10px;height:10px;border-radius:50%;background:'+color}></span>
+                  ${label}${g.kgPerM > 0 ? ' · '+g.kgPerM.toFixed(2)+' kg/m' : ''}
                 </div>
-              `)}
+                <div style="font-size:11px;color:var(--slate-600)">
+                  ${stockSummary.map(s => html`<span style="margin-left:8px"><b>${s.count}×</b> ${(s.lengthMm/1000).toFixed(2)}m bars</span>`)}
+                  ${totalStockKg > 0 && html` · <b>${totalStockKg.toFixed(1)} kg</b> total`}
+                </div>
+              </div>
+              ${g.bars.map(b => {
+                // Aggregate identical cuts within this bar: "6× Part A (900mm)"
+                const agg = new Map();
+                for (const c of b.cuts) {
+                  const k = (c.label || '?') + ':' + c.length;
+                  if (!agg.has(k)) agg.set(k, { label: c.label || '?', length: c.length, n: 0 });
+                  agg.get(k).n += 1;
+                }
+                const cutRows = Array.from(agg.values()).sort((a, b) => b.length - a.length);
+                const usedMm = b.stockLength - b.wasteMm;
+                const cutOk = b.wasteMm < b.stockLength * 0.1;
+                return html`
+                  <div key=${'b-'+g.material.id+'-'+b.index} style=${'border:1px solid var(--slate-200);border-left:4px solid '+color+';border-radius:8px;padding:10px 12px;margin-bottom:8px;background:white'}>
+                    <div style="display:flex;justify-content:space-between;align-items:baseline;font-size:13px;font-weight:800;margin-bottom:6px">
+                      <span>Bar #${b.index}<span style="color:var(--slate-400);font-weight:500"> · ${(b.stockLength/1000).toFixed(2)}m stock</span></span>
+                      <span style=${'color:'+(cutOk?'var(--emerald-600)':b.wasteMm > b.stockLength * 0.3 ? 'var(--rose-600)':'var(--amber-600)')}>${cutOk?'✓ ':''}${b.wasteMm}mm endbit</span>
+                    </div>
+                    <table style="width:100%;font-size:12px;border-collapse:collapse">
+                      <tbody>
+                        ${cutRows.map(r => html`
+                          <tr key=${r.label+r.length}>
+                            <td style="padding:2px 4px;color:var(--slate-700)"><b style="display:inline-block;min-width:24px">${r.n}×</b> ${r.label}</td>
+                            <td style="padding:2px 4px;text-align:right;color:var(--slate-500);font-family:monospace">${r.length} mm</td>
+                            <td style="padding:2px 4px;text-align:right;color:var(--slate-800);font-family:monospace;font-weight:600">${(r.n * r.length).toLocaleString('en-IN')} mm</td>
+                          </tr>
+                        `)}
+                      </tbody>
+                      <tfoot style="border-top:1px dashed var(--slate-200);font-size:11px">
+                        <tr><td style="padding:3px 4px;color:var(--slate-500)">Pieces total</td><td></td><td style="padding:3px 4px;text-align:right;font-family:monospace;color:var(--slate-700)">${(usedMm - b.kerfsInBar).toLocaleString('en-IN')} mm</td></tr>
+                        ${b.kerfsInBar > 0 && html`<tr><td style="padding:3px 4px;color:var(--slate-500)">Saw kerf · ${b.cuts.length - 1} cut${b.cuts.length - 1 === 1 ? '' : 's'}</td><td></td><td style="padding:3px 4px;text-align:right;font-family:monospace;color:var(--slate-500)">${b.kerfsInBar} mm</td></tr>`}
+                        <tr><td style="padding:3px 4px;color:var(--slate-500)">Used</td><td></td><td style="padding:3px 4px;text-align:right;font-family:monospace;font-weight:700">${usedMm.toLocaleString('en-IN')} mm</td></tr>
+                        <tr><td style="padding:3px 4px;color:var(--slate-500)">Endbit</td><td></td><td style=${'padding:3px 4px;text-align:right;font-family:monospace;font-weight:700;color:'+(cutOk?'var(--emerald-600)':b.wasteMm > b.stockLength * 0.3 ? 'var(--rose-600)':'var(--amber-600)')}>${b.wasteMm} mm</td></tr>
+                      </tfoot>
+                    </table>
+                    ${b.suggestions && b.suggestions.length > 0 && html`
+                      <div style="font-size:10px;color:var(--slate-500);margin-top:8px;padding-top:8px;border-top:1px dashed var(--slate-200);display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+                        <span style="font-weight:700;color:var(--amber-700)">💡 Could still fit:</span>
+                        ${b.suggestions.map(s => html`<span style="display:inline-block;padding:1px 6px;border-radius:999px;background:var(--amber-50);color:var(--amber-700);font-weight:600">${s.n}× ${s.label || s.length+'mm'}</span>`)}
+                      </div>
+                    `}
+                  </div>
+                `;
+              })}
             </div>
           `;
         })}
