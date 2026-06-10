@@ -162,6 +162,18 @@ body{
 .modal{background:white;width:100%;max-width:520px;border-radius:18px;padding:20px 18px;max-height:calc(100vh - 32px);overflow-y:auto;-webkit-overflow-scrolling:touch;animation:fadeInUp 0.22s ease;margin:auto;box-shadow:0 20px 60px rgba(15,23,42,0.25)}
 @keyframes fadeInUp{from{opacity:0;transform:translateY(8px) scale(0.98)}to{opacity:1;transform:translateY(0) scale(1)}}
 @keyframes slideUp{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+/* Cutting Planner animations: cuts draw left→right, bars fade in one at a time, stat numbers tick */
+@keyframes cutDrawIn{from{transform:scaleX(0);opacity:0.4}to{transform:scaleX(1);opacity:1}}
+@keyframes barFadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+@keyframes ribbonShine{0%{background-position:-200% 0}100%{background-position:200% 0}}
+@keyframes statPulse{0%{transform:scale(1)}40%{transform:scale(1.12);color:var(--teal-600)}100%{transform:scale(1)}}
+@keyframes wasteFlash{0%{background:#fee2e2}100%{background:transparent}}
+.cut-svg .cut-seg{transform-box:fill-box;transform-origin:left center;animation:cutDrawIn 0.45s cubic-bezier(0.22,0.61,0.36,1) both}
+.cut-svg .cut-text{animation:barFadeIn 0.3s ease both}
+.cut-svg .cut-bar{animation:barFadeIn 0.35s ease both}
+.cut-stat-num.tick{animation:statPulse 0.55s ease both}
+.cut-ribbon{position:relative;overflow:hidden}
+.cut-ribbon::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 30%,rgba(255,255,255,0.5) 50%,transparent 70%);background-size:200% 100%;animation:ribbonShine 2.2s ease-in-out infinite;pointer-events:none}
 .modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
 .modal-title{font-family:'Bricolage Grotesque',sans-serif;font-size:20px;font-weight:700}
 .close-btn{background:var(--slate-100);border:none;border-radius:50%;width:32px;height:32px;cursor:pointer;color:var(--slate-600);font-size:18px;line-height:1}
@@ -1342,6 +1354,7 @@ const MORE_GROUPS = [
     items: [
       { key:'actions',             icon:'✓',  label:'Action Hub',                sub:'All open commitments, owners, due dates' },
       { key:'projects',            icon:'📐', label:'Projects',                  sub:'Fabrication & site-work job tracking · progress, weight, milestones' },
+      { key:'cutting',             icon:'✂️', label:'Cutting Planner',           sub:'1D cutting optimisation for rods, tubes, bars · auto layout with kerf · waste %' },
       { key:'cad3d',               icon:'🧊', label:'3D Models · CadNexa',       sub:'View, measure & estimate STEP/STL/CAD parts inside the plant' },
       { key:'npd',                 icon:'🧪', label:'NPD Projects (APQP)', iatf:true, sub:'RFQ → SOP lifecycle, PPAP auto-feed, commercials' },
       { key:'ppap',                icon:'📑', label:'PPAP Submissions',   iatf:true, sub:'Part approval status (IATF 8.3.4.4)' },
@@ -1566,6 +1579,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${tab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} /></${Page}>
       <${Page} active=${tab === 'projects'}><${ProjectTracker} plant=${plant} me=${me} myPerms=${myPerms} go=${go} /></${Page}>
+      <${Page} active=${tab === 'cutting'}><${CuttingPlanner} plant=${plant} me=${me} navAction=${navAction} go=${go} /></${Page}>
       <${Page} active=${tab === 'expenses'}><${ExpenseLedger} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'machine_prod'}><${MachineProductionModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
@@ -11732,6 +11746,20 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
     } catch(e){}
     if (go) go('chat', 'upload_bill');
   };
+  const planCutting = (stage) => {
+    try {
+      sessionStorage.setItem('loglinkr_cutting_project_id', project.id);
+      sessionStorage.setItem('loglinkr_cutting_project_name', project.name || project.code || '');
+      if (stage) {
+        sessionStorage.setItem('loglinkr_cutting_stage_id', stage.id);
+        sessionStorage.setItem('loglinkr_cutting_stage_name', stage.name || '');
+      } else {
+        sessionStorage.removeItem('loglinkr_cutting_stage_id');
+        sessionStorage.removeItem('loglinkr_cutting_stage_name');
+      }
+    } catch(e){}
+    if (go) go('cutting', 'from_stage');
+  };
 
   const st = STATUS[project.status] || { c:'', l: project.status };
   const owner = users.find(u => u.id === project.owner_user_id);
@@ -11822,6 +11850,7 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
                   <button class="btn small" onClick=${()=>uploadBill(s)} style="padding:4px 10px;font-size:11px">📷 Upload bill</button>
                   <button class="btn small ghost" onClick=${()=>setAskModal({kind:'approval', stage:s})} style="padding:4px 10px;font-size:11px">📋 Raise approval</button>
                   <button class="btn small ghost" onClick=${()=>setAskModal({kind:'query', stage:s})} style="padding:4px 10px;font-size:11px">💬 Ask query</button>
+                  <button class="btn small ghost" onClick=${()=>planCutting(s)} style="padding:4px 10px;font-size:11px">✂️ Plan cutting</button>
                 </div>
                 ${stageBills.length>0 && html`
                   <div style="margin-top:8px;border-top:1px dashed var(--slate-100);padding-top:6px">
@@ -11939,6 +11968,516 @@ function StageAskModal({ plant, me, project, stage, kind, onClose, onSent }) {
         <button class="btn" disabled=${busy || !groupId || !body.trim()} style="width:100%" onClick=${send}>${busy?'Sending…':('Send '+(isApproval?'approval':'query'))}</button>
       </div>
     </div>
+  `;
+}
+
+// =================================================================
+// CUTTING PLANNER — 1D nesting for rods / tubes / bars
+// Pure-JS First-Fit-Decreasing with kerf. Inputs (pieces, stocks) and the
+// computed layout are persisted as jsonb on mcp_cut_plans so the supervisor
+// can save / reopen / print a plan.
+// =================================================================
+function planOneDimensionalCut({ pieces, stocks, kerfMm }) {
+  // Expand pieces into individual instances and sort largest-first.
+  const items = [];
+  for (const p of (pieces || [])) {
+    const len = Number(p.lengthMm) || 0;
+    const qty = Math.max(0, Math.floor(Number(p.qty) || 0));
+    if (len <= 0 || qty <= 0) continue;
+    for (let i = 0; i < qty; i++) {
+      items.push({ id: p.id + ':' + i, pieceId: p.id, label: p.label || 'piece', length: len });
+    }
+  }
+  items.sort((a, b) => b.length - a.length);
+
+  const stockPool = (stocks || [])
+    .filter(s => Number(s.qty) > 0 && Number(s.lengthMm) > 0)
+    .map(s => ({ id: s.id, lengthMm: Number(s.lengthMm), unitCost: Number(s.unitCost) || 0, remaining: Math.floor(Number(s.qty)) }));
+
+  if (items.length === 0) {
+    return { ok: true, bars: [], stats: { barsUsed: 0, totalStockMm: 0, totalPiecesMm: 0, totalKerfMm: 0, wasteMm: 0, wastePct: 0, totalCost: 0 } };
+  }
+  if (stockPool.length === 0) {
+    return { ok: false, error: 'No stock bars defined. Add at least one stock length and qty.' };
+  }
+
+  const k = Number(kerfMm) || 0;
+  const bars = [];
+  for (const item of items) {
+    let placed = false;
+    for (const bar of bars) {
+      const need = item.length + (bar.cuts.length > 0 ? k : 0);
+      if (bar.used + need <= bar.stockLength) {
+        bar.cuts.push({ pieceId: item.pieceId, label: item.label, length: item.length });
+        bar.used += need;
+        placed = true;
+        break;
+      }
+    }
+    if (placed) continue;
+    const fit = stockPool
+      .filter(s => s.remaining > 0 && s.lengthMm >= item.length)
+      .sort((a, b) => a.lengthMm - b.lengthMm)[0];
+    if (!fit) {
+      return { ok: false, error: 'No stock long enough for piece "' + item.label + '" (' + item.length + 'mm). Add a longer stock length or increase qty.' };
+    }
+    fit.remaining -= 1;
+    bars.push({
+      stockId: fit.id, stockLength: fit.lengthMm, unitCost: fit.unitCost,
+      cuts: [{ pieceId: item.pieceId, label: item.label, length: item.length }],
+      used: item.length,
+    });
+  }
+
+  let totalStock = 0, totalPieces = 0, totalKerf = 0, totalCost = 0;
+  const enriched = bars.map((b, idx) => {
+    const kerfsInBar = Math.max(0, b.cuts.length - 1) * k;
+    const wasteMm = Math.max(0, b.stockLength - b.used);
+    totalStock += b.stockLength;
+    totalPieces += b.cuts.reduce((s, c) => s + c.length, 0);
+    totalKerf += kerfsInBar;
+    totalCost += b.unitCost;
+    return Object.assign({}, b, { index: idx + 1, wasteMm, kerfsInBar });
+  });
+  const wasteMm = totalStock - totalPieces; // kerf + scrap tail
+  const wastePct = totalStock > 0 ? (wasteMm / totalStock) * 100 : 0;
+  return {
+    ok: true,
+    bars: enriched,
+    stats: {
+      barsUsed: enriched.length,
+      totalStockMm: totalStock,
+      totalPiecesMm: totalPieces,
+      totalKerfMm: totalKerf,
+      wasteMm,
+      wastePct,
+      totalCost,
+    },
+  };
+}
+
+function CuttingPlanner({ plant, me, navAction, go }) {
+  const [view, setView] = useState('list');
+  const [plans, setPlans] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [draft, setDraft] = useState(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('mcp_cut_plans')
+      .select('*, project:mcp_projects(name,code), stage:mcp_project_milestones(name)')
+      .eq('plant_id', plant.id)
+      .order('created_at', { ascending: false })
+      .limit(50);
+    setPlans(data || []);
+    setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const newPlan = useCallback((preset = {}) => {
+    setDraft({
+      id: null,
+      project_id: preset.project_id || null,
+      project_name: preset.project_name || '',
+      stage_id: preset.stage_id || null,
+      stage_name: preset.stage_name || '',
+      title: preset.project_name
+        ? 'Cut plan · ' + preset.project_name + (preset.stage_name ? ' · ' + preset.stage_name : '')
+        : 'New cut plan',
+      stock_material: 'MS Round Bar 25mm',
+      kerf_mm: 3,
+      status: 'draft',
+      stocks: [
+        { id: 's1', lengthMm: 6000, qty: 50, unitCost: 0 },
+        { id: 's2', lengthMm: 12000, qty: 25, unitCost: 0 },
+      ],
+      pieces: [
+        { id: 'p1', lengthMm: 1850, qty: 8,  label: 'Part A' },
+        { id: 'p2', lengthMm: 1250, qty: 12, label: 'Part B' },
+        { id: 'p3', lengthMm: 850,  qty: 20, label: 'Part C' },
+      ],
+      notes: '',
+    });
+    setView('edit');
+  }, []);
+
+  // Deep-link from project stage: open a fresh draft pre-tagged
+  useEffect(() => {
+    if (navAction?.tab !== 'cutting' || navAction.sub !== 'from_stage') return;
+    try {
+      const pid   = sessionStorage.getItem('loglinkr_cutting_project_id');
+      const pname = sessionStorage.getItem('loglinkr_cutting_project_name');
+      const sid   = sessionStorage.getItem('loglinkr_cutting_stage_id');
+      const sname = sessionStorage.getItem('loglinkr_cutting_stage_name');
+      sessionStorage.removeItem('loglinkr_cutting_project_id');
+      sessionStorage.removeItem('loglinkr_cutting_project_name');
+      sessionStorage.removeItem('loglinkr_cutting_stage_id');
+      sessionStorage.removeItem('loglinkr_cutting_stage_name');
+      newPlan({ project_id: pid, project_name: pname || '', stage_id: sid, stage_name: sname || '' });
+    } catch (e) {}
+  }, [navAction?.ts, newPlan]);
+
+  const openPlan = (p) => {
+    setDraft(Object.assign({}, p, {
+      project_name: p.project?.name || p.project?.code || '',
+      stage_name: p.stage?.name || '',
+    }));
+    setView('edit');
+  };
+
+  if (view === 'edit' && draft) {
+    return html`<${CutPlannerEditor} draft=${draft} setDraft=${setDraft} plant=${plant} me=${me}
+      onSaved=${async () => { await refresh(); }}
+      onBack=${() => { setDraft(null); setView('list'); }} />`;
+  }
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">
+      <div>
+        <h1>✂️ Cutting Planner</h1>
+        <div class="sub">1D nesting for rods, tubes &amp; bars — auto layout with kerf and live waste %</div>
+      </div>
+      <button class="btn" onClick=${() => newPlan()}>+ New plan</button>
+    </div>
+    ${loading ? html`<div class="spinner" style="margin:30px auto"></div>` : (plans.length === 0 ? html`
+      <div class="card" style="padding:30px;text-align:center;color:var(--slate-500)">
+        <div style="font-size:48px;margin-bottom:8px">✂️</div>
+        <div style="font-weight:700;font-size:16px;color:var(--slate-700);margin-bottom:6px">No cutting plans yet</div>
+        <div style="font-size:13px;margin-bottom:14px;max-width:380px;margin-left:auto;margin-right:auto">Punch in the pieces you need, the stock lengths you have on hand, and the planner lays out every bar to minimise scrap.</div>
+        <button class="btn small" onClick=${() => newPlan()}>+ Create your first plan</button>
+      </div>
+    ` : html`
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px">
+        ${plans.map(p => html`
+          <div key=${p.id} class="card" style="padding:12px;cursor:pointer;transition:transform 0.15s,box-shadow 0.15s"
+            onClick=${() => openPlan(p)}
+            onMouseOver=${e => { e.currentTarget.style.transform = 'translateY(-2px)'; e.currentTarget.style.boxShadow = '0 4px 14px rgba(15,23,42,0.08)'; }}
+            onMouseOut=${e => { e.currentTarget.style.transform = ''; e.currentTarget.style.boxShadow = ''; }}>
+            <div style="font-weight:700;font-size:14px;margin-bottom:4px">${p.title}</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">
+              ${p.stock_material || ''}
+              ${p.project ? ' · ' + (p.project.code || p.project.name) : ''}
+              ${p.stage ? ' · ' + p.stage.name : ''}
+            </div>
+            ${p.totals ? html`
+              <div style="display:flex;gap:10px;font-size:11px;color:var(--slate-700)">
+                <div><b>${p.totals.barsUsed}</b> bars</div>
+                <div style=${'color:' + (Number(p.totals.wastePct) > 15 ? 'var(--rose-600)' : 'var(--emerald-600)')}>
+                  <b>${Number(p.totals.wastePct || 0).toFixed(1)}%</b> waste
+                </div>
+                <div><b>${((Number(p.totals.totalPiecesMm) || 0) / 1000).toFixed(1)}m</b> pieces</div>
+              </div>
+            ` : html`<div style="font-size:11px;color:var(--slate-400)">No layout computed yet</div>`}
+            <div style="font-size:10px;color:var(--slate-400);margin-top:6px">${p.created_at ? new Date(p.created_at).toLocaleDateString() : ''}</div>
+          </div>
+        `)}
+      </div>
+    `)}
+  `;
+}
+
+function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
+  const [result, setResult] = useState(null);
+  const [animKey, setAnimKey] = useState(0);
+  const [statTick, setStatTick] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const debounceRef = useRef(null);
+
+  const piecesKey = JSON.stringify(draft.pieces);
+  const stocksKey = JSON.stringify(draft.stocks);
+
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      const r = planOneDimensionalCut({
+        pieces: draft.pieces,
+        stocks: draft.stocks,
+        kerfMm: Number(draft.kerf_mm) || 0,
+      });
+      setResult(r);
+      setAnimKey(k => k + 1);
+      setStatTick(t => t + 1);
+    }, 180);
+    return () => clearTimeout(debounceRef.current);
+  }, [piecesKey, stocksKey, draft.kerf_mm]);
+
+  const updatePiece = (idx, field, val) => {
+    const next = draft.pieces.slice();
+    next[idx] = Object.assign({}, next[idx], { [field]: field === 'label' ? val : Number(val) || 0 });
+    setDraft(Object.assign({}, draft, { pieces: next }));
+  };
+  const addPiece = () => {
+    const id = 'p' + Date.now();
+    setDraft(Object.assign({}, draft, {
+      pieces: [...draft.pieces, { id, lengthMm: 1000, qty: 1, label: 'Part ' + String.fromCharCode(65 + (draft.pieces.length % 26)) }],
+    }));
+  };
+  const removePiece = (idx) => setDraft(Object.assign({}, draft, { pieces: draft.pieces.filter((_, i) => i !== idx) }));
+
+  const updateStock = (idx, field, val) => {
+    const next = draft.stocks.slice();
+    next[idx] = Object.assign({}, next[idx], { [field]: Number(val) || 0 });
+    setDraft(Object.assign({}, draft, { stocks: next }));
+  };
+  const addStock = () => {
+    const id = 's' + Date.now();
+    setDraft(Object.assign({}, draft, { stocks: [...draft.stocks, { id, lengthMm: 6000, qty: 10, unitCost: 0 }] }));
+  };
+  const removeStock = (idx) => setDraft(Object.assign({}, draft, { stocks: draft.stocks.filter((_, i) => i !== idx) }));
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        project_id: draft.project_id || null,
+        stage_id: draft.stage_id || null,
+        title: (draft.title || 'Cut plan').trim(),
+        stock_material: draft.stock_material || null,
+        kerf_mm: Number(draft.kerf_mm) || 0,
+        status: draft.status || 'draft',
+        stocks: draft.stocks,
+        pieces: draft.pieces,
+        layout: result?.ok ? result.bars : null,
+        totals: result?.ok ? result.stats : null,
+        notes: draft.notes || null,
+      };
+      let row;
+      if (draft.id) {
+        const { data, error } = await sb.from('mcp_cut_plans').update(payload).eq('id', draft.id).select().single();
+        if (error) throw error;
+        row = data;
+      } else {
+        const { data, error } = await sb.from('mcp_cut_plans').insert(Object.assign({}, payload, { created_by: me.id })).select().single();
+        if (error) throw error;
+        row = data;
+      }
+      setDraft(Object.assign({}, draft, { id: row.id }));
+      showToast('✓ Plan saved');
+      onSaved && onSaved();
+    } catch (e) {
+      alert('Could not save: ' + (e.message || e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Deterministic color per piece id so the same piece shows the same colour everywhere.
+  const colorFor = (pieceId) => {
+    const palette = ['#0d9488', '#f59e0b', '#7c3aed', '#dc2626', '#0284c7', '#65a30d', '#db2777', '#ea580c', '#4f46e5', '#0891b2'];
+    let h = 0;
+    for (const c of String(pieceId || '')) h = (h * 31 + c.charCodeAt(0)) | 0;
+    return palette[Math.abs(h) % palette.length];
+  };
+
+  const wastePctNum = result?.ok ? result.stats.wastePct : 0;
+  const ribbonGrad = !result?.ok ? 'linear-gradient(135deg,#9ca3af,#6b7280)'
+    : (wastePctNum > 20 ? 'linear-gradient(135deg,#b91c1c,#dc2626)'
+    : (wastePctNum > 10 ? 'linear-gradient(135deg,#b45309,#d97706)'
+    : 'linear-gradient(135deg,#0f766e,#0d9488)'));
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn small ghost" onClick=${onBack} style="padding:6px 10px">← Back</button>
+      <div style="flex:1;min-width:0">
+        <input type="text" value=${draft.title} onChange=${e => setDraft(Object.assign({}, draft, { title: e.target.value }))}
+          style="width:100%;font-size:20px;font-weight:700;border:none;outline:none;background:transparent;padding:2px 0;font-family:inherit" />
+        <div style="font-size:11px;color:var(--slate-500)">
+          ${draft.project_name ? html`<span>📐 ${draft.project_name}${draft.stage_name ? ' · ' + draft.stage_name : ''}</span>` : html`<span>Plan-wide · not linked to a project</span>`}
+        </div>
+      </div>
+      <button class="btn" onClick=${save} disabled=${saving}>${saving ? 'Saving…' : (draft.id ? 'Save' : '+ Save plan')}</button>
+    </div>
+
+    ${result?.ok === false && html`
+      <div class="card" style="background:#fef2f2;border:1px solid var(--rose-300);padding:14px;color:var(--rose-700);margin-bottom:12px;font-size:13px">
+        ⚠ ${result.error}
+      </div>
+    `}
+
+    ${result?.ok && html`
+      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:14px;padding:16px 14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
+        <${CutStat} num=${result.stats.barsUsed}                                       label="Bars used"     tickKey=${statTick} />
+        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'}                       label="Total waste"   tickKey=${statTick} />
+        <${CutStat} num=${(result.stats.wasteMm / 1000).toFixed(2) + ' m'}              label="Waste length"  tickKey=${statTick} />
+        <${CutStat} num=${(result.stats.totalPiecesMm / 1000).toFixed(1) + ' m'}        label="Pieces total"  tickKey=${statTick} />
+        <${CutStat} num=${result.stats.totalCost > 0 ? '₹' + fmtNum(result.stats.totalCost.toFixed(0)) : '—'} label="Stock cost" tickKey=${statTick} />
+      </div>
+    `}
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:10px;margin-bottom:12px">
+      <div class="card" style="padding:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div style="font-weight:700;font-size:13px">Pieces required</div>
+          <button class="btn small ghost" onClick=${addPiece} style="padding:3px 8px;font-size:11px">+ Add</button>
+        </div>
+        <table style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
+            <th style="text-align:left;padding:4px 2px">Label</th>
+            <th style="text-align:right;padding:4px 2px;width:74px">Length mm</th>
+            <th style="text-align:right;padding:4px 2px;width:54px">Qty</th>
+            <th style="width:22px"></th>
+          </tr></thead>
+          <tbody>
+            ${draft.pieces.map((p, idx) => html`
+              <tr key=${p.id}>
+                <td style="padding:3px 2px"><div style="display:flex;align-items:center;gap:6px">
+                  <span style=${'width:10px;height:10px;border-radius:3px;flex-shrink:0;background:' + colorFor(p.id)}></span>
+                  <input type="text" value=${p.label} onChange=${e => updatePiece(idx, 'label', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px" />
+                </div></td>
+                <td style="padding:3px 2px"><input type="number" value=${p.lengthMm} onChange=${e => updatePiece(idx, 'lengthMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px"><input type="number" value=${p.qty} onChange=${e => updatePiece(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px;text-align:center"><button onClick=${() => removePiece(idx)} style="background:none;border:none;color:var(--slate-400);cursor:pointer;font-size:14px;padding:2px 4px" title="Remove">×</button></td>
+              </tr>
+            `)}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card" style="padding:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div style="font-weight:700;font-size:13px">Stock available</div>
+          <button class="btn small ghost" onClick=${addStock} style="padding:3px 8px;font-size:11px">+ Add</button>
+        </div>
+        <input type="text" value=${draft.stock_material || ''} onChange=${e => setDraft(Object.assign({}, draft, { stock_material: e.target.value }))}
+          placeholder="Material (e.g. MS Round Bar 25mm)" style="width:100%;font-size:12px;padding:5px 8px;border:1px solid var(--slate-200);border-radius:4px;margin-bottom:8px;font-family:inherit" />
+        <table style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
+            <th style="text-align:right;padding:4px 2px;width:74px">Length mm</th>
+            <th style="text-align:right;padding:4px 2px;width:54px">Qty</th>
+            <th style="text-align:right;padding:4px 2px;width:64px">Cost/bar</th>
+            <th style="width:22px"></th>
+          </tr></thead>
+          <tbody>
+            ${draft.stocks.map((s, idx) => html`
+              <tr key=${s.id}>
+                <td style="padding:3px 2px"><input type="number" value=${s.lengthMm} onChange=${e => updateStock(idx, 'lengthMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px"><input type="number" value=${s.qty} onChange=${e => updateStock(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px"><input type="number" value=${s.unitCost} onChange=${e => updateStock(idx, 'unitCost', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px;text-align:center"><button onClick=${() => removeStock(idx)} style="background:none;border:none;color:var(--slate-400);cursor:pointer;font-size:14px;padding:2px 4px">×</button></td>
+              </tr>
+            `)}
+          </tbody>
+        </table>
+        <div style="margin-top:8px;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--slate-600)">
+          <span>Saw kerf (mm):</span>
+          <input type="number" value=${draft.kerf_mm} step="0.5" onChange=${e => setDraft(Object.assign({}, draft, { kerf_mm: e.target.value }))}
+            style="width:60px;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" />
+          <span style="color:var(--slate-400);font-size:10px">width of each saw cut</span>
+        </div>
+      </div>
+    </div>
+
+    ${result?.ok && result.bars.length > 0 && html`
+      <div class="card" style="padding:14px;margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <div style="font-weight:700;font-size:13px">Layout · ${result.bars.length} ${result.bars.length === 1 ? 'bar' : 'bars'}</div>
+          <div style="display:flex;gap:8px;align-items:center;font-size:10px;color:var(--slate-500)">
+            <span style="display:flex;align-items:center;gap:4px"><span style="display:inline-block;width:10px;height:10px;background:#f1f5f9;border:1px solid #cbd5e1"></span> waste</span>
+            <span style="display:flex;align-items:center;gap:4px"><span style="display:inline-block;width:10px;height:10px;background:#0d9488"></span> cut piece</span>
+          </div>
+        </div>
+        <${CutSvg} key=${animKey} bars=${result.bars} kerfMm=${Number(draft.kerf_mm) || 0} colorFor=${colorFor} />
+      </div>
+    `}
+
+    ${result?.ok && result.bars.length > 0 && html`
+      <div class="card" style="padding:14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <div style="font-weight:700;font-size:13px">Cutting list · for shop floor</div>
+          <button class="btn small ghost" onClick=${() => window.print()} style="padding:4px 10px;font-size:11px">🖨 Print</button>
+        </div>
+        ${result.bars.map(b => html`
+          <div key=${b.index} style="border:1px solid var(--slate-100);border-radius:6px;padding:8px 10px;margin-bottom:6px">
+            <div style="display:flex;justify-content:space-between;font-size:12px;font-weight:700">
+              <span>Bar #${b.index} · ${(b.stockLength / 1000).toFixed(2)}m</span>
+              <span style=${'color:' + (b.wasteMm > b.stockLength * 0.15 ? 'var(--rose-600)' : 'var(--slate-500)')}>${b.wasteMm}mm scrap · ${(b.wasteMm / b.stockLength * 100).toFixed(1)}%</span>
+            </div>
+            <div style="font-size:11px;color:var(--slate-600);margin-top:4px">
+              ${b.cuts.map(c => c.label + ' · ' + c.length + 'mm').join('  ·  ')}
+              ${b.kerfsInBar > 0 ? html`<span style="color:var(--slate-400)"> · ${b.cuts.length - 1} saw cut${b.cuts.length - 1 === 1 ? '' : 's'} (${b.kerfsInBar}mm kerf)</span>` : null}
+            </div>
+          </div>
+        `)}
+      </div>
+    `}
+  `;
+}
+
+function CutStat({ num, label, tickKey }) {
+  return html`
+    <div style="text-align:center;min-width:0">
+      <div key=${tickKey} class="cut-stat-num tick" style="font-size:22px;font-weight:800;color:white;line-height:1;font-family:'Bricolage Grotesque',sans-serif">${num}</div>
+      <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:rgba(255,255,255,0.85);margin-top:4px">${label}</div>
+    </div>
+  `;
+}
+
+function CutSvg({ bars, kerfMm, colorFor }) {
+  if (!bars || bars.length === 0) return null;
+  const maxLen = Math.max.apply(null, bars.map(b => b.stockLength).concat([1]));
+  const barH = 38;
+  const gap = 14;
+  const leftPad = 32;
+  const rightPad = 8;
+  const usableW = 1000 - leftPad - rightPad;
+  const svgH = bars.length * (barH + gap) + gap;
+  const scale = usableW / maxLen;
+
+  return html`
+    <svg class="cut-svg" viewBox=${'0 0 1000 ' + svgH}
+      style="width:100%;height:auto;display:block;font-family:system-ui,-apple-system,sans-serif"
+      preserveAspectRatio="xMinYMin meet">
+      <defs>
+        <pattern id="wasteHatch" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+          <rect width="6" height="6" fill="#f1f5f9" />
+          <line x1="0" y1="0" x2="0" y2="6" stroke="#cbd5e1" stroke-width="1.5" />
+        </pattern>
+      </defs>
+      ${bars.map((bar, bIdx) => {
+        const y = gap + bIdx * (barH + gap);
+        const barW = bar.stockLength * scale;
+        let x = 0;
+        const segs = bar.cuts.map((c) => {
+          const cw = c.length * scale;
+          const seg = { x, w: cw, color: colorFor(c.pieceId || c.label), label: c.label, length: c.length };
+          x += cw + kerfMm * scale; // advance past piece + kerf
+          return seg;
+        });
+        // Last seg shouldn't add kerf — but it's fine for positioning since waste starts at "used" mark.
+        const usedMm = bar.cuts.reduce((s, c) => s + c.length, 0) + Math.max(0, bar.cuts.length - 1) * kerfMm;
+        const wasteX = usedMm * scale;
+        const wasteW = bar.wasteMm * scale;
+        return html`
+          <g key=${bIdx} class="cut-bar" style=${'animation-delay:' + (bIdx * 0.06) + 's'} transform=${'translate(' + leftPad + ',' + y + ')'}>
+            <text x=${-6} y=${barH / 2 + 4} font-size="11" fill="#475569" text-anchor="end" font-weight="700">#${bIdx + 1}</text>
+            <rect x=${0} y=${0} width=${barW} height=${barH} fill="#f8fafc" stroke="#cbd5e1" stroke-width="1" rx="3" />
+            ${segs.map((s, i) => html`
+              <g key=${'s' + i}>
+                <rect class="cut-seg" style=${'animation-delay:' + (bIdx * 0.1 + i * 0.06) + 's'}
+                  x=${s.x} y=${1} width=${Math.max(0.5, s.w)} height=${barH - 2} fill=${s.color} opacity="0.92">
+                  <title>${s.label} · ${s.length}mm</title>
+                </rect>
+                ${s.w > 26 && html`<text class="cut-text" style=${'animation-delay:' + (bIdx * 0.1 + i * 0.06 + 0.18) + 's'}
+                  x=${s.x + s.w / 2} y=${barH / 2 + 4} font-size="11" font-weight="700" fill="white" text-anchor="middle" pointer-events="none">${s.label}</text>`}
+                ${s.w > 60 && html`<text class="cut-text" style=${'animation-delay:' + (bIdx * 0.1 + i * 0.06 + 0.22) + 's'}
+                  x=${s.x + s.w / 2} y=${barH / 2 - 7} font-size="9" fill="rgba(255,255,255,0.85)" text-anchor="middle" pointer-events="none">${s.length}mm</text>`}
+              </g>
+            `)}
+            ${bar.wasteMm > 0 && wasteW > 0.5 && html`
+              <g>
+                <rect class="cut-seg" style=${'animation-delay:' + (bIdx * 0.1 + segs.length * 0.06 + 0.05) + 's'}
+                  x=${wasteX} y=${1} width=${wasteW} height=${barH - 2} fill="url(#wasteHatch)" stroke="#cbd5e1" stroke-width="0.5">
+                  <title>Waste · ${bar.wasteMm}mm</title>
+                </rect>
+                ${wasteW > 36 && html`<text class="cut-text" style=${'animation-delay:' + (bIdx * 0.1 + segs.length * 0.06 + 0.18) + 's'}
+                  x=${wasteX + wasteW / 2} y=${barH / 2 + 4} font-size="10" fill="#64748b" text-anchor="middle" pointer-events="none">${bar.wasteMm}mm</text>`}
+              </g>
+            `}
+          </g>
+        `;
+      })}
+    </svg>
   `;
 }
 
