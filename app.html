@@ -1322,6 +1322,7 @@ const MORE_GROUPS = [
     items: [
       { key:'tpm',           icon:'🛠', label:'TPM Daily Checks',     sub:'30-sec machine checks · oil, coolant, leaks, guards' },
       { key:'maintenance',   icon:'🔧', label:'Maintenance',          sub:'Breakdowns log, machine status' },
+      { key:'cutting',       icon:'✂️', label:'Cutting Planner',      sub:'1D cutting optimisation for rods, tubes, bars · auto layout with kerf · waste %' },
       { key:'petty_cash',    icon:'💰', label:'Petty Cash',           sub:'Expenses · advances · recollection · who owes how much' },
       { key:'jobwork',       icon:'🏭', label:'Sub-Contracting',      sub:'Send / receive parts at job-work vendors · 180-day GST clock' },
       { key:'supplier_chase',icon:'🛒', label:'Supplier Chase', mfg:true, sub:'Raw material runway vs upcoming schedule · auto-alerts which vendor to chase' },
@@ -1354,7 +1355,6 @@ const MORE_GROUPS = [
     items: [
       { key:'actions',             icon:'✓',  label:'Action Hub',                sub:'All open commitments, owners, due dates' },
       { key:'projects',            icon:'📐', label:'Projects',                  sub:'Fabrication & site-work job tracking · progress, weight, milestones' },
-      { key:'cutting',             icon:'✂️', label:'Cutting Planner',           sub:'1D cutting optimisation for rods, tubes, bars · auto layout with kerf · waste %' },
       { key:'cad3d',               icon:'🧊', label:'3D Models · CadNexa',       sub:'View, measure & estimate STEP/STL/CAD parts inside the plant' },
       { key:'npd',                 icon:'🧪', label:'NPD Projects (APQP)', iatf:true, sub:'RFQ → SOP lifecycle, PPAP auto-feed, commercials' },
       { key:'ppap',                icon:'📑', label:'PPAP Submissions',   iatf:true, sub:'Part approval status (IATF 8.3.4.4)' },
@@ -1579,7 +1579,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${tab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} /></${Page}>
       <${Page} active=${tab === 'projects'}><${ProjectTracker} plant=${plant} me=${me} myPerms=${myPerms} go=${go} /></${Page}>
-      <${Page} active=${tab === 'cutting'}><${CuttingPlanner} plant=${plant} me=${me} navAction=${navAction} go=${go} /></${Page}>
+      <${Page} active=${tab === 'cutting'}><${CuttingPlanner} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'expenses'}><${ExpenseLedger} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'machine_prod'}><${MachineProductionModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
@@ -11746,20 +11746,6 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
     } catch(e){}
     if (go) go('chat', 'upload_bill');
   };
-  const planCutting = (stage) => {
-    try {
-      sessionStorage.setItem('loglinkr_cutting_project_id', project.id);
-      sessionStorage.setItem('loglinkr_cutting_project_name', project.name || project.code || '');
-      if (stage) {
-        sessionStorage.setItem('loglinkr_cutting_stage_id', stage.id);
-        sessionStorage.setItem('loglinkr_cutting_stage_name', stage.name || '');
-      } else {
-        sessionStorage.removeItem('loglinkr_cutting_stage_id');
-        sessionStorage.removeItem('loglinkr_cutting_stage_name');
-      }
-    } catch(e){}
-    if (go) go('cutting', 'from_stage');
-  };
 
   const st = STATUS[project.status] || { c:'', l: project.status };
   const owner = users.find(u => u.id === project.owner_user_id);
@@ -11850,7 +11836,6 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
                   <button class="btn small" onClick=${()=>uploadBill(s)} style="padding:4px 10px;font-size:11px">📷 Upload bill</button>
                   <button class="btn small ghost" onClick=${()=>setAskModal({kind:'approval', stage:s})} style="padding:4px 10px;font-size:11px">📋 Raise approval</button>
                   <button class="btn small ghost" onClick=${()=>setAskModal({kind:'query', stage:s})} style="padding:4px 10px;font-size:11px">💬 Ask query</button>
-                  <button class="btn small ghost" onClick=${()=>planCutting(s)} style="padding:4px 10px;font-size:11px">✂️ Plan cutting</button>
                 </div>
                 ${stageBills.length>0 && html`
                   <div style="margin-top:8px;border-top:1px dashed var(--slate-100);padding-top:6px">
@@ -12056,7 +12041,7 @@ function planOneDimensionalCut({ pieces, stocks, kerfMm }) {
   };
 }
 
-function CuttingPlanner({ plant, me, navAction, go }) {
+function CuttingPlanner({ plant, me }) {
   const [view, setView] = useState('list');
   const [plans, setPlans] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -12065,7 +12050,7 @@ function CuttingPlanner({ plant, me, navAction, go }) {
   const refresh = useCallback(async () => {
     setLoading(true);
     const { data } = await sb.from('mcp_cut_plans')
-      .select('*, project:mcp_projects(name,code), stage:mcp_project_milestones(name)')
+      .select('*')
       .eq('plant_id', plant.id)
       .order('created_at', { ascending: false })
       .limit(50);
@@ -12074,16 +12059,10 @@ function CuttingPlanner({ plant, me, navAction, go }) {
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
 
-  const newPlan = useCallback((preset = {}) => {
+  const newPlan = useCallback(() => {
     setDraft({
       id: null,
-      project_id: preset.project_id || null,
-      project_name: preset.project_name || '',
-      stage_id: preset.stage_id || null,
-      stage_name: preset.stage_name || '',
-      title: preset.project_name
-        ? 'Cut plan · ' + preset.project_name + (preset.stage_name ? ' · ' + preset.stage_name : '')
-        : 'New cut plan',
+      title: 'New cut plan',
       stock_material: 'MS Round Bar 25mm',
       kerf_mm: 3,
       status: 'draft',
@@ -12101,29 +12080,7 @@ function CuttingPlanner({ plant, me, navAction, go }) {
     setView('edit');
   }, []);
 
-  // Deep-link from project stage: open a fresh draft pre-tagged
-  useEffect(() => {
-    if (navAction?.tab !== 'cutting' || navAction.sub !== 'from_stage') return;
-    try {
-      const pid   = sessionStorage.getItem('loglinkr_cutting_project_id');
-      const pname = sessionStorage.getItem('loglinkr_cutting_project_name');
-      const sid   = sessionStorage.getItem('loglinkr_cutting_stage_id');
-      const sname = sessionStorage.getItem('loglinkr_cutting_stage_name');
-      sessionStorage.removeItem('loglinkr_cutting_project_id');
-      sessionStorage.removeItem('loglinkr_cutting_project_name');
-      sessionStorage.removeItem('loglinkr_cutting_stage_id');
-      sessionStorage.removeItem('loglinkr_cutting_stage_name');
-      newPlan({ project_id: pid, project_name: pname || '', stage_id: sid, stage_name: sname || '' });
-    } catch (e) {}
-  }, [navAction?.ts, newPlan]);
-
-  const openPlan = (p) => {
-    setDraft(Object.assign({}, p, {
-      project_name: p.project?.name || p.project?.code || '',
-      stage_name: p.stage?.name || '',
-    }));
-    setView('edit');
-  };
+  const openPlan = (p) => { setDraft(Object.assign({}, p)); setView('edit'); };
 
   if (view === 'edit' && draft) {
     return html`<${CutPlannerEditor} draft=${draft} setDraft=${setDraft} plant=${plant} me=${me}
@@ -12154,11 +12111,7 @@ function CuttingPlanner({ plant, me, navAction, go }) {
             onMouseOver=${e => { e.currentTarget.style.transform = 'translateY(-2px)'; e.currentTarget.style.boxShadow = '0 4px 14px rgba(15,23,42,0.08)'; }}
             onMouseOut=${e => { e.currentTarget.style.transform = ''; e.currentTarget.style.boxShadow = ''; }}>
             <div style="font-weight:700;font-size:14px;margin-bottom:4px">${p.title}</div>
-            <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">
-              ${p.stock_material || ''}
-              ${p.project ? ' · ' + (p.project.code || p.project.name) : ''}
-              ${p.stage ? ' · ' + p.stage.name : ''}
-            </div>
+            <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">${p.stock_material || ''}</div>
             ${p.totals ? html`
               <div style="display:flex;gap:10px;font-size:11px;color:var(--slate-700)">
                 <div><b>${p.totals.barsUsed}</b> bars</div>
@@ -12230,8 +12183,6 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
     try {
       const payload = {
         plant_id: plant.id,
-        project_id: draft.project_id || null,
-        stage_id: draft.stage_id || null,
         title: (draft.title || 'Cut plan').trim(),
         stock_material: draft.stock_material || null,
         kerf_mm: Number(draft.kerf_mm) || 0,
@@ -12279,13 +12230,8 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
   return html`
     <div class="page-header" style="display:flex;align-items:center;gap:10px">
       <button class="btn small ghost" onClick=${onBack} style="padding:6px 10px">← Back</button>
-      <div style="flex:1;min-width:0">
-        <input type="text" value=${draft.title} onChange=${e => setDraft(Object.assign({}, draft, { title: e.target.value }))}
-          style="width:100%;font-size:20px;font-weight:700;border:none;outline:none;background:transparent;padding:2px 0;font-family:inherit" />
-        <div style="font-size:11px;color:var(--slate-500)">
-          ${draft.project_name ? html`<span>📐 ${draft.project_name}${draft.stage_name ? ' · ' + draft.stage_name : ''}</span>` : html`<span>Plan-wide · not linked to a project</span>`}
-        </div>
-      </div>
+      <input type="text" value=${draft.title} onChange=${e => setDraft(Object.assign({}, draft, { title: e.target.value }))}
+        style="flex:1;min-width:0;font-size:20px;font-weight:700;border:none;outline:none;background:transparent;padding:2px 0;font-family:inherit" />
       <button class="btn" onClick=${save} disabled=${saving}>${saving ? 'Saving…' : (draft.id ? 'Save' : '+ Save plan')}</button>
     </div>
 
