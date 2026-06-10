@@ -171,6 +171,9 @@ body{
 .cut-svg .cut-seg{transform-box:fill-box;transform-origin:left center;animation:cutDrawIn 0.45s cubic-bezier(0.22,0.61,0.36,1) both}
 .cut-svg .cut-text{animation:barFadeIn 0.3s ease both}
 .cut-svg .cut-bar{animation:barFadeIn 0.35s ease both}
+@keyframes sheetPieceIn{from{opacity:0;transform:scale(0.7)}to{opacity:1;transform:scale(1)}}
+.sheet-svg .sheet-rect{transform-box:fill-box;transform-origin:center;animation:sheetPieceIn 0.4s cubic-bezier(0.22,0.61,0.36,1) both}
+.sheet-svg .sheet-text{animation:barFadeIn 0.3s ease both}
 .cut-stat-num.tick{animation:statPulse 0.55s ease both}
 .cut-ribbon{position:relative;overflow:hidden}
 .cut-ribbon::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 30%,rgba(255,255,255,0.5) 50%,transparent 70%);background-size:200% 100%;animation:ribbonShine 2.2s ease-in-out infinite;pointer-events:none}
@@ -12096,6 +12099,121 @@ function planSingleMaterial({ pieces, stocks, kerfMm }) {
   };
 }
 
+// =================================================================
+// 2D PLATE NESTING — guillotine cuts + Best Area Fit + rotation.
+// Same plan row in mcp_cut_plans but plan_kind='2d'. Pieces have widthMm +
+// heightMm; stocks have widthMm + heightMm. Layout is per-sheet rectangles.
+// =================================================================
+
+function cutPlatePlaceRect(sheet, rect, rectIdx, item, pw, ph, rotated, kerf) {
+  sheet.placed.push({
+    pieceId: item.pieceId, label: item.label,
+    x: rect.x, y: rect.y, w: pw, h: ph,
+    rotated, origW: item.w, origH: item.h,
+  });
+  sheet.freeRects.splice(rectIdx, 1);
+  // Guillotine "long right" split — right rect spans the parent's full height,
+  // below rect is constrained to the placed piece's width.
+  const rightW = rect.w - pw - kerf;
+  const belowH = rect.h - ph - kerf;
+  if (rightW > 0) sheet.freeRects.push({ x: rect.x + pw + kerf, y: rect.y, w: rightW, h: rect.h });
+  if (belowH > 0) sheet.freeRects.push({ x: rect.x, y: rect.y + ph + kerf, w: pw, h: belowH });
+}
+
+function planSingleSheet({ pieces, stocks, kerfMm }) {
+  const items = [];
+  for (const p of (pieces || [])) {
+    const w = Number(p.widthMm) || 0;
+    const h = Number(p.heightMm) || 0;
+    const qty = Math.max(0, Math.floor(Number(p.qty) || 0));
+    if (w <= 0 || h <= 0 || qty <= 0) continue;
+    for (let i = 0; i < qty; i++) {
+      items.push({ id: p.id + ':' + i, pieceId: p.id, label: p.label || 'piece', w, h, allowRotation: p.allow_rotation !== false });
+    }
+  }
+  items.sort((a, b) => (b.w * b.h) - (a.w * a.h));
+
+  const stockPool = (stocks || [])
+    .filter(s => Number(s.qty) > 0 && Number(s.widthMm) > 0 && Number(s.heightMm) > 0)
+    .map(s => ({ id: s.id, widthMm: Number(s.widthMm), heightMm: Number(s.heightMm), unitCost: Number(s.unitCost) || 0, remaining: Math.floor(Number(s.qty)) }));
+
+  if (items.length === 0) {
+    return { ok: true, sheets: [], stats: { sheetsUsed: 0, totalStockAreaMm2: 0, totalPiecesAreaMm2: 0, wasteAreaMm2: 0, wastePct: 0, totalCost: 0 } };
+  }
+  if (stockPool.length === 0) return { ok: false, error: 'No sheet stocks defined.' };
+
+  const k = Number(kerfMm) || 0;
+  const sheets = [];
+
+  for (const item of items) {
+    let best = null;
+    for (const sheet of sheets) {
+      for (let i = 0; i < sheet.freeRects.length; i++) {
+        const rect = sheet.freeRects[i];
+        const area = rect.w * rect.h;
+        if (item.w <= rect.w && item.h <= rect.h) {
+          if (best === null || area < best.score) best = { sheet, rect, rectIdx: i, rotated: false, score: area };
+        }
+        if (item.allowRotation && item.h <= rect.w && item.w <= rect.h) {
+          if (best === null || area < best.score) best = { sheet, rect, rectIdx: i, rotated: true, score: area };
+        }
+      }
+    }
+    if (best) {
+      const pw = best.rotated ? item.h : item.w;
+      const ph = best.rotated ? item.w : item.h;
+      cutPlatePlaceRect(best.sheet, best.rect, best.rectIdx, item, pw, ph, best.rotated, k);
+      continue;
+    }
+    // Open a new sheet: smallest stock that holds the item in either orientation
+    const fit = stockPool
+      .filter(s => s.remaining > 0 && (
+        (item.w <= s.widthMm && item.h <= s.heightMm) ||
+        (item.allowRotation && item.h <= s.widthMm && item.w <= s.heightMm)
+      ))
+      .sort((a, b) => (a.widthMm * a.heightMm) - (b.widthMm * b.heightMm))[0];
+    if (!fit) {
+      return { ok: false, error: 'No sheet big enough for piece "' + item.label + '" (' + item.w + '×' + item.h + 'mm).' };
+    }
+    fit.remaining -= 1;
+    const newSheet = {
+      stockId: fit.id, stockW: fit.widthMm, stockH: fit.heightMm,
+      unitCost: fit.unitCost, placed: [],
+      freeRects: [{ x: 0, y: 0, w: fit.widthMm, h: fit.heightMm }],
+    };
+    const fitsAsIs = item.w <= newSheet.stockW && item.h <= newSheet.stockH;
+    const rotated = !fitsAsIs;
+    const pw = rotated ? item.h : item.w;
+    const ph = rotated ? item.w : item.h;
+    cutPlatePlaceRect(newSheet, newSheet.freeRects[0], 0, item, pw, ph, rotated, k);
+    sheets.push(newSheet);
+  }
+
+  let totalStockArea = 0, totalPiecesArea = 0, totalCost = 0;
+  const enriched = sheets.map((s, idx) => {
+    const usedArea = s.placed.reduce((sum, p) => sum + p.w * p.h, 0);
+    const stockArea = s.stockW * s.stockH;
+    totalStockArea += stockArea;
+    totalPiecesArea += usedArea;
+    totalCost += s.unitCost;
+    return Object.assign({}, s, { index: idx + 1, usedArea, stockArea, wasteArea: stockArea - usedArea });
+  });
+  const wasteArea = totalStockArea - totalPiecesArea;
+  const wastePct = totalStockArea > 0 ? (wasteArea / totalStockArea) * 100 : 0;
+  return {
+    ok: true, sheets: enriched,
+    stats: { sheetsUsed: enriched.length, totalStockAreaMm2: totalStockArea, totalPiecesAreaMm2: totalPiecesArea, wasteAreaMm2: wasteArea, wastePct, totalCost },
+  };
+}
+
+// kg/m² for a plate material. (Bars use kg/m via cutComputeKgPerM.)
+function cutComputePlateKgPerM2(spec, density) {
+  const t = Number(spec?.thickness) || 0;
+  if (t <= 0) return null;
+  const rho = Number(density) || 7850;
+  return t * rho * 1e-3; // mm × kg/m³ × 1e-3 = kg/m²
+}
+
 // Endbit advisor: for a bar with significant scrap, list which pieces from the
 // input could still fit in that scrap (with kerf). For a small endbit that's
 // shorter than the smallest piece + kerf, return a single explainer entry so
@@ -12180,6 +12298,7 @@ const CUT_MATERIAL_TYPES = [
   { value: 'angle',      label: 'Angle (L)',     fields: ['leg1', 'leg2', 'thickness'] },
   { value: 'channel',    label: 'Channel (ISMC)',fields: ['designation', 'kgPerM'], manualKgPerM: true },
   { value: 'i_beam',     label: 'I-beam (ISMB)', fields: ['designation', 'kgPerM'], manualKgPerM: true },
+  { value: 'plate',      label: 'Plate / Sheet', fields: ['thickness'], is2D: true },
   { value: 'other',      label: 'Other',         fields: ['size', 'kgPerM'],        manualKgPerM: true },
 ];
 const CUT_SPEC_FIELD_META = {
@@ -12205,6 +12324,7 @@ function cutDefaultSpec(type) {
     case 'angle':      return { leg1: 50, leg2: 50, thickness: 5 };
     case 'channel':    return { designation: 'ISMC 100', kgPerM: 9.56 };
     case 'i_beam':     return { designation: 'ISMB 100', kgPerM: 11.5 };
+    case 'plate':      return { thickness: 10 };
     case 'other':      return { size: '', kgPerM: 0 };
   }
   return {};
@@ -12236,6 +12356,7 @@ function cutFormatMaterialLabel(type, spec) {
     case 'angle':      return (s.leg1 && s.leg2 && s.thickness) ? `Angle ${s.leg1}×${s.leg2}×${s.thickness}` : 'Angle';
     case 'channel':    return s.designation || 'Channel';
     case 'i_beam':     return s.designation || 'I-beam';
+    case 'plate':      return s.thickness ? `${s.thickness}mm Plate` : 'Plate';
     case 'other':      return s.size || 'Other';
   }
   return type;
@@ -12294,32 +12415,55 @@ function CuttingPlanner({ plant, me }) {
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
 
-  const newPlan = useCallback(() => {
-    const m1 = { id: 'm1', type: 'round_bar', spec: cutDefaultSpec('round_bar'), density_kg_per_m3: 7850 };
-    setDraft({
-      id: null,
-      title: 'New cut plan',
-      kerf_mm: 3,
-      status: 'draft',
-      materials: [m1],
-      stocks: [
-        { id: 's1', material_id: 'm1', lengthMm: 6000,  qty: 50, unitCost: 0 },
-        { id: 's2', material_id: 'm1', lengthMm: 12000, qty: 25, unitCost: 0 },
-      ],
-      pieces: [
-        { id: 'p1', material_id: 'm1', lengthMm: 900, qty: 6, label: 'Part A' },
-        { id: 'p2', material_id: 'm1', lengthMm: 400, qty: 2, label: 'Part B' },
-        { id: 'p3', material_id: 'm1', lengthMm: 30,  qty: 6, label: 'Spacer' },
-      ],
-      notes: '',
-    });
+  const newPlan = useCallback((kind = '1d') => {
+    if (kind === '2d') {
+      const m1 = { id: 'm1', type: 'plate', spec: cutDefaultSpec('plate'), density_kg_per_m3: 7850 };
+      setDraft({
+        id: null,
+        title: 'New plate cut plan',
+        plan_kind: '2d',
+        kerf_mm: 3,
+        status: 'draft',
+        materials: [m1],
+        stocks: [
+          { id: 's1', material_id: 'm1', widthMm: 2500, heightMm: 1250, qty: 10, unitCost: 0 },
+        ],
+        pieces: [
+          { id: 'p1', material_id: 'm1', widthMm: 600, heightMm: 400, qty: 4, label: 'Plate A', allow_rotation: true },
+          { id: 'p2', material_id: 'm1', widthMm: 800, heightMm: 300, qty: 2, label: 'Plate B', allow_rotation: true },
+          { id: 'p3', material_id: 'm1', widthMm: 200, heightMm: 200, qty: 8, label: 'Bracket',  allow_rotation: true },
+        ],
+        notes: '',
+      });
+    } else {
+      const m1 = { id: 'm1', type: 'round_bar', spec: cutDefaultSpec('round_bar'), density_kg_per_m3: 7850 };
+      setDraft({
+        id: null,
+        title: 'New cut plan',
+        plan_kind: '1d',
+        kerf_mm: 3,
+        status: 'draft',
+        materials: [m1],
+        stocks: [
+          { id: 's1', material_id: 'm1', lengthMm: 6000,  qty: 50, unitCost: 0 },
+          { id: 's2', material_id: 'm1', lengthMm: 12000, qty: 25, unitCost: 0 },
+        ],
+        pieces: [
+          { id: 'p1', material_id: 'm1', lengthMm: 900, qty: 6, label: 'Part A' },
+          { id: 'p2', material_id: 'm1', lengthMm: 400, qty: 2, label: 'Part B' },
+          { id: 'p3', material_id: 'm1', lengthMm: 30,  qty: 6, label: 'Spacer' },
+        ],
+        notes: '',
+      });
+    }
     setView('edit');
   }, []);
 
   const openPlan = (p) => { setDraft(cutEnsureMaterials(Object.assign({}, p))); setView('edit'); };
 
   if (view === 'edit' && draft) {
-    return html`<${CutPlannerEditor} draft=${draft} setDraft=${setDraft} plant=${plant} me=${me}
+    const EditorComp = draft.plan_kind === '2d' ? CutPlannerEditor2D : CutPlannerEditor;
+    return html`<${EditorComp} draft=${draft} setDraft=${setDraft} plant=${plant} me=${me}
       onSaved=${async () => { await refresh(); }}
       onBack=${() => { setDraft(null); setView('list'); }} />`;
   }
@@ -12328,16 +12472,22 @@ function CuttingPlanner({ plant, me }) {
     <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">
       <div>
         <h1>✂️ Cutting Planner</h1>
-        <div class="sub">1D nesting for rods, tubes &amp; bars — auto layout with kerf and live waste %</div>
+        <div class="sub">1D for bars / 2D for plates &amp; sheets — auto layout with kerf, live waste %, weight breakdown</div>
       </div>
-      <button class="btn" onClick=${() => newPlan()}>+ New plan</button>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn" onClick=${() => newPlan('1d')}>+ 1D · bar plan</button>
+        <button class="btn" style="background:var(--indigo-600,#4f46e5)" onClick=${() => newPlan('2d')}>+ 2D · plate plan</button>
+      </div>
     </div>
     ${loading ? html`<div class="spinner" style="margin:30px auto"></div>` : (plans.length === 0 ? html`
       <div class="card" style="padding:30px;text-align:center;color:var(--slate-500)">
         <div style="font-size:48px;margin-bottom:8px">✂️</div>
         <div style="font-weight:700;font-size:16px;color:var(--slate-700);margin-bottom:6px">No cutting plans yet</div>
-        <div style="font-size:13px;margin-bottom:14px;max-width:380px;margin-left:auto;margin-right:auto">Punch in the pieces you need, the stock lengths you have on hand, and the planner lays out every bar to minimise scrap.</div>
-        <button class="btn small" onClick=${() => newPlan()}>+ Create your first plan</button>
+        <div style="font-size:13px;margin-bottom:14px;max-width:380px;margin-left:auto;margin-right:auto">1D for bars / tubes / profiles. 2D for steel plate &amp; sheet metal. Punch in pieces and stock, the planner does the rest.</div>
+        <div style="display:flex;gap:6px;justify-content:center;flex-wrap:wrap">
+          <button class="btn small" onClick=${() => newPlan('1d')}>+ 1D · bar plan</button>
+          <button class="btn small" style="background:var(--indigo-600,#4f46e5)" onClick=${() => newPlan('2d')}>+ 2D · plate plan</button>
+        </div>
       </div>
     ` : html`
       <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px">
@@ -12346,7 +12496,10 @@ function CuttingPlanner({ plant, me }) {
             onClick=${() => openPlan(p)}
             onMouseOver=${e => { e.currentTarget.style.transform = 'translateY(-2px)'; e.currentTarget.style.boxShadow = '0 4px 14px rgba(15,23,42,0.08)'; }}
             onMouseOut=${e => { e.currentTarget.style.transform = ''; e.currentTarget.style.boxShadow = ''; }}>
-            <div style="font-weight:700;font-size:14px;margin-bottom:4px">${p.title}</div>
+            <div style="display:flex;justify-content:space-between;align-items:start;gap:6px;margin-bottom:4px">
+              <div style="font-weight:700;font-size:14px;flex:1">${p.title}</div>
+              <span style=${'display:inline-block;padding:1px 6px;border-radius:4px;font-size:9px;font-weight:700;letter-spacing:0.05em;background:'+(p.plan_kind==='2d'?'var(--indigo-100,#e0e7ff)':'var(--teal-50)')+';color:'+(p.plan_kind==='2d'?'var(--indigo-700,#4338ca)':'var(--teal-700)')}>${(p.plan_kind || '1d').toUpperCase()}</span>
+            </div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
               ${(() => {
                 const mats = (Array.isArray(p.materials) && p.materials.length > 0)
@@ -12359,11 +12512,15 @@ function CuttingPlanner({ plant, me }) {
             </div>
             ${p.totals ? html`
               <div style="display:flex;gap:10px;font-size:11px;color:var(--slate-700)">
-                <div><b>${p.totals.barsUsed}</b> bars</div>
+                ${p.plan_kind === '2d'
+                  ? html`<div><b>${p.totals.sheetsUsed || 0}</b> sheets</div>`
+                  : html`<div><b>${p.totals.barsUsed || 0}</b> bars</div>`}
                 <div style=${'color:' + (Number(p.totals.wastePct) > 15 ? 'var(--rose-600)' : 'var(--emerald-600)')}>
                   <b>${Number(p.totals.wastePct || 0).toFixed(1)}%</b> waste
                 </div>
-                <div><b>${((Number(p.totals.totalPiecesMm) || 0) / 1000).toFixed(1)}m</b> pieces</div>
+                ${p.plan_kind === '2d'
+                  ? html`<div><b>${((Number(p.totals.totalPiecesAreaMm2) || 0) / 1e6).toFixed(2)}m²</b> pieces</div>`
+                  : html`<div><b>${((Number(p.totals.totalPiecesMm) || 0) / 1000).toFixed(1)}m</b> pieces</div>`}
               </div>
             ` : html`<div style="font-size:11px;color:var(--slate-400)">No layout computed yet</div>`}
             <div style="font-size:10px;color:var(--slate-400);margin-top:6px">${p.created_at ? new Date(p.created_at).toLocaleDateString() : ''}</div>
@@ -12701,6 +12858,329 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
         })}
       </div>
     `}
+  `;
+}
+
+// =================================================================
+// 2D plate-cutting editor. Single-material in v1: plate type + thickness
+// drive kg/m^2; pieces and stocks declare width x height; layout is a
+// per-sheet SVG with rectangles guillotined into place.
+// =================================================================
+function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
+  const [result, setResult] = useState(null);
+  const [animKey, setAnimKey] = useState(0);
+  const [statTick, setStatTick] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const debounceRef = useRef(null);
+
+  const materials = draft.materials || [];
+  const piecesKey = JSON.stringify(draft.pieces);
+  const stocksKey = JSON.stringify(draft.stocks);
+  const materialsKey = JSON.stringify(materials);
+
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      // Single material in v1 — gather all pieces/stocks under the only material.
+      const r = planSingleSheet({
+        pieces: draft.pieces,
+        stocks: draft.stocks,
+        kerfMm: Number(draft.kerf_mm) || 0,
+      });
+      setResult(r);
+      setAnimKey(k => k + 1);
+      setStatTick(t => t + 1);
+    }, 180);
+    return () => clearTimeout(debounceRef.current);
+  }, [piecesKey, stocksKey, materialsKey, draft.kerf_mm]);
+
+  const updatePiece = (idx, field, val) => {
+    const next = draft.pieces.slice();
+    const isText = field === 'label';
+    const isBool = field === 'allow_rotation';
+    next[idx] = Object.assign({}, next[idx], { [field]: isText ? val : (isBool ? !!val : (Number(val) || 0)) });
+    setDraft(Object.assign({}, draft, { pieces: next }));
+  };
+  const addPiece = () => {
+    const id = 'p' + Date.now();
+    const firstMat = materials[0]?.id || null;
+    setDraft(Object.assign({}, draft, {
+      pieces: [...draft.pieces, { id, material_id: firstMat, widthMm: 400, heightMm: 300, qty: 1, label: 'Plate ' + String.fromCharCode(65 + (draft.pieces.length % 26)), allow_rotation: true }],
+    }));
+  };
+  const removePiece = (idx) => setDraft(Object.assign({}, draft, { pieces: draft.pieces.filter((_, i) => i !== idx) }));
+
+  const updateStock = (idx, field, val) => {
+    const next = draft.stocks.slice();
+    next[idx] = Object.assign({}, next[idx], { [field]: Number(val) || 0 });
+    setDraft(Object.assign({}, draft, { stocks: next }));
+  };
+  const addStock = () => {
+    const id = 's' + Date.now();
+    const firstMat = materials[0]?.id || null;
+    setDraft(Object.assign({}, draft, { stocks: [...draft.stocks, { id, material_id: firstMat, widthMm: 2500, heightMm: 1250, qty: 10, unitCost: 0 }] }));
+  };
+  const removeStock = (idx) => setDraft(Object.assign({}, draft, { stocks: draft.stocks.filter((_, i) => i !== idx) }));
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const mats = materials.map(m => Object.assign({}, m, {
+        kg_per_m2: cutComputePlateKgPerM2(m.spec, m.density_kg_per_m3) || null,
+      }));
+      const firstMat = mats[0] || { type: 'plate', spec: { thickness: 10 }, density_kg_per_m3: 7850 };
+      const summary = cutFormatMaterialLabel(firstMat.type, firstMat.spec);
+      const payload = {
+        plant_id: plant.id,
+        title: (draft.title || 'Cut plan').trim(),
+        plan_kind: '2d',
+        materials: mats,
+        material_type: firstMat.type,
+        spec: firstMat.spec || {},
+        density_kg_per_m3: Number(firstMat.density_kg_per_m3) || 7850,
+        kg_per_m: null,
+        stock_material: summary,
+        kerf_mm: Number(draft.kerf_mm) || 0,
+        status: draft.status || 'draft',
+        stocks: draft.stocks,
+        pieces: draft.pieces,
+        layout: result?.ok ? result.sheets : null,
+        totals: result?.ok ? result.stats : null,
+        notes: draft.notes || null,
+      };
+      let row;
+      if (draft.id) {
+        const { data, error } = await sb.from('mcp_cut_plans').update(payload).eq('id', draft.id).select().single();
+        if (error) throw error;
+        row = data;
+      } else {
+        const { data, error } = await sb.from('mcp_cut_plans').insert(Object.assign({}, payload, { created_by: me.id })).select().single();
+        if (error) throw error;
+        row = data;
+      }
+      setDraft(Object.assign({}, draft, { id: row.id }));
+      showToast('✓ Plan saved');
+      onSaved && onSaved();
+    } catch (e) {
+      alert('Could not save: ' + (e.message || e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const colorFor = (pieceId) => {
+    const palette = ['#0d9488', '#f59e0b', '#7c3aed', '#dc2626', '#0284c7', '#65a30d', '#db2777', '#ea580c', '#4f46e5', '#0891b2'];
+    let h = 0;
+    for (const c of String(pieceId || '')) h = (h * 31 + c.charCodeAt(0)) | 0;
+    return palette[Math.abs(h) % palette.length];
+  };
+
+  const kgPerM2 = materials[0] ? cutComputePlateKgPerM2(materials[0].spec, materials[0].density_kg_per_m3) : null;
+  const wastePctNum = result?.ok ? result.stats.wastePct : 0;
+  const ribbonGrad = !result?.ok ? 'linear-gradient(135deg,#9ca3af,#6b7280)'
+    : (wastePctNum > 30 ? 'linear-gradient(135deg,#b91c1c,#dc2626)'
+    : (wastePctNum > 15 ? 'linear-gradient(135deg,#b45309,#d97706)'
+    : 'linear-gradient(135deg,#4338ca,#4f46e5)'));
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn small ghost" onClick=${onBack} style="padding:6px 10px">← Back</button>
+      <input type="text" value=${draft.title} onChange=${e => setDraft(Object.assign({}, draft, { title: e.target.value }))}
+        style="flex:1;min-width:0;font-size:20px;font-weight:700;border:none;outline:none;background:transparent;padding:2px 0;font-family:inherit" />
+      <span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:0.05em;background:var(--indigo-100,#e0e7ff);color:var(--indigo-700,#4338ca)">2D</span>
+      <button class="btn" onClick=${save} disabled=${saving}>${saving ? 'Saving…' : (draft.id ? 'Save' : '+ Save plan')}</button>
+    </div>
+
+    <${CutMaterialList} draft=${draft} setDraft=${setDraft} />
+
+    ${result?.ok === false && html`
+      <div class="card" style="background:#fef2f2;border:1px solid var(--rose-300);padding:14px;color:var(--rose-700);margin-bottom:12px;font-size:13px">⚠ ${result.error}</div>
+    `}
+
+    ${result?.ok && result.stats.sheetsUsed > 0 && html`
+      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:14px;padding:16px 14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
+        <${CutStat} num=${result.stats.sheetsUsed}                                                              label="Sheets used"   tickKey=${statTick} />
+        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'}                                                label="Total waste"    tickKey=${statTick} />
+        <${CutStat} num=${(result.stats.totalPiecesAreaMm2 / 1e6).toFixed(2) + ' m²'}                            label="Pieces area"    tickKey=${statTick} />
+        <${CutStat} num=${(result.stats.wasteAreaMm2 / 1e6).toFixed(2) + ' m²'}                                  label="Scrap area"     tickKey=${statTick} />
+        ${kgPerM2 != null && html`<${CutStat} num=${((result.stats.totalPiecesAreaMm2 / 1e6) * kgPerM2).toFixed(1) + ' kg'} label="Pieces weight" tickKey=${statTick} />`}
+        ${kgPerM2 != null && html`<${CutStat} num=${((result.stats.wasteAreaMm2 / 1e6) * kgPerM2).toFixed(1) + ' kg'}      label="Scrap weight"  tickKey=${statTick} />`}
+        <${CutStat} num=${result.stats.totalCost > 0 ? '₹' + fmtNum(result.stats.totalCost.toFixed(0)) : '—'} label="Stock cost" tickKey=${statTick} />
+      </div>
+    `}
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;margin-bottom:12px">
+      <div class="card" style="padding:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div style="font-weight:700;font-size:13px">Pieces required</div>
+          <button class="btn small ghost" onClick=${addPiece} style="padding:3px 8px;font-size:11px">+ Add</button>
+        </div>
+        <table style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
+            <th style="text-align:left;padding:4px 2px">Label</th>
+            <th style="text-align:right;padding:4px 2px;width:54px">W mm</th>
+            <th style="text-align:right;padding:4px 2px;width:54px">H mm</th>
+            <th style="text-align:right;padding:4px 2px;width:42px">Qty</th>
+            <th style="text-align:center;padding:4px 2px;width:32px" title="Allow rotation 90°">↻</th>
+            <th style="width:20px"></th>
+          </tr></thead>
+          <tbody>
+            ${draft.pieces.map((p, idx) => html`
+              <tr key=${p.id}>
+                <td style="padding:3px 2px"><div style="display:flex;align-items:center;gap:6px">
+                  <span style=${'width:10px;height:10px;border-radius:3px;flex-shrink:0;background:' + colorFor(p.id)}></span>
+                  <input type="text" value=${p.label} onChange=${e => updatePiece(idx, 'label', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px" />
+                </div></td>
+                <td style="padding:3px 2px"><input type="number" value=${p.widthMm} onChange=${e => updatePiece(idx, 'widthMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px"><input type="number" value=${p.heightMm} onChange=${e => updatePiece(idx, 'heightMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px"><input type="number" value=${p.qty} onChange=${e => updatePiece(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px;text-align:center"><input type="checkbox" checked=${p.allow_rotation !== false} onChange=${e => updatePiece(idx, 'allow_rotation', e.target.checked)} /></td>
+                <td style="padding:3px 2px;text-align:center"><button onClick=${() => removePiece(idx)} style="background:none;border:none;color:var(--slate-400);cursor:pointer;font-size:14px;padding:2px 4px">×</button></td>
+              </tr>
+            `)}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card" style="padding:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div style="font-weight:700;font-size:13px">Sheet stock</div>
+          <button class="btn small ghost" onClick=${addStock} style="padding:3px 8px;font-size:11px">+ Add</button>
+        </div>
+        <table style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
+            <th style="text-align:right;padding:4px 2px;width:62px">W mm</th>
+            <th style="text-align:right;padding:4px 2px;width:62px">H mm</th>
+            <th style="text-align:right;padding:4px 2px;width:48px">Qty</th>
+            <th style="text-align:right;padding:4px 2px;width:64px">Cost/sheet</th>
+            <th style="width:22px"></th>
+          </tr></thead>
+          <tbody>
+            ${draft.stocks.map((s, idx) => html`
+              <tr key=${s.id}>
+                <td style="padding:3px 2px"><input type="number" value=${s.widthMm} onChange=${e => updateStock(idx, 'widthMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px"><input type="number" value=${s.heightMm} onChange=${e => updateStock(idx, 'heightMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px"><input type="number" value=${s.qty} onChange=${e => updateStock(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px"><input type="number" value=${s.unitCost} onChange=${e => updateStock(idx, 'unitCost', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px;text-align:center"><button onClick=${() => removeStock(idx)} style="background:none;border:none;color:var(--slate-400);cursor:pointer;font-size:14px;padding:2px 4px">×</button></td>
+              </tr>
+            `)}
+          </tbody>
+        </table>
+        <div style="margin-top:8px;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--slate-600)">
+          <span>Saw / plasma kerf (mm):</span>
+          <input type="number" value=${draft.kerf_mm} step="0.5" onChange=${e => setDraft(Object.assign({}, draft, { kerf_mm: e.target.value }))}
+            style="width:60px;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" />
+          <span style="color:var(--slate-400);font-size:10px">cut width on each pass</span>
+        </div>
+      </div>
+    </div>
+
+    ${result?.ok && result.sheets.length > 0 && html`
+      <div class="card" style="padding:14px;margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:6px">
+          <div style="font-weight:700;font-size:13px">Layout · ${result.sheets.length} ${result.sheets.length===1?'sheet':'sheets'}</div>
+          <button class="btn small ghost" onClick=${() => window.print()} style="padding:4px 10px;font-size:11px">🖨 Print</button>
+        </div>
+        ${result.sheets.map(sheet => {
+          const usedPct = (sheet.usedArea / sheet.stockArea) * 100;
+          const wastePct = 100 - usedPct;
+          return html`
+            <div key=${'sh-'+sheet.index} style="margin-bottom:14px;padding-top:8px;border-top:2px solid var(--indigo-500,#6366f1)">
+              <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px;margin-bottom:8px">
+                <div style="font-weight:800;font-size:13px;color:var(--slate-800)">
+                  Sheet #${sheet.index}<span style="color:var(--slate-400);font-weight:500"> · ${sheet.stockW}×${sheet.stockH}mm · ${sheet.placed.length} pieces</span>
+                </div>
+                <div style="font-size:11px">
+                  <span style=${'color:'+(wastePct>30?'var(--rose-600)':wastePct>15?'var(--amber-600)':'var(--emerald-600)')+';font-weight:700'}>${usedPct.toFixed(1)}% used · ${(sheet.wasteArea/1e6).toFixed(2)}m² scrap</span>
+                </div>
+              </div>
+              <${CutSheetSvg} key=${animKey + '-' + sheet.index} sheet=${sheet} colorFor=${colorFor} />
+            </div>
+          `;
+        })}
+      </div>
+    `}
+
+    ${result?.ok && result.sheets.length > 0 && html`
+      <div class="card" style="padding:14px">
+        <div style="font-weight:700;font-size:13px;margin-bottom:10px">Cutting list · sheet-by-sheet</div>
+        ${result.sheets.map(sheet => {
+          const agg = new Map();
+          for (const pl of sheet.placed) {
+            const k = (pl.label || '?') + ':' + pl.origW + 'x' + pl.origH;
+            if (!agg.has(k)) agg.set(k, { label: pl.label, w: pl.origW, h: pl.origH, n: 0, area: 0 });
+            const e = agg.get(k); e.n += 1; e.area += pl.w * pl.h;
+          }
+          const rows = Array.from(agg.values()).sort((a, b) => (b.w * b.h) - (a.w * a.h));
+          return html`
+            <div key=${'cl-'+sheet.index} style="border:1px solid var(--slate-200);border-left:4px solid var(--indigo-500,#6366f1);border-radius:8px;padding:10px 12px;margin-bottom:8px">
+              <div style="font-weight:800;font-size:13px;margin-bottom:6px">Sheet #${sheet.index}<span style="color:var(--slate-400);font-weight:500"> · ${sheet.stockW}×${sheet.stockH}mm</span></div>
+              <table style="width:100%;font-size:12px;border-collapse:collapse">
+                <tbody>
+                  ${rows.map(r => html`
+                    <tr key=${r.label+r.w+r.h}>
+                      <td style="padding:2px 4px"><b style="display:inline-block;min-width:24px">${r.n}×</b> ${r.label}</td>
+                      <td style="padding:2px 4px;text-align:right;color:var(--slate-500);font-family:monospace">${r.w} × ${r.h} mm</td>
+                      <td style="padding:2px 4px;text-align:right;color:var(--slate-800);font-family:monospace;font-weight:600">${(r.area/1e6).toFixed(3)} m²</td>
+                    </tr>
+                  `)}
+                </tbody>
+                <tfoot style="border-top:1px dashed var(--slate-200);font-size:11px">
+                  <tr><td style="padding:3px 4px;color:var(--slate-500)">Pieces area</td><td></td><td style="padding:3px 4px;text-align:right;font-family:monospace;font-weight:700">${(sheet.usedArea/1e6).toFixed(3)} m²</td></tr>
+                  <tr><td style="padding:3px 4px;color:var(--slate-500)">Sheet area</td><td></td><td style="padding:3px 4px;text-align:right;font-family:monospace">${(sheet.stockArea/1e6).toFixed(3)} m²</td></tr>
+                  <tr><td style="padding:3px 4px;color:var(--slate-500)">Scrap</td><td></td><td style=${'padding:3px 4px;text-align:right;font-family:monospace;font-weight:700;color:'+((sheet.wasteArea/sheet.stockArea*100)>30?'var(--rose-600)':(sheet.wasteArea/sheet.stockArea*100)>15?'var(--amber-600)':'var(--emerald-600)')}>${(sheet.wasteArea/1e6).toFixed(3)} m² · ${(sheet.wasteArea/sheet.stockArea*100).toFixed(1)}%</td></tr>
+                </tfoot>
+              </table>
+            </div>
+          `;
+        })}
+      </div>
+    `}
+  `;
+}
+
+function CutSheetSvg({ sheet, colorFor }) {
+  if (!sheet || !sheet.placed) return null;
+  // Fit the sheet into a 1000-wide viewport while keeping aspect ratio.
+  const viewW = 1000;
+  const viewH = Math.round(viewW * (sheet.stockH / sheet.stockW));
+  const scale = viewW / sheet.stockW;
+  return html`
+    <svg class="sheet-svg" viewBox=${'0 0 ' + viewW + ' ' + viewH}
+      style="width:100%;height:auto;display:block;background:#f8fafc;border:1px solid #cbd5e1;border-radius:4px;font-family:system-ui,-apple-system,sans-serif"
+      preserveAspectRatio="xMinYMin meet">
+      <defs>
+        <pattern id="sheetWasteHatch" patternUnits="userSpaceOnUse" width="8" height="8" patternTransform="rotate(45)">
+          <rect width="8" height="8" fill="#f1f5f9" />
+          <line x1="0" y1="0" x2="0" y2="8" stroke="#cbd5e1" stroke-width="1" />
+        </pattern>
+      </defs>
+      <rect x="0" y="0" width=${viewW} height=${viewH} fill="url(#sheetWasteHatch)" />
+      ${sheet.placed.map((p, i) => {
+        const x = p.x * scale;
+        const y = p.y * scale;
+        const w = p.w * scale;
+        const h = p.h * scale;
+        const color = colorFor(p.pieceId);
+        const wLabel = p.rotated ? p.origH : p.origW;
+        const hLabel = p.rotated ? p.origW : p.origH;
+        const dimsLabel = wLabel + '×' + hLabel + (p.rotated ? ' ↻' : '');
+        const fontSize = Math.max(8, Math.min(16, Math.min(w, h) / 10));
+        return html`
+          <g key=${i}>
+            <rect class="sheet-rect" style=${'animation-delay:' + (i * 0.05) + 's'}
+              x=${x} y=${y} width=${w} height=${h} fill=${color} opacity="0.9" stroke="white" stroke-width="1">
+              <title>${p.label} · ${dimsLabel}mm${p.rotated ? ' (rotated)' : ''}</title>
+            </rect>
+            ${w > 50 && h > 24 && html`<text class="sheet-text" style=${'animation-delay:'+(i*0.05+0.18)+'s'}
+              x=${x + w/2} y=${y + h/2 - 2} font-size=${fontSize} font-weight="700" fill="white" text-anchor="middle" dominant-baseline="middle" pointer-events="none">${p.label}</text>`}
+            ${w > 80 && h > 40 && html`<text class="sheet-text" style=${'animation-delay:'+(i*0.05+0.22)+'s'}
+              x=${x + w/2} y=${y + h/2 + fontSize*0.9} font-size=${fontSize*0.7} fill="rgba(255,255,255,0.85)" text-anchor="middle" dominant-baseline="middle" pointer-events="none">${dimsLabel}</text>`}
+          </g>
+        `;
+      })}
+    </svg>
   `;
 }
 
