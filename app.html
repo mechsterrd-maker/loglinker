@@ -11977,13 +11977,13 @@ function StageAskModal({ plant, me, project, stage, kind, onClose, onSent }) {
 }
 
 // =================================================================
-// CUTTING PLANNER — 1D nesting for rods / tubes / bars
-// Pure-JS First-Fit-Decreasing with kerf. Inputs (pieces, stocks) and the
-// computed layout are persisted as jsonb on mcp_cut_plans so the supervisor
-// can save / reopen / print a plan.
+// CUTTING PLANNER — 1D nesting for rods / tubes / bars.
+// Multi-material: each plan holds a list of materials, every piece + stock
+// declares which material_id it belongs to, and the algorithm runs FFD per
+// material partition (no material ever shares a bar with another).
 // =================================================================
-function planOneDimensionalCut({ pieces, stocks, kerfMm }) {
-  // Expand pieces into individual instances and sort largest-first.
+
+function planSingleMaterial({ pieces, stocks, kerfMm }) {
   const items = [];
   for (const p of (pieces || [])) {
     const len = Number(p.lengthMm) || 0;
@@ -12003,7 +12003,7 @@ function planOneDimensionalCut({ pieces, stocks, kerfMm }) {
     return { ok: true, bars: [], stats: { barsUsed: 0, totalStockMm: 0, totalPiecesMm: 0, totalKerfMm: 0, wasteMm: 0, wastePct: 0, totalCost: 0 } };
   }
   if (stockPool.length === 0) {
-    return { ok: false, error: 'No stock bars defined. Add at least one stock length and qty.' };
+    return { ok: false, error: 'No stock bars defined.' };
   }
 
   const k = Number(kerfMm) || 0;
@@ -12024,7 +12024,7 @@ function planOneDimensionalCut({ pieces, stocks, kerfMm }) {
       .filter(s => s.remaining > 0 && s.lengthMm >= item.length)
       .sort((a, b) => a.lengthMm - b.lengthMm)[0];
     if (!fit) {
-      return { ok: false, error: 'No stock long enough for piece "' + item.label + '" (' + item.length + 'mm). Add a longer stock length or increase qty.' };
+      return { ok: false, error: 'No stock long enough for piece "' + item.label + '" (' + item.length + 'mm).' };
     }
     fit.remaining -= 1;
     bars.push({
@@ -12044,22 +12044,50 @@ function planOneDimensionalCut({ pieces, stocks, kerfMm }) {
     totalCost += b.unitCost;
     return Object.assign({}, b, { index: idx + 1, wasteMm, kerfsInBar });
   });
-  const wasteMm = totalStock - totalPieces; // kerf + scrap tail
+  const wasteMm = totalStock - totalPieces;
   const wastePct = totalStock > 0 ? (wasteMm / totalStock) * 100 : 0;
   return {
     ok: true,
     bars: enriched,
-    stats: {
-      barsUsed: enriched.length,
-      totalStockMm: totalStock,
-      totalPiecesMm: totalPieces,
-      totalKerfMm: totalKerf,
-      wasteMm,
-      wastePct,
-      totalCost,
-    },
+    stats: { barsUsed: enriched.length, totalStockMm: totalStock, totalPiecesMm: totalPieces, totalKerfMm: totalKerf, wasteMm, wastePct, totalCost },
   };
 }
+
+function planMultiMaterialCut({ materials, pieces, stocks, kerfMm }) {
+  const mats = Array.isArray(materials) ? materials : [];
+  if (mats.length === 0) return { ok: true, groups: [], stats: { barsUsed:0, totalStockMm:0, totalPiecesMm:0, totalKerfMm:0, wasteMm:0, wastePct:0, totalCost:0, totalPiecesKg:0, totalWasteKg:0, totalScrapValue:0 }, errors: [] };
+
+  const groups = [];
+  const errors = [];
+  let agg = { barsUsed:0, totalStockMm:0, totalPiecesMm:0, totalKerfMm:0, wasteMm:0, wastePct:0, totalCost:0, totalPiecesKg:0, totalWasteKg:0, totalScrapValue:0 };
+
+  for (const m of mats) {
+    const myPieces = (pieces || []).filter(p => (p.material_id || mats[0].id) === m.id);
+    const myStocks = (stocks || []).filter(s => (s.material_id || mats[0].id) === m.id);
+    if (myPieces.length === 0) continue;
+    const r = planSingleMaterial({ pieces: myPieces, stocks: myStocks, kerfMm });
+    if (!r.ok) {
+      errors.push(cutFormatMaterialLabel(m.type, m.spec) + ': ' + r.error);
+      groups.push({ material: m, ok: false, error: r.error, bars: [], stats: null });
+      continue;
+    }
+    const kgPerM = Number(m.kg_per_m) || cutComputeKgPerM(m.type, m.spec, m.density_kg_per_m3) || 0;
+    groups.push({ material: m, ok: true, bars: r.bars, stats: r.stats, kgPerM });
+    agg.barsUsed += r.stats.barsUsed;
+    agg.totalStockMm += r.stats.totalStockMm;
+    agg.totalPiecesMm += r.stats.totalPiecesMm;
+    agg.totalKerfMm += r.stats.totalKerfMm;
+    agg.wasteMm += r.stats.wasteMm;
+    agg.totalCost += r.stats.totalCost;
+    if (kgPerM > 0) {
+      agg.totalPiecesKg += (r.stats.totalPiecesMm / 1000) * kgPerM;
+      agg.totalWasteKg += (r.stats.wasteMm / 1000) * kgPerM;
+    }
+  }
+  agg.wastePct = agg.totalStockMm > 0 ? (agg.wasteMm / agg.totalStockMm) * 100 : 0;
+  return { ok: errors.length === 0 || groups.some(g => g.ok), groups, stats: agg, errors };
+}
+
 
 // Material catalog. The algorithm cares only about length; material+spec govern
 // kg/m, label, and the visual cross-section. One plan = one material+spec --
@@ -12133,6 +12161,41 @@ function cutFormatMaterialLabel(type, spec) {
   return type;
 }
 
+// Deterministic per-material colour for chips, dropdowns, SVG group bands.
+const CUT_MATERIAL_PALETTE = ['#0d9488','#dc2626','#7c3aed','#ea580c','#0284c7','#65a30d','#db2777','#4f46e5','#0891b2','#b45309'];
+function cutMaterialColor(id) {
+  let h = 0;
+  for (const c of String(id || '')) h = (h * 31 + c.charCodeAt(0)) | 0;
+  return CUT_MATERIAL_PALETTE[Math.abs(h) % CUT_MATERIAL_PALETTE.length];
+}
+
+// Back-fill helper for legacy plans (single material at the top-level columns).
+// Any plan loaded without a materials[] is lifted into a 1-entry list and every
+// piece + stock gets material_id pointing at it.
+function cutEnsureMaterials(draft) {
+  if (Array.isArray(draft.materials) && draft.materials.length > 0) {
+    // Make sure every piece/stock has a material_id; default to the first.
+    const firstId = draft.materials[0].id;
+    const pieces = (draft.pieces || []).map(p => p.material_id ? p : Object.assign({}, p, { material_id: firstId }));
+    const stocks = (draft.stocks || []).map(s => s.material_id ? s : Object.assign({}, s, { material_id: firstId }));
+    return Object.assign({}, draft, { pieces, stocks });
+  }
+  const m = {
+    id: 'm1',
+    type: draft.material_type || 'round_bar',
+    spec: draft.spec || cutDefaultSpec(draft.material_type || 'round_bar'),
+    density_kg_per_m3: draft.density_kg_per_m3 || 7850,
+    kg_per_m: draft.kg_per_m || null,
+  };
+  const pieces = (draft.pieces || []).map(p => Object.assign({}, p, { material_id: 'm1' }));
+  const stocks = (draft.stocks || []).map(s => Object.assign({}, s, { material_id: 'm1' }));
+  return Object.assign({}, draft, { materials: [m], pieces, stocks });
+}
+
+function cutMaterialById(materials, id) {
+  return (materials || []).find(m => m.id === id) || (materials || [])[0] || null;
+}
+
 function CuttingPlanner({ plant, me }) {
   const [view, setView] = useState('list');
   const [plans, setPlans] = useState([]);
@@ -12152,30 +12215,30 @@ function CuttingPlanner({ plant, me }) {
   useEffect(() => { refresh(); }, [refresh]);
 
   const newPlan = useCallback(() => {
+    const m1 = { id: 'm1', type: 'round_bar', spec: cutDefaultSpec('round_bar'), density_kg_per_m3: 7850 };
+    const m2 = { id: 'm2', type: 'flat_bar',  spec: cutDefaultSpec('flat_bar'),  density_kg_per_m3: 7850 };
     setDraft({
       id: null,
       title: 'New cut plan',
-      material_type: 'round_bar',
-      spec: cutDefaultSpec('round_bar'),
-      density_kg_per_m3: 7850,
-      stock_material: 'MS Round Bar Ø25',
       kerf_mm: 3,
       status: 'draft',
+      materials: [m1, m2],
       stocks: [
-        { id: 's1', lengthMm: 6000, qty: 50, unitCost: 0 },
-        { id: 's2', lengthMm: 12000, qty: 25, unitCost: 0 },
+        { id: 's1', material_id: 'm1', lengthMm: 6000,  qty: 50, unitCost: 0 },
+        { id: 's2', material_id: 'm1', lengthMm: 12000, qty: 25, unitCost: 0 },
+        { id: 's3', material_id: 'm2', lengthMm: 6000,  qty: 30, unitCost: 0 },
       ],
       pieces: [
-        { id: 'p1', lengthMm: 1850, qty: 8,  label: 'Part A' },
-        { id: 'p2', lengthMm: 1250, qty: 12, label: 'Part B' },
-        { id: 'p3', lengthMm: 850,  qty: 20, label: 'Part C' },
+        { id: 'p1', material_id: 'm1', lengthMm: 1850, qty: 8,  label: 'Part A' },
+        { id: 'p2', material_id: 'm1', lengthMm: 1250, qty: 12, label: 'Part B' },
+        { id: 'p3', material_id: 'm2', lengthMm: 850,  qty: 20, label: 'Bracket' },
       ],
       notes: '',
     });
     setView('edit');
   }, []);
 
-  const openPlan = (p) => { setDraft(Object.assign({}, p)); setView('edit'); };
+  const openPlan = (p) => { setDraft(cutEnsureMaterials(Object.assign({}, p))); setView('edit'); };
 
   if (view === 'edit' && draft) {
     return html`<${CutPlannerEditor} draft=${draft} setDraft=${setDraft} plant=${plant} me=${me}
@@ -12207,8 +12270,14 @@ function CuttingPlanner({ plant, me }) {
             onMouseOut=${e => { e.currentTarget.style.transform = ''; e.currentTarget.style.boxShadow = ''; }}>
             <div style="font-weight:700;font-size:14px;margin-bottom:4px">${p.title}</div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
-              ${p.material_type && html`<span style="display:inline-block;padding:2px 7px;border-radius:999px;background:var(--teal-50);color:var(--teal-700);font-size:10px;font-weight:600">${cutFormatMaterialLabel(p.material_type, p.spec)}</span>`}
-              ${p.kg_per_m && html`<span style="display:inline-block;padding:2px 7px;border-radius:999px;background:var(--slate-100);color:var(--slate-700);font-size:10px;font-weight:600">${Number(p.kg_per_m).toFixed(2)} kg/m</span>`}
+              ${(() => {
+                const mats = (Array.isArray(p.materials) && p.materials.length > 0)
+                  ? p.materials
+                  : (p.material_type ? [{ id: 'm1', type: p.material_type, spec: p.spec, kg_per_m: p.kg_per_m }] : []);
+                return mats.map(m => html`
+                  <span key=${m.id} style=${'display:inline-block;padding:2px 7px;border-radius:999px;color:white;font-size:10px;font-weight:600;background:'+cutMaterialColor(m.id)}>${cutFormatMaterialLabel(m.type, m.spec)}</span>
+                `);
+              })()}
             </div>
             ${p.totals ? html`
               <div style="display:flex;gap:10px;font-size:11px;color:var(--slate-700)">
@@ -12234,13 +12303,16 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
   const [saving, setSaving] = useState(false);
   const debounceRef = useRef(null);
 
+  const materials = draft.materials || [];
   const piecesKey = JSON.stringify(draft.pieces);
   const stocksKey = JSON.stringify(draft.stocks);
+  const materialsKey = JSON.stringify(materials);
 
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
-      const r = planOneDimensionalCut({
+      const r = planMultiMaterialCut({
+        materials: draft.materials,
         pieces: draft.pieces,
         stocks: draft.stocks,
         kerfMm: Number(draft.kerf_mm) || 0,
@@ -12250,50 +12322,64 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
       setStatTick(t => t + 1);
     }, 180);
     return () => clearTimeout(debounceRef.current);
-  }, [piecesKey, stocksKey, draft.kerf_mm]);
+  }, [piecesKey, stocksKey, materialsKey, draft.kerf_mm]);
 
   const updatePiece = (idx, field, val) => {
     const next = draft.pieces.slice();
-    next[idx] = Object.assign({}, next[idx], { [field]: field === 'label' ? val : Number(val) || 0 });
+    const isText = field === 'label' || field === 'material_id';
+    next[idx] = Object.assign({}, next[idx], { [field]: isText ? val : (Number(val) || 0) });
     setDraft(Object.assign({}, draft, { pieces: next }));
   };
   const addPiece = () => {
     const id = 'p' + Date.now();
+    const firstMat = (draft.materials && draft.materials[0]) ? draft.materials[0].id : null;
     setDraft(Object.assign({}, draft, {
-      pieces: [...draft.pieces, { id, lengthMm: 1000, qty: 1, label: 'Part ' + String.fromCharCode(65 + (draft.pieces.length % 26)) }],
+      pieces: [...draft.pieces, { id, material_id: firstMat, lengthMm: 1000, qty: 1, label: 'Part ' + String.fromCharCode(65 + (draft.pieces.length % 26)) }],
     }));
   };
   const removePiece = (idx) => setDraft(Object.assign({}, draft, { pieces: draft.pieces.filter((_, i) => i !== idx) }));
 
   const updateStock = (idx, field, val) => {
     const next = draft.stocks.slice();
-    next[idx] = Object.assign({}, next[idx], { [field]: Number(val) || 0 });
+    const isText = field === 'material_id';
+    next[idx] = Object.assign({}, next[idx], { [field]: isText ? val : (Number(val) || 0) });
     setDraft(Object.assign({}, draft, { stocks: next }));
   };
   const addStock = () => {
     const id = 's' + Date.now();
-    setDraft(Object.assign({}, draft, { stocks: [...draft.stocks, { id, lengthMm: 6000, qty: 10, unitCost: 0 }] }));
+    const firstMat = (draft.materials && draft.materials[0]) ? draft.materials[0].id : null;
+    setDraft(Object.assign({}, draft, { stocks: [...draft.stocks, { id, material_id: firstMat, lengthMm: 6000, qty: 10, unitCost: 0 }] }));
   };
   const removeStock = (idx) => setDraft(Object.assign({}, draft, { stocks: draft.stocks.filter((_, i) => i !== idx) }));
 
   const save = async () => {
     setSaving(true);
     try {
-      const kgPerM = cutComputeKgPerM(draft.material_type, draft.spec, draft.density_kg_per_m3);
-      const autoLabel = cutFormatMaterialLabel(draft.material_type, draft.spec);
+      // Snapshot kg/m onto each material before save so the saved-plan list
+      // can show kg/m chips without recomputing on the client.
+      const mats = (draft.materials || []).map(m => Object.assign({}, m, {
+        kg_per_m: cutComputeKgPerM(m.type, m.spec, m.density_kg_per_m3) || null,
+      }));
+      const firstMat = mats[0] || { type: 'round_bar', spec: {}, density_kg_per_m3: 7850, kg_per_m: null };
+      // For backward-compat with the listing query, mirror the first material
+      // into the legacy plan-level columns (material_type/spec/kg_per_m).
+      const summary = mats.length === 1
+        ? cutFormatMaterialLabel(firstMat.type, firstMat.spec)
+        : mats.map(m => cutFormatMaterialLabel(m.type, m.spec)).join(' + ');
       const payload = {
         plant_id: plant.id,
         title: (draft.title || 'Cut plan').trim(),
-        material_type: draft.material_type || 'round_bar',
-        spec: draft.spec || {},
-        density_kg_per_m3: Number(draft.density_kg_per_m3) || 7850,
-        kg_per_m: kgPerM,
-        stock_material: autoLabel,
+        materials: mats,
+        material_type: firstMat.type,
+        spec: firstMat.spec || {},
+        density_kg_per_m3: Number(firstMat.density_kg_per_m3) || 7850,
+        kg_per_m: firstMat.kg_per_m,
+        stock_material: summary,
         kerf_mm: Number(draft.kerf_mm) || 0,
         status: draft.status || 'draft',
         stocks: draft.stocks,
         pieces: draft.pieces,
-        layout: result?.ok ? result.bars : null,
+        layout: result?.ok ? result.groups.map(g => ({ material_id: g.material.id, bars: g.bars })) : null,
         totals: result?.ok ? result.stats : null,
         notes: draft.notes || null,
       };
@@ -12339,36 +12425,28 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
       <button class="btn" onClick=${save} disabled=${saving}>${saving ? 'Saving…' : (draft.id ? 'Save' : '+ Save plan')}</button>
     </div>
 
-    ${/* Material picker — type + spec drive kg/m and the auto-generated label */ null}
-    <${CutMaterialPicker} draft=${draft} setDraft=${setDraft} />
+    ${/* Material list: define every material the plan will need, then tag pieces/stocks. */ null}
+    <${CutMaterialList} draft=${draft} setDraft=${setDraft} />
 
-    ${result?.ok === false && html`
-      <div class="card" style="background:#fef2f2;border:1px solid var(--rose-300);padding:14px;color:var(--rose-700);margin-bottom:12px;font-size:13px">
-        ⚠ ${result.error}
+    ${result?.errors && result.errors.length > 0 && html`
+      <div class="card" style="background:#fef2f2;border:1px solid var(--rose-300);padding:12px 14px;color:var(--rose-700);margin-bottom:12px;font-size:12px">
+        ${result.errors.map(e => html`<div>⚠ ${e}</div>`)}
       </div>
     `}
 
-    ${result?.ok && html`
+    ${result?.ok && result.stats.barsUsed > 0 && html`
       <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:14px;padding:16px 14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
-        <${CutStat} num=${result.stats.barsUsed}                                       label="Bars used"     tickKey=${statTick} />
-        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'}                       label="Total waste"   tickKey=${statTick} />
-        <${CutStat} num=${(result.stats.wasteMm / 1000).toFixed(2) + ' m'}              label="Waste length"  tickKey=${statTick} />
-        <${CutStat} num=${(result.stats.totalPiecesMm / 1000).toFixed(1) + ' m'}        label="Pieces total"  tickKey=${statTick} />
-        ${(() => {
-          const kgPerM = cutComputeKgPerM(draft.material_type, draft.spec, draft.density_kg_per_m3);
-          if (!kgPerM) return null;
-          const totalKg = (result.stats.totalPiecesMm / 1000) * kgPerM;
-          const wasteKg = (result.stats.wasteMm / 1000) * kgPerM;
-          return html`
-            <${CutStat} num=${totalKg.toFixed(1) + ' kg'} label="Pieces weight" tickKey=${statTick} />
-            <${CutStat} num=${wasteKg.toFixed(1) + ' kg'} label="Scrap weight"  tickKey=${statTick} />
-          `;
-        })()}
-        <${CutStat} num=${result.stats.totalCost > 0 ? '₹' + fmtNum(result.stats.totalCost.toFixed(0)) : '—'} label="Stock cost" tickKey=${statTick} />
+        <${CutStat} num=${result.stats.barsUsed}                                                        label="Bars used"    tickKey=${statTick} />
+        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'}                                        label="Total waste"  tickKey=${statTick} />
+        <${CutStat} num=${(result.stats.wasteMm / 1000).toFixed(2) + ' m'}                               label="Waste length" tickKey=${statTick} />
+        <${CutStat} num=${(result.stats.totalPiecesMm / 1000).toFixed(1) + ' m'}                         label="Pieces total" tickKey=${statTick} />
+        ${result.stats.totalPiecesKg > 0 && html`<${CutStat} num=${result.stats.totalPiecesKg.toFixed(1) + ' kg'} label="Pieces weight" tickKey=${statTick} />`}
+        ${result.stats.totalWasteKg > 0 && html`<${CutStat} num=${result.stats.totalWasteKg.toFixed(1) + ' kg'}  label="Scrap weight"  tickKey=${statTick} />`}
+        <${CutStat} num=${result.stats.totalCost > 0 ? '₹' + fmtNum(result.stats.totalCost.toFixed(0)) : '—'} label="Stock cost"   tickKey=${statTick} />
       </div>
     `}
 
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:10px;margin-bottom:12px">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;margin-bottom:12px">
       <div class="card" style="padding:12px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
           <div style="font-weight:700;font-size:13px">Pieces required</div>
@@ -12376,6 +12454,7 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
         </div>
         <table style="width:100%;font-size:12px;border-collapse:collapse">
           <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
+            <th style="text-align:left;padding:4px 2px">Material</th>
             <th style="text-align:left;padding:4px 2px">Label</th>
             <th style="text-align:right;padding:4px 2px;width:74px">Length mm</th>
             <th style="text-align:right;padding:4px 2px;width:54px">Qty</th>
@@ -12383,7 +12462,10 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
           </tr></thead>
           <tbody>
             ${draft.pieces.map((p, idx) => html`
-              <tr key=${p.id}>
+              <tr key=${p.id} style=${'border-left:4px solid ' + cutMaterialColor(p.material_id || (materials[0] && materials[0].id))}>
+                <td style="padding:3px 2px">
+                  <${CutRowMaterialPicker} value=${p.material_id} materials=${materials} onChange=${v => updatePiece(idx, 'material_id', v)} />
+                </td>
                 <td style="padding:3px 2px"><div style="display:flex;align-items:center;gap:6px">
                   <span style=${'width:10px;height:10px;border-radius:3px;flex-shrink:0;background:' + colorFor(p.id)}></span>
                   <input type="text" value=${p.label} onChange=${e => updatePiece(idx, 'label', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px" />
@@ -12404,6 +12486,7 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
         </div>
         <table style="width:100%;font-size:12px;border-collapse:collapse">
           <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
+            <th style="text-align:left;padding:4px 2px">Material</th>
             <th style="text-align:right;padding:4px 2px;width:74px">Length mm</th>
             <th style="text-align:right;padding:4px 2px;width:54px">Qty</th>
             <th style="text-align:right;padding:4px 2px;width:64px">Cost/bar</th>
@@ -12411,7 +12494,10 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
           </tr></thead>
           <tbody>
             ${draft.stocks.map((s, idx) => html`
-              <tr key=${s.id}>
+              <tr key=${s.id} style=${'border-left:4px solid ' + cutMaterialColor(s.material_id || (materials[0] && materials[0].id))}>
+                <td style="padding:3px 2px">
+                  <${CutRowMaterialPicker} value=${s.material_id} materials=${materials} onChange=${v => updateStock(idx, 'material_id', v)} />
+                </td>
                 <td style="padding:3px 2px"><input type="number" value=${s.lengthMm} onChange=${e => updateStock(idx, 'lengthMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
                 <td style="padding:3px 2px"><input type="number" value=${s.qty} onChange=${e => updateStock(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
                 <td style="padding:3px 2px"><input type="number" value=${s.unitCost} onChange=${e => updateStock(idx, 'unitCost', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
@@ -12429,37 +12515,57 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
       </div>
     </div>
 
-    ${result?.ok && result.bars.length > 0 && html`
-      <div class="card" style="padding:14px;margin-bottom:12px">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-          <div style="font-weight:700;font-size:13px">Layout · ${result.bars.length} ${result.bars.length === 1 ? 'bar' : 'bars'}</div>
-          <div style="display:flex;gap:8px;align-items:center;font-size:10px;color:var(--slate-500)">
-            <span style="display:flex;align-items:center;gap:4px"><span style="display:inline-block;width:10px;height:10px;background:#f1f5f9;border:1px solid #cbd5e1"></span> waste</span>
-            <span style="display:flex;align-items:center;gap:4px"><span style="display:inline-block;width:10px;height:10px;background:#0d9488"></span> cut piece</span>
+    ${result?.ok && result.groups.filter(g => g.ok && g.bars.length > 0).map(g => {
+      const color = cutMaterialColor(g.material.id);
+      const label = cutFormatMaterialLabel(g.material.type, g.material.spec);
+      return html`
+        <div key=${'lay-'+g.material.id} class="card" style=${'padding:14px;margin-bottom:12px;border-left:5px solid ' + color}>
+          <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+            <div>
+              <div style="font-weight:700;font-size:13px;display:flex;align-items:center;gap:6px">
+                <span style=${'display:inline-block;width:10px;height:10px;border-radius:50%;background:'+color}></span>
+                ${label}
+              </div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                ${g.stats.barsUsed} ${g.stats.barsUsed === 1 ? 'bar' : 'bars'} · ${g.stats.wastePct.toFixed(1)}% waste · ${(g.stats.totalPiecesMm/1000).toFixed(1)}m pieces
+                ${g.kgPerM > 0 && html` · ${((g.stats.totalPiecesMm/1000)*g.kgPerM).toFixed(1)} kg`}
+              </div>
+            </div>
           </div>
+          <${CutSvg} key=${animKey + '-' + g.material.id} bars=${g.bars} kerfMm=${Number(draft.kerf_mm) || 0} colorFor=${colorFor} />
         </div>
-        <${CutSvg} key=${animKey} bars=${result.bars} kerfMm=${Number(draft.kerf_mm) || 0} colorFor=${colorFor} />
-      </div>
-    `}
+      `;
+    })}
 
-    ${result?.ok && result.bars.length > 0 && html`
+    ${result?.ok && result.stats.barsUsed > 0 && html`
       <div class="card" style="padding:14px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
           <div style="font-weight:700;font-size:13px">Cutting list · for shop floor</div>
           <button class="btn small ghost" onClick=${() => window.print()} style="padding:4px 10px;font-size:11px">🖨 Print</button>
         </div>
-        ${result.bars.map(b => html`
-          <div key=${b.index} style="border:1px solid var(--slate-100);border-radius:6px;padding:8px 10px;margin-bottom:6px">
-            <div style="display:flex;justify-content:space-between;font-size:12px;font-weight:700">
-              <span>Bar #${b.index} · ${(b.stockLength / 1000).toFixed(2)}m</span>
-              <span style=${'color:' + (b.wasteMm > b.stockLength * 0.15 ? 'var(--rose-600)' : 'var(--slate-500)')}>${b.wasteMm}mm scrap · ${(b.wasteMm / b.stockLength * 100).toFixed(1)}%</span>
+        ${result.groups.filter(g => g.ok && g.bars.length > 0).map(g => {
+          const color = cutMaterialColor(g.material.id);
+          const label = cutFormatMaterialLabel(g.material.type, g.material.spec);
+          return html`
+            <div key=${'cl-'+g.material.id} style="margin-bottom:12px">
+              <div style="display:flex;align-items:center;gap:6px;font-size:11px;font-weight:700;color:var(--slate-700);margin-bottom:6px;padding-left:4px;border-left:4px solid ${color}">
+                <span style="padding-left:6px">${label}</span>
+              </div>
+              ${g.bars.map(b => html`
+                <div key=${'b-'+g.material.id+'-'+b.index} style=${'border:1px solid var(--slate-100);border-left:4px solid '+color+';border-radius:6px;padding:8px 10px;margin-bottom:6px'}>
+                  <div style="display:flex;justify-content:space-between;font-size:12px;font-weight:700">
+                    <span>Bar #${b.index} · ${(b.stockLength / 1000).toFixed(2)}m</span>
+                    <span style=${'color:' + (b.wasteMm > b.stockLength * 0.15 ? 'var(--rose-600)' : 'var(--slate-500)')}>${b.wasteMm}mm scrap · ${(b.wasteMm / b.stockLength * 100).toFixed(1)}%</span>
+                  </div>
+                  <div style="font-size:11px;color:var(--slate-600);margin-top:4px">
+                    ${b.cuts.map(c => c.label + ' · ' + c.length + 'mm').join('  ·  ')}
+                    ${b.kerfsInBar > 0 ? html`<span style="color:var(--slate-400)"> · ${b.cuts.length - 1} saw cut${b.cuts.length - 1 === 1 ? '' : 's'} (${b.kerfsInBar}mm kerf)</span>` : null}
+                  </div>
+                </div>
+              `)}
             </div>
-            <div style="font-size:11px;color:var(--slate-600);margin-top:4px">
-              ${b.cuts.map(c => c.label + ' · ' + c.length + 'mm').join('  ·  ')}
-              ${b.kerfsInBar > 0 ? html`<span style="color:var(--slate-400)"> · ${b.cuts.length - 1} saw cut${b.cuts.length - 1 === 1 ? '' : 's'} (${b.kerfsInBar}mm kerf)</span>` : null}
-            </div>
-          </div>
-        `)}
+          `;
+        })}
       </div>
     `}
   `;
@@ -12474,70 +12580,118 @@ function CutStat({ num, label, tickKey }) {
   `;
 }
 
-function CutMaterialPicker({ draft, setDraft }) {
-  const t = draft.material_type || 'round_bar';
-  const meta = CUT_MATERIAL_TYPES.find(m => m.value === t) || CUT_MATERIAL_TYPES[0];
-  const spec = draft.spec || {};
-  const kgPerM = cutComputeKgPerM(t, spec, draft.density_kg_per_m3);
-  const label = cutFormatMaterialLabel(t, spec);
+// Material LIST — the plan's material library. Each row is one always-editable
+// material card with type + dynamic spec inputs + density + live kg/m chip.
+// A colored band on the left identifies each material; the same colour shows
+// on every piece + stock row that references this material.
+function CutMaterialList({ draft, setDraft }) {
+  const materials = draft.materials || [];
 
-  const setType = (newType) => {
+  const update = (idx, patch) => {
+    const next = materials.slice();
+    next[idx] = Object.assign({}, next[idx], patch);
+    setDraft(Object.assign({}, draft, { materials: next }));
+  };
+  const remove = (idx) => {
+    if (materials.length <= 1) { alert('A plan needs at least one material.'); return; }
+    const m = materials[idx];
+    const inUse = (draft.pieces || []).some(p => p.material_id === m.id) || (draft.stocks || []).some(s => s.material_id === m.id);
+    if (inUse && !confirm('This material is used by some pieces or stock rows. Remove anyway? Those rows will get reassigned to the first material.')) return;
+    const next = materials.filter((_, i) => i !== idx);
+    const fallback = next[0]?.id || null;
     setDraft(Object.assign({}, draft, {
-      material_type: newType,
-      spec: cutDefaultSpec(newType),
+      materials: next,
+      pieces: (draft.pieces || []).map(p => p.material_id === m.id ? Object.assign({}, p, { material_id: fallback }) : p),
+      stocks: (draft.stocks || []).map(s => s.material_id === m.id ? Object.assign({}, s, { material_id: fallback }) : s),
     }));
   };
-  const setSpecField = (field, val) => {
-    const next = Object.assign({}, spec, { [field]: val });
-    setDraft(Object.assign({}, draft, { spec: next }));
+  const add = () => {
+    const id = 'm' + Date.now();
+    const newMat = { id, type: 'round_bar', spec: cutDefaultSpec('round_bar'), density_kg_per_m3: 7850 };
+    setDraft(Object.assign({}, draft, { materials: [...materials, newMat] }));
   };
 
   return html`
     <div class="card" style="padding:12px 14px;margin-bottom:10px">
-      <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px">
         <div>
-          <div style="font-weight:700;font-size:13px">Material</div>
-          <div style="font-size:11px;color:var(--slate-500)">Cross-section drives kg/m and the saw setup.</div>
+          <div style="font-weight:700;font-size:13px">Materials · ${materials.length}</div>
+          <div style="font-size:11px;color:var(--slate-500)">Each piece + stock row picks one of these. The saw plans each material on its own.</div>
         </div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap">
-          <span style="display:inline-block;padding:4px 10px;border-radius:999px;background:var(--teal-50);color:var(--teal-700);font-size:12px;font-weight:700">${label}</span>
-          ${kgPerM != null && html`<span key=${kgPerM.toFixed(3)} class="cut-stat-num tick" style="display:inline-block;padding:4px 10px;border-radius:999px;background:var(--slate-100);color:var(--slate-700);font-size:12px;font-weight:700">${kgPerM.toFixed(2)} kg/m</span>`}
+        <button class="btn small ghost" onClick=${add} style="padding:4px 10px;font-size:11px">+ Add material</button>
+      </div>
+      ${materials.map((m, idx) => html`<${CutMaterialRow} key=${m.id} m=${m} idx=${idx} update=${update} remove=${remove} />`)}
+    </div>
+  `;
+}
+
+function CutMaterialRow({ m, idx, update, remove }) {
+  const meta = CUT_MATERIAL_TYPES.find(x => x.value === m.type) || CUT_MATERIAL_TYPES[0];
+  const kgPerM = cutComputeKgPerM(m.type, m.spec, m.density_kg_per_m3);
+  const label = cutFormatMaterialLabel(m.type, m.spec);
+  const color = cutMaterialColor(m.id);
+
+  const setType = (newType) => update(idx, { type: newType, spec: cutDefaultSpec(newType) });
+  const setSpecField = (field, val) => update(idx, { spec: Object.assign({}, m.spec || {}, { [field]: val }) });
+
+  return html`
+    <div style=${'border:1px solid var(--slate-200);border-left:5px solid '+color+';border-radius:8px;padding:10px 12px;margin-bottom:8px;background:white'}>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span style=${'display:inline-block;padding:3px 9px;border-radius:999px;background:'+color+';color:white;font-size:11px;font-weight:700'}>${label}</span>
+          ${kgPerM != null && html`<span key=${kgPerM.toFixed(3)} class="cut-stat-num tick" style="display:inline-block;padding:3px 9px;border-radius:999px;background:var(--slate-100);color:var(--slate-700);font-size:11px;font-weight:700">${kgPerM.toFixed(2)} kg/m</span>`}
         </div>
+        <button onClick=${() => remove(idx)} style="background:none;border:none;color:var(--slate-400);cursor:pointer;font-size:14px;padding:2px 6px" title="Remove material">×</button>
       </div>
-
-      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
-        ${CUT_MATERIAL_TYPES.map(m => html`
-          <button key=${m.value} type="button" onClick=${() => setType(m.value)}
-            style=${'padding:5px 10px;border-radius:999px;border:1px solid '+(t===m.value?'var(--teal-500)':'var(--slate-200)')+';background:'+(t===m.value?'var(--teal-500)':'white')+';color:'+(t===m.value?'white':'var(--slate-700)')+';font-size:11px;font-weight:600;cursor:pointer;transition:all 0.15s'}>
-            ${m.label}
-          </button>
-        `)}
-      </div>
-
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;align-items:end">
+      <div style="display:grid;grid-template-columns:minmax(140px,1.4fr) repeat(auto-fit,minmax(90px,1fr));gap:6px;align-items:end">
+        <label style="display:flex;flex-direction:column;gap:3px;font-size:10px;color:var(--slate-600);font-weight:600">
+          <span>Type</span>
+          <select value=${m.type} onChange=${e => setType(e.target.value)}
+            style="border:1px solid var(--slate-200);border-radius:5px;padding:5px 8px;font-size:12px;font-family:inherit;background:white">
+            ${CUT_MATERIAL_TYPES.map(t => html`<option key=${t.value} value=${t.value}>${t.label}</option>`)}
+          </select>
+        </label>
         ${meta.fields.map(field => {
           const fm = CUT_SPEC_FIELD_META[field];
           if (!fm) return null;
           return html`
-            <label key=${field} style="display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--slate-600)">
-              <span style="font-weight:600">${fm.label}${fm.unit ? html` <span style="color:var(--slate-400);font-weight:400">(${fm.unit})</span>` : null}</span>
-              <input type=${fm.kind} value=${spec[field] ?? ''} placeholder=${fm.placeholder || ''}
+            <label key=${field} style="display:flex;flex-direction:column;gap:3px;font-size:10px;color:var(--slate-600);font-weight:600">
+              <span>${fm.label}${fm.unit ? html` <span style="color:var(--slate-400);font-weight:400">(${fm.unit})</span>` : null}</span>
+              <input type=${fm.kind} value=${m.spec?.[field] ?? ''} placeholder=${fm.placeholder || ''}
                 onChange=${e => setSpecField(field, fm.kind === 'number' ? (Number(e.target.value) || 0) : e.target.value)}
                 style="border:1px solid var(--slate-200);border-radius:5px;padding:5px 8px;font-size:12px;font-family:inherit" />
             </label>
           `;
         })}
-        <label style="display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--slate-600)">
-          <span style="font-weight:600">Density <span style="color:var(--slate-400);font-weight:400">(kg/m³)</span></span>
-          <input type="number" value=${draft.density_kg_per_m3 || 7850}
-            onChange=${e => setDraft(Object.assign({}, draft, { density_kg_per_m3: Number(e.target.value) || 7850 }))}
+        <label style="display:flex;flex-direction:column;gap:3px;font-size:10px;color:var(--slate-600);font-weight:600">
+          <span>Density <span style="color:var(--slate-400);font-weight:400">(kg/m³)</span></span>
+          <input type="number" value=${m.density_kg_per_m3 || 7850}
+            onChange=${e => update(idx, { density_kg_per_m3: Number(e.target.value) || 7850 })}
             style="border:1px solid var(--slate-200);border-radius:5px;padding:5px 8px;font-size:12px;font-family:inherit" />
         </label>
       </div>
-      <div style="font-size:10px;color:var(--slate-400);margin-top:6px">
-        Steel = 7850 · Aluminium = 2700 · Brass = 8500 · Stainless = 8000
-      </div>
     </div>
+  `;
+}
+
+// Compact picker for table rows. If there's only one material the row just
+// shows the label as text (no point in a select-of-one); else it's a select
+// with a colour band on the left edge.
+function CutRowMaterialPicker({ value, materials, onChange }) {
+  if (!materials || materials.length === 0) return null;
+  const cur = materials.find(m => m.id === value) || materials[0];
+  const color = cutMaterialColor(cur.id);
+  const label = cutFormatMaterialLabel(cur.type, cur.spec);
+  if (materials.length === 1) {
+    return html`<span style=${'display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--slate-700);font-weight:600'}>
+      <span style=${'width:9px;height:9px;border-radius:50%;background:'+color+';flex-shrink:0'}></span>${label}
+    </span>`;
+  }
+  return html`
+    <select value=${cur.id} onChange=${e => onChange(e.target.value)}
+      style=${'font-size:11px;padding:3px 6px;border:1px solid var(--slate-200);border-radius:4px;background:white;font-family:inherit;color:var(--slate-700);font-weight:600;border-left:4px solid '+color+';width:100%'}>
+      ${materials.map(m => html`<option key=${m.id} value=${m.id}>${cutFormatMaterialLabel(m.type, m.spec)}</option>`)}
+    </select>
   `;
 }
 
