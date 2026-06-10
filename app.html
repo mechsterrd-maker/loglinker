@@ -12061,6 +12061,78 @@ function planOneDimensionalCut({ pieces, stocks, kerfMm }) {
   };
 }
 
+// Material catalog. The algorithm cares only about length; material+spec govern
+// kg/m, label, and the visual cross-section. One plan = one material+spec --
+// mixing diameters on a saw is a separate setup anyway.
+const CUT_MATERIAL_TYPES = [
+  { value: 'round_bar',  label: 'Round bar',     fields: ['diameter'] },
+  { value: 'square_bar', label: 'Square bar',    fields: ['side'] },
+  { value: 'flat_bar',   label: 'Flat bar',      fields: ['width', 'thickness'] },
+  { value: 'pipe',       label: 'Pipe',          fields: ['od', 'wall'] },
+  { value: 'angle',      label: 'Angle (L)',     fields: ['leg1', 'leg2', 'thickness'] },
+  { value: 'channel',    label: 'Channel (ISMC)',fields: ['designation', 'kgPerM'], manualKgPerM: true },
+  { value: 'i_beam',     label: 'I-beam (ISMB)', fields: ['designation', 'kgPerM'], manualKgPerM: true },
+  { value: 'other',      label: 'Other',         fields: ['size', 'kgPerM'],        manualKgPerM: true },
+];
+const CUT_SPEC_FIELD_META = {
+  diameter:    { label: 'Diameter',    unit: 'mm', kind: 'number' },
+  side:        { label: 'Side',        unit: 'mm', kind: 'number' },
+  width:       { label: 'Width',       unit: 'mm', kind: 'number' },
+  thickness:   { label: 'Thickness',   unit: 'mm', kind: 'number' },
+  od:          { label: 'OD',          unit: 'mm', kind: 'number' },
+  wall:        { label: 'Wall',        unit: 'mm', kind: 'number' },
+  leg1:        { label: 'Leg 1',       unit: 'mm', kind: 'number' },
+  leg2:        { label: 'Leg 2',       unit: 'mm', kind: 'number' },
+  designation: { label: 'Designation', unit: '',   kind: 'text', placeholder: 'e.g. ISMC 100' },
+  size:        { label: 'Size',        unit: '',   kind: 'text', placeholder: 'free text' },
+  kgPerM:      { label: 'Weight',      unit: 'kg/m', kind: 'number' },
+};
+
+function cutDefaultSpec(type) {
+  switch (type) {
+    case 'round_bar':  return { diameter: 25 };
+    case 'square_bar': return { side: 25 };
+    case 'flat_bar':   return { width: 50, thickness: 10 };
+    case 'pipe':       return { od: 25, wall: 2 };
+    case 'angle':      return { leg1: 50, leg2: 50, thickness: 5 };
+    case 'channel':    return { designation: 'ISMC 100', kgPerM: 9.56 };
+    case 'i_beam':     return { designation: 'ISMB 100', kgPerM: 11.5 };
+    case 'other':      return { size: '', kgPerM: 0 };
+  }
+  return {};
+}
+
+function cutComputeKgPerM(type, spec, densityKgPerM3) {
+  const rho = Number(densityKgPerM3) || 7850;
+  const v = (k) => Number(spec?.[k]) || 0;
+  switch (type) {
+    case 'round_bar':  { const d = v('diameter'); return d > 0 ? (Math.PI / 4) * d * d * rho * 1e-6 : null; }
+    case 'square_bar': { const s = v('side');     return s > 0 ? s * s * rho * 1e-6 : null; }
+    case 'flat_bar':   { const w = v('width'), t = v('thickness'); return (w > 0 && t > 0) ? w * t * rho * 1e-6 : null; }
+    case 'pipe':       { const od = v('od'), t = v('wall'); return (od > 0 && t > 0 && t < od/2) ? Math.PI * t * (od - t) * rho * 1e-6 : null; }
+    case 'angle':      { const a = v('leg1'), b = v('leg2'), t = v('thickness'); return (a > 0 && b > 0 && t > 0) ? (a + b - t) * t * rho * 1e-6 : null; }
+    case 'channel':
+    case 'i_beam':
+    case 'other':      { const k = v('kgPerM'); return k > 0 ? k : null; }
+  }
+  return null;
+}
+
+function cutFormatMaterialLabel(type, spec) {
+  const s = spec || {};
+  switch (type) {
+    case 'round_bar':  return s.diameter ? `Round Ø${s.diameter}` : 'Round bar';
+    case 'square_bar': return s.side ? `Square ${s.side}` : 'Square bar';
+    case 'flat_bar':   return (s.width && s.thickness) ? `Flat ${s.width}×${s.thickness}` : 'Flat bar';
+    case 'pipe':       return (s.od && s.wall) ? `Pipe Ø${s.od}×${s.wall}` : 'Pipe';
+    case 'angle':      return (s.leg1 && s.leg2 && s.thickness) ? `Angle ${s.leg1}×${s.leg2}×${s.thickness}` : 'Angle';
+    case 'channel':    return s.designation || 'Channel';
+    case 'i_beam':     return s.designation || 'I-beam';
+    case 'other':      return s.size || 'Other';
+  }
+  return type;
+}
+
 function CuttingPlanner({ plant, me }) {
   const [view, setView] = useState('list');
   const [plans, setPlans] = useState([]);
@@ -12083,7 +12155,10 @@ function CuttingPlanner({ plant, me }) {
     setDraft({
       id: null,
       title: 'New cut plan',
-      stock_material: 'MS Round Bar 25mm',
+      material_type: 'round_bar',
+      spec: cutDefaultSpec('round_bar'),
+      density_kg_per_m3: 7850,
+      stock_material: 'MS Round Bar Ø25',
       kerf_mm: 3,
       status: 'draft',
       stocks: [
@@ -12131,7 +12206,10 @@ function CuttingPlanner({ plant, me }) {
             onMouseOver=${e => { e.currentTarget.style.transform = 'translateY(-2px)'; e.currentTarget.style.boxShadow = '0 4px 14px rgba(15,23,42,0.08)'; }}
             onMouseOut=${e => { e.currentTarget.style.transform = ''; e.currentTarget.style.boxShadow = ''; }}>
             <div style="font-weight:700;font-size:14px;margin-bottom:4px">${p.title}</div>
-            <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">${p.stock_material || ''}</div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+              ${p.material_type && html`<span style="display:inline-block;padding:2px 7px;border-radius:999px;background:var(--teal-50);color:var(--teal-700);font-size:10px;font-weight:600">${cutFormatMaterialLabel(p.material_type, p.spec)}</span>`}
+              ${p.kg_per_m && html`<span style="display:inline-block;padding:2px 7px;border-radius:999px;background:var(--slate-100);color:var(--slate-700);font-size:10px;font-weight:600">${Number(p.kg_per_m).toFixed(2)} kg/m</span>`}
+            </div>
             ${p.totals ? html`
               <div style="display:flex;gap:10px;font-size:11px;color:var(--slate-700)">
                 <div><b>${p.totals.barsUsed}</b> bars</div>
@@ -12201,10 +12279,16 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
   const save = async () => {
     setSaving(true);
     try {
+      const kgPerM = cutComputeKgPerM(draft.material_type, draft.spec, draft.density_kg_per_m3);
+      const autoLabel = cutFormatMaterialLabel(draft.material_type, draft.spec);
       const payload = {
         plant_id: plant.id,
         title: (draft.title || 'Cut plan').trim(),
-        stock_material: draft.stock_material || null,
+        material_type: draft.material_type || 'round_bar',
+        spec: draft.spec || {},
+        density_kg_per_m3: Number(draft.density_kg_per_m3) || 7850,
+        kg_per_m: kgPerM,
+        stock_material: autoLabel,
         kerf_mm: Number(draft.kerf_mm) || 0,
         status: draft.status || 'draft',
         stocks: draft.stocks,
@@ -12255,6 +12339,9 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
       <button class="btn" onClick=${save} disabled=${saving}>${saving ? 'Saving…' : (draft.id ? 'Save' : '+ Save plan')}</button>
     </div>
 
+    ${/* Material picker — type + spec drive kg/m and the auto-generated label */ null}
+    <${CutMaterialPicker} draft=${draft} setDraft=${setDraft} />
+
     ${result?.ok === false && html`
       <div class="card" style="background:#fef2f2;border:1px solid var(--rose-300);padding:14px;color:var(--rose-700);margin-bottom:12px;font-size:13px">
         ⚠ ${result.error}
@@ -12262,11 +12349,21 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
     `}
 
     ${result?.ok && html`
-      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:14px;padding:16px 14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
+      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:14px;padding:16px 14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
         <${CutStat} num=${result.stats.barsUsed}                                       label="Bars used"     tickKey=${statTick} />
         <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'}                       label="Total waste"   tickKey=${statTick} />
         <${CutStat} num=${(result.stats.wasteMm / 1000).toFixed(2) + ' m'}              label="Waste length"  tickKey=${statTick} />
         <${CutStat} num=${(result.stats.totalPiecesMm / 1000).toFixed(1) + ' m'}        label="Pieces total"  tickKey=${statTick} />
+        ${(() => {
+          const kgPerM = cutComputeKgPerM(draft.material_type, draft.spec, draft.density_kg_per_m3);
+          if (!kgPerM) return null;
+          const totalKg = (result.stats.totalPiecesMm / 1000) * kgPerM;
+          const wasteKg = (result.stats.wasteMm / 1000) * kgPerM;
+          return html`
+            <${CutStat} num=${totalKg.toFixed(1) + ' kg'} label="Pieces weight" tickKey=${statTick} />
+            <${CutStat} num=${wasteKg.toFixed(1) + ' kg'} label="Scrap weight"  tickKey=${statTick} />
+          `;
+        })()}
         <${CutStat} num=${result.stats.totalCost > 0 ? '₹' + fmtNum(result.stats.totalCost.toFixed(0)) : '—'} label="Stock cost" tickKey=${statTick} />
       </div>
     `}
@@ -12305,8 +12402,6 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
           <div style="font-weight:700;font-size:13px">Stock available</div>
           <button class="btn small ghost" onClick=${addStock} style="padding:3px 8px;font-size:11px">+ Add</button>
         </div>
-        <input type="text" value=${draft.stock_material || ''} onChange=${e => setDraft(Object.assign({}, draft, { stock_material: e.target.value }))}
-          placeholder="Material (e.g. MS Round Bar 25mm)" style="width:100%;font-size:12px;padding:5px 8px;border:1px solid var(--slate-200);border-radius:4px;margin-bottom:8px;font-family:inherit" />
         <table style="width:100%;font-size:12px;border-collapse:collapse">
           <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
             <th style="text-align:right;padding:4px 2px;width:74px">Length mm</th>
@@ -12375,6 +12470,73 @@ function CutStat({ num, label, tickKey }) {
     <div style="text-align:center;min-width:0">
       <div key=${tickKey} class="cut-stat-num tick" style="font-size:22px;font-weight:800;color:white;line-height:1;font-family:'Bricolage Grotesque',sans-serif">${num}</div>
       <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:rgba(255,255,255,0.85);margin-top:4px">${label}</div>
+    </div>
+  `;
+}
+
+function CutMaterialPicker({ draft, setDraft }) {
+  const t = draft.material_type || 'round_bar';
+  const meta = CUT_MATERIAL_TYPES.find(m => m.value === t) || CUT_MATERIAL_TYPES[0];
+  const spec = draft.spec || {};
+  const kgPerM = cutComputeKgPerM(t, spec, draft.density_kg_per_m3);
+  const label = cutFormatMaterialLabel(t, spec);
+
+  const setType = (newType) => {
+    setDraft(Object.assign({}, draft, {
+      material_type: newType,
+      spec: cutDefaultSpec(newType),
+    }));
+  };
+  const setSpecField = (field, val) => {
+    const next = Object.assign({}, spec, { [field]: val });
+    setDraft(Object.assign({}, draft, { spec: next }));
+  };
+
+  return html`
+    <div class="card" style="padding:12px 14px;margin-bottom:10px">
+      <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px">
+        <div>
+          <div style="font-weight:700;font-size:13px">Material</div>
+          <div style="font-size:11px;color:var(--slate-500)">Cross-section drives kg/m and the saw setup.</div>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <span style="display:inline-block;padding:4px 10px;border-radius:999px;background:var(--teal-50);color:var(--teal-700);font-size:12px;font-weight:700">${label}</span>
+          ${kgPerM != null && html`<span key=${kgPerM.toFixed(3)} class="cut-stat-num tick" style="display:inline-block;padding:4px 10px;border-radius:999px;background:var(--slate-100);color:var(--slate-700);font-size:12px;font-weight:700">${kgPerM.toFixed(2)} kg/m</span>`}
+        </div>
+      </div>
+
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+        ${CUT_MATERIAL_TYPES.map(m => html`
+          <button key=${m.value} type="button" onClick=${() => setType(m.value)}
+            style=${'padding:5px 10px;border-radius:999px;border:1px solid '+(t===m.value?'var(--teal-500)':'var(--slate-200)')+';background:'+(t===m.value?'var(--teal-500)':'white')+';color:'+(t===m.value?'white':'var(--slate-700)')+';font-size:11px;font-weight:600;cursor:pointer;transition:all 0.15s'}>
+            ${m.label}
+          </button>
+        `)}
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;align-items:end">
+        ${meta.fields.map(field => {
+          const fm = CUT_SPEC_FIELD_META[field];
+          if (!fm) return null;
+          return html`
+            <label key=${field} style="display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--slate-600)">
+              <span style="font-weight:600">${fm.label}${fm.unit ? html` <span style="color:var(--slate-400);font-weight:400">(${fm.unit})</span>` : null}</span>
+              <input type=${fm.kind} value=${spec[field] ?? ''} placeholder=${fm.placeholder || ''}
+                onChange=${e => setSpecField(field, fm.kind === 'number' ? (Number(e.target.value) || 0) : e.target.value)}
+                style="border:1px solid var(--slate-200);border-radius:5px;padding:5px 8px;font-size:12px;font-family:inherit" />
+            </label>
+          `;
+        })}
+        <label style="display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--slate-600)">
+          <span style="font-weight:600">Density <span style="color:var(--slate-400);font-weight:400">(kg/m³)</span></span>
+          <input type="number" value=${draft.density_kg_per_m3 || 7850}
+            onChange=${e => setDraft(Object.assign({}, draft, { density_kg_per_m3: Number(e.target.value) || 7850 }))}
+            style="border:1px solid var(--slate-200);border-radius:5px;padding:5px 8px;font-size:12px;font-family:inherit" />
+        </label>
+      </div>
+      <div style="font-size:10px;color:var(--slate-400);margin-top:6px">
+        Steel = 7850 · Aluminium = 2700 · Brass = 8500 · Stainless = 8000
+      </div>
     </div>
   `;
 }
