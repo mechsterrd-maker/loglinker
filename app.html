@@ -11983,6 +11983,55 @@ function StageAskModal({ plant, me, project, stage, kind, onClose, onSent }) {
 // material partition (no material ever shares a bar with another).
 // =================================================================
 
+// Internal: place a list of pre-sorted items into bars using a given placement
+// rule. The placement rules differ in which existing bar a new item lands in.
+function cutPackBars(items, stockPool, kerfMm, placement) {
+  const sp = stockPool.map(s => Object.assign({}, s));
+  const bars = [];
+  for (const item of items) {
+    let placed = false;
+    if (placement === 'first-fit') {
+      for (const bar of bars) {
+        const need = item.length + (bar.cuts.length > 0 ? kerfMm : 0);
+        if (bar.used + need <= bar.stockLength) {
+          bar.cuts.push({ pieceId: item.pieceId, label: item.label, length: item.length });
+          bar.used += need;
+          placed = true;
+          break;
+        }
+      }
+    } else if (placement === 'best-fit' || placement === 'worst-fit') {
+      let best = null, bestRem = (placement === 'best-fit') ? Infinity : -1;
+      for (const bar of bars) {
+        const need = item.length + (bar.cuts.length > 0 ? kerfMm : 0);
+        const rem = bar.stockLength - bar.used - need;
+        if (rem < 0) continue;
+        if (placement === 'best-fit'  ? rem < bestRem : rem > bestRem) { best = bar; bestRem = rem; }
+      }
+      if (best) {
+        const need = item.length + (best.cuts.length > 0 ? kerfMm : 0);
+        best.cuts.push({ pieceId: item.pieceId, label: item.label, length: item.length });
+        best.used += need;
+        placed = true;
+      }
+    }
+    if (placed) continue;
+    const fit = sp.filter(s => s.remaining > 0 && s.lengthMm >= item.length)
+                  .sort((a, b) => a.lengthMm - b.lengthMm)[0];
+    if (!fit) return { ok: false, error: 'No stock long enough for piece "' + item.label + '" (' + item.length + 'mm).' };
+    fit.remaining -= 1;
+    bars.push({
+      stockId: fit.id, stockLength: fit.lengthMm, unitCost: fit.unitCost,
+      cuts: [{ pieceId: item.pieceId, label: item.label, length: item.length }],
+      used: item.length,
+    });
+  }
+  return { ok: true, bars };
+}
+
+// Single-material pack. Runs four strategies (FFD, BFD, WFD, FFI) and keeps
+// the result that uses the fewest bars; ties broken by least total waste.
+// "Smart pack" without the user choosing — they just get the best answer.
 function planSingleMaterial({ pieces, stocks, kerfMm }) {
   const items = [];
   for (const p of (pieces || [])) {
@@ -11993,49 +12042,42 @@ function planSingleMaterial({ pieces, stocks, kerfMm }) {
       items.push({ id: p.id + ':' + i, pieceId: p.id, label: p.label || 'piece', length: len });
     }
   }
-  items.sort((a, b) => b.length - a.length);
-
   const stockPool = (stocks || [])
     .filter(s => Number(s.qty) > 0 && Number(s.lengthMm) > 0)
     .map(s => ({ id: s.id, lengthMm: Number(s.lengthMm), unitCost: Number(s.unitCost) || 0, remaining: Math.floor(Number(s.qty)) }));
 
   if (items.length === 0) {
-    return { ok: true, bars: [], stats: { barsUsed: 0, totalStockMm: 0, totalPiecesMm: 0, totalKerfMm: 0, wasteMm: 0, wastePct: 0, totalCost: 0 } };
+    return { ok: true, bars: [], strategy: '—', stats: { barsUsed: 0, totalStockMm: 0, totalPiecesMm: 0, totalKerfMm: 0, wasteMm: 0, wastePct: 0, totalCost: 0 } };
   }
-  if (stockPool.length === 0) {
-    return { ok: false, error: 'No stock bars defined.' };
-  }
+  if (stockPool.length === 0) return { ok: false, error: 'No stock bars defined.' };
 
   const k = Number(kerfMm) || 0;
-  const bars = [];
-  for (const item of items) {
-    let placed = false;
-    for (const bar of bars) {
-      const need = item.length + (bar.cuts.length > 0 ? k : 0);
-      if (bar.used + need <= bar.stockLength) {
-        bar.cuts.push({ pieceId: item.pieceId, label: item.label, length: item.length });
-        bar.used += need;
-        placed = true;
-        break;
-      }
+  const strategies = [
+    { name: 'FFD', sort: (a, b) => b.length - a.length, place: 'first-fit' },
+    { name: 'BFD', sort: (a, b) => b.length - a.length, place: 'best-fit'  },
+    { name: 'WFD', sort: (a, b) => b.length - a.length, place: 'worst-fit' },
+    { name: 'FFI', sort: (a, b) => a.length - b.length, place: 'first-fit' },
+  ];
+
+  let best = null;
+  let lastErr = null;
+  for (const strat of strategies) {
+    const sortedItems = items.slice().sort(strat.sort);
+    const r = cutPackBars(sortedItems, stockPool, k, strat.place);
+    if (!r.ok) { lastErr = r.error; continue; }
+    const totalStock = r.bars.reduce((s, b) => s + b.stockLength, 0);
+    const totalPieces = r.bars.reduce((s, b) => s + b.cuts.reduce((x, c) => x + c.length, 0), 0);
+    const waste = totalStock - totalPieces;
+    // Score: bars first (fewer is better), then waste (less is better).
+    const score = r.bars.length * 1e9 + waste;
+    if (best === null || score < best.score) {
+      best = { bars: r.bars, strategy: strat.name, score };
     }
-    if (placed) continue;
-    const fit = stockPool
-      .filter(s => s.remaining > 0 && s.lengthMm >= item.length)
-      .sort((a, b) => a.lengthMm - b.lengthMm)[0];
-    if (!fit) {
-      return { ok: false, error: 'No stock long enough for piece "' + item.label + '" (' + item.length + 'mm).' };
-    }
-    fit.remaining -= 1;
-    bars.push({
-      stockId: fit.id, stockLength: fit.lengthMm, unitCost: fit.unitCost,
-      cuts: [{ pieceId: item.pieceId, label: item.label, length: item.length }],
-      used: item.length,
-    });
   }
+  if (!best) return { ok: false, error: lastErr || 'Could not pack pieces.' };
 
   let totalStock = 0, totalPieces = 0, totalKerf = 0, totalCost = 0;
-  const enriched = bars.map((b, idx) => {
+  const enriched = best.bars.map((b, idx) => {
     const kerfsInBar = Math.max(0, b.cuts.length - 1) * k;
     const wasteMm = Math.max(0, b.stockLength - b.used);
     totalStock += b.stockLength;
@@ -12049,8 +12091,34 @@ function planSingleMaterial({ pieces, stocks, kerfMm }) {
   return {
     ok: true,
     bars: enriched,
+    strategy: best.strategy,
     stats: { barsUsed: enriched.length, totalStockMm: totalStock, totalPiecesMm: totalPieces, totalKerfMm: totalKerf, wasteMm, wastePct, totalCost },
   };
+}
+
+// Endbit advisor: for a bar with significant scrap, list which pieces from the
+// input could still fit in that scrap (with kerf). Helps the user decide
+// whether to bump qty on a part or save the bar end for next time.
+function cutEndbitSuggestions(bar, pieces, kerfMm) {
+  const endbit = bar.wasteMm;
+  if (!endbit || endbit < 80) return [];
+  const k = Number(kerfMm) || 0;
+  const seen = new Set();
+  const out = [];
+  for (const p of pieces || []) {
+    const len = Number(p.lengthMm) || 0;
+    if (len <= 0) continue;
+    const slot = len + k;
+    if (slot > endbit) continue;
+    const n = Math.floor(endbit / slot);
+    if (n <= 0) continue;
+    if (seen.has(len)) continue;
+    seen.add(len);
+    out.push({ label: p.label, length: len, n });
+  }
+  // Sort by piece length descending so "fit 6× 900mm" sits above "168× 30mm"
+  out.sort((a, b) => b.length - a.length);
+  return out.slice(0, 4);
 }
 
 function planMultiMaterialCut({ materials, pieces, stocks, kerfMm }) {
@@ -12072,7 +12140,11 @@ function planMultiMaterialCut({ materials, pieces, stocks, kerfMm }) {
       continue;
     }
     const kgPerM = Number(m.kg_per_m) || cutComputeKgPerM(m.type, m.spec, m.density_kg_per_m3) || 0;
-    groups.push({ material: m, ok: true, bars: r.bars, stats: r.stats, kgPerM });
+    // Attach endbit suggestions to each bar for the advisor UI
+    const barsWithAdvice = r.bars.map(b => Object.assign({}, b, {
+      suggestions: cutEndbitSuggestions(b, myPieces, kerfMm),
+    }));
+    groups.push({ material: m, ok: true, bars: barsWithAdvice, stats: r.stats, kgPerM, strategy: r.strategy });
     agg.barsUsed += r.stats.barsUsed;
     agg.totalStockMm += r.stats.totalStockMm;
     agg.totalPiecesMm += r.stats.totalPiecesMm;
@@ -12216,22 +12288,20 @@ function CuttingPlanner({ plant, me }) {
 
   const newPlan = useCallback(() => {
     const m1 = { id: 'm1', type: 'round_bar', spec: cutDefaultSpec('round_bar'), density_kg_per_m3: 7850 };
-    const m2 = { id: 'm2', type: 'flat_bar',  spec: cutDefaultSpec('flat_bar'),  density_kg_per_m3: 7850 };
     setDraft({
       id: null,
       title: 'New cut plan',
       kerf_mm: 3,
       status: 'draft',
-      materials: [m1, m2],
+      materials: [m1],
       stocks: [
         { id: 's1', material_id: 'm1', lengthMm: 6000,  qty: 50, unitCost: 0 },
         { id: 's2', material_id: 'm1', lengthMm: 12000, qty: 25, unitCost: 0 },
-        { id: 's3', material_id: 'm2', lengthMm: 6000,  qty: 30, unitCost: 0 },
       ],
       pieces: [
-        { id: 'p1', material_id: 'm1', lengthMm: 1850, qty: 8,  label: 'Part A' },
-        { id: 'p2', material_id: 'm1', lengthMm: 1250, qty: 12, label: 'Part B' },
-        { id: 'p3', material_id: 'm2', lengthMm: 850,  qty: 20, label: 'Bracket' },
+        { id: 'p1', material_id: 'm1', lengthMm: 900, qty: 6, label: 'Part A' },
+        { id: 'p2', material_id: 'm1', lengthMm: 400, qty: 2, label: 'Part B' },
+        { id: 'p3', material_id: 'm1', lengthMm: 30,  qty: 6, label: 'Spacer' },
       ],
       notes: '',
     });
@@ -12529,6 +12599,7 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
               <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
                 ${g.stats.barsUsed} ${g.stats.barsUsed === 1 ? 'bar' : 'bars'} · ${g.stats.wastePct.toFixed(1)}% waste · ${(g.stats.totalPiecesMm/1000).toFixed(1)}m pieces
                 ${g.kgPerM > 0 && html` · ${((g.stats.totalPiecesMm/1000)*g.kgPerM).toFixed(1)} kg`}
+                ${g.strategy && html` · <span style="font-family:monospace;background:var(--slate-100);padding:1px 5px;border-radius:3px;color:var(--slate-600)" title="Tried 4 strategies (FFD/BFD/WFD/FFI), picked the best">smart-pack: ${g.strategy}</span>`}
               </div>
             </div>
           </div>
@@ -12561,6 +12632,12 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
                     ${b.cuts.map(c => c.label + ' · ' + c.length + 'mm').join('  ·  ')}
                     ${b.kerfsInBar > 0 ? html`<span style="color:var(--slate-400)"> · ${b.cuts.length - 1} saw cut${b.cuts.length - 1 === 1 ? '' : 's'} (${b.kerfsInBar}mm kerf)</span>` : null}
                   </div>
+                  ${b.suggestions && b.suggestions.length > 0 && html`
+                    <div style="font-size:10px;color:var(--slate-500);margin-top:6px;padding-top:6px;border-top:1px dashed var(--slate-200);display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+                      <span style="font-weight:700;color:var(--amber-700)">Could still fit:</span>
+                      ${b.suggestions.map(s => html`<span style="display:inline-block;padding:1px 6px;border-radius:999px;background:var(--amber-50);color:var(--amber-700);font-weight:600">${s.n}× ${s.label || s.length+'mm'}</span>`)}
+                    </div>
+                  `}
                 </div>
               `)}
             </div>
