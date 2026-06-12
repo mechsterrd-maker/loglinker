@@ -12380,6 +12380,43 @@ function cutSuggestBarLengths(pieces, opts) {
   return procurement ? candidates.slice(0, 1) : candidates.slice(0, 2);
 }
 
+// Custom mill-cut bar lengths -- mills WILL cut to a specified length for
+// structural steel orders. We try several "N bars" splits, round the length
+// up to the nearest 100mm so the mill can quote it sensibly, and pick the
+// option with the lowest waste %. Single best result returned.
+function cutSuggestCustomBarLengths(pieces, opts) {
+  opts = opts || {};
+  const kerfMm = Number(opts.kerf_mm) || 3;
+  const valid = (pieces || []).filter(p => Number(p.lengthMm) > 0 && Number(p.qty) > 0);
+  if (valid.length === 0) return [];
+  const totalPieceLen = valid.reduce((s, p) => s + p.lengthMm * p.qty, 0);
+  const totalPieceCount = valid.reduce((s, p) => s + Math.floor(p.qty), 0);
+  const maxLen = Math.max.apply(null, valid.map(p => p.lengthMm));
+  const MILL_MAX = 12000;
+  const ROUND_TO = 100;
+  // Try N=1..6 bars, each of length = ceil(total / N / 100) * 100.
+  const candidates = [];
+  for (let n = 1; n <= 6; n++) {
+    // Target length per bar: pieces_total + kerfs distributed across n bars
+    const kerfsTotal = Math.max(0, totalPieceCount - n) * kerfMm;
+    const targetLen = (totalPieceLen + kerfsTotal) / n;
+    let customLen = Math.ceil(targetLen / ROUND_TO) * ROUND_TO;
+    if (customLen < maxLen) customLen = Math.ceil(maxLen / ROUND_TO) * ROUND_TO;
+    if (customLen > MILL_MAX) continue;
+    const fakeStocks = [{ id: 'fake', lengthMm: customLen, qty: 9999, unitCost: 0 }];
+    const r = planSingleMaterial({ pieces: valid, stocks: fakeStocks, kerfMm });
+    if (!r.ok) continue;
+    // Only accept if it used <= n bars (otherwise the split didn't work)
+    if (r.stats.barsUsed > n) continue;
+    candidates.push({ lengthMm: customLen, barsUsed: r.stats.barsUsed, wastePct: r.stats.wastePct, custom: true });
+  }
+  candidates.sort((a, b) => {
+    if (Math.abs(a.wastePct - b.wastePct) > 0.5) return a.wastePct - b.wastePct;
+    return a.barsUsed - b.barsUsed;
+  });
+  return candidates.slice(0, 1);
+}
+
 // Smart stock pick: for each unique stock size, try planning using ONLY that
 // size, then pick the result with the least waste. Tie-break on lowest cost.
 // Pieces with pin_stock_size set are routed to that size specifically and skip
@@ -12814,6 +12851,7 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
   const [animKey, setAnimKey] = useState(0);
   const [statTick, setStatTick] = useState(0);
   const [saving, setSaving] = useState(false);
+  const [showPOModal, setShowPOModal] = useState(false);
   const debounceRef = useRef(null);
 
   const materials = draft.materials || [];
@@ -12938,8 +12976,10 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
       <input type="text" value=${draft.title} onChange=${e => setDraft(Object.assign({}, draft, { title: e.target.value }))}
         style="flex:1;min-width:0;font-size:20px;font-weight:700;border:none;outline:none;background:transparent;padding:2px 0;font-family:inherit" />
       <${CutModeToggle} draft=${draft} setDraft=${setDraft} />
+      ${draft.procurement_mode === true && (draft.stocks || []).length > 0 && html`<button class="btn small ghost" onClick=${() => setShowPOModal(true)} style="padding:6px 10px;font-size:11px" title="Create a Purchase Order from this plan's stock list">📋 PO</button>`}
       <button class="btn" onClick=${save} disabled=${saving}>${saving ? 'Saving…' : (draft.id ? 'Save' : '+ Save')}</button>
     </div>
+    ${showPOModal && html`<${CutGeneratePOModal} draft=${draft} plant=${plant} me=${me} onClose=${() => setShowPOModal(false)} />`}
 
     ${result?.errors && result.errors.length > 0 && html`
       <div class="card" style="background:#fef2f2;border:1px solid var(--rose-300);padding:12px 14px;color:var(--rose-700);margin-bottom:12px;font-size:12px">
@@ -13027,7 +13067,6 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
               }
               const proc = draft.procurement_mode === true;
               const next = proc ? [] : [...draft.stocks];
-              // Group pieces by material so each material gets its own recommendation.
               const groupedByMaterial = new Map();
               for (const p of allPieces) {
                 const mid = p.material_id || (materials[0] && materials[0].id);
@@ -13036,32 +13075,38 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
               }
               const perMatResult = [];
               for (const [matId, group] of groupedByMaterial) {
-                const suggestions = cutSuggestBarLengths(group, { procurement: proc, kerf_mm: draft.kerf_mm });
-                if (suggestions.length === 0) {
+                const market = cutSuggestBarLengths(group, { procurement: true, kerf_mm: draft.kerf_mm });
+                const custom = cutSuggestCustomBarLengths(group, { kerf_mm: draft.kerf_mm });
+                const errs = [];
+                const matInfo = materials.find(m => m.id === matId) || {};
+                const matName = matInfo.type ? cutFormatMaterialLabel(matInfo.type, matInfo.spec) : 'material';
+                if (market.length === 0 && custom.length === 0) {
                   const maxLen = Math.max.apply(null, group.map(p => Number(p.lengthMm) || 0));
-                  const matLabel = (materials.find(m => m.id === matId) || {});
-                  const matName = matLabel.type ? cutFormatMaterialLabel(matLabel.type, matLabel.spec) : 'material';
-                  perMatResult.push({ matId, error: matName + ': longest piece ' + maxLen + 'mm > 12m market max' });
+                  perMatResult.push({ matId, error: matName + ': longest piece ' + maxLen + 'mm > 12m mill max' });
                   continue;
                 }
-                for (const s of suggestions) {
-                  // Skip if a stock row with the same length + material already exists.
-                  const dupe = next.some(x => x.material_id === matId && Number(x.lengthMm) === s.lengthMm);
-                  if (dupe) continue;
-                  next.push({ id: 's' + Date.now() + Math.random().toString(36).slice(2,5), material_id: matId, lengthMm: s.lengthMm, qty: 50, unitCost: 0 });
+                if (custom.length > 0) {
+                  const c = custom[0];
+                  const dupe = next.some(x => x.material_id === matId && Number(x.lengthMm) === c.lengthMm);
+                  if (!dupe) next.push({ id: 's' + Date.now() + Math.random().toString(36).slice(2,5) + 'c', material_id: matId, lengthMm: c.lengthMm, qty: proc ? 1 : 10, unitCost: 0 });
                 }
-                perMatResult.push({ matId, best: suggestions[0] });
+                if (market.length > 0) {
+                  const m = market[0];
+                  const dupe = next.some(x => x.material_id === matId && Number(x.lengthMm) === m.lengthMm);
+                  if (!dupe) next.push({ id: 's' + Date.now() + Math.random().toString(36).slice(2,5) + 'm', material_id: matId, lengthMm: m.lengthMm, qty: 50, unitCost: 0 });
+                }
+                perMatResult.push({ matId, matName, market: market[0], custom: custom[0] });
               }
               setDraft(Object.assign({}, draft, { stocks: next }));
-              // Build per-material toast.
               const lines = perMatResult.map(r => {
                 if (r.error) return '⚠ ' + r.error;
-                const matLabel = (materials.find(m => m.id === r.matId) || {});
-                const matName = matLabel.type ? cutFormatMaterialLabel(matLabel.type, matLabel.spec) : '';
-                return (matName ? matName + ' → ' : '') + (r.best.lengthMm / 1000).toFixed(2) + 'm, ' + r.best.wastePct.toFixed(1) + '% waste';
+                const parts = [];
+                if (r.custom) parts.push('CUSTOM ' + (r.custom.lengthMm/1000).toFixed(2) + 'm (' + r.custom.wastePct.toFixed(1) + '%)');
+                if (r.market) parts.push('MARKET ' + (r.market.lengthMm/1000).toFixed(0) + 'm (' + r.market.wastePct.toFixed(1) + '%)');
+                return r.matName + ': ' + parts.join(' vs ');
               });
               showToast('✓ ' + lines.join(' · '));
-            }} style="padding:3px 8px;font-size:11px" title=${draft.procurement_mode === true ? 'Recommend bar lengths to buy, per material' : 'Suggest the best bar lengths per material'}>✨ Suggest</button>
+            }} style="padding:3px 8px;font-size:11px" title="Suggests BOTH a custom mill-cut length and the best market standard, per material">✨ Suggest</button>
             <button class="btn small ghost" onClick=${addStock} style="padding:3px 8px;font-size:11px">+ Add</button>
           </div>
         </div>
@@ -13217,6 +13262,7 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
   const [animKey, setAnimKey] = useState(0);
   const [statTick, setStatTick] = useState(0);
   const [saving, setSaving] = useState(false);
+  const [showPOModal, setShowPOModal] = useState(false);
   const debounceRef = useRef(null);
 
   const materials = draft.materials || [];
@@ -13346,8 +13392,10 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
         style="flex:1;min-width:0;font-size:20px;font-weight:700;border:none;outline:none;background:transparent;padding:2px 0;font-family:inherit" />
       <span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:0.05em;background:var(--indigo-100,#e0e7ff);color:var(--indigo-700,#4338ca)">2D</span>
       <${CutModeToggle} draft=${draft} setDraft=${setDraft} />
+      ${draft.procurement_mode === true && (draft.stocks || []).length > 0 && html`<button class="btn small ghost" onClick=${() => setShowPOModal(true)} style="padding:6px 10px;font-size:11px" title="Create a Purchase Order from this plan's stock list">📋 PO</button>`}
       <button class="btn" onClick=${save} disabled=${saving}>${saving ? 'Saving…' : (draft.id ? 'Save' : '+ Save')}</button>
     </div>
+    ${showPOModal && html`<${CutGeneratePOModal} draft=${draft} plant=${plant} me=${me} onClose=${() => setShowPOModal(false)} />`}
 
     ${result?.ok && result.smartPick && html`<${CutSmartPickCaption} smartPick=${result.smartPick} dim="2d" procurement=${draft.procurement_mode === true} />`}
 
@@ -13821,6 +13869,126 @@ function CutSmartPickCaption({ smartPick, dim, procurement }) {
         ${savedPct > 0.5 ? html` · saves <b>${savedPct.toFixed(1)} pts</b> vs ${fallLabel} (${fallback.wastePct.toFixed(1)}%)` : null}
       </span>
       ${winner.cost > 0 && html`<span style="font-weight:700">₹${fmtNum(winner.cost.toFixed(0))}</span>`}
+    </div>
+  `;
+}
+
+function CutGeneratePOModal({ draft, plant, me, onClose }) {
+  const [vendor, setVendor] = useState(null);
+  const [vendors, setVendors] = useState([]);
+  const [notes, setNotes] = useState('');
+  const [items, setItems] = useState([]);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const { data } = await sb.from('mcp_logistics_vendors')
+        .select('id, name').eq('plant_id', plant.id).eq('is_vendor', true).order('name');
+      setVendors(data || []);
+    })();
+    const is2D = draft.plan_kind === '2d';
+    const rows = (draft.stocks || []).map(s => {
+      const mat = (draft.materials || []).find(m => m.id === s.material_id);
+      const matLabel = mat ? cutFormatMaterialLabel(mat.type, mat.spec) : '';
+      const sizeDesc = is2D ? (s.widthMm + '×' + s.heightMm + 'mm') : ((s.lengthMm / 1000).toFixed(2) + 'm');
+      return {
+        description: (matLabel ? matLabel + ' · ' : '') + sizeDesc,
+        qty: Number(s.qty) || 1,
+        unit_cost: Number(s.unitCost) || 0,
+        size_mm: is2D ? (s.widthMm + 'x' + s.heightMm) : String(s.lengthMm),
+      };
+    });
+    setItems(rows);
+  }, []);
+
+  const updateItem = (idx, field, val) => {
+    const next = items.slice();
+    const isText = field === 'description';
+    next[idx] = Object.assign({}, next[idx], { [field]: isText ? val : (Number(val) || 0) });
+    setItems(next);
+  };
+  const removeItem = (idx) => setItems(items.filter((_, i) => i !== idx));
+
+  const total = items.reduce((s, i) => s + (i.qty * i.unit_cost), 0);
+
+  const save = async () => {
+    if (!vendor) { alert('Pick a vendor first'); return; }
+    if (items.length === 0) { alert('Add at least one item'); return; }
+    setSaving(true);
+    try {
+      const payload = {
+        plant_id: plant.id,
+        doc_type: 'po',
+        vendor_id: vendor.id,
+        vendor_name_raw: vendor.name,
+        doc_date: new Date().toISOString().slice(0, 10),
+        items: items,
+        total_value: total,
+        taxable_value: total,
+        status: 'pending',
+        notes: (draft.title || 'Cut plan') + (notes ? ' · ' + notes : ''),
+        created_by: me.id,
+      };
+      const { data, error } = await sb.from('mcp_logistics_documents').insert(payload).select('id, doc_number').single();
+      if (error) throw error;
+      showToast('✓ PO created' + (data.doc_number ? ' · ' + data.doc_number : ''));
+      onClose();
+    } catch (e) {
+      alert('Could not create PO: ' + (e.message || e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:640px">
+        <div class="modal-header">
+          <div class="modal-title">📋 Generate Purchase Order</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="field">
+          <label>Vendor</label>
+          <select value=${vendor?.id || ''} onChange=${e => setVendor(vendors.find(v => v.id === e.target.value) || null)}>
+            <option value="">— Pick vendor —</option>
+            ${vendors.map(v => html`<option key=${v.id} value=${v.id}>${v.name}</option>`)}
+          </select>
+          ${vendors.length === 0 && html`<div style="font-size:11px;color:var(--rose-600);margin-top:4px">No vendors yet — add one under People → Vendors first.</div>`}
+        </div>
+        <div class="field">
+          <label>Notes / Description</label>
+          <textarea rows=${3} value=${notes} onChange=${e => setNotes(e.target.value)} placeholder="Delivery instructions, project ref, etc."></textarea>
+        </div>
+        <div style="margin:14px 0">
+          <div style="font-weight:700;font-size:13px;margin-bottom:8px">Line items · ${items.length}</div>
+          ${items.length === 0 ? html`<div style="color:var(--slate-500);font-size:12px;padding:10px 0">No stock items defined yet. Add stock rows in the planner first.</div>` : html`
+            <table style="width:100%;font-size:12px;border-collapse:collapse">
+              <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
+                <th style="text-align:left;padding:4px 2px">Description</th>
+                <th style="text-align:right;padding:4px 2px;width:54px">Qty</th>
+                <th style="text-align:right;padding:4px 2px;width:84px">Cost</th>
+                <th style="text-align:right;padding:4px 2px;width:88px">Total</th>
+                <th style="width:24px"></th>
+              </tr></thead>
+              <tbody>
+                ${items.map((it, i) => html`
+                  <tr key=${i} style="border-top:1px solid var(--slate-100)">
+                    <td style="padding:5px 2px"><input type="text" value=${it.description} onChange=${e => updateItem(i, 'description', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:4px 6px;font-size:12px" /></td>
+                    <td style="padding:5px 2px"><input type="number" value=${it.qty} onChange=${e => updateItem(i, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:4px 6px;font-size:12px;text-align:right" /></td>
+                    <td style="padding:5px 2px"><input type="number" value=${it.unit_cost} onChange=${e => updateItem(i, 'unit_cost', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:4px 6px;font-size:12px;text-align:right" /></td>
+                    <td style="padding:5px 2px;text-align:right;font-weight:600;font-family:monospace">₹${fmtNum((it.qty * it.unit_cost).toFixed(0))}</td>
+                    <td style="padding:5px 2px;text-align:center"><button onClick=${() => removeItem(i)} style="background:none;border:none;color:var(--slate-400);cursor:pointer;font-size:16px;padding:2px 6px">×</button></td>
+                  </tr>
+                `)}
+              </tbody>
+              <tfoot>
+                <tr style="border-top:2px solid var(--slate-300)"><td colspan="3" style="padding:8px 2px;text-align:right;font-weight:700">PO Total</td><td style="padding:8px 2px;text-align:right;font-weight:800;font-size:14px;font-family:monospace">₹${fmtNum(total.toFixed(0))}</td><td></td></tr>
+              </tfoot>
+            </table>
+          `}
+        </div>
+        <button class="btn" disabled=${saving || !vendor || items.length === 0} style="width:100%" onClick=${save}>${saving ? 'Creating…' : '✓ Create Purchase Order'}</button>
+      </div>
     </div>
   `;
 }
