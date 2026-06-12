@@ -12855,6 +12855,8 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
       </div>
     `}
 
+    <${CutAIAnalysis} draft=${draft} result=${result} plant=${plant} />
+
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;margin-bottom:12px">
       <div class="card" style="padding:12px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
@@ -13207,6 +13209,8 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
       </div>
     `}
 
+    <${CutAIAnalysis} draft=${draft} result=${result} plant=${plant} />
+
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;margin-bottom:12px">
       <div class="card" style="padding:12px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
@@ -13403,6 +13407,128 @@ function CutSheetSvg({ sheet, colorFor }) {
         `;
       })}
     </svg>
+  `;
+}
+
+// Build a compact text summary the AI analyzer can consume. Includes the
+// plan kind, kerf, material, every piece + stock, headline stats, and any
+// bars/sheets the planner already flagged as wasteful.
+function cutBuildPlanSummary(draft, result) {
+  const is2D = draft.plan_kind === '2d';
+  const lines = [];
+  lines.push('Plan kind: ' + (is2D ? '2D plate cutting' : '1D bar cutting'));
+  lines.push('Kerf: ' + (Number(draft.kerf_mm) || 0) + 'mm');
+  if (draft.procurement_mode) lines.push('Mode: procurement (recommend what to buy)');
+  const m = (draft.materials || [])[0];
+  if (m) {
+    const k = is2D ? cutComputePlateKgPerM2(m.spec, m.density_kg_per_m3) : cutComputeKgPerM(m.type, m.spec, m.density_kg_per_m3);
+    lines.push('Material: ' + cutFormatMaterialLabel(m.type, m.spec) + (k ? ' (' + k.toFixed(2) + ' kg/' + (is2D ? 'm²' : 'm') + ')' : ''));
+  }
+  lines.push('Pieces:');
+  for (const p of draft.pieces || []) {
+    if (is2D) {
+      lines.push('  - ' + (p.label || '?') + ': ' + p.widthMm + '×' + p.heightMm + 'mm × ' + p.qty + (p.pin_stock_size ? ' [pinned to ' + p.pin_stock_size + ']' : '') + (p.allow_rotation === false ? ' [no rotate]' : ''));
+    } else {
+      lines.push('  - ' + (p.label || '?') + ': ' + p.lengthMm + 'mm × ' + p.qty + (p.pin_stock_size ? ' [pinned to ' + p.pin_stock_size + 'mm]' : ''));
+    }
+  }
+  lines.push('Stocks:');
+  for (const s of draft.stocks || []) {
+    if (is2D) {
+      lines.push('  - ' + s.widthMm + '×' + s.heightMm + 'mm' + (draft.procurement_mode ? '' : ' × ' + s.qty) + (s.unitCost ? ' @ ₹' + s.unitCost + '/sheet' : ''));
+    } else {
+      lines.push('  - ' + s.lengthMm + 'mm' + (draft.procurement_mode ? '' : ' × ' + s.qty) + (s.unitCost ? ' @ ₹' + s.unitCost + '/bar' : ''));
+    }
+  }
+  if (result?.ok) {
+    if (is2D) {
+      lines.push('Result: ' + (result.stats.sheetsUsed || 0) + ' sheets used, ' + (result.stats.wastePct || 0).toFixed(1) + '% waste, ' + ((result.stats.wasteAreaMm2 || 0) / 1e6).toFixed(2) + ' m² scrap');
+      const sheets = result.sheets || [];
+      const wasteful = sheets.filter(sh => (sh.wasteArea / sh.stockArea) > 0.3).slice(0, 5);
+      for (const sh of wasteful) {
+        lines.push('  Sheet #' + sh.index + ': ' + sh.stockW + '×' + sh.stockH + 'mm, ' + (sh.wasteArea / 1e6).toFixed(2) + ' m² scrap (' + (sh.wasteArea / sh.stockArea * 100).toFixed(1) + '%)');
+      }
+    } else {
+      lines.push('Result: ' + (result.stats.barsUsed || 0) + ' bars used, ' + (result.stats.wastePct || 0).toFixed(1) + '% waste, ' + (result.stats.wasteMm || 0) + 'mm scrap');
+      const bars = result.bars || [];
+      const wasteful = bars.filter(b => (b.wasteMm / b.stockLength) > 0.25).slice(0, 5);
+      for (const b of wasteful) {
+        lines.push('  Bar #' + b.index + ': ' + b.stockLength + 'mm, ' + b.wasteMm + 'mm endbit (' + (b.wasteMm / b.stockLength * 100).toFixed(1) + '%)');
+      }
+    }
+    if (result.smartPick && result.smartPick.alternatives && result.smartPick.alternatives.length > 1) {
+      lines.push('Smart picker compared:');
+      for (const a of result.smartPick.alternatives.slice(0, 4)) {
+        lines.push('  - ' + (a.size === 'mix' ? 'mixed sizes' : a.size) + ': ' + a.used + ' used, ' + a.wastePct.toFixed(1) + '% waste');
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
+function CutAIAnalysis({ draft, result, plant }) {
+  const [analysis, setAnalysis] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const usable = !!result?.ok && (((result.stats.barsUsed || 0) + (result.stats.sheetsUsed || 0)) > 0);
+  if (!usable) return null;
+
+  const run = async () => {
+    setLoading(true); setError(null);
+    try {
+      const summary = cutBuildPlanSummary(draft, result);
+      const { data, error: err } = await sb.functions.invoke('analyze-cut-plan', {
+        body: { summary, plant_id: plant.id },
+      });
+      if (err) throw err;
+      if (data?.error) throw new Error(data.error);
+      setAnalysis(data?.analysis || null);
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return html`
+    <div class="card" style="padding:12px 14px;margin-bottom:12px;border:1px solid #fcd34d;background:linear-gradient(135deg,#fffbeb,#fef3c7)">
+      <div style="display:flex;justify-content:space-between;align-items:center;${analysis ? 'margin-bottom:10px' : ''}">
+        <div style="font-weight:700;font-size:12px;color:#92400e;display:flex;align-items:center;gap:6px">
+          <span>🤖</span><span>AI shop foreman</span>
+          ${analysis && html`<span style="font-weight:500;font-size:10px;color:#a16207">· Haiku 4.5 · ~₹0.03 / analysis</span>`}
+        </div>
+        <button type="button" class="btn small" onClick=${run} disabled=${loading} style="background:#92400e;color:white;padding:4px 10px;font-size:11px;border:none;border-radius:6px">
+          ${loading ? '…thinking' : (analysis ? 'Re-analyze' : 'Analyze plan')}
+        </button>
+      </div>
+      ${error && html`<div style="color:var(--rose-700);font-size:12px;padding:6px 0">⚠ ${error}</div>`}
+      ${analysis && html`
+        <div style="font-size:12px;color:#451a03">
+          ${analysis.summary && html`<div style="font-weight:600;margin-bottom:10px;line-height:1.4">${analysis.summary}</div>`}
+          ${analysis.concerns && analysis.concerns.length > 0 && html`
+            <div style="margin-bottom:10px">
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:#92400e;margin-bottom:5px;font-weight:700">Concerns</div>
+              <ul style="margin:0;padding-left:18px;font-size:11px;line-height:1.5">
+                ${analysis.concerns.map((c, i) => html`<li key=${i}>${c}</li>`)}
+              </ul>
+            </div>
+          `}
+          ${analysis.suggestions && analysis.suggestions.length > 0 && html`
+            <div>
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:#92400e;margin-bottom:5px;font-weight:700">Suggestions</div>
+              ${analysis.suggestions.map((s, i) => html`
+                <div key=${i} style="background:white;border:1px solid #fcd34d;border-radius:6px;padding:8px 10px;margin-bottom:6px">
+                  <div style="font-weight:700;font-size:12px;color:#78350f">${i+1}. ${s.title}</div>
+                  ${s.explanation && html`<div style="font-size:11px;color:#451a03;margin-top:3px;line-height:1.4">${s.explanation}</div>`}
+                  ${s.savings && html`<div style="font-size:11px;color:var(--emerald-700);margin-top:4px;font-weight:600">→ ${s.savings}</div>`}
+                </div>
+              `)}
+            </div>
+          `}
+        </div>
+      `}
+    </div>
   `;
 }
 
