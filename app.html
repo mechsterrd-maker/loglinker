@@ -13026,21 +13026,42 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
                 return;
               }
               const proc = draft.procurement_mode === true;
-              const suggestions = cutSuggestBarLengths(allPieces, { procurement: proc, kerf_mm: draft.kerf_mm });
-              if (suggestions.length === 0) {
-                const maxLen = Math.max.apply(null, allPieces.map(p => Number(p.lengthMm) || 0));
-                showToast('Longest piece ' + maxLen + 'mm exceeds the 12m market max. Add stock manually.');
-                return;
-              }
-              const firstMat = (draft.materials && draft.materials[0]) ? draft.materials[0].id : null;
               const next = proc ? [] : [...draft.stocks];
-              for (const s of suggestions) {
-                next.push({ id: 's' + Date.now() + Math.random().toString(36).slice(2,5), material_id: firstMat, lengthMm: s.lengthMm, qty: 50, unitCost: 0 });
+              // Group pieces by material so each material gets its own recommendation.
+              const groupedByMaterial = new Map();
+              for (const p of allPieces) {
+                const mid = p.material_id || (materials[0] && materials[0].id);
+                if (!groupedByMaterial.has(mid)) groupedByMaterial.set(mid, []);
+                groupedByMaterial.get(mid).push(p);
+              }
+              const perMatResult = [];
+              for (const [matId, group] of groupedByMaterial) {
+                const suggestions = cutSuggestBarLengths(group, { procurement: proc, kerf_mm: draft.kerf_mm });
+                if (suggestions.length === 0) {
+                  const maxLen = Math.max.apply(null, group.map(p => Number(p.lengthMm) || 0));
+                  const matLabel = (materials.find(m => m.id === matId) || {});
+                  const matName = matLabel.type ? cutFormatMaterialLabel(matLabel.type, matLabel.spec) : 'material';
+                  perMatResult.push({ matId, error: matName + ': longest piece ' + maxLen + 'mm > 12m market max' });
+                  continue;
+                }
+                for (const s of suggestions) {
+                  // Skip if a stock row with the same length + material already exists.
+                  const dupe = next.some(x => x.material_id === matId && Number(x.lengthMm) === s.lengthMm);
+                  if (dupe) continue;
+                  next.push({ id: 's' + Date.now() + Math.random().toString(36).slice(2,5), material_id: matId, lengthMm: s.lengthMm, qty: 50, unitCost: 0 });
+                }
+                perMatResult.push({ matId, best: suggestions[0] });
               }
               setDraft(Object.assign({}, draft, { stocks: next }));
-              const best = suggestions[0];
-              showToast('✓ ' + (best.lengthMm / 1000).toFixed(2) + 'm — ' + best.barsUsed + ' bar' + (best.barsUsed === 1 ? '' : 's') + ', ' + best.wastePct.toFixed(1) + '% waste');
-            }} style="padding:3px 8px;font-size:11px" title=${draft.procurement_mode === true ? 'Recommend ONE market-standard bar length to buy for these pieces' : 'Suggest the best market-standard bar lengths for these pieces'}>✨ Suggest</button>
+              // Build per-material toast.
+              const lines = perMatResult.map(r => {
+                if (r.error) return '⚠ ' + r.error;
+                const matLabel = (materials.find(m => m.id === r.matId) || {});
+                const matName = matLabel.type ? cutFormatMaterialLabel(matLabel.type, matLabel.spec) : '';
+                return (matName ? matName + ' → ' : '') + (r.best.lengthMm / 1000).toFixed(2) + 'm, ' + r.best.wastePct.toFixed(1) + '% waste';
+              });
+              showToast('✓ ' + lines.join(' · '));
+            }} style="padding:3px 8px;font-size:11px" title=${draft.procurement_mode === true ? 'Recommend bar lengths to buy, per material' : 'Suggest the best bar lengths per material'}>✨ Suggest</button>
             <button class="btn small ghost" onClick=${addStock} style="padding:3px 8px;font-size:11px">+ Add</button>
           </div>
         </div>
