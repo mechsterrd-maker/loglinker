@@ -12215,71 +12215,127 @@ function cutComputePlateKgPerM2(spec, density) {
 
 // Smart stock pick: for each unique stock size, try planning using ONLY that
 // size, then pick the result with the least waste. Tie-break on lowest cost.
-// Also tries the "use everything mixed" option (in stock mode) for cases where
-// mixing sizes beats any one alone. In procurement mode, qty is treated as
-// effectively unlimited so the algorithm doesn't get blocked by inventory.
+// Pieces with pin_stock_size set are routed to that size specifically and skip
+// the smart-pick step. In procurement mode qty is treated as effectively
+// unlimited so the algorithm doesn't get blocked by inventory.
 function planMultiStockPick({ pieces, stocks, kerfMm, dim, procurement }) {
   const is2D = dim === '2d';
   const sizeKey = is2D ? (s => s.widthMm + 'x' + s.heightMm) : (s => String(s.lengthMm));
   const effective = procurement
     ? (stocks || []).map(s => Object.assign({}, s, { qty: 9999 }))
     : (stocks || []);
-
-  const runPack = (subset) => is2D
-    ? planSingleSheet({ pieces, stocks: subset, kerfMm })
-    : planSingleMaterial({ pieces, stocks: subset, kerfMm });
-
-  const wasteOf = (r) => is2D ? r.stats.wasteAreaMm2 : r.stats.wasteMm;
-  const usedOf  = (r) => is2D ? r.stats.sheetsUsed   : r.stats.barsUsed;
-
-  // Group by size; collect candidate single-size runs.
-  const sizes = [];
+  const allSizes = [];
   const seen = new Set();
   for (const s of effective) {
     const k = sizeKey(s);
-    if (!seen.has(k)) { seen.add(k); sizes.push(k); }
+    if (!seen.has(k)) { seen.add(k); allSizes.push(k); }
   }
 
-  if (sizes.length <= 1) {
-    return runPack(effective);
+  // Partition by pin
+  const pinned = new Map();
+  const autoPieces = [];
+  for (const p of (pieces || [])) {
+    const pin = p.pin_stock_size;
+    if (pin && allSizes.indexOf(pin) >= 0) {
+      if (!pinned.has(pin)) pinned.set(pin, []);
+      pinned.get(pin).push(p);
+    } else {
+      autoPieces.push(p);
+    }
   }
 
-  const candidates = [];
-  for (const sz of sizes) {
+  const runPack = (pcs, stks) => is2D
+    ? planSingleSheet({ pieces: pcs, stocks: stks, kerfMm })
+    : planSingleMaterial({ pieces: pcs, stocks: stks, kerfMm });
+  const wasteOf = (r) => is2D ? r.stats.wasteAreaMm2 : r.stats.wasteMm;
+  const usedOf  = (r) => is2D ? r.stats.sheetsUsed   : r.stats.barsUsed;
+
+  // Initialise combined output
+  const combined = {
+    ok: true,
+    strategy: is2D ? null : 'mixed',
+    [is2D ? 'sheets' : 'bars']: [],
+    stats: is2D
+      ? { sheetsUsed: 0, totalStockAreaMm2: 0, totalPiecesAreaMm2: 0, wasteAreaMm2: 0, wastePct: 0, totalCost: 0 }
+      : { barsUsed: 0, totalStockMm: 0, totalPiecesMm: 0, totalKerfMm: 0, wasteMm: 0, wastePct: 0, totalCost: 0 },
+  };
+  const mergeIn = (r) => {
+    if (is2D) {
+      combined.sheets.push(...r.sheets);
+      combined.stats.sheetsUsed += r.stats.sheetsUsed;
+      combined.stats.totalStockAreaMm2 += r.stats.totalStockAreaMm2;
+      combined.stats.totalPiecesAreaMm2 += r.stats.totalPiecesAreaMm2;
+      combined.stats.wasteAreaMm2 += r.stats.wasteAreaMm2;
+      combined.stats.totalCost += r.stats.totalCost;
+    } else {
+      combined.bars.push(...r.bars);
+      combined.stats.barsUsed += r.stats.barsUsed;
+      combined.stats.totalStockMm += r.stats.totalStockMm;
+      combined.stats.totalPiecesMm += r.stats.totalPiecesMm;
+      combined.stats.totalKerfMm += r.stats.totalKerfMm;
+      combined.stats.wasteMm += r.stats.wasteMm;
+      combined.stats.totalCost += r.stats.totalCost;
+    }
+  };
+
+  // Pack pinned groups: each goes to its assigned stock size only.
+  for (const [sz, group] of pinned) {
     const subset = effective.filter(s => sizeKey(s) === sz);
-    const r = runPack(subset);
-    if (r.ok) candidates.push({ size: sz, result: r });
-  }
-  // The "mix everything" option only makes sense in stock mode (procurement
-  // means buying one size; mixing would mean multiple purchases).
-  if (!procurement) {
-    const r = runPack(effective);
-    if (r.ok) candidates.push({ size: 'mix', result: r });
+    const r = runPack(group, subset);
+    if (!r.ok) return r;
+    mergeIn(r);
   }
 
-  if (candidates.length === 0) {
-    return runPack(effective); // returns the last error
+  // Pack auto pieces with smart pick.
+  let smartPick = null;
+  if (autoPieces.length > 0) {
+    if (allSizes.length <= 1) {
+      const r = runPack(autoPieces, effective);
+      if (!r.ok) return r;
+      mergeIn(r);
+    } else {
+      const candidates = [];
+      for (const sz of allSizes) {
+        const subset = effective.filter(s => sizeKey(s) === sz);
+        const r = runPack(autoPieces, subset);
+        if (r.ok) candidates.push({ size: sz, result: r });
+      }
+      if (!procurement) {
+        const r = runPack(autoPieces, effective);
+        if (r.ok) candidates.push({ size: 'mix', result: r });
+      }
+      if (candidates.length === 0) return runPack(autoPieces, effective);
+      candidates.sort((a, b) => {
+        const wa = wasteOf(a.result), wb = wasteOf(b.result);
+        if (Math.abs(wa - wb) > 0.001) return wa - wb;
+        const ca = a.result.stats.totalCost || 0, cb = b.result.stats.totalCost || 0;
+        return ca - cb;
+      });
+      const best = candidates[0];
+      mergeIn(best.result);
+      smartPick = {
+        winnerSize: best.size,
+        alternatives: candidates.map(c => ({
+          size: c.size,
+          used: usedOf(c.result),
+          wastePct: c.result.stats.wastePct,
+          wasteAbs: wasteOf(c.result),
+          cost: c.result.stats.totalCost || 0,
+        })),
+      };
+    }
   }
 
-  candidates.sort((a, b) => {
-    const wa = wasteOf(a.result), wb = wasteOf(b.result);
-    if (Math.abs(wa - wb) > 0.001) return wa - wb;
-    const ca = a.result.stats.totalCost || 0, cb = b.result.stats.totalCost || 0;
-    return ca - cb;
-  });
-  const best = candidates[0];
-  return Object.assign({}, best.result, {
-    smartPick: {
-      winnerSize: best.size,
-      alternatives: candidates.map(c => ({
-        size: c.size,
-        used: usedOf(c.result),
-        wastePct: c.result.stats.wastePct,
-        wasteAbs: wasteOf(c.result),
-        cost: c.result.stats.totalCost || 0,
-      })),
-    },
-  });
+  // Reindex output items
+  const itemsKey = is2D ? 'sheets' : 'bars';
+  combined[itemsKey] = combined[itemsKey].map((item, i) => Object.assign({}, item, { index: i + 1 }));
+
+  // Recompute wastePct from aggregated totals.
+  const totalStock = is2D ? combined.stats.totalStockAreaMm2 : combined.stats.totalStockMm;
+  const waste = is2D ? combined.stats.wasteAreaMm2 : combined.stats.wasteMm;
+  combined.stats.wastePct = totalStock > 0 ? (waste / totalStock) * 100 : 0;
+  combined.smartPick = smartPick;
+  return combined;
 }
 
 // Endbit advisor: for a bar with significant scrap, list which pieces from the
@@ -12630,7 +12686,7 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
 
   const updatePiece = (idx, field, val) => {
     const next = draft.pieces.slice();
-    const isText = field === 'label' || field === 'material_id';
+    const isText = field === 'label' || field === 'material_id' || field === 'pin_stock_size';
     next[idx] = Object.assign({}, next[idx], { [field]: isText ? val : (Number(val) || 0) });
     setDraft(Object.assign({}, draft, { pieces: next }));
   };
@@ -12761,11 +12817,16 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
             ${materials.length > 1 && html`<th style="text-align:left;padding:4px 2px">Material</th>`}
             <th style="text-align:left;padding:4px 2px">Label</th>
             <th style="text-align:right;padding:4px 2px;width:74px">Length mm</th>
-            <th style="text-align:right;padding:4px 2px;width:54px">Qty</th>
+            <th style="text-align:right;padding:4px 2px;width:42px">Qty</th>
+            <th style="text-align:left;padding:4px 2px;width:80px" title="Pin this piece to a specific bar length, or leave Auto">Bar</th>
             <th style="width:22px"></th>
           </tr></thead>
           <tbody>
-            ${draft.pieces.map((p, idx) => html`
+            ${draft.pieces.map((p, idx) => {
+              const myStocks = draft.stocks.filter(s => !p.material_id || s.material_id === p.material_id);
+              const seenSz = new Set();
+              const sizeOpts = myStocks.filter(s => { const k = String(s.lengthMm); if (seenSz.has(k)) return false; seenSz.add(k); return true; });
+              return html`
               <tr key=${p.id} style=${materials.length > 1 ? ('border-left:4px solid ' + cutMaterialColor(p.material_id || (materials[0] && materials[0].id))) : ''}>
                 ${materials.length > 1 && html`<td style="padding:3px 2px">
                   <${CutRowMaterialPicker} value=${p.material_id} materials=${materials} onChange=${v => updatePiece(idx, 'material_id', v)} />
@@ -12776,23 +12837,29 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
                 </div></td>
                 <td style="padding:3px 2px"><input type="number" value=${p.lengthMm} onChange=${e => updatePiece(idx, 'lengthMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
                 <td style="padding:3px 2px"><input type="number" value=${p.qty} onChange=${e => updatePiece(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px">
+                  <select value=${p.pin_stock_size || ''} onChange=${e => updatePiece(idx, 'pin_stock_size', e.target.value || null)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 4px;font-size:11px;background:white">
+                    <option value="">Auto</option>
+                    ${sizeOpts.map(s => html`<option key=${s.lengthMm} value=${String(s.lengthMm)}>${(s.lengthMm/1000).toFixed(2)}m</option>`)}
+                  </select>
+                </td>
                 <td style="padding:3px 2px;text-align:center"><button onClick=${() => removePiece(idx)} style="background:none;border:none;color:var(--slate-400);cursor:pointer;font-size:14px;padding:2px 4px" title="Remove">×</button></td>
               </tr>
-            `)}
+            `})}
           </tbody>
         </table>
       </div>
 
       <div class="card" style="padding:12px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-          <div style="font-weight:700;font-size:13px">Stock available</div>
+          <div style="font-weight:700;font-size:13px">${draft.procurement_mode === true ? 'Candidate bar lengths' : 'Stock available'}</div>
           <button class="btn small ghost" onClick=${addStock} style="padding:3px 8px;font-size:11px">+ Add</button>
         </div>
         <table style="width:100%;font-size:12px;border-collapse:collapse">
           <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
             ${materials.length > 1 && html`<th style="text-align:left;padding:4px 2px">Material</th>`}
             <th style="text-align:right;padding:4px 2px;width:74px">Length mm</th>
-            <th style="text-align:right;padding:4px 2px;width:54px">Qty</th>
+            ${draft.procurement_mode !== true && html`<th style="text-align:right;padding:4px 2px;width:54px">Qty</th>`}
             <th style="text-align:right;padding:4px 2px;width:64px">Cost/bar</th>
             <th style="width:22px"></th>
           </tr></thead>
@@ -12803,7 +12870,7 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
                   <${CutRowMaterialPicker} value=${s.material_id} materials=${materials} onChange=${v => updateStock(idx, 'material_id', v)} />
                 </td>`}
                 <td style="padding:3px 2px"><input type="number" value=${s.lengthMm} onChange=${e => updateStock(idx, 'lengthMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
-                <td style="padding:3px 2px"><input type="number" value=${s.qty} onChange=${e => updateStock(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                ${draft.procurement_mode !== true && html`<td style="padding:3px 2px"><input type="number" value=${s.qty} onChange=${e => updateStock(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>`}
                 <td style="padding:3px 2px"><input type="number" value=${s.unitCost} onChange=${e => updateStock(idx, 'unitCost', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
                 <td style="padding:3px 2px;text-align:center"><button onClick=${() => removeStock(idx)} style="background:none;border:none;color:var(--slate-400);cursor:pointer;font-size:14px;padding:2px 4px">×</button></td>
               </tr>
@@ -12966,7 +13033,7 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
 
   const updatePiece = (idx, field, val) => {
     const next = draft.pieces.slice();
-    const isText = field === 'label';
+    const isText = field === 'label' || field === 'pin_stock_size';
     const isBool = field === 'allow_rotation';
     next[idx] = Object.assign({}, next[idx], { [field]: isText ? val : (isBool ? !!val : (Number(val) || 0)) });
     setDraft(Object.assign({}, draft, { pieces: next }));
@@ -13092,6 +13159,7 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
             <th style="text-align:right;padding:4px 2px;width:54px">W mm</th>
             <th style="text-align:right;padding:4px 2px;width:54px">H mm</th>
             <th style="text-align:right;padding:4px 2px;width:42px">Qty</th>
+            <th style="text-align:left;padding:4px 2px;width:90px" title="Pin this piece to a specific sheet size, or leave Auto">Sheet</th>
             <th style="text-align:center;padding:4px 2px;width:32px" title="Allow rotation 90°">↻</th>
             <th style="width:20px"></th>
           </tr></thead>
@@ -13105,6 +13173,18 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
                 <td style="padding:3px 2px"><input type="number" value=${p.widthMm} onChange=${e => updatePiece(idx, 'widthMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
                 <td style="padding:3px 2px"><input type="number" value=${p.heightMm} onChange=${e => updatePiece(idx, 'heightMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
                 <td style="padding:3px 2px"><input type="number" value=${p.qty} onChange=${e => updatePiece(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px">
+                  <select value=${p.pin_stock_size || ''} onChange=${e => updatePiece(idx, 'pin_stock_size', e.target.value || null)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 4px;font-size:11px;background:white">
+                    <option value="">Auto</option>
+                    ${(() => {
+                      const seen = new Set();
+                      return draft.stocks.filter(s => {
+                        const k = s.widthMm + 'x' + s.heightMm;
+                        if (seen.has(k)) return false; seen.add(k); return true;
+                      }).map(s => html`<option key=${s.widthMm+'x'+s.heightMm} value=${s.widthMm+'x'+s.heightMm}>${s.widthMm}×${s.heightMm}</option>`);
+                    })()}
+                  </select>
+                </td>
                 <td style="padding:3px 2px;text-align:center"><input type="checkbox" checked=${p.allow_rotation !== false} onChange=${e => updatePiece(idx, 'allow_rotation', e.target.checked)} /></td>
                 <td style="padding:3px 2px;text-align:center"><button onClick=${() => removePiece(idx)} style="background:none;border:none;color:var(--slate-400);cursor:pointer;font-size:14px;padding:2px 4px">×</button></td>
               </tr>
@@ -13115,14 +13195,14 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
 
       <div class="card" style="padding:12px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-          <div style="font-weight:700;font-size:13px">Sheet stock</div>
+          <div style="font-weight:700;font-size:13px">${draft.procurement_mode === true ? 'Candidate sheet sizes' : 'Sheet stock'}</div>
           <button class="btn small ghost" onClick=${addStock} style="padding:3px 8px;font-size:11px">+ Add</button>
         </div>
         <table style="width:100%;font-size:12px;border-collapse:collapse">
           <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
             <th style="text-align:right;padding:4px 2px;width:62px">W mm</th>
             <th style="text-align:right;padding:4px 2px;width:62px">H mm</th>
-            <th style="text-align:right;padding:4px 2px;width:48px">Qty</th>
+            ${draft.procurement_mode !== true && html`<th style="text-align:right;padding:4px 2px;width:48px">Qty</th>`}
             <th style="text-align:right;padding:4px 2px;width:64px">Cost/sheet</th>
             <th style="width:22px"></th>
           </tr></thead>
@@ -13131,7 +13211,7 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
               <tr key=${s.id}>
                 <td style="padding:3px 2px"><input type="number" value=${s.widthMm} onChange=${e => updateStock(idx, 'widthMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
                 <td style="padding:3px 2px"><input type="number" value=${s.heightMm} onChange=${e => updateStock(idx, 'heightMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
-                <td style="padding:3px 2px"><input type="number" value=${s.qty} onChange=${e => updateStock(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                ${draft.procurement_mode !== true && html`<td style="padding:3px 2px"><input type="number" value=${s.qty} onChange=${e => updateStock(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>`}
                 <td style="padding:3px 2px"><input type="number" value=${s.unitCost} onChange=${e => updateStock(idx, 'unitCost', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
                 <td style="padding:3px 2px;text-align:center"><button onClick=${() => removeStock(idx)} style="background:none;border:none;color:var(--slate-400);cursor:pointer;font-size:14px;padding:2px 4px">×</button></td>
               </tr>
