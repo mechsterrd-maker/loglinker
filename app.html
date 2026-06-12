@@ -12109,6 +12109,7 @@ function cutPlatePlaceRect(sheet, rect, rectIdx, item, pw, ph, rotated, kerf) {
     pieceId: item.pieceId, label: item.label,
     x: rect.x, y: rect.y, w: pw, h: ph,
     rotated, origW: item.w, origH: item.h,
+    shape: item.shape || 'rect',
   });
   sheet.freeRects.splice(rectIdx, 1);
   // Guillotine "long right" split — right rect spans the parent's full height,
@@ -12127,7 +12128,7 @@ function planSingleSheet({ pieces, stocks, kerfMm }) {
     const qty = Math.max(0, Math.floor(Number(p.qty) || 0));
     if (w <= 0 || h <= 0 || qty <= 0) continue;
     for (let i = 0; i < qty; i++) {
-      items.push({ id: p.id + ':' + i, pieceId: p.id, label: p.label || 'piece', w, h, allowRotation: p.allow_rotation !== false });
+      items.push({ id: p.id + ':' + i, pieceId: p.id, label: p.label || 'piece', w, h, allowRotation: p.allow_rotation !== false, shape: p.shape || 'rect' });
     }
   }
   items.sort((a, b) => (b.w * b.h) - (a.w * a.h));
@@ -12250,31 +12251,36 @@ function cutSuggestSheetSizes(pieces, opts) {
     if (!r.ok) continue;
     candidates.push({ widthMm: s.w, heightMm: s.h, sheetsUsed: r.stats.sheetsUsed, wastePct: r.stats.wastePct, custom: false });
   }
-  // Custom mill-cut (heavy plate only). We scan a range of aspect ratios from
-  // square to 4:1, run the actual packer for each, and pick the one with the
-  // LOWEST waste. If two candidates are within 2 percentage points of each
-  // other, we softly prefer the more-square option -- but a clearly better
-  // rectangle always beats a square.
+  // Custom mill-cut (heavy plate only). For each aspect ratio, iterate from
+  // the theoretical-minimum area upward in small steps until pieces fit; that
+  // first-fit IS the tightest possible plate for that aspect. We collect one
+  // candidate per aspect and pick the lowest waste overall. The 2-pt
+  // tie-break still prefers a more-square option when waste is similar.
   if (allowCustom && longSide <= MILL_MAX_L && shortSide <= MILL_MAX_W) {
     const totalPieceArea = valid.reduce((sum, p) => sum + p.widthMm * p.heightMm * p.qty, 0);
-    const targetArea = totalPieceArea * 1.20; // 20% buffer for kerf + packing
-    const aspects = [1.0, 1.2, 1.4, 1.7, 2.0, 2.5, 3.0, 4.0];
+    const aspects = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.7, 2.0, 2.5, 3.0];
+    const scales = [1.00, 1.02, 1.04, 1.06, 1.08, 1.10, 1.13, 1.16, 1.20, 1.25, 1.30, 1.40, 1.55];
     const customAttempts = [];
     for (const ar of aspects) {
-      let h = Math.sqrt(targetArea * ar);
-      let w = h / ar;
-      if (w < shortSide) w = shortSide;
-      if (h < longSide) h = longSide;
-      const W = Math.ceil(w / 10) * 10;
-      const H = Math.ceil(h / 10) * 10;
-      if (W > MILL_MAX_W || H > MILL_MAX_L) continue;
-      const fakeStock = [{ id: 'cust', widthMm: W, heightMm: H, qty: 9999, unitCost: 0 }];
-      const r = planSingleSheet({ pieces: valid, stocks: fakeStock, kerfMm });
-      if (r.ok && r.sheets.length === 1) {
-        customAttempts.push({ widthMm: W, heightMm: H, sheetsUsed: 1, wastePct: r.stats.wastePct, ar });
+      for (const scale of scales) {
+        const area = totalPieceArea * scale;
+        const w = Math.sqrt(area / ar);
+        const h = w * ar;
+        let W = Math.ceil(w / 10) * 10;
+        let H = Math.ceil(h / 10) * 10;
+        if (W < shortSide) W = Math.ceil(shortSide / 10) * 10;
+        if (H < longSide) H = Math.ceil(longSide / 10) * 10;
+        if (W > MILL_MAX_W || H > MILL_MAX_L) continue;
+        const fakeStock = [{ id: 'cust', widthMm: W, heightMm: H, qty: 1, unitCost: 0 }];
+        const r = planSingleSheet({ pieces: valid, stocks: fakeStock, kerfMm });
+        if (r.ok && r.sheets.length === 1) {
+          // Actual waste from the plate area we picked
+          const wastePct = Math.max(0, (1 - totalPieceArea / (W * H)) * 100);
+          customAttempts.push({ widthMm: W, heightMm: H, wastePct, ar });
+          break; // tightest scale for this aspect found
+        }
       }
     }
-    // Lowest waste wins. Within 2pts, prefer the more square (smaller ar).
     customAttempts.sort((a, b) => {
       if (Math.abs(a.wastePct - b.wastePct) > 2) return a.wastePct - b.wastePct;
       return a.ar - b.ar;
@@ -13161,16 +13167,25 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
 
   const updatePiece = (idx, field, val) => {
     const next = draft.pieces.slice();
-    const isText = field === 'label' || field === 'pin_stock_size' || field === 'material_id';
+    const isText = field === 'label' || field === 'pin_stock_size' || field === 'material_id' || field === 'shape';
     const isBool = field === 'allow_rotation';
-    next[idx] = Object.assign({}, next[idx], { [field]: isText ? val : (isBool ? !!val : (Number(val) || 0)) });
+    const newVal = isText ? val : (isBool ? !!val : (Number(val) || 0));
+    next[idx] = Object.assign({}, next[idx], { [field]: newVal });
+    // Round pieces have a single diameter, so keep heightMm in sync with widthMm.
+    if (field === 'shape' && newVal === 'round') {
+      next[idx].heightMm = next[idx].widthMm;
+    } else if (field === 'widthMm' && next[idx].shape === 'round') {
+      next[idx].heightMm = newVal;
+    } else if (field === 'heightMm' && next[idx].shape === 'round') {
+      next[idx].widthMm = newVal;
+    }
     setDraft(Object.assign({}, draft, { pieces: next }));
   };
   const addPiece = () => {
     const id = 'p' + Date.now();
     const firstMat = materials[0]?.id || null;
     setDraft(Object.assign({}, draft, {
-      pieces: [...draft.pieces, { id, material_id: firstMat, widthMm: 400, heightMm: 300, qty: 1, label: 'Plate ' + String.fromCharCode(65 + (draft.pieces.length % 26)), allow_rotation: true }],
+      pieces: [...draft.pieces, { id, material_id: firstMat, shape: 'rect', widthMm: 400, heightMm: 300, qty: 1, label: 'Plate ' + String.fromCharCode(65 + (draft.pieces.length % 26)), allow_rotation: true }],
     }));
   };
   const removePiece = (idx) => setDraft(Object.assign({}, draft, { pieces: draft.pieces.filter((_, i) => i !== idx) }));
@@ -13287,9 +13302,10 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
         <table style="width:100%;font-size:12px;border-collapse:collapse">
           <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
             <th style="text-align:left;padding:4px 2px;width:90px">Material</th>
+            <th style="text-align:left;padding:4px 2px;width:62px" title="Rectangular plate or round disc">Shape</th>
             <th style="text-align:left;padding:4px 2px">Label</th>
-            <th style="text-align:right;padding:4px 2px;width:54px">W mm</th>
-            <th style="text-align:right;padding:4px 2px;width:54px">H mm</th>
+            <th style="text-align:right;padding:4px 2px;width:54px" title="Width (rect) or diameter (round)">W / Ø</th>
+            <th style="text-align:right;padding:4px 2px;width:54px" title="Height (rect)">H mm</th>
             <th style="text-align:right;padding:4px 2px;width:42px">Qty</th>
             <th style="text-align:left;padding:4px 2px;width:90px" title="Pin this piece to a specific sheet size, or leave Auto">Sheet</th>
             <th style="text-align:center;padding:4px 2px;width:32px" title="Allow rotation 90°">↻</th>
@@ -13301,12 +13317,18 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
                 <td style="padding:3px 2px">
                   <${CutRowMaterialPicker} value=${p.material_id} materials=${materials} onChange=${v => updatePiece(idx, 'material_id', v)} />
                 </td>
+                <td style="padding:3px 2px">
+                  <select value=${p.shape || 'rect'} onChange=${e => updatePiece(idx, 'shape', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 4px;font-size:11px;background:white">
+                    <option value="rect">▭ Rect</option>
+                    <option value="round">◯ Round</option>
+                  </select>
+                </td>
                 <td style="padding:3px 2px"><div style="display:flex;align-items:center;gap:6px">
-                  <span style=${'width:10px;height:10px;border-radius:3px;flex-shrink:0;background:' + colorFor(p.id)}></span>
+                  <span style=${'width:10px;height:10px;border-radius:'+(p.shape==='round'?'50%':'3px')+';flex-shrink:0;background:' + colorFor(p.id)}></span>
                   <input type="text" value=${p.label} onChange=${e => updatePiece(idx, 'label', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px" />
                 </div></td>
                 <td style="padding:3px 2px"><input type="number" value=${p.widthMm} onChange=${e => updatePiece(idx, 'widthMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
-                <td style="padding:3px 2px"><input type="number" value=${p.heightMm} onChange=${e => updatePiece(idx, 'heightMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
+                <td style="padding:3px 2px"><input type="number" value=${p.heightMm} onChange=${e => updatePiece(idx, 'heightMm', e.target.value)} disabled=${p.shape === 'round'} style=${'width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right;background:' + (p.shape === 'round' ? 'var(--slate-100)' : 'white') + ';color:' + (p.shape === 'round' ? 'var(--slate-500)' : 'inherit')} title=${p.shape === 'round' ? 'For round pieces, H follows the diameter automatically' : 'Height (mm)'} /></td>
                 <td style="padding:3px 2px"><input type="number" value=${p.qty} onChange=${e => updatePiece(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
                 <td style="padding:3px 2px">
                   <select value=${p.pin_stock_size || ''} onChange=${e => updatePiece(idx, 'pin_stock_size', e.target.value || null)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 4px;font-size:11px;background:white">
@@ -13498,7 +13520,6 @@ function CutSheetSvg({ sheet, colorFor }) {
       <rect x="0" y="0" width=${viewW} height=${viewH} fill="url(#sheetWasteHatch)" />
       ${rotate90 && html`<text x=${viewW - 6} y=${14} font-size="9" fill="#94a3b8" text-anchor="end">↻ rotated to fit</text>`}
       ${sheet.placed.map((p, i) => {
-        // Transpose if we rotated the sheet for display.
         const px = rotate90 ? p.y : p.x;
         const py = rotate90 ? p.x : p.y;
         const pw = rotate90 ? p.h : p.w;
@@ -13508,16 +13529,22 @@ function CutSheetSvg({ sheet, colorFor }) {
         const w = pw * scale;
         const h = ph * scale;
         const color = colorFor(p.pieceId);
+        const isRound = p.shape === 'round';
         const wLabel = p.rotated ? p.origH : p.origW;
         const hLabel = p.rotated ? p.origW : p.origH;
-        const dimsLabel = wLabel + '×' + hLabel + (p.rotated ? ' ↻' : '');
+        const dimsLabel = isRound ? ('Ø' + p.origW) : (wLabel + '×' + hLabel + (p.rotated ? ' ↻' : ''));
         const fontSize = Math.max(8, Math.min(16, Math.min(w, h) / 10));
         return html`
           <g key=${i}>
-            <rect class="sheet-rect" style=${'animation-delay:' + (i * 0.05) + 's'}
-              x=${x} y=${y} width=${w} height=${h} fill=${color} opacity="0.9" stroke="white" stroke-width="1">
-              <title>${p.label} · ${dimsLabel}mm${p.rotated ? ' (rotated)' : ''}</title>
-            </rect>
+            ${isRound
+              ? html`<circle class="sheet-rect" style=${'animation-delay:' + (i * 0.05) + 's'}
+                  cx=${x + w/2} cy=${y + h/2} r=${Math.min(w, h)/2} fill=${color} opacity="0.9" stroke="white" stroke-width="1">
+                  <title>${p.label} · ${dimsLabel}mm${p.rotated ? ' (rotated)' : ''}</title>
+                </circle>`
+              : html`<rect class="sheet-rect" style=${'animation-delay:' + (i * 0.05) + 's'}
+                  x=${x} y=${y} width=${w} height=${h} fill=${color} opacity="0.9" stroke="white" stroke-width="1">
+                  <title>${p.label} · ${dimsLabel}mm${p.rotated ? ' (rotated)' : ''}</title>
+                </rect>`}
             ${w > 50 && h > 24 && html`<text class="sheet-text" style=${'animation-delay:'+(i*0.05+0.18)+'s'}
               x=${x + w/2} y=${y + h/2 - 2} font-size=${fontSize} font-weight="700" fill="white" text-anchor="middle" dominant-baseline="middle" pointer-events="none">${p.label}</text>`}
             ${w > 80 && h > 40 && html`<text class="sheet-text" style=${'animation-delay:'+(i*0.05+0.22)+'s'}
