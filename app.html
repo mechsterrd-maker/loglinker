@@ -175,8 +175,7 @@ body{
 .sheet-svg .sheet-rect{transform-box:fill-box;transform-origin:center;animation:sheetPieceIn 0.4s cubic-bezier(0.22,0.61,0.36,1) both}
 .sheet-svg .sheet-text{animation:barFadeIn 0.3s ease both}
 .cut-stat-num.tick{animation:statPulse 0.55s ease both}
-.cut-ribbon{position:relative;overflow:hidden}
-.cut-ribbon::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 30%,rgba(255,255,255,0.5) 50%,transparent 70%);background-size:200% 100%;animation:ribbonShine 2.2s ease-in-out infinite;pointer-events:none}
+.cut-ribbon{position:relative}
 .modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
 .modal-title{font-family:'Bricolage Grotesque',sans-serif;font-size:20px;font-weight:700}
 .close-btn{background:var(--slate-100);border:none;border-radius:50%;width:32px;height:32px;cursor:pointer;color:var(--slate-600);font-size:18px;line-height:1}
@@ -12214,6 +12213,75 @@ function cutComputePlateKgPerM2(spec, density) {
   return t * rho * 1e-3; // mm × kg/m³ × 1e-3 = kg/m²
 }
 
+// Smart stock pick: for each unique stock size, try planning using ONLY that
+// size, then pick the result with the least waste. Tie-break on lowest cost.
+// Also tries the "use everything mixed" option (in stock mode) for cases where
+// mixing sizes beats any one alone. In procurement mode, qty is treated as
+// effectively unlimited so the algorithm doesn't get blocked by inventory.
+function planMultiStockPick({ pieces, stocks, kerfMm, dim, procurement }) {
+  const is2D = dim === '2d';
+  const sizeKey = is2D ? (s => s.widthMm + 'x' + s.heightMm) : (s => String(s.lengthMm));
+  const effective = procurement
+    ? (stocks || []).map(s => Object.assign({}, s, { qty: 9999 }))
+    : (stocks || []);
+
+  const runPack = (subset) => is2D
+    ? planSingleSheet({ pieces, stocks: subset, kerfMm })
+    : planSingleMaterial({ pieces, stocks: subset, kerfMm });
+
+  const wasteOf = (r) => is2D ? r.stats.wasteAreaMm2 : r.stats.wasteMm;
+  const usedOf  = (r) => is2D ? r.stats.sheetsUsed   : r.stats.barsUsed;
+
+  // Group by size; collect candidate single-size runs.
+  const sizes = [];
+  const seen = new Set();
+  for (const s of effective) {
+    const k = sizeKey(s);
+    if (!seen.has(k)) { seen.add(k); sizes.push(k); }
+  }
+
+  if (sizes.length <= 1) {
+    return runPack(effective);
+  }
+
+  const candidates = [];
+  for (const sz of sizes) {
+    const subset = effective.filter(s => sizeKey(s) === sz);
+    const r = runPack(subset);
+    if (r.ok) candidates.push({ size: sz, result: r });
+  }
+  // The "mix everything" option only makes sense in stock mode (procurement
+  // means buying one size; mixing would mean multiple purchases).
+  if (!procurement) {
+    const r = runPack(effective);
+    if (r.ok) candidates.push({ size: 'mix', result: r });
+  }
+
+  if (candidates.length === 0) {
+    return runPack(effective); // returns the last error
+  }
+
+  candidates.sort((a, b) => {
+    const wa = wasteOf(a.result), wb = wasteOf(b.result);
+    if (Math.abs(wa - wb) > 0.001) return wa - wb;
+    const ca = a.result.stats.totalCost || 0, cb = b.result.stats.totalCost || 0;
+    return ca - cb;
+  });
+  const best = candidates[0];
+  return Object.assign({}, best.result, {
+    smartPick: {
+      winnerSize: best.size,
+      alternatives: candidates.map(c => ({
+        size: c.size,
+        used: usedOf(c.result),
+        wastePct: c.result.stats.wastePct,
+        wasteAbs: wasteOf(c.result),
+        cost: c.result.stats.totalCost || 0,
+      })),
+    },
+  });
+}
+
 // Endbit advisor: for a bar with significant scrap, list which pieces from the
 // input could still fit in that scrap (with kerf). For a small endbit that's
 // shorter than the smallest piece + kerf, return a single explainer entry so
@@ -12247,7 +12315,7 @@ function cutEndbitSuggestions(bar, pieces, kerfMm) {
   return out.slice(0, 4);
 }
 
-function planMultiMaterialCut({ materials, pieces, stocks, kerfMm }) {
+function planMultiMaterialCut({ materials, pieces, stocks, kerfMm, procurement }) {
   const mats = Array.isArray(materials) ? materials : [];
   if (mats.length === 0) return { ok: true, groups: [], stats: { barsUsed:0, totalStockMm:0, totalPiecesMm:0, totalKerfMm:0, wasteMm:0, wastePct:0, totalCost:0, totalPiecesKg:0, totalWasteKg:0, totalScrapValue:0 }, errors: [] };
 
@@ -12259,7 +12327,7 @@ function planMultiMaterialCut({ materials, pieces, stocks, kerfMm }) {
     const myPieces = (pieces || []).filter(p => (p.material_id || mats[0].id) === m.id);
     const myStocks = (stocks || []).filter(s => (s.material_id || mats[0].id) === m.id);
     if (myPieces.length === 0) continue;
-    const r = planSingleMaterial({ pieces: myPieces, stocks: myStocks, kerfMm });
+    const r = planMultiStockPick({ pieces: myPieces, stocks: myStocks, kerfMm, dim: '1d', procurement });
     if (!r.ok) {
       errors.push(cutFormatMaterialLabel(m.type, m.spec) + ': ' + r.error);
       groups.push({ material: m, ok: false, error: r.error, bars: [], stats: null });
@@ -12270,7 +12338,7 @@ function planMultiMaterialCut({ materials, pieces, stocks, kerfMm }) {
     const barsWithAdvice = r.bars.map(b => Object.assign({}, b, {
       suggestions: cutEndbitSuggestions(b, myPieces, kerfMm),
     }));
-    groups.push({ material: m, ok: true, bars: barsWithAdvice, stats: r.stats, kgPerM, strategy: r.strategy });
+    groups.push({ material: m, ok: true, bars: barsWithAdvice, stats: r.stats, kgPerM, strategy: r.strategy, smartPick: r.smartPick });
     agg.barsUsed += r.stats.barsUsed;
     agg.totalStockMm += r.stats.totalStockMm;
     agg.totalPiecesMm += r.stats.totalPiecesMm;
@@ -12551,13 +12619,14 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
         pieces: draft.pieces,
         stocks: draft.stocks,
         kerfMm: Number(draft.kerf_mm) || 0,
+        procurement: draft.procurement_mode === true,
       });
       setResult(r);
       setAnimKey(k => k + 1);
       setStatTick(t => t + 1);
     }, 180);
     return () => clearTimeout(debounceRef.current);
-  }, [piecesKey, stocksKey, materialsKey, draft.kerf_mm]);
+  }, [piecesKey, stocksKey, materialsKey, draft.kerf_mm, draft.procurement_mode]);
 
   const updatePiece = (idx, field, val) => {
     const next = draft.pieces.slice();
@@ -12604,6 +12673,7 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
       const payload = {
         plant_id: plant.id,
         title: (draft.title || 'Cut plan').trim(),
+        plan_kind: '1d',
         materials: mats,
         material_type: firstMat.type,
         spec: firstMat.spec || {},
@@ -12653,14 +12723,14 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
     : 'linear-gradient(135deg,#0f766e,#0d9488)'));
 
   return html`
-    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+    <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <button class="btn small ghost" onClick=${onBack} style="padding:6px 10px">← Back</button>
       <input type="text" value=${draft.title} onChange=${e => setDraft(Object.assign({}, draft, { title: e.target.value }))}
         style="flex:1;min-width:0;font-size:20px;font-weight:700;border:none;outline:none;background:transparent;padding:2px 0;font-family:inherit" />
-      <button class="btn" onClick=${save} disabled=${saving}>${saving ? 'Saving…' : (draft.id ? 'Save' : '+ Save plan')}</button>
+      <${CutModeToggle} draft=${draft} setDraft=${setDraft} />
+      <button class="btn" onClick=${save} disabled=${saving}>${saving ? 'Saving…' : (draft.id ? 'Save' : '+ Save')}</button>
     </div>
 
-    ${/* Material list: define every material the plan will need, then tag pieces/stocks. */ null}
     <${CutMaterialList} draft=${draft} setDraft=${setDraft} />
 
     ${result?.errors && result.errors.length > 0 && html`
@@ -12670,14 +12740,13 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
     `}
 
     ${result?.ok && result.stats.barsUsed > 0 && html`
-      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:14px;padding:16px 14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
-        <${CutStat} num=${result.stats.barsUsed}                                                        label="Bars used"    tickKey=${statTick} />
-        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'}                                        label="Total waste"  tickKey=${statTick} />
-        <${CutStat} num=${(result.stats.wasteMm / 1000).toFixed(2) + ' m'}                               label="Waste length" tickKey=${statTick} />
-        <${CutStat} num=${(result.stats.totalPiecesMm / 1000).toFixed(1) + ' m'}                         label="Pieces total" tickKey=${statTick} />
-        ${result.stats.totalPiecesKg > 0 && html`<${CutStat} num=${result.stats.totalPiecesKg.toFixed(1) + ' kg'} label="Pieces weight" tickKey=${statTick} />`}
-        ${result.stats.totalWasteKg > 0 && html`<${CutStat} num=${result.stats.totalWasteKg.toFixed(1) + ' kg'}  label="Scrap weight"  tickKey=${statTick} />`}
-        <${CutStat} num=${result.stats.totalCost > 0 ? '₹' + fmtNum(result.stats.totalCost.toFixed(0)) : '—'} label="Stock cost"   tickKey=${statTick} />
+      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:14px;padding:14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
+        <${CutStat} num=${result.stats.barsUsed}                                                        label="Bars" tickKey=${statTick} />
+        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'}                                        label="Waste" tickKey=${statTick} />
+        ${result.stats.totalPiecesKg > 0
+          ? html`<${CutStat} num=${result.stats.totalPiecesKg.toFixed(1) + ' kg'} label="Pieces" tickKey=${statTick} />`
+          : html`<${CutStat} num=${(result.stats.totalPiecesMm / 1000).toFixed(1) + ' m'} label="Pieces" tickKey=${statTick} />`}
+        ${result.stats.totalCost > 0 && html`<${CutStat} num=${'₹' + fmtNum(result.stats.totalCost.toFixed(0))} label="Stock cost" tickKey=${statTick} />`}
       </div>
     `}
 
@@ -12689,7 +12758,7 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
         </div>
         <table style="width:100%;font-size:12px;border-collapse:collapse">
           <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
-            <th style="text-align:left;padding:4px 2px">Material</th>
+            ${materials.length > 1 && html`<th style="text-align:left;padding:4px 2px">Material</th>`}
             <th style="text-align:left;padding:4px 2px">Label</th>
             <th style="text-align:right;padding:4px 2px;width:74px">Length mm</th>
             <th style="text-align:right;padding:4px 2px;width:54px">Qty</th>
@@ -12697,10 +12766,10 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
           </tr></thead>
           <tbody>
             ${draft.pieces.map((p, idx) => html`
-              <tr key=${p.id} style=${'border-left:4px solid ' + cutMaterialColor(p.material_id || (materials[0] && materials[0].id))}>
-                <td style="padding:3px 2px">
+              <tr key=${p.id} style=${materials.length > 1 ? ('border-left:4px solid ' + cutMaterialColor(p.material_id || (materials[0] && materials[0].id))) : ''}>
+                ${materials.length > 1 && html`<td style="padding:3px 2px">
                   <${CutRowMaterialPicker} value=${p.material_id} materials=${materials} onChange=${v => updatePiece(idx, 'material_id', v)} />
-                </td>
+                </td>`}
                 <td style="padding:3px 2px"><div style="display:flex;align-items:center;gap:6px">
                   <span style=${'width:10px;height:10px;border-radius:3px;flex-shrink:0;background:' + colorFor(p.id)}></span>
                   <input type="text" value=${p.label} onChange=${e => updatePiece(idx, 'label', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px" />
@@ -12721,7 +12790,7 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
         </div>
         <table style="width:100%;font-size:12px;border-collapse:collapse">
           <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
-            <th style="text-align:left;padding:4px 2px">Material</th>
+            ${materials.length > 1 && html`<th style="text-align:left;padding:4px 2px">Material</th>`}
             <th style="text-align:right;padding:4px 2px;width:74px">Length mm</th>
             <th style="text-align:right;padding:4px 2px;width:54px">Qty</th>
             <th style="text-align:right;padding:4px 2px;width:64px">Cost/bar</th>
@@ -12729,10 +12798,10 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
           </tr></thead>
           <tbody>
             ${draft.stocks.map((s, idx) => html`
-              <tr key=${s.id} style=${'border-left:4px solid ' + cutMaterialColor(s.material_id || (materials[0] && materials[0].id))}>
-                <td style="padding:3px 2px">
+              <tr key=${s.id} style=${materials.length > 1 ? ('border-left:4px solid ' + cutMaterialColor(s.material_id || (materials[0] && materials[0].id))) : ''}>
+                ${materials.length > 1 && html`<td style="padding:3px 2px">
                   <${CutRowMaterialPicker} value=${s.material_id} materials=${materials} onChange=${v => updateStock(idx, 'material_id', v)} />
-                </td>
+                </td>`}
                 <td style="padding:3px 2px"><input type="number" value=${s.lengthMm} onChange=${e => updateStock(idx, 'lengthMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
                 <td style="padding:3px 2px"><input type="number" value=${s.qty} onChange=${e => updateStock(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
                 <td style="padding:3px 2px"><input type="number" value=${s.unitCost} onChange=${e => updateStock(idx, 'unitCost', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
@@ -12764,10 +12833,10 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
               <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
                 ${g.stats.barsUsed} ${g.stats.barsUsed === 1 ? 'bar' : 'bars'} · ${g.stats.wastePct.toFixed(1)}% waste · ${(g.stats.totalPiecesMm/1000).toFixed(1)}m pieces
                 ${g.kgPerM > 0 && html` · ${((g.stats.totalPiecesMm/1000)*g.kgPerM).toFixed(1)} kg`}
-                ${g.strategy && html` · <span style="font-family:monospace;background:var(--slate-100);padding:1px 5px;border-radius:3px;color:var(--slate-600)" title="Tried 4 strategies (FFD/BFD/WFD/FFI), picked the best">smart-pack: ${g.strategy}</span>`}
               </div>
             </div>
           </div>
+          ${g.smartPick && html`<${CutSmartPickCaption} smartPick=${g.smartPick} dim="1d" procurement=${draft.procurement_mode === true} />`}
           <${CutSvg} key=${animKey + '-' + g.material.id} bars=${g.bars} kerfMm=${Number(draft.kerf_mm) || 0} colorFor=${colorFor} />
         </div>
       `;
@@ -12881,18 +12950,19 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
-      // Single material in v1 — gather all pieces/stocks under the only material.
-      const r = planSingleSheet({
+      const r = planMultiStockPick({
         pieces: draft.pieces,
         stocks: draft.stocks,
         kerfMm: Number(draft.kerf_mm) || 0,
+        dim: '2d',
+        procurement: draft.procurement_mode === true,
       });
       setResult(r);
       setAnimKey(k => k + 1);
       setStatTick(t => t + 1);
     }, 180);
     return () => clearTimeout(debounceRef.current);
-  }, [piecesKey, stocksKey, materialsKey, draft.kerf_mm]);
+  }, [piecesKey, stocksKey, materialsKey, draft.kerf_mm, draft.procurement_mode]);
 
   const updatePiece = (idx, field, val) => {
     const next = draft.pieces.slice();
@@ -12983,29 +13053,30 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
     : 'linear-gradient(135deg,#4338ca,#4f46e5)'));
 
   return html`
-    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+    <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <button class="btn small ghost" onClick=${onBack} style="padding:6px 10px">← Back</button>
       <input type="text" value=${draft.title} onChange=${e => setDraft(Object.assign({}, draft, { title: e.target.value }))}
         style="flex:1;min-width:0;font-size:20px;font-weight:700;border:none;outline:none;background:transparent;padding:2px 0;font-family:inherit" />
       <span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:0.05em;background:var(--indigo-100,#e0e7ff);color:var(--indigo-700,#4338ca)">2D</span>
-      <button class="btn" onClick=${save} disabled=${saving}>${saving ? 'Saving…' : (draft.id ? 'Save' : '+ Save plan')}</button>
+      <${CutModeToggle} draft=${draft} setDraft=${setDraft} />
+      <button class="btn" onClick=${save} disabled=${saving}>${saving ? 'Saving…' : (draft.id ? 'Save' : '+ Save')}</button>
     </div>
 
     <${CutMaterialList} draft=${draft} setDraft=${setDraft} />
+    ${result?.ok && result.smartPick && html`<${CutSmartPickCaption} smartPick=${result.smartPick} dim="2d" procurement=${draft.procurement_mode === true} />`}
 
     ${result?.ok === false && html`
       <div class="card" style="background:#fef2f2;border:1px solid var(--rose-300);padding:14px;color:var(--rose-700);margin-bottom:12px;font-size:13px">⚠ ${result.error}</div>
     `}
 
     ${result?.ok && result.stats.sheetsUsed > 0 && html`
-      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:14px;padding:16px 14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
-        <${CutStat} num=${result.stats.sheetsUsed}                                                              label="Sheets used"   tickKey=${statTick} />
-        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'}                                                label="Total waste"    tickKey=${statTick} />
-        <${CutStat} num=${(result.stats.totalPiecesAreaMm2 / 1e6).toFixed(2) + ' m²'}                            label="Pieces area"    tickKey=${statTick} />
-        <${CutStat} num=${(result.stats.wasteAreaMm2 / 1e6).toFixed(2) + ' m²'}                                  label="Scrap area"     tickKey=${statTick} />
-        ${kgPerM2 != null && html`<${CutStat} num=${((result.stats.totalPiecesAreaMm2 / 1e6) * kgPerM2).toFixed(1) + ' kg'} label="Pieces weight" tickKey=${statTick} />`}
-        ${kgPerM2 != null && html`<${CutStat} num=${((result.stats.wasteAreaMm2 / 1e6) * kgPerM2).toFixed(1) + ' kg'}      label="Scrap weight"  tickKey=${statTick} />`}
-        <${CutStat} num=${result.stats.totalCost > 0 ? '₹' + fmtNum(result.stats.totalCost.toFixed(0)) : '—'} label="Stock cost" tickKey=${statTick} />
+      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:14px;padding:14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
+        <${CutStat} num=${result.stats.sheetsUsed} label="Sheets" tickKey=${statTick} />
+        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'} label="Waste" tickKey=${statTick} />
+        ${kgPerM2 != null
+          ? html`<${CutStat} num=${((result.stats.totalPiecesAreaMm2 / 1e6) * kgPerM2).toFixed(1) + ' kg'} label="Pieces" tickKey=${statTick} />`
+          : html`<${CutStat} num=${(result.stats.totalPiecesAreaMm2 / 1e6).toFixed(2) + ' m²'} label="Pieces" tickKey=${statTick} />`}
+        ${result.stats.totalCost > 0 && html`<${CutStat} num=${'₹' + fmtNum(result.stats.totalCost.toFixed(0))} label="Stock cost" tickKey=${statTick} />`}
       </div>
     `}
 
@@ -13184,6 +13255,40 @@ function CutSheetSvg({ sheet, colorFor }) {
   `;
 }
 
+function CutModeToggle({ draft, setDraft }) {
+  const proc = draft.procurement_mode === true;
+  const btn = (active) => 'padding:4px 10px;border-radius:5px;border:none;cursor:pointer;font-size:11px;font-weight:600;background:' + (active ? 'white' : 'transparent') + ';color:' + (active ? 'var(--slate-800)' : 'var(--slate-500)') + ';box-shadow:' + (active ? '0 1px 3px rgba(15,23,42,0.12)' : 'none');
+  return html`
+    <div style="display:flex;background:var(--slate-100);border-radius:7px;padding:2px" title="Switch between using existing stock or recommending what to procure">
+      <button type="button" onClick=${() => setDraft(Object.assign({}, draft, { procurement_mode: false }))} style=${btn(!proc)}>📦 My stock</button>
+      <button type="button" onClick=${() => setDraft(Object.assign({}, draft, { procurement_mode: true }))} style=${btn(proc)}>🛒 Procure</button>
+    </div>
+  `;
+}
+
+function CutSmartPickCaption({ smartPick, dim, procurement }) {
+  if (!smartPick || !smartPick.alternatives || smartPick.alternatives.length < 2) return null;
+  const is2D = dim === '2d';
+  const winner = smartPick.alternatives[0];
+  const fallback = smartPick.alternatives[1];
+  if (!fallback) return null;
+  const savedPct = fallback.wastePct - winner.wastePct;
+  if (savedPct < 0.5 && !procurement) return null; // not interesting if they're roughly the same
+  const winLabel = winner.size === 'mix' ? 'mixed sizes' : (winner.size + ' mm');
+  const fallLabel = fallback.size === 'mix' ? 'mixed' : (fallback.size + ' mm');
+  return html`
+    <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:6px 10px;margin-bottom:8px;font-size:11px;color:#166534;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
+      <span>
+        ${procurement ? '🛒 ' : '💡 '}
+        <b>${procurement ? 'Buy' : 'Use'} ${winner.used}× ${winLabel}</b>
+        · ${winner.wastePct.toFixed(1)}% waste
+        ${savedPct > 0.5 ? html` · saves <b>${savedPct.toFixed(1)} pts</b> vs ${fallLabel} (${fallback.wastePct.toFixed(1)}%)` : null}
+      </span>
+      ${winner.cost > 0 && html`<span style="font-weight:700">₹${fmtNum(winner.cost.toFixed(0))}</span>`}
+    </div>
+  `;
+}
+
 function CutStat({ num, label, tickKey }) {
   return html`
     <div style="text-align:center;min-width:0">
@@ -13224,37 +13329,41 @@ function CutMaterialList({ draft, setDraft }) {
     setDraft(Object.assign({}, draft, { materials: [...materials, newMat] }));
   };
 
+  const multi = materials.length > 1;
   return html`
-    <div class="card" style="padding:12px 14px;margin-bottom:10px">
-      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px">
-        <div>
-          <div style="font-weight:700;font-size:13px">Materials · ${materials.length}</div>
-          <div style="font-size:11px;color:var(--slate-500)">Each piece + stock row picks one of these. The saw plans each material on its own.</div>
-        </div>
-        <button class="btn small ghost" onClick=${add} style="padding:4px 10px;font-size:11px">+ Add material</button>
+    <div class="card" style="padding:10px 12px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div style="font-weight:700;font-size:12px;color:var(--slate-600)">Material${multi ? 's · ' + materials.length : ''}</div>
+        <button class="btn small ghost" onClick=${add} style="padding:3px 8px;font-size:11px">+ Add</button>
       </div>
-      ${materials.map((m, idx) => html`<${CutMaterialRow} key=${m.id} m=${m} idx=${idx} update=${update} remove=${remove} />`)}
+      ${materials.map((m, idx) => html`<${CutMaterialRow} key=${m.id} m=${m} idx=${idx} update=${update} remove=${remove} multi=${multi} />`)}
     </div>
   `;
 }
 
-function CutMaterialRow({ m, idx, update, remove }) {
+function CutMaterialRow({ m, idx, update, remove, multi }) {
   const meta = CUT_MATERIAL_TYPES.find(x => x.value === m.type) || CUT_MATERIAL_TYPES[0];
-  const kgPerM = cutComputeKgPerM(m.type, m.spec, m.density_kg_per_m3);
+  const isPlate = meta.is2D === true;
+  const kgPerM = isPlate ? cutComputePlateKgPerM2(m.spec, m.density_kg_per_m3) : cutComputeKgPerM(m.type, m.spec, m.density_kg_per_m3);
+  const kgUnit = isPlate ? 'kg/m²' : 'kg/m';
   const label = cutFormatMaterialLabel(m.type, m.spec);
   const color = cutMaterialColor(m.id);
 
   const setType = (newType) => update(idx, { type: newType, spec: cutDefaultSpec(newType) });
   const setSpecField = (field, val) => update(idx, { spec: Object.assign({}, m.spec || {}, { [field]: val }) });
 
+  const borderStyle = multi
+    ? 'border:1px solid var(--slate-200);border-left:4px solid '+color+';border-radius:6px;padding:8px 10px;margin-bottom:6px;background:white'
+    : 'padding:4px 0';
   return html`
-    <div style=${'border:1px solid var(--slate-200);border-left:5px solid '+color+';border-radius:8px;padding:10px 12px;margin-bottom:8px;background:white'}>
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px">
+    <div style=${borderStyle}>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:6px">
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          <span style=${'display:inline-block;padding:3px 9px;border-radius:999px;background:'+color+';color:white;font-size:11px;font-weight:700'}>${label}</span>
-          ${kgPerM != null && html`<span key=${kgPerM.toFixed(3)} class="cut-stat-num tick" style="display:inline-block;padding:3px 9px;border-radius:999px;background:var(--slate-100);color:var(--slate-700);font-size:11px;font-weight:700">${kgPerM.toFixed(2)} kg/m</span>`}
+          ${multi && html`<span style=${'display:inline-block;padding:2px 8px;border-radius:999px;background:'+color+';color:white;font-size:11px;font-weight:700'}>${label}</span>`}
+          ${!multi && html`<span style="font-weight:700;font-size:13px;color:var(--slate-800)">${label}</span>`}
+          ${kgPerM != null && html`<span key=${kgPerM.toFixed(3)} class="cut-stat-num tick" style="display:inline-block;padding:2px 8px;border-radius:999px;background:var(--slate-100);color:var(--slate-700);font-size:11px;font-weight:600">${kgPerM.toFixed(2)} ${kgUnit}</span>`}
         </div>
-        <button onClick=${() => remove(idx)} style="background:none;border:none;color:var(--slate-400);cursor:pointer;font-size:14px;padding:2px 6px" title="Remove material">×</button>
+        ${multi && html`<button onClick=${() => remove(idx)} style="background:none;border:none;color:var(--slate-400);cursor:pointer;font-size:14px;padding:2px 6px" title="Remove material">×</button>`}
       </div>
       <div style="display:grid;grid-template-columns:minmax(140px,1.4fr) repeat(auto-fit,minmax(90px,1fr));gap:6px;align-items:end">
         <label style="display:flex;flex-direction:column;gap:3px;font-size:10px;color:var(--slate-600);font-weight:600">
