@@ -12215,33 +12215,61 @@ function cutComputePlateKgPerM2(spec, density) {
 
 // Suggest candidate sheet stock sizes for a 2D plan. Runs the actual nester
 // for every market-standard size that fits the largest piece, ranks by waste,
-// and returns the winner(s). In procurement mode we return just the single
-// best option (one purchase recommendation). In stock mode we return the top
-// two so the user has an alternative to compare. Empty pieces → empty array
-// (a procurement suggestion needs a target).
+// and returns the winner(s). For HEAVY plate (thickness > 8mm) we ALSO try a
+// custom mill-cut size derived from the bounding box of the nested pieces --
+// thick-plate mills will roll any rectangle up to ~3000x12000mm, so for those
+// jobs a custom size usually beats every market standard for waste.
+// CR/HR sheet (<=8mm) is sold off-the-shelf only and stays restricted to the
+// market sizes regardless.
+// In procurement mode we return just the single best option. In stock mode
+// we return the top two so the user has an alternative.
 function cutSuggestSheetSizes(pieces, opts) {
   opts = opts || {};
   const procurement = opts.procurement === true;
   const kerfMm = Number(opts.kerf_mm) || 3;
+  const thickness = Number(opts.thickness) || 0;
+  const allowCustom = thickness > 8;
   const valid = (pieces || []).filter(p => Number(p.widthMm) > 0 && Number(p.heightMm) > 0 && Number(p.qty) > 0);
   if (valid.length === 0) return [];
-  // Indian market-available sheet metal / plate sizes only (BIS + common imports).
   const STANDARDS_2D = [
     { w: 1000, h: 2000 }, { w: 1220, h: 2440 }, { w: 1250, h: 2500 },
     { w: 1500, h: 3000 }, { w: 1500, h: 6000 }, { w: 2000, h: 6000 },
   ];
+  const MILL_MAX_W = 3000, MILL_MAX_L = 12000;
   const maxW = Math.max.apply(null, valid.map(p => p.widthMm));
   const maxH = Math.max.apply(null, valid.map(p => p.heightMm));
   const longSide = Math.max(maxW, maxH);
   const shortSide = Math.min(maxW, maxH);
   const candidates = [];
+  // Market standards
   for (const s of STANDARDS_2D) {
     const fits = (s.w >= longSide && s.h >= shortSide) || (s.h >= longSide && s.w >= shortSide);
     if (!fits) continue;
     const fakeStocks = [{ id: 'fake', widthMm: s.w, heightMm: s.h, qty: 9999, unitCost: 0 }];
     const r = planSingleSheet({ pieces: valid, stocks: fakeStocks, kerfMm });
     if (!r.ok) continue;
-    candidates.push({ widthMm: s.w, heightMm: s.h, sheetsUsed: r.stats.sheetsUsed, wastePct: r.stats.wastePct });
+    candidates.push({ widthMm: s.w, heightMm: s.h, sheetsUsed: r.stats.sheetsUsed, wastePct: r.stats.wastePct, custom: false });
+  }
+  // Custom mill-cut (heavy plate only)
+  if (allowCustom && longSide <= MILL_MAX_L && shortSide <= MILL_MAX_W) {
+    const fakeStock = [{ id: 'mill', widthMm: MILL_MAX_W, heightMm: MILL_MAX_L, qty: 1, unitCost: 0 }];
+    const r = planSingleSheet({ pieces: valid, stocks: fakeStock, kerfMm });
+    if (r.ok && r.sheets.length === 1) {
+      const sh = r.sheets[0];
+      let maxX = 0, maxY = 0;
+      for (const p of sh.placed) {
+        if (p.x + p.w > maxX) maxX = p.x + p.w;
+        if (p.y + p.h > maxY) maxY = p.y + p.h;
+      }
+      // Round up to nearest 10mm so the mill can quote a sensible size
+      const customW = Math.ceil(maxX / 10) * 10;
+      const customH = Math.ceil(maxY / 10) * 10;
+      const customStock = [{ id: 'cust', widthMm: customW, heightMm: customH, qty: 9999, unitCost: 0 }];
+      const r2 = planSingleSheet({ pieces: valid, stocks: customStock, kerfMm });
+      if (r2.ok) {
+        candidates.push({ widthMm: customW, heightMm: customH, sheetsUsed: r2.stats.sheetsUsed, wastePct: r2.stats.wastePct, custom: true });
+      }
+    }
   }
   // Rank by waste % ascending. Tie-break: fewer sheets used.
   candidates.sort((a, b) => {
@@ -13309,21 +13337,24 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
                 return;
               }
               const proc = draft.procurement_mode === true;
-              const suggestions = cutSuggestSheetSizes(allPieces, { procurement: proc, kerf_mm: draft.kerf_mm });
+              const firstMat = (draft.materials && draft.materials[0]) || null;
+              const thickness = Number(firstMat?.spec?.thickness) || 0;
+              const suggestions = cutSuggestSheetSizes(allPieces, { procurement: proc, kerf_mm: draft.kerf_mm, thickness });
               if (suggestions.length === 0) {
                 const maxW = Math.max.apply(null, allPieces.map(p => Number(p.widthMm) || 0));
                 const maxH = Math.max.apply(null, allPieces.map(p => Number(p.heightMm) || 0));
                 showToast('Largest piece ' + maxW + '×' + maxH + 'mm exceeds the 2000×6000mm market max. Add stock manually.');
                 return;
               }
-              const firstMat = (draft.materials && draft.materials[0]) ? draft.materials[0].id : null;
+              const firstMatId = firstMat ? firstMat.id : null;
               const next = proc ? [] : [...draft.stocks];
               for (const s of suggestions) {
-                next.push({ id: 's' + Date.now() + Math.random().toString(36).slice(2,5), material_id: firstMat, widthMm: s.widthMm, heightMm: s.heightMm, qty: 10, unitCost: 0 });
+                next.push({ id: 's' + Date.now() + Math.random().toString(36).slice(2,5), material_id: firstMatId, widthMm: s.widthMm, heightMm: s.heightMm, qty: 10, unitCost: 0 });
               }
               setDraft(Object.assign({}, draft, { stocks: next }));
               const best = suggestions[0];
-              showToast('✓ ' + best.widthMm + '×' + best.heightMm + 'mm — ' + best.sheetsUsed + ' sheet' + (best.sheetsUsed === 1 ? '' : 's') + ', ' + best.wastePct.toFixed(1) + '% waste');
+              const tag = best.custom ? ' (CUSTOM mill-cut)' : '';
+              showToast('✓ ' + best.widthMm + '×' + best.heightMm + 'mm' + tag + ' — ' + best.sheetsUsed + ' sheet' + (best.sheetsUsed === 1 ? '' : 's') + ', ' + best.wastePct.toFixed(1) + '% waste');
             }} style="padding:3px 8px;font-size:11px" title=${draft.procurement_mode === true ? 'Recommend ONE market-standard sheet size to buy for these pieces' : 'Suggest the best market-standard sheet sizes for these pieces'}>✨ Suggest</button>
             <button class="btn small ghost" onClick=${addStock} style="padding:3px 8px;font-size:11px">+ Add</button>
           </div>
