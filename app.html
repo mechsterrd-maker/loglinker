@@ -12250,24 +12250,28 @@ function cutSuggestSheetSizes(pieces, opts) {
     if (!r.ok) continue;
     candidates.push({ widthMm: s.w, heightMm: s.h, sheetsUsed: r.stats.sheetsUsed, wastePct: r.stats.wastePct, custom: false });
   }
-  // Custom mill-cut (heavy plate only)
+  // Custom mill-cut (heavy plate only). Try square FIRST, then progressively
+  // more rectangular aspect ratios. First successful fit wins -- this is how
+  // we get a 1200x1200 square instead of a 400x3800 strip.
   if (allowCustom && longSide <= MILL_MAX_L && shortSide <= MILL_MAX_W) {
-    const fakeStock = [{ id: 'mill', widthMm: MILL_MAX_W, heightMm: MILL_MAX_L, qty: 1, unitCost: 0 }];
-    const r = planSingleSheet({ pieces: valid, stocks: fakeStock, kerfMm });
-    if (r.ok && r.sheets.length === 1) {
-      const sh = r.sheets[0];
-      let maxX = 0, maxY = 0;
-      for (const p of sh.placed) {
-        if (p.x + p.w > maxX) maxX = p.x + p.w;
-        if (p.y + p.h > maxY) maxY = p.y + p.h;
-      }
-      // Round up to nearest 10mm so the mill can quote a sensible size
-      const customW = Math.ceil(maxX / 10) * 10;
-      const customH = Math.ceil(maxY / 10) * 10;
-      const customStock = [{ id: 'cust', widthMm: customW, heightMm: customH, qty: 9999, unitCost: 0 }];
-      const r2 = planSingleSheet({ pieces: valid, stocks: customStock, kerfMm });
-      if (r2.ok) {
-        candidates.push({ widthMm: customW, heightMm: customH, sheetsUsed: r2.stats.sheetsUsed, wastePct: r2.stats.wastePct, custom: true });
+    const totalPieceArea = valid.reduce((sum, p) => sum + p.widthMm * p.heightMm * p.qty, 0);
+    const targetArea = totalPieceArea * 1.20; // 20% buffer for kerf + packing
+    const aspects = [1.0, 1.2, 1.4, 1.7, 2.0, 2.5, 3.0];
+    for (const ar of aspects) {
+      // Build a candidate W x H with this aspect ratio and the target area
+      let h = Math.sqrt(targetArea * ar);
+      let w = h / ar;
+      // Ensure short side is shortSide-or-greater (must hold the widest piece)
+      if (w < shortSide) w = shortSide;
+      if (h < longSide) h = longSide;
+      const W = Math.ceil(w / 10) * 10;
+      const H = Math.ceil(h / 10) * 10;
+      if (W > MILL_MAX_W || H > MILL_MAX_L) continue;
+      const fakeStock = [{ id: 'cust', widthMm: W, heightMm: H, qty: 9999, unitCost: 0 }];
+      const r = planSingleSheet({ pieces: valid, stocks: fakeStock, kerfMm });
+      if (r.ok && r.sheets.length === 1) {
+        candidates.push({ widthMm: W, heightMm: H, sheetsUsed: 1, wastePct: r.stats.wastePct, custom: true });
+        break; // first successful aspect = preferred (most square)
       }
     }
   }
@@ -13458,13 +13462,23 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
 
 function CutSheetSvg({ sheet, colorFor }) {
   if (!sheet || !sheet.placed) return null;
-  // Fit the sheet into a 1000-wide viewport while keeping aspect ratio.
-  const viewW = 1000;
-  const viewH = Math.round(viewW * (sheet.stockH / sheet.stockW));
-  const scale = viewW / sheet.stockW;
+  // ALWAYS render the longer side of the sheet horizontally. Without this,
+  // a 400x3800 sheet would render as a 1000x9500 SVG that scrolls forever.
+  // When sheet is taller than wide, we transpose stockW <-> stockH and swap
+  // every placed piece's x/y, w/h. The data on disk stays in original (W,H)
+  // orientation -- this is a pure presentation rotation.
+  const rotate90 = sheet.stockH > sheet.stockW;
+  const stockW = rotate90 ? sheet.stockH : sheet.stockW;
+  const stockH = rotate90 ? sheet.stockW : sheet.stockH;
+  // Cap the viewport: target ~1000 wide, but never taller than 520 (keeps the
+  // page from scrolling when aspect ratio is still extreme after rotation).
+  let viewW = 1000;
+  let viewH = Math.round(viewW * (stockH / stockW));
+  if (viewH > 520) { viewH = 520; viewW = Math.round(viewH * (stockW / stockH)); }
+  const scale = viewW / stockW;
   return html`
     <svg class="sheet-svg" viewBox=${'0 0 ' + viewW + ' ' + viewH}
-      style="width:100%;height:auto;display:block;background:#f8fafc;border:1px solid #cbd5e1;border-radius:4px;font-family:system-ui,-apple-system,sans-serif"
+      style="width:100%;height:auto;max-height:520px;display:block;background:#f8fafc;border:1px solid #cbd5e1;border-radius:4px;font-family:system-ui,-apple-system,sans-serif"
       preserveAspectRatio="xMinYMin meet">
       <defs>
         <pattern id="sheetWasteHatch" patternUnits="userSpaceOnUse" width="8" height="8" patternTransform="rotate(45)">
@@ -13473,11 +13487,17 @@ function CutSheetSvg({ sheet, colorFor }) {
         </pattern>
       </defs>
       <rect x="0" y="0" width=${viewW} height=${viewH} fill="url(#sheetWasteHatch)" />
+      ${rotate90 && html`<text x=${viewW - 6} y=${14} font-size="9" fill="#94a3b8" text-anchor="end">↻ rotated to fit</text>`}
       ${sheet.placed.map((p, i) => {
-        const x = p.x * scale;
-        const y = p.y * scale;
-        const w = p.w * scale;
-        const h = p.h * scale;
+        // Transpose if we rotated the sheet for display.
+        const px = rotate90 ? p.y : p.x;
+        const py = rotate90 ? p.x : p.y;
+        const pw = rotate90 ? p.h : p.w;
+        const ph = rotate90 ? p.w : p.h;
+        const x = px * scale;
+        const y = py * scale;
+        const w = pw * scale;
+        const h = ph * scale;
         const color = colorFor(p.pieceId);
         const wLabel = p.rotated ? p.origH : p.origW;
         const hLabel = p.rotated ? p.origW : p.origH;
