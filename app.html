@@ -12250,18 +12250,19 @@ function cutSuggestSheetSizes(pieces, opts) {
     if (!r.ok) continue;
     candidates.push({ widthMm: s.w, heightMm: s.h, sheetsUsed: r.stats.sheetsUsed, wastePct: r.stats.wastePct, custom: false });
   }
-  // Custom mill-cut (heavy plate only). Try square FIRST, then progressively
-  // more rectangular aspect ratios. First successful fit wins -- this is how
-  // we get a 1200x1200 square instead of a 400x3800 strip.
+  // Custom mill-cut (heavy plate only). We scan a range of aspect ratios from
+  // square to 4:1, run the actual packer for each, and pick the one with the
+  // LOWEST waste. If two candidates are within 2 percentage points of each
+  // other, we softly prefer the more-square option -- but a clearly better
+  // rectangle always beats a square.
   if (allowCustom && longSide <= MILL_MAX_L && shortSide <= MILL_MAX_W) {
     const totalPieceArea = valid.reduce((sum, p) => sum + p.widthMm * p.heightMm * p.qty, 0);
     const targetArea = totalPieceArea * 1.20; // 20% buffer for kerf + packing
-    const aspects = [1.0, 1.2, 1.4, 1.7, 2.0, 2.5, 3.0];
+    const aspects = [1.0, 1.2, 1.4, 1.7, 2.0, 2.5, 3.0, 4.0];
+    const customAttempts = [];
     for (const ar of aspects) {
-      // Build a candidate W x H with this aspect ratio and the target area
       let h = Math.sqrt(targetArea * ar);
       let w = h / ar;
-      // Ensure short side is shortSide-or-greater (must hold the widest piece)
       if (w < shortSide) w = shortSide;
       if (h < longSide) h = longSide;
       const W = Math.ceil(w / 10) * 10;
@@ -12270,9 +12271,17 @@ function cutSuggestSheetSizes(pieces, opts) {
       const fakeStock = [{ id: 'cust', widthMm: W, heightMm: H, qty: 9999, unitCost: 0 }];
       const r = planSingleSheet({ pieces: valid, stocks: fakeStock, kerfMm });
       if (r.ok && r.sheets.length === 1) {
-        candidates.push({ widthMm: W, heightMm: H, sheetsUsed: 1, wastePct: r.stats.wastePct, custom: true });
-        break; // first successful aspect = preferred (most square)
+        customAttempts.push({ widthMm: W, heightMm: H, sheetsUsed: 1, wastePct: r.stats.wastePct, ar });
       }
+    }
+    // Lowest waste wins. Within 2pts, prefer the more square (smaller ar).
+    customAttempts.sort((a, b) => {
+      if (Math.abs(a.wastePct - b.wastePct) > 2) return a.wastePct - b.wastePct;
+      return a.ar - b.ar;
+    });
+    if (customAttempts.length > 0) {
+      const c = customAttempts[0];
+      candidates.push({ widthMm: c.widthMm, heightMm: c.heightMm, sheetsUsed: 1, wastePct: c.wastePct, custom: true });
     }
   }
   // Rank by waste % ascending. Tie-break: fewer sheets used.
