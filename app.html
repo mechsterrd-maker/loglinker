@@ -12213,6 +12213,68 @@ function cutComputePlateKgPerM2(spec, density) {
   return t * rho * 1e-3; // mm × kg/m³ × 1e-3 = kg/m²
 }
 
+// Suggest 2–4 candidate sheet stock sizes for a 2D plan given the pieces.
+// Combines a "tight-fit" custom size derived from total area + a filter of
+// common Indian fabrication sheet sizes that are big enough for the largest
+// piece. Empty pieces fall back to common defaults.
+function cutSuggestSheetSizes(pieces) {
+  const valid = (pieces || []).filter(p => Number(p.widthMm) > 0 && Number(p.heightMm) > 0 && Number(p.qty) > 0);
+  // Common Indian fabrication sheet sizes (BIS standard + common imports).
+  const STANDARDS_2D = [
+    { w: 1000, h: 2000 }, { w: 1220, h: 2440 }, { w: 1250, h: 2500 },
+    { w: 1500, h: 3000 }, { w: 1500, h: 6000 }, { w: 2000, h: 6000 },
+  ];
+  if (valid.length === 0) {
+    return [
+      { widthMm: 1250, heightMm: 2500, note: 'BIS standard' },
+      { widthMm: 1500, heightMm: 3000, note: 'common' },
+    ];
+  }
+  const maxW = Math.max(...valid.map(p => p.widthMm));
+  const maxH = Math.max(...valid.map(p => p.heightMm));
+  const longSide = Math.max(maxW, maxH);
+  const shortSide = Math.min(maxW, maxH);
+  const out = [];
+  // Tight-fit: derive a square-ish sheet from total area + a 25% buffer for
+  // packing inefficiency, rounded to 100mm.
+  const totalArea = valid.reduce((s, p) => s + p.widthMm * p.heightMm * p.qty, 0);
+  const sqSide = Math.ceil(Math.sqrt(totalArea * 1.25) / 100) * 100;
+  if (sqSide >= longSide) {
+    out.push({ widthMm: sqSide, heightMm: sqSide, note: 'tight fit · ~80% efficient' });
+  }
+  // Filter standards that fit the largest piece in at least one orientation.
+  for (const s of STANDARDS_2D) {
+    if ((s.w >= longSide && s.h >= shortSide) || (s.h >= longSide && s.w >= shortSide)) {
+      out.push({ widthMm: s.w, heightMm: s.h, note: 'standard' });
+    }
+  }
+  return out.slice(0, 4);
+}
+
+// Suggest 2–3 candidate bar lengths for a 1D plan.
+function cutSuggestBarLengths(pieces) {
+  const valid = (pieces || []).filter(p => Number(p.lengthMm) > 0 && Number(p.qty) > 0);
+  const STANDARDS_1D = [3000, 5500, 6000, 9000, 12000];
+  if (valid.length === 0) {
+    return [
+      { lengthMm: 6000, note: 'standard' },
+      { lengthMm: 12000, note: 'long' },
+    ];
+  }
+  const maxLen = Math.max(...valid.map(p => p.lengthMm));
+  const totalLen = valid.reduce((s, p) => s + p.lengthMm * p.qty, 0);
+  const out = [];
+  // Tight fit: smallest "fits-largest" multiple of 1000 close to total length.
+  const tight = Math.max(maxLen, Math.ceil(totalLen / 1.15 / 1000) * 1000);
+  if (tight !== 6000 && tight !== 12000) {
+    out.push({ lengthMm: tight, note: 'tight fit' });
+  }
+  for (const l of STANDARDS_1D) {
+    if (l >= maxLen) out.push({ lengthMm: l, note: 'standard' });
+  }
+  return out.slice(0, 3);
+}
+
 // Smart stock pick: for each unique stock size, try planning using ONLY that
 // size, then pick the result with the least waste. Tie-break on lowest cost.
 // Pieces with pin_stock_size set are routed to that size specifically and skip
@@ -12549,14 +12611,8 @@ function CuttingPlanner({ plant, me }) {
         kerf_mm: 3,
         status: 'draft',
         materials: [m1],
-        stocks: [
-          { id: 's1', material_id: 'm1', widthMm: 2500, heightMm: 1250, qty: 10, unitCost: 0 },
-        ],
-        pieces: [
-          { id: 'p1', material_id: 'm1', widthMm: 600, heightMm: 400, qty: 4, label: 'Plate A', allow_rotation: true },
-          { id: 'p2', material_id: 'm1', widthMm: 800, heightMm: 300, qty: 2, label: 'Plate B', allow_rotation: true },
-          { id: 'p3', material_id: 'm1', widthMm: 200, heightMm: 200, qty: 8, label: 'Bracket',  allow_rotation: true },
-        ],
+        stocks: [],
+        pieces: [],
         notes: '',
       });
     } else {
@@ -12568,15 +12624,8 @@ function CuttingPlanner({ plant, me }) {
         kerf_mm: 3,
         status: 'draft',
         materials: [m1],
-        stocks: [
-          { id: 's1', material_id: 'm1', lengthMm: 6000,  qty: 50, unitCost: 0 },
-          { id: 's2', material_id: 'm1', lengthMm: 12000, qty: 25, unitCost: 0 },
-        ],
-        pieces: [
-          { id: 'p1', material_id: 'm1', lengthMm: 900, qty: 6, label: 'Part A' },
-          { id: 'p2', material_id: 'm1', lengthMm: 400, qty: 2, label: 'Part B' },
-          { id: 'p3', material_id: 'm1', lengthMm: 30,  qty: 6, label: 'Spacer' },
-        ],
+        stocks: [],
+        pieces: [],
         notes: '',
       });
     }
@@ -12853,7 +12902,18 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
       <div class="card" style="padding:12px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
           <div style="font-weight:700;font-size:13px">${draft.procurement_mode === true ? 'Candidate bar lengths' : 'Stock available'}</div>
-          <button class="btn small ghost" onClick=${addStock} style="padding:3px 8px;font-size:11px">+ Add</button>
+          <div style="display:flex;gap:6px">
+            <button class="btn small ghost" onClick=${() => {
+              const suggestions = cutSuggestBarLengths(draft.pieces);
+              const firstMat = (draft.materials && draft.materials[0]) ? draft.materials[0].id : null;
+              const next = [...draft.stocks];
+              for (const s of suggestions) {
+                next.push({ id: 's' + Date.now() + Math.random().toString(36).slice(2,5), material_id: firstMat, lengthMm: s.lengthMm, qty: 50, unitCost: 0 });
+              }
+              setDraft(Object.assign({}, draft, { stocks: next }));
+            }} style="padding:3px 8px;font-size:11px" title="Auto-suggest 2-3 bar lengths based on your pieces">✨ Suggest</button>
+            <button class="btn small ghost" onClick=${addStock} style="padding:3px 8px;font-size:11px">+ Add</button>
+          </div>
         </div>
         <table style="width:100%;font-size:12px;border-collapse:collapse">
           <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
@@ -13196,7 +13256,18 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
       <div class="card" style="padding:12px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
           <div style="font-weight:700;font-size:13px">${draft.procurement_mode === true ? 'Candidate sheet sizes' : 'Sheet stock'}</div>
-          <button class="btn small ghost" onClick=${addStock} style="padding:3px 8px;font-size:11px">+ Add</button>
+          <div style="display:flex;gap:6px">
+            <button class="btn small ghost" onClick=${() => {
+              const suggestions = cutSuggestSheetSizes(draft.pieces);
+              const firstMat = (draft.materials && draft.materials[0]) ? draft.materials[0].id : null;
+              const next = [...draft.stocks];
+              for (const s of suggestions) {
+                next.push({ id: 's' + Date.now() + Math.random().toString(36).slice(2,5), material_id: firstMat, widthMm: s.widthMm, heightMm: s.heightMm, qty: 10, unitCost: 0 });
+              }
+              setDraft(Object.assign({}, draft, { stocks: next }));
+            }} style="padding:3px 8px;font-size:11px" title="Auto-suggest 2-4 sheet sizes based on your pieces">✨ Suggest</button>
+            <button class="btn small ghost" onClick=${addStock} style="padding:3px 8px;font-size:11px">+ Add</button>
+          </div>
         </div>
         <table style="width:100%;font-size:12px;border-collapse:collapse">
           <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:0.04em">
