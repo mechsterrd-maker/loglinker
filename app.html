@@ -12839,8 +12839,6 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
       <button class="btn" onClick=${save} disabled=${saving}>${saving ? 'Saving…' : (draft.id ? 'Save' : '+ Save')}</button>
     </div>
 
-    <${CutMaterialList} draft=${draft} setDraft=${setDraft} />
-
     ${result?.errors && result.errors.length > 0 && html`
       <div class="card" style="background:#fef2f2;border:1px solid var(--rose-300);padding:12px 14px;color:var(--rose-700);margin-bottom:12px;font-size:12px">
         ${result.errors.map(e => html`<div>⚠ ${e}</div>`)}
@@ -12858,10 +12856,11 @@ function CutPlannerEditor({ draft, setDraft, plant, me, onSaved, onBack }) {
       </div>
     `}
 
-    <${CutAIAnalysis} draft=${draft} result=${result} plant=${plant} />
+    <${CutAIAnalysis} draft=${draft} setDraft=${setDraft} result=${result} plant=${plant} />
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;margin-bottom:12px">
       <div class="card" style="padding:12px">
+        <${CutMaterialList} draft=${draft} setDraft=${setDraft} />
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
           <div style="font-weight:700;font-size:13px">Pieces required</div>
           <button class="btn small ghost" onClick=${addPiece} style="padding:3px 8px;font-size:11px">+ Add</button>
@@ -13201,7 +13200,6 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
       <button class="btn" onClick=${save} disabled=${saving}>${saving ? 'Saving…' : (draft.id ? 'Save' : '+ Save')}</button>
     </div>
 
-    <${CutMaterialList} draft=${draft} setDraft=${setDraft} />
     ${result?.ok && result.smartPick && html`<${CutSmartPickCaption} smartPick=${result.smartPick} dim="2d" procurement=${draft.procurement_mode === true} />`}
 
     ${result?.ok === false && html`
@@ -13219,10 +13217,11 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
       </div>
     `}
 
-    <${CutAIAnalysis} draft=${draft} result=${result} plant=${plant} />
+    <${CutAIAnalysis} draft=${draft} setDraft=${setDraft} result=${result} plant=${plant} />
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;margin-bottom:12px">
       <div class="card" style="padding:12px">
+        <${CutMaterialList} draft=${draft} setDraft=${setDraft} />
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
           <div style="font-weight:700;font-size:13px">Pieces required</div>
           <button class="btn small ghost" onClick=${addPiece} style="padding:3px 8px;font-size:11px">+ Add</button>
@@ -13483,7 +13482,7 @@ function cutBuildPlanSummary(draft, result) {
   return lines.join('\n');
 }
 
-function CutAIAnalysis({ draft, result, plant }) {
+function CutAIAnalysis({ draft, setDraft, result, plant }) {
   const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -13508,12 +13507,46 @@ function CutAIAnalysis({ draft, result, plant }) {
     }
   };
 
+  const applyPreview = (preview) => {
+    if (!preview || !preview.action) { showToast('No preview action on this suggestion'); return; }
+    const is2D = draft.plan_kind === '2d';
+    const firstMatId = (draft.materials && draft.materials[0]) ? draft.materials[0].id : null;
+    if (preview.action === 'set_stocks' || preview.action === 'add_stocks') {
+      const incoming = Array.isArray(preview.stocks) ? preview.stocks : [];
+      const rows = incoming.map(s => Object.assign({
+        id: 's' + Date.now() + Math.random().toString(36).slice(2,5),
+        material_id: firstMatId,
+        qty: Number(s.qty) || 10,
+        unitCost: Number(s.unitCost) || 0,
+      }, is2D
+        ? { widthMm: Number(s.widthMm) || 0, heightMm: Number(s.heightMm) || 0 }
+        : { lengthMm: Number(s.lengthMm) || 0 }));
+      const next = preview.action === 'set_stocks' ? rows : [...(draft.stocks || []), ...rows];
+      setDraft(Object.assign({}, draft, { stocks: next }));
+      showToast('✓ Preview applied — layout updating');
+    } else if (preview.action === 'pin_piece') {
+      const targetLabel = String(preview.piece_label || '');
+      const pin = String(preview.pin_stock_size || '');
+      const next = (draft.pieces || []).map(p => p.label === targetLabel ? Object.assign({}, p, { pin_stock_size: pin }) : p);
+      setDraft(Object.assign({}, draft, { pieces: next }));
+      showToast('✓ Pinned "' + targetLabel + '" to ' + pin);
+    } else if (preview.action === 'set_kerf') {
+      const v = Number(preview.value);
+      if (v >= 0) {
+        setDraft(Object.assign({}, draft, { kerf_mm: v }));
+        showToast('✓ Kerf set to ' + v + 'mm');
+      }
+    } else {
+      showToast('Unknown preview action: ' + preview.action);
+    }
+  };
+
   return html`
     <div class="card" style="padding:12px 14px;margin-bottom:12px;border:1px solid #fcd34d;background:linear-gradient(135deg,#fffbeb,#fef3c7)">
       <div style="display:flex;justify-content:space-between;align-items:center;${analysis ? 'margin-bottom:10px' : ''}">
         <div style="font-weight:700;font-size:12px;color:#92400e;display:flex;align-items:center;gap:6px">
           <span>🤖</span><span>AI shop foreman</span>
-          ${analysis && html`<span style="font-weight:500;font-size:10px;color:#a16207">· Haiku 4.5 · ~₹0.03 / analysis</span>`}
+          ${analysis && html`<span style="font-weight:500;font-size:10px;color:#a16207">· Haiku 4.5 · ~₹0.06 / run</span>`}
         </div>
         <button type="button" class="btn small" onClick=${run} disabled=${loading} style="background:#92400e;color:white;padding:4px 10px;font-size:11px;border:none;border-radius:6px">
           ${loading ? '…thinking' : (analysis ? 'Re-analyze' : 'Analyze plan')}
@@ -13536,8 +13569,11 @@ function CutAIAnalysis({ draft, result, plant }) {
               <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:#92400e;margin-bottom:5px;font-weight:700">Suggestions</div>
               ${analysis.suggestions.map((s, i) => html`
                 <div key=${i} style="background:white;border:1px solid #fcd34d;border-radius:6px;padding:8px 10px;margin-bottom:6px">
-                  <div style="font-weight:700;font-size:12px;color:#78350f">${i+1}. ${s.title}</div>
-                  ${s.explanation && html`<div style="font-size:11px;color:#451a03;margin-top:3px;line-height:1.4">${s.explanation}</div>`}
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                    <div style="font-weight:700;font-size:12px;color:#78350f;flex:1">${i+1}. ${s.title}</div>
+                    ${s.preview && html`<button type="button" onClick=${() => applyPreview(s.preview)} style="background:#16a34a;color:white;border:none;border-radius:5px;padding:3px 9px;font-size:10px;font-weight:700;cursor:pointer;flex-shrink:0;white-space:nowrap">👁️ Preview</button>`}
+                  </div>
+                  ${s.explanation && html`<div style="font-size:11px;color:#451a03;margin-top:4px;line-height:1.4">${s.explanation}</div>`}
                   ${s.savings && html`<div style="font-size:11px;color:var(--emerald-700);margin-top:4px;font-weight:600">→ ${s.savings}</div>`}
                 </div>
               `)}
@@ -13625,10 +13661,10 @@ function CutMaterialList({ draft, setDraft }) {
 
   const multi = materials.length > 1;
   return html`
-    <div class="card" style="padding:10px 12px;margin-bottom:10px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <div style="font-weight:700;font-size:12px;color:var(--slate-600)">Material${multi ? 's · ' + materials.length : ''}</div>
-        <button class="btn small ghost" onClick=${add} style="padding:3px 8px;font-size:11px">+ Add</button>
+    <div style="padding-bottom:8px;margin-bottom:8px;border-bottom:1px dashed var(--slate-200)">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <div style="font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500)">Material${multi ? 's · ' + materials.length : ''}</div>
+        <button class="btn small ghost" onClick=${add} style="padding:2px 7px;font-size:10px">+ Add</button>
       </div>
       ${materials.map((m, idx) => html`<${CutMaterialRow} key=${m.id} m=${m} idx=${idx} update=${update} remove=${remove} multi=${multi} />`)}
     </div>
