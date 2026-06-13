@@ -15669,7 +15669,11 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCount
     po_reference: '',
     notes: '',
     igst: false, // true if interstate (no SGST/CGST)
-    items: [{ part_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }],
+    // Each row can be a 'part' (PartPicker from mcp_pdc_parts) or a
+    // 'stock' line (StockItemPicker from mcp_stocks_items). DC-out rows
+    // tagged 'stock' carry a stock_item_id that the cascade trigger uses
+    // to deduct stock without name guessing.
+    items: [{ kind: 'part', part_id: '', stock_item_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }],
     cgst_pct: 9,
     sgst_pct: 9,
     igst_pct: 18,
@@ -15678,7 +15682,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCount
   const [err, setErr] = useState('');
 
   const setItem = (i, patch) => setForm(f => ({ ...f, items: f.items.map((x, idx) => idx === i ? { ...x, ...patch } : x) }));
-  const addItem = () => setForm(f => ({ ...f, items: [...f.items, { part_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }] }));
+  const addItem = () => setForm(f => ({ ...f, items: [...f.items, { kind: 'part', part_id: '', stock_item_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }] }));
   const removeItem = (i) => setForm(f => ({ ...f, items: f.items.length <= 1 ? f.items : f.items.filter((_, idx) => idx !== i) }));
   const recalcAmount = (i) => {
     const it = form.items[i];
@@ -15710,7 +15714,8 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCount
 
       const items = validItems.map(it => ({
         name: it.name.trim(),
-        part_id: it.part_id || null,
+        part_id: it.kind === 'part' ? (it.part_id || null) : null,
+        stock_item_id: it.kind === 'stock' ? (it.stock_item_id || null) : null,
         hsn: it.hsn || null,
         qty: parseFloat(it.qty),
         uom: it.uom || 'nos',
@@ -15793,13 +15798,20 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCount
       `}
 
       <div class="field"><label>Items *</label>
+        ${!isInvoice && !isReturnable && html`<div style="font-size:11px;color:var(--slate-500);margin-bottom:6px">📦 <b>Stock</b> rows auto-deduct from the stock master when the DC is saved. 🔧 <b>Part</b> rows are document-only.</div>`}
         <div style="display:flex;flex-direction:column;gap:8px">
           ${form.items.map((it, idx) => html`
             <div key=${idx} style="border:1px solid var(--slate-200);border-radius:6px;padding:8px;background:var(--slate-50)">
-              <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
+              <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
                 <span style="font-size:11px;font-weight:600;color:var(--teal-700);min-width:18px">${idx+1}.</span>
-                <div style="flex:1">
-                  <${PartPicker} plant=${plant} value=${it.part_id} onChange=${(id, p) => setItem(idx, { part_id: id, name: p ? (p.part_number + ' · ' + (p.name || '')) : it.name })} placeholder="— Pick part —" />
+                <div style="display:inline-flex;border:1px solid var(--slate-200);border-radius:5px;overflow:hidden;background:white;font-size:11px;font-weight:600">
+                  <button type="button" onClick=${() => setItem(idx, { kind: 'part', stock_item_id: '' })} style=${'padding:5px 9px;border:none;cursor:pointer;background:'+((it.kind||'part')==='part'?'var(--teal-600)':'white')+';color:'+((it.kind||'part')==='part'?'white':'var(--slate-600)')}>🔧 Part</button>
+                  <button type="button" onClick=${() => setItem(idx, { kind: 'stock', part_id: '' })} style=${'padding:5px 9px;border:none;cursor:pointer;background:'+(it.kind==='stock'?'var(--teal-600)':'white')+';color:'+(it.kind==='stock'?'white':'var(--slate-600)')} title="Pick from stock master · auto-deducts on save">📦 Stock</button>
+                </div>
+                <div style="flex:1;min-width:160px">
+                  ${(it.kind || 'part') === 'part'
+                    ? html`<${PartPicker} plant=${plant} value=${it.part_id} onChange=${(id, p) => setItem(idx, { part_id: id, name: p ? (p.part_number + ' · ' + (p.name || '')) : it.name })} placeholder="— Pick part —" />`
+                    : html`<${StockItemPicker} plant=${plant} value=${it.stock_item_id} onChange=${(id, p) => setItem(idx, { stock_item_id: id, name: p ? ((p.code ? p.code + ' · ' : '') + (p.name || '')) : it.name, uom: p?.uom || it.uom })} placeholder="— Pick stock item —" />`}
                 </div>
                 ${form.items.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => removeItem(idx)} style="padding:2px 8px;font-size:11px">×</button>`}
               </div>
@@ -17721,6 +17733,70 @@ function IatfDocsLibrary() {
 // =================================================================
 // Replaces every free-text part-number input. Returns parts master id
 // + part_number snapshot so downstream queries can join cleanly.
+// Stock item dropdown -- parallel to PartPicker but pulls from
+// mcp_stocks_items so the user can dispatch raw / sub-assembly inventory.
+// The DC create form switches between this and PartPicker per-row.
+function StockItemPicker({ plant, value, onChange, placeholder, allowClear = true }) {
+  const [items, setItems] = useState([]);
+  const [search, setSearch] = useState('');
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const wrapRef = useRef(null);
+
+  useEffect(() => {
+    sb.from('mcp_stocks_items').select('id, code, name, uom, current_qty')
+      .eq('plant_id', plant.id).order('code')
+      .then(({ data }) => { setItems(data || []); setLoading(false); });
+  }, [plant.id]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [open]);
+
+  const selected = items.find(p => p.id === value);
+  const filtered = !search.trim() ? items : items.filter(p =>
+    ((p.code || '') + ' ' + (p.name || '')).toLowerCase().includes(search.toLowerCase())
+  );
+
+  const pick = (p) => { onChange(p ? p.id : null, p); setOpen(false); setSearch(''); };
+
+  return html`
+    <div ref=${wrapRef} style="position:relative">
+      <button type="button" onClick=${() => setOpen(o => !o)}
+        style="width:100%;text-align:left;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;background:white;font-size:13px;cursor:pointer;display:flex;align-items:center;gap:8px">
+        ${selected ? html`
+          ${selected.code && html`<span style="font-family:monospace;font-weight:600">${selected.code}</span>`}
+          <span style="color:var(--slate-700)">${selected.name}</span>
+          <span style="margin-left:auto;font-size:11px;color:${parseFloat(selected.current_qty) > 0 ? 'var(--teal-600)' : 'var(--rose-600)'}">${fmtNum(selected.current_qty || 0)} ${selected.uom || ''}</span>
+        ` : html`<span style="color:var(--slate-400)">${placeholder || (loading ? 'Loading stock…' : (items.length === 0 ? 'No stock items yet' : '— Pick stock item —'))}</span>`}
+        <span style="margin-left:8px;color:var(--slate-400);font-size:11px">▾</span>
+      </button>
+      ${open && html`
+        <div style="position:absolute;top:100%;left:0;right:0;margin-top:4px;background:white;border:1px solid var(--slate-200);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.08);max-height:280px;overflow-y:auto;z-index:50">
+          <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search code / name…"
+            style="width:100%;padding:8px 10px;border:none;border-bottom:1px solid var(--slate-100);font-size:13px;outline:none;box-sizing:border-box" autoFocus />
+          ${allowClear && selected && html`
+            <button type="button" onClick=${() => pick(null)} style="width:100%;text-align:left;padding:8px 10px;background:transparent;border:none;border-bottom:1px solid var(--slate-100);color:var(--slate-500);font-size:12px;cursor:pointer">✕ Clear selection</button>
+          `}
+          ${filtered.length === 0 ? html`
+            <div style="padding:12px;text-align:center;color:var(--slate-500);font-size:12px">No matches</div>
+          ` : filtered.slice(0, 80).map(p => html`
+            <button type="button" key=${p.id} onClick=${() => pick(p)}
+              style="width:100%;text-align:left;padding:8px 10px;background:transparent;border:none;border-bottom:1px solid var(--slate-50);cursor:pointer;display:flex;align-items:center;gap:8px;font-size:13px">
+              ${p.code && html`<span style="font-family:monospace;font-weight:600">${p.code}</span>`}
+              <span style="color:var(--slate-700);flex:1">${p.name}</span>
+              <span style="font-size:11px;color:${parseFloat(p.current_qty) > 0 ? 'var(--teal-600)' : 'var(--rose-500)'}">${fmtNum(p.current_qty || 0)} ${p.uom || ''}</span>
+            </button>
+          `)}
+        </div>
+      `}
+    </div>
+  `;
+}
+
 function PartPicker({ plant, value, onChange, placeholder, required, allowClear = true }) {
   const [parts, setParts] = useState([]);
   const [search, setSearch] = useState('');
