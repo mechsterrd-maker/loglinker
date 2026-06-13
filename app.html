@@ -11077,7 +11077,13 @@ function rtResolveValue(hint, ctx) {
     return d[key] ?? '';
   }
   if (scope === 'summary' && ctx.summary) return ctx.summary[key] ?? 0;
-  if (scope === 'plant'   && ctx.plant)   return ctx.plant[key]   ?? '';
+  if (scope === 'plant'   && ctx.plant) {
+    if (key === 'address_full') {
+      const p = ctx.plant;
+      return [p.address, p.city, p.state].filter(Boolean).join(', ') + (p.pincode ? ' - ' + p.pincode : '');
+    }
+    return ctx.plant[key] ?? '';
+  }
   if (scope === 'range'   && ctx.range)   return ctx.range[key]   ?? '';
   return '';
 }
@@ -11280,14 +11286,76 @@ function rtBuildDocCtx({ doc, plant, party, isInvoice }) {
   };
 }
 
+// Strip <script> tags and on* handlers from AI-generated HTML before we drop
+// it into a popup window. The window is the user's own opted-in template and
+// runs in a separate origin context, but belt-and-braces.
+function rtSanitizeHtml(s) {
+  return String(s || '')
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+    .replace(/\son\w+\s*=\s*"[^"]*"/gi, '')
+    .replace(/\son\w+\s*=\s*'[^']*'/gi, '');
+}
+
+// Expand a Mustache-style HTML template:
+//   {{#each items}}<tr>...{{item.name}}...{{row_num}}...</tr>{{/each}}
+//   {{scope.key|format}}   — format optional (currency/date/number)
+//   {{plant.legal_name}}
+// Anything unresolved becomes '' so an empty doc field doesn't show "undefined".
+function rtExpandHtmlTemplate(htmlIn, ctx) {
+  let out = String(htmlIn || '');
+  // Loop block expansion
+  out = out.replace(/\{\{#each\s+items\}\}([\s\S]*?)\{\{\/each\}\}/g, (_, body) => {
+    return (ctx.rows || []).map((item, i) => {
+      const rctx = Object.assign({}, ctx, { item, txn: item, row_num: i + 1 });
+      let row = body;
+      row = row.replace(/\{\{row_num\}\}/g, String(i + 1));
+      row = row.replace(/\{\{([a-z_]+)\.([a-z_0-9]+)(?:\|([a-z]+))?\}\}/gi, (_m, scope, key, fmt) => {
+        const v = rtResolveValue(scope + '.' + key, rctx);
+        return rtEsc(rtFormatValue(v, fmt || ''));
+      });
+      return row;
+    }).join('');
+  });
+  // Single-token substitution (outside loops)
+  out = out.replace(/\{\{row_num\}\}/g, '');
+  out = out.replace(/\{\{(today|now)\}\}/g, (_m, k) => rtEsc(rtResolveValue(k, ctx)));
+  out = out.replace(/\{\{([a-z_]+)\.([a-z_0-9]+)(?:\|([a-z]+))?\}\}/gi, (_m, scope, key, fmt) => {
+    const v = rtResolveValue(scope + '.' + key, ctx);
+    return rtEsc(rtFormatValue(v, fmt || ''));
+  });
+  return out;
+}
+
 // Render a complete template to standalone HTML (the document opened in the
 // "Save as PDF" window). rows[] is the iterated record list (transactions
 // for petty cash, items for sales docs, NCR rows for NCR log, etc.).
+//
+// Templates emitted by the AI come in two shapes:
+//   1. { html: "<table>...{{doc.doc_number}}...{{#each items}}...{{/each}}" }
+//      — preferred for sales docs, lets the AI mirror any bordered grid
+//      layout with two-column headers, multi-cell footers etc.
+//   2. { header_blocks, table, footer_blocks } — original block schema,
+//      kept for petty cash and any older templates already saved.
 function rtRenderDocument(template, ctx) {
+  const docTitle = template.title || 'Report';
+  if (template.html && String(template.html).trim().length > 0) {
+    const body = rtExpandHtmlTemplate(rtSanitizeHtml(template.html), ctx);
+    const extraCss = template.css ? rtSanitizeHtml(template.css) : '';
+    const orient = (template.orientation === 'landscape') ? 'landscape' : 'portrait';
+    const pageSize = template.page_size || 'A4';
+    return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + rtEsc(docTitle) + '</title>' +
+      '<style>@page{size:' + pageSize + ' ' + orient + ';margin:8mm}' +
+      'body{font-family:"Times New Roman",Times,serif;color:#000;margin:0;padding:10mm}' +
+      '.rt-btn{position:fixed;top:12px;right:12px;padding:9px 16px;background:#0d9488;color:white;border:none;border-radius:6px;font-weight:700;cursor:pointer;font-size:13px;box-shadow:0 2px 6px rgba(0,0,0,0.15);z-index:9999;font-family:system-ui}' +
+      '@media print{.rt-btn{display:none}body{padding:0}}' +
+      extraCss + '</style></head><body>' +
+      '<button class="rt-btn" onclick="window.print()">🖨 Save as PDF / Print</button>' +
+      body +
+      '</body></html>';
+  }
   const headers = (template.header_blocks || []).map(b => rtRenderBlock(b, ctx)).join('');
   const table   = rtRenderTable(template.table, ctx);
   const footers = (template.footer_blocks || []).map(b => rtRenderBlock(b, ctx)).join('');
-  const docTitle = template.title || 'Report';
   return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + rtEsc(docTitle) + '</title><style>' + RT_PRINT_CSS + '</style></head><body>' +
     '<button class="rt-btn" onclick="window.print()">🖨 Save as PDF / Print</button>' +
     headers + table + footers +
@@ -11405,7 +11473,7 @@ function RecordTemplateUploadModal({ plant, me, source, sourceLabel, onClose, on
               <div style="font-weight:700;font-size:13px;color:var(--teal-800)">✓ AI extracted the layout</div>
               <span style=${'font-size:10px;padding:2px 8px;border-radius:999px;background:'+(confidence==='high'?'#bbf7d0':confidence==='low'?'#fecaca':'#fde68a')+';font-weight:700;text-transform:uppercase'}>${confidence} confidence</span>
             </div>
-            <div style="font-size:11px;color:var(--slate-700);margin-bottom:6px"><b>${rtEsc(extracted.title || '—')}</b> · ${cols.length} column${cols.length===1?'':'s'} · ${(extracted.header_blocks||[]).length} header block${(extracted.header_blocks||[]).length===1?'':'s'} · ${(extracted.footer_blocks||[]).length} footer block${(extracted.footer_blocks||[]).length===1?'':'s'}</div>
+            <div style="font-size:11px;color:var(--slate-700);margin-bottom:6px"><b>${rtEsc(extracted.title || '—')}</b>${extracted.html ? html` · HTML layout · ${String(extracted.html).length} bytes` : html` · ${cols.length} column${cols.length===1?'':'s'} · ${(extracted.header_blocks||[]).length} header block${(extracted.header_blocks||[]).length===1?'':'s'} · ${(extracted.footer_blocks||[]).length} footer block${(extracted.footer_blocks||[]).length===1?'':'s'}`}</div>
             ${cols.length > 0 && html`
               <div style="margin-top:8px">
                 <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500);font-weight:700;margin-bottom:4px">Columns</div>
@@ -11413,6 +11481,20 @@ function RecordTemplateUploadModal({ plant, me, source, sourceLabel, onClose, on
                   ${cols.map((c, i) => html`<span key=${i} style="font-size:10px;background:white;border:1px solid var(--slate-200);padding:3px 7px;border-radius:4px"><b>${rtEsc(c.label)}</b>${c.data_hint ? html` <span style="color:var(--slate-500)">→ ${rtEsc(c.data_hint)}</span>` : html` <span style="color:var(--rose-600)">⚠ no mapping</span>`}</span>`)}
                 </div>
               </div>
+            `}
+            ${extracted.html && html`
+              <button type="button" onClick=${() => {
+                const sample = { name: 'SAMPLE PART', hsn: '8400', qty: 10, uom: 'nos', rate: 100, amount: 1000 };
+                const ctx = {
+                  plant,
+                  doc: { doc_number: 'SAMPLE/0001', doc_date: new Date().toISOString().slice(0,10), customer_name: 'Sample Customer', customer_gstin: '33AAA0000A1Z5', customer_address: 'Sample Address, City', vendor_name: 'Sample Vendor', vehicle_no: 'TN-00-XX-0000', total_value: 1000, taxable_value: 1000, tax_amount: 0 },
+                  rows: [sample, sample],
+                };
+                const doc = rtRenderDocument(extracted, ctx);
+                const w = window.open('', '_blank');
+                if (!w) { alert('Pop-up blocked.'); return; }
+                w.document.write(doc); w.document.close();
+              }} style="margin-top:8px;padding:6px 10px;background:white;border:1px solid var(--teal-400);color:var(--teal-700);font-size:11px;font-weight:600;border-radius:5px;cursor:pointer">👁 Preview with sample data</button>
             `}
             ${notes && html`<div style="margin-top:8px;font-size:10px;color:var(--slate-600);font-style:italic">${rtEsc(notes)}</div>`}
           </div>
