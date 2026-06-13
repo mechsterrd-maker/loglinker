@@ -15292,13 +15292,17 @@ function PoPackingForm({ plant, me, kind, previewNumber, customers, vendors, onS
         plant_id: plant.id,
         doc_type: isPo ? 'po' : 'packing_list',
         doc_number: docNo, doc_date: form.doc_date,
-        vendor_id: form.party_id,
+        // vendor_id FK -> mcp_logistics_vendors. For PO it's the vendor;
+        // for packing list the party is a customer (different table), so
+        // keep the column null and stash the id in raw_extraction.
+        vendor_id: isPo ? form.party_id : null,
         vendor_name_raw: party?.name || null,
         vendor_gstin_raw: party?.gstin || null,
         taxable_value: isPo ? poTotal : null,
         total_value: isPo ? poTotal : null,
         items,
         raw_extraction: {
+          customer_id: isPo ? null : form.party_id,
           delivery_date: form.delivery_date||null, payment_terms: form.payment_terms||null,
           transport: form.transport||null,
           party: party ? { name:party.name, gstin:party.gstin, address:party.address, city:party.city } : null,
@@ -15492,7 +15496,10 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCount
         doc_type: isInvoice ? 'invoice_out' : (isReturnable ? 'dc_out_returnable' : 'dc_out'),
         doc_number: docNo,
         doc_date: form.doc_date,
-        vendor_id: form.customer_id,
+        // Customers live in mcp_sched_customers, but vendor_id FK'd to
+        // mcp_logistics_vendors. Snapshot name/GSTIN here; keep the lookup
+        // pointer in raw_extraction.customer_id.
+        vendor_id: null,
         vendor_name_raw: cust?.name || null,
         vendor_gstin_raw: cust?.gstin || null,
         taxable_value: isInvoice ? taxableValue : null,
@@ -15500,6 +15507,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCount
         total_value: isInvoice ? total : null,
         items: items,
         raw_extraction: {
+          customer_id: form.customer_id,
           place_of_supply: form.place_of_supply || null,
           vehicle_no: form.vehicle_no || null,
           eway_bill: form.eway_bill || null,
@@ -15706,7 +15714,8 @@ function DocFormatBar({ plant, me, doc, party, isInvoice, onPrintDefault }) {
 
 function PoPackingPreview({ doc, plant, me, customers, vendors, onClose }) {
   const isPo = doc.doc_type === 'po';
-  const party = (isPo ? (vendors||[]) : (customers||[])).find(p => p.id === doc.vendor_id) || doc.raw_extraction?.party || null;
+  const partyId = isPo ? doc.vendor_id : (doc.raw_extraction?.customer_id || doc.vendor_id);
+  const party = (isPo ? (vendors||[]) : (customers||[])).find(p => p.id === partyId) || doc.raw_extraction?.party || null;
   const items = Array.isArray(doc.items) ? doc.items : [];
   const pt = doc.raw_extraction?.packing_totals || {};
   const printIt = () => window.print();
@@ -15784,7 +15793,8 @@ function SalesDocPreview({ doc, plant, me, customers, vendors, onClose }) {
     return html`<${PoPackingPreview} doc=${doc} plant=${plant} me=${me} customers=${customers} vendors=${vendors} onClose=${onClose} />`;
   }
   const isInvoice = doc.doc_type === 'invoice_out';
-  const cust = customers.find(c => c.id === doc.vendor_id) || (doc.raw_extraction?.customer || null);
+  const custId = doc.raw_extraction?.customer_id || doc.vendor_id;
+  const cust = customers.find(c => c.id === custId) || (doc.raw_extraction?.customer || null);
   const items = Array.isArray(doc.items) ? doc.items : [];
   const igst = !!doc.raw_extraction?.igst;
   const printIt = () => window.print();
