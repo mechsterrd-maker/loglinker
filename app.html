@@ -10766,6 +10766,7 @@ function PettyCashModule({ plant, me }) {
   const [tab, setTab] = useState('summary'); // summary | txns | advances | books
   const [createBookOpen, setCreateBookOpen] = useState(false);
   const [createTxnOpen, setCreateTxnOpen] = useState(null); // {type, prefilledAdvanceId?}
+  const [reportOpen, setReportOpen] = useState(false);
   const [period, setPeriod] = useState('30'); // last N days for txns list
   const [filterType, setFilterType] = useState('all');
 
@@ -10844,7 +10845,9 @@ function PettyCashModule({ plant, me }) {
   return html`
     <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
       <div><h1>💰 Petty Cash</h1><div class="sub">${books.length} book${books.length>1?'s':''} · ₹${fmtNum(totalBalance.toFixed(0))} in hand · ₹${fmtNum(totalOutstanding.toFixed(0))} owed by team</div></div>
+      <button class="btn small" onClick=${() => setReportOpen(true)} style="background:var(--slate-700);padding:6px 12px;font-size:12px">📊 Reports</button>
     </div>
+    ${reportOpen && html`<${PettyCashReportModal} plant=${plant} me=${me} books=${books} balances=${balances} onClose=${() => setReportOpen(false)} />`}
 
     ${isAdmin ? html`
       <div class="card" style="margin-bottom:12px;padding:10px 12px;background:var(--teal-50);border-color:var(--teal-200)">
@@ -11026,6 +11029,238 @@ function PettyCashModule({ plant, me }) {
 
     ${createBookOpen && html`<${PettyCashBookModal} plant=${plant} me=${me} users=${users} onClose=${() => setCreateBookOpen(false)} onSaved=${() => { setCreateBookOpen(false); refresh(); }} />`}
     ${createTxnOpen && html`<${PettyCashTxnModal} plant=${plant} me=${me} books=${books} users=${users} initial=${createTxnOpen} advances=${advances} onClose=${() => setCreateTxnOpen(null)} onSaved=${() => { setCreateTxnOpen(null); refresh(); }} />`}
+  `;
+}
+
+function PettyCashReportModal({ plant, me, books, balances, onClose }) {
+  const [period, setPeriod] = useState('this_month');
+  const [customFrom, setCustomFrom] = useState('');
+  const [customTo, setCustomTo] = useState('');
+  const [filtered, setFiltered] = useState([]);
+  const [fetching, setFetching] = useState(false);
+
+  const toISO = (d) => d.toISOString().slice(0, 10);
+  const today = new Date();
+
+  const range = (() => {
+    if (period === 'this_week') {
+      const day = today.getDay() || 7; // Mon=1..Sun=7
+      const monday = new Date(today); monday.setDate(today.getDate() - (day - 1));
+      const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6);
+      return { from: toISO(monday), to: toISO(sunday), label: 'This week' };
+    }
+    if (period === 'last_week') {
+      const day = today.getDay() || 7;
+      const monday = new Date(today); monday.setDate(today.getDate() - (day - 1) - 7);
+      const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6);
+      return { from: toISO(monday), to: toISO(sunday), label: 'Last week' };
+    }
+    if (period === 'this_month') {
+      const first = new Date(today.getFullYear(), today.getMonth(), 1);
+      const last = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+      return { from: toISO(first), to: toISO(last), label: 'This month' };
+    }
+    if (period === 'last_month') {
+      const first = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+      const last = new Date(today.getFullYear(), today.getMonth(), 0);
+      return { from: toISO(first), to: toISO(last), label: 'Last month' };
+    }
+    return { from: customFrom, to: customTo, label: 'Custom range' };
+  })();
+
+  // Always fetch fresh data for the chosen range so the report isn't capped
+  // by the in-memory list (limit 300). Re-runs whenever the from/to changes.
+  useEffect(() => {
+    if (!range.from || !range.to) { setFiltered([]); return; }
+    let aborted = false;
+    setFetching(true);
+    sb.from('mcp_petty_cash_txns')
+      .select('*, book:book_id(name), party:party_user_id(full_name), creator:created_by(full_name)')
+      .eq('plant_id', plant.id)
+      .gte('txn_date', range.from)
+      .lte('txn_date', range.to)
+      .order('txn_date')
+      .order('created_at')
+      .then(({ data }) => {
+        if (aborted) return;
+        setFiltered(data || []);
+        setFetching(false);
+      });
+    return () => { aborted = true; };
+  }, [plant.id, range.from, range.to]);
+
+  const sumBy = (typ) => filtered.filter(t => t.txn_type === typ).reduce((s, t) => s + parseFloat(t.amount), 0);
+  const totalTopup = sumBy('topup');
+  const totalExpense = sumBy('expense');
+  const totalAdvance = sumBy('advance_given');
+  const totalReturn = sumBy('advance_returned');
+  const totalIn = totalTopup + totalReturn;
+  const totalOut = totalExpense + totalAdvance;
+  const net = totalIn - totalOut;
+
+  const labelOf = (t) => ({ topup: 'Top-up', expense: 'Expense', advance_given: 'Advance', advance_returned: 'Returned' }[t] || t);
+
+  // Per-category expense breakdown (for the report body)
+  const catTotals = (() => {
+    const m = {};
+    for (const t of filtered) {
+      if (t.txn_type !== 'expense') continue;
+      const k = (t.category || '(uncategorised)').trim() || '(uncategorised)';
+      m[k] = (m[k] || 0) + parseFloat(t.amount);
+    }
+    return Object.entries(m).sort((a, b) => b[1] - a[1]);
+  })();
+
+  const downloadCSV = () => {
+    const cols = ['Date', 'Txn No', 'Type', 'Description', 'Party', 'Vendor', 'Bill No', 'Category', 'Amount (₹)', 'Book', 'Recorded By'];
+    const rows = filtered.map(t => [
+      t.txn_date,
+      t.txn_no || '',
+      labelOf(t.txn_type),
+      t.description || '',
+      t.party?.full_name || t.party_name || '',
+      t.vendor_name || '',
+      t.bill_number || '',
+      t.category || '',
+      Number(t.amount).toFixed(2),
+      t.book?.name || '',
+      t.creator?.full_name || '',
+    ].map(v => '"' + String(v ?? '').replace(/"/g, '""') + '"').join(','));
+    const totalsRow = ['"' + range.label + '"', '', '', '', '', '', '', '"Net"', '"' + net.toFixed(2) + '"', '', ''].join(',');
+    const csv = [cols.map(c => '"' + c + '"').join(','), ...rows, '', totalsRow].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'pettycash-' + plant.name.replace(/[^a-z0-9]+/gi, '-').toLowerCase() + '-' + range.from + '-to-' + range.to + '.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast('✓ CSV downloaded');
+  };
+
+  const openPDF = () => {
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+    const txnRows = filtered.map(t => {
+      const sign = (t.txn_type === 'topup' || t.txn_type === 'advance_returned') ? '+' : '−';
+      const col = (t.txn_type === 'topup' || t.txn_type === 'advance_returned') ? '#047857' : '#b91c1c';
+      return '<tr>' +
+        '<td>' + esc(t.txn_date) + '</td>' +
+        '<td>' + esc(t.txn_no || '') + '</td>' +
+        '<td>' + esc(labelOf(t.txn_type)) + '</td>' +
+        '<td>' + esc(t.description || '') + '</td>' +
+        '<td>' + esc(t.party?.full_name || t.party_name || t.vendor_name || '') + '</td>' +
+        '<td>' + esc(t.category || '') + '</td>' +
+        '<td>' + esc(t.book?.name || '') + '</td>' +
+        '<td class="num" style="color:' + col + '">' + sign + '₹' + fmtNum(t.amount) + '</td>' +
+        '</tr>';
+    }).join('');
+    const catRows = catTotals.map(([cat, amt]) =>
+      '<tr><td>' + esc(cat) + '</td><td class="num">₹' + fmtNum(amt.toFixed(0)) + '</td></tr>'
+    ).join('');
+    const bookRows = (balances || []).map(b =>
+      '<tr><td>' + esc(b.name) + '</td><td class="num">₹' + fmtNum(parseFloat(b.current_balance || 0).toFixed(0)) + '</td></tr>'
+    ).join('');
+    const docHtml = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Petty Cash · ' + esc(range.label) + ' · ' + esc(plant.name) + '</title>' +
+      '<style>' +
+      '  *,*:before,*:after{box-sizing:border-box}' +
+      '  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#0f172a;margin:0;padding:18px;font-size:12px;line-height:1.4}' +
+      '  h1{font-size:22px;margin:0 0 4px 0}' +
+      '  .sub{color:#64748b;font-size:11px;margin-bottom:18px}' +
+      '  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}' +
+      '  .grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:18px}' +
+      '  .stat{padding:10px 12px;border:1px solid #cbd5e1;border-radius:6px}' +
+      '  .stat .lbl{font-size:9px;text-transform:uppercase;letter-spacing:0.04em;color:#64748b;font-weight:700}' +
+      '  .stat .val{font-size:14px;font-weight:700;margin-top:2px;font-family:ui-monospace,Menlo,monospace}' +
+      '  h2{font-size:13px;margin:18px 0 6px 0;border-bottom:1px solid #cbd5e1;padding-bottom:3px}' +
+      '  table{width:100%;border-collapse:collapse;margin-bottom:12px}' +
+      '  th{background:#f1f5f9;text-align:left;padding:5px 6px;border:1px solid #cbd5e1;font-size:9px;text-transform:uppercase;letter-spacing:0.04em}' +
+      '  td{padding:4px 6px;border:1px solid #e2e8f0;font-size:11px}' +
+      '  .num{font-family:ui-monospace,Menlo,monospace;text-align:right;white-space:nowrap}' +
+      '  .net{background:#f1f5f9;font-weight:700}' +
+      '  .btn{position:fixed;top:12px;right:12px;padding:9px 16px;background:#0d9488;color:white;border:none;border-radius:6px;font-weight:700;cursor:pointer;font-size:13px;box-shadow:0 2px 6px rgba(0,0,0,0.15)}' +
+      '  .meta{display:flex;justify-content:space-between;font-size:10px;color:#64748b;margin-top:24px;border-top:1px solid #cbd5e1;padding-top:8px}' +
+      '  @media print{.btn{display:none}body{padding:12mm 14mm}}' +
+      '</style></head><body>' +
+      '<button class="btn" onclick="window.print()">🖨 Save as PDF / Print</button>' +
+      '<h1>Petty Cash Report</h1>' +
+      '<div class="sub">' + esc(plant.name) + ' · ' + esc(range.label) + ' · ' + esc(range.from) + ' → ' + esc(range.to) + ' · Generated ' + esc(new Date().toLocaleString()) + '</div>' +
+      '<div class="grid4">' +
+      '  <div class="stat"><div class="lbl">Top-up</div><div class="val">₹' + fmtNum(totalTopup.toFixed(0)) + '</div></div>' +
+      '  <div class="stat"><div class="lbl">Expense</div><div class="val" style="color:#b91c1c">₹' + fmtNum(totalExpense.toFixed(0)) + '</div></div>' +
+      '  <div class="stat"><div class="lbl">Advances given</div><div class="val">₹' + fmtNum(totalAdvance.toFixed(0)) + '</div></div>' +
+      '  <div class="stat"><div class="lbl">Advances returned</div><div class="val">₹' + fmtNum(totalReturn.toFixed(0)) + '</div></div>' +
+      '</div>' +
+      '<div class="grid2">' +
+      '  <div class="stat"><div class="lbl">Cash in</div><div class="val" style="color:#047857">+₹' + fmtNum(totalIn.toFixed(0)) + '</div></div>' +
+      '  <div class="stat"><div class="lbl">Cash out</div><div class="val" style="color:#b91c1c">−₹' + fmtNum(totalOut.toFixed(0)) + '</div></div>' +
+      '</div>' +
+      (catTotals.length ? '<h2>Expense by category</h2><table><thead><tr><th>Category</th><th class="num">Amount</th></tr></thead><tbody>' + catRows + '</tbody></table>' : '') +
+      (bookRows ? '<h2>Closing balances by book</h2><table><thead><tr><th>Book</th><th class="num">Balance now</th></tr></thead><tbody>' + bookRows + '</tbody></table>' : '') +
+      '<h2>All transactions · ' + filtered.length + '</h2>' +
+      (filtered.length === 0
+        ? '<p style="color:#64748b;font-size:12px">No transactions in this period.</p>'
+        : '<table><thead><tr><th>Date</th><th>Txn No</th><th>Type</th><th>Description</th><th>Party / Vendor</th><th>Category</th><th>Book</th><th class="num">Amount</th></tr></thead><tbody>' +
+          txnRows +
+          '<tr class="net"><td colspan="7" style="text-align:right">Net (in − out)</td><td class="num" style="color:' + (net >= 0 ? '#047857' : '#b91c1c') + '">' + (net >= 0 ? '+' : '−') + '₹' + fmtNum(Math.abs(net).toFixed(0)) + '</td></tr>' +
+          '</tbody></table>') +
+      '<div class="meta"><span>' + esc(plant.name) + ' · Petty Cash Report</span><span>Loglinkr · ' + esc(new Date().toLocaleDateString()) + '</span></div>' +
+      '</body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { alert('Pop-up blocked — allow pop-ups for this site so the report can open.'); return; }
+    w.document.write(docHtml);
+    w.document.close();
+  };
+
+  const ready = !fetching && filtered.length > 0 && range.from && range.to;
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:540px">
+        <div class="modal-header">
+          <div class="modal-title">📊 Petty Cash Report</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div style="margin-bottom:14px">
+          <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500);font-weight:700;margin-bottom:6px">Period</div>
+          <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:6px">
+            ${[
+              { v: 'this_week', l: 'This week' },
+              { v: 'last_week', l: 'Last week' },
+              { v: 'this_month', l: 'This month' },
+              { v: 'last_month', l: 'Last month' },
+              { v: 'custom', l: 'Custom range' },
+            ].map(p => html`
+              <button key=${p.v} type="button" onClick=${() => setPeriod(p.v)}
+                style=${'padding:9px 12px;border-radius:6px;border:1px solid '+(period===p.v?'var(--teal-500)':'var(--slate-200)')+';background:'+(period===p.v?'var(--teal-50)':'white')+';color:'+(period===p.v?'var(--teal-800)':'var(--slate-700)')+';font-size:12px;font-weight:600;cursor:pointer;font-family:inherit'}>${p.l}</button>
+            `)}
+          </div>
+          ${period === 'custom' && html`
+            <div style="display:flex;gap:8px;margin-top:8px">
+              <label style="flex:1"><div style="font-size:10px;color:var(--slate-500);margin-bottom:3px">From</div>
+                <input type="date" value=${customFrom} onChange=${e => setCustomFrom(e.target.value)} style="width:100%;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+              </label>
+              <label style="flex:1"><div style="font-size:10px;color:var(--slate-500);margin-bottom:3px">To</div>
+                <input type="date" value=${customTo} onChange=${e => setCustomTo(e.target.value)} style="width:100%;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+              </label>
+            </div>
+          `}
+        </div>
+        <div style="background:var(--slate-50);padding:12px 14px;border-radius:8px;margin-bottom:14px">
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:4px">${range.label}${range.from && range.to ? ' · ' + range.from + ' → ' + range.to : ''}</div>
+          ${fetching
+            ? html`<div style="font-size:13px;color:var(--slate-500)">Loading transactions…</div>`
+            : html`<div>
+                <div style="font-size:13px;font-weight:700">${filtered.length} transaction${filtered.length === 1 ? '' : 's'}</div>
+                <div style="font-size:11px;color:var(--slate-600);margin-top:4px">+₹${fmtNum(totalIn.toFixed(0))} in · −₹${fmtNum(totalOut.toFixed(0))} out · net ${net >= 0 ? '+' : '−'}₹${fmtNum(Math.abs(net).toFixed(0))}</div>
+              </div>`}
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <button class="btn" disabled=${!ready} onClick=${downloadCSV} style=${'background:'+(ready?'var(--slate-700)':'var(--slate-300)')+';color:white'}>📥 Download CSV</button>
+          <button class="btn" disabled=${!ready} onClick=${openPDF}>🖨 PDF / Print</button>
+        </div>
+        ${!ready && period === 'custom' && html`<div style="margin-top:8px;font-size:11px;color:var(--rose-600)">Pick a from and to date.</div>`}
+        ${!ready && period !== 'custom' && filtered.length === 0 && html`<div style="margin-top:8px;font-size:11px;color:var(--slate-500)">No transactions in this period yet.</div>`}
+      </div>
+    </div>
   `;
 }
 
