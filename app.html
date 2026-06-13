@@ -11038,7 +11038,7 @@ function PettyCashModule({ plant, me }) {
 // =================================================================
 
 // Map a template "data_hint" string to a concrete value from the report
-// context. ctx = { plant, range, summary, txn?, row_num? }.
+// context. ctx = { plant, range?, summary?, txn?, doc?, item?, row_num? }.
 function rtResolveValue(hint, ctx) {
   if (!hint) return '';
   if (hint === 'row_num') return ctx.row_num ?? '';
@@ -11057,6 +11057,24 @@ function rtResolveValue(hint, ctx) {
     if (key === 'book_name')        return t.book?.name || '';
     if (key === 'created_by_name')  return t.creator?.full_name || '';
     return t[key] ?? '';
+  }
+  if (scope === 'item' && ctx.item) {
+    const it = ctx.item;
+    if (key === 'amount') {
+      if (it.amount != null && it.amount !== '') return it.amount;
+      const qty = parseFloat(it.qty) || 0;
+      const rate = parseFloat(it.rate) || 0;
+      return qty && rate ? (qty * rate).toFixed(2) : '';
+    }
+    if (key === 'total')     return it.total ?? it.amount ?? '';
+    if (key === 'gross_weight') return it.gross_wt ?? it.gross_weight ?? '';
+    if (key === 'net_weight')   return it.net_wt   ?? it.net_weight   ?? '';
+    if (key === 'po_ref')    return it.po_ref ?? it.po_reference ?? '';
+    return it[key] ?? '';
+  }
+  if (scope === 'doc' && ctx.doc) {
+    const d = ctx.doc;
+    return d[key] ?? '';
   }
   if (scope === 'summary' && ctx.summary) return ctx.summary[key] ?? 0;
   if (scope === 'plant'   && ctx.plant)   return ctx.plant[key]   ?? '';
@@ -11113,22 +11131,28 @@ function rtRenderTable(table, ctx) {
     html += '<th style="text-align:' + (c.align || 'left') + ';' + w + '">' + rtEsc(c.label || '') + '</th>';
   }
   html += '</tr></thead><tbody>';
+  // rctx carries both `txn` and `item` so the same row works whether the
+  // template was extracted for a petty-cash register or a sales document.
+  let runningTotal = 0;
   for (let i = 0; i < (ctx.rows || []).length; i++) {
     const row = ctx.rows[i];
-    const rctx = Object.assign({}, ctx, { txn: row, row_num: i + 1 });
+    const rctx = Object.assign({}, ctx, { txn: row, item: row, row_num: i + 1 });
     html += '<tr>';
     for (const c of cols) {
       const raw = rtResolveValue(c.data_hint, rctx);
+      if (c.data_hint === table.total_column_hint) {
+        const n = parseFloat(raw);
+        if (Number.isFinite(n)) runningTotal += n;
+      }
       html += '<td style="text-align:' + (c.align || 'left') + '">' + rtEsc(rtFormatValue(raw, c.format)) + '</td>';
     }
     html += '</tr>';
   }
   if (totalHintIdx >= 0) {
-    const total = (ctx.rows || []).reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
     html += '<tr class="rt-total">';
     for (let i = 0; i < cols.length; i++) {
       if (i === totalHintIdx) {
-        html += '<td style="text-align:' + (cols[i].align || 'right') + ';font-weight:700">' + rtFormatValue(total, 'currency') + '</td>';
+        html += '<td style="text-align:' + (cols[i].align || 'right') + ';font-weight:700">' + rtFormatValue(runningTotal, cols[i].format || 'currency') + '</td>';
       } else if (i === 0) {
         html += '<td colspan="' + totalHintIdx + '" style="text-align:right;font-weight:700">Total</td>';
       } else if (i < totalHintIdx) {
@@ -11165,9 +11189,100 @@ const RT_PRINT_CSS = `
   @media print{.rt-btn{display:none}body{padding:12mm 14mm}}
 `;
 
+// Map "doc_kind" used in the SalesDoc module to the canonical source string
+// stored in mcp_record_templates. Used both for filtering templates per kind
+// and for picking the right field set when uploading a custom format.
+const DOC_SOURCE_LABEL = {
+  dc_out:             { source: 'dc_out',             label: 'Delivery Challan format' },
+  dc_out_returnable:  { source: 'dc_out_returnable',  label: 'Returnable DC format' },
+  invoice_out:        { source: 'invoice_out',        label: 'Tax Invoice format' },
+  po:                 { source: 'po',                 label: 'Purchase Order format' },
+  packing_list:       { source: 'packing_list',       label: 'Packing List format' },
+  job_work_dc_out:    { source: 'job_work_dc_out',    label: 'Job-work DC (out) format' },
+  job_work_dc_in:     { source: 'job_work_dc_in',     label: 'Job-work DC (in) format' },
+  quote:              { source: 'quote',              label: 'Quotation format' },
+};
+
+// Flatten a mcp_logistics_documents row into the doc fields the renderer
+// understands (doc.*). Pulls customer/vendor identity out of either the joined
+// party object or raw_extraction snapshots so the same template works for
+// every doc_type the SalesDocMaker emits.
+function rtBuildDocCtx({ doc, plant, party, isInvoice }) {
+  const items = Array.isArray(doc.items) ? doc.items : [];
+  const raw = doc.raw_extraction || {};
+  const tax = parseFloat(doc.tax_amount || 0);
+  const igstPct = parseFloat(raw.igst_pct || (raw.igst ? 18 : 0)) || 0;
+  const cgstPct = parseFloat(raw.cgst_pct || (raw.igst ? 0 : 9)) || 0;
+  const sgstPct = parseFloat(raw.sgst_pct || (raw.igst ? 0 : 9)) || 0;
+  const igstAmt = raw.igst ? tax : 0;
+  const cgstAmt = raw.igst ? 0 : tax / 2;
+  const sgstAmt = raw.igst ? 0 : tax / 2;
+  const isPo = doc.doc_type === 'po';
+  const isPacking = doc.doc_type === 'packing_list';
+  const pt = raw.packing_totals || {};
+
+  const docFields = {
+    doc_number:        doc.doc_number,
+    doc_date:          doc.doc_date,
+    due_date:          raw.delivery_date || raw.expected_return_date || '',
+    po_number:         raw.po_reference || '',
+    po_date:           raw.po_date || '',
+    ref_number:        raw.ref_number || '',
+    notes:             doc.notes || '',
+    payment_terms:     raw.payment_terms || '',
+    delivery_terms:    raw.delivery_terms || raw.transport || '',
+    return_by_date:    raw.expected_return_date || '',
+    purpose:           raw.purpose || '',
+    transport_mode:    raw.transport || '',
+    vehicle_no:        raw.vehicle_no || '',
+    lr_number:         raw.lr_number || '',
+    lr_date:           raw.lr_date || '',
+    transporter_name:  raw.transporter_name || '',
+    eway_bill_no:      raw.eway_bill || raw.eway_bill_no || '',
+    place_of_supply:   raw.place_of_supply || '',
+    taxable_value:     doc.taxable_value,
+    tax_amount:        doc.tax_amount,
+    total_value:       doc.total_value,
+    cgst_amount:       cgstAmt,
+    sgst_amount:       sgstAmt,
+    igst_amount:       igstAmt,
+    discount_amount:   raw.discount_amount || 0,
+    round_off:         raw.round_off || 0,
+    amount_in_words:   raw.amount_in_words || '',
+    total_qty:         items.reduce((s, it) => s + (parseFloat(it.qty) || 0), 0),
+    total_packages:    pt.packages || items.reduce((s, it) => s + (parseInt(it.packages) || 0), 0),
+    total_gross_weight: pt.gross_wt || items.reduce((s, it) => s + (parseFloat(it.gross_wt) || 0), 0),
+    total_net_weight:   pt.net_wt   || items.reduce((s, it) => s + (parseFloat(it.net_wt) || 0), 0),
+  };
+
+  // For PO: party = vendor. For DC/Invoice/Packing: party = customer.
+  if (isPo) {
+    docFields.vendor_name    = party?.name || doc.vendor_name_raw || '';
+    docFields.vendor_gstin   = party?.gstin || doc.vendor_gstin_raw || '';
+    docFields.vendor_address = party?.address || '';
+    docFields.vendor_contact = party?.contact_person || '';
+    docFields.vendor_phone   = party?.phone || party?.contact_phone || '';
+  } else {
+    docFields.customer_name    = party?.name || doc.vendor_name_raw || '';
+    docFields.customer_gstin   = party?.gstin || doc.vendor_gstin_raw || '';
+    docFields.customer_address = party?.address || '';
+    docFields.customer_contact = party?.contact_person || '';
+    docFields.customer_phone   = party?.phone || party?.contact_phone || '';
+    docFields.ship_to_name     = raw.ship_to_name || party?.name || '';
+    docFields.ship_to_address  = raw.ship_to_address || party?.address || '';
+    docFields.ship_to_gstin    = raw.ship_to_gstin || party?.gstin || '';
+  }
+
+  return {
+    plant,
+    doc: docFields,
+    rows: items,
+  };
+}
+
 // Render a complete template to standalone HTML (the document opened in the
 // "Save as PDF" window). rows[] is the iterated record list (transactions
-// for petty cash, NCR rows for NCR log, etc.).
+// for petty cash, items for sales docs, NCR rows for NCR log, etc.).
 function rtRenderDocument(template, ctx) {
   const headers = (template.header_blocks || []).map(b => rtRenderBlock(b, ctx)).join('');
   const table   = rtRenderTable(template.table, ctx);
@@ -11180,10 +11295,12 @@ function rtRenderDocument(template, ctx) {
 }
 
 // =================================================================
-// PettyCashTemplateUploadModal -- pick image, send to Claude vision,
-// preview the extracted template, save with a name.
+// RecordTemplateUploadModal -- pick image, send to Claude vision,
+// preview the extracted template, save with a name. Reused by every
+// module that prints records (petty cash, DC, RDC, PO, invoice,
+// packing list, job-work DCs, quotes).
 // =================================================================
-function PettyCashTemplateUploadModal({ plant, me, onClose, onSaved }) {
+function RecordTemplateUploadModal({ plant, me, source, sourceLabel, onClose, onSaved }) {
   const [file, setFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState('');
   const [extracted, setExtracted] = useState(null);
@@ -11216,7 +11333,7 @@ function PettyCashTemplateUploadModal({ plant, me, onClose, onSaved }) {
       }
       b64 = btoa(b64);
       const { data, error: err } = await sb.functions.invoke('analyze-record-template', {
-        body: { image_b64: b64, image_mime: file.type, source: 'petty_cash', plant_id: plant.id },
+        body: { image_b64: b64, image_mime: file.type, source, plant_id: plant.id },
       });
       if (err) throw err;
       if (data?.error) throw new Error(data.error);
@@ -11239,7 +11356,7 @@ function PettyCashTemplateUploadModal({ plant, me, onClose, onSaved }) {
       const payload = {
         plant_id: plant.id,
         name: name.trim(),
-        source: 'petty_cash',
+        source,
         config: extracted,
         ai_model: 'claude-sonnet-4',
         ai_confidence: confidence,
@@ -11257,16 +11374,17 @@ function PettyCashTemplateUploadModal({ plant, me, onClose, onSaved }) {
   };
 
   const cols = extracted?.table?.columns || [];
+  const label = sourceLabel || 'format';
 
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal" style="max-width:640px;max-height:92vh;overflow-y:auto">
         <div class="modal-header">
-          <div class="modal-title">🤖 Upload Format</div>
+          <div class="modal-title">🤖 Upload ${label}</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
         <div style="font-size:12px;color:var(--slate-600);margin-bottom:12px;line-height:1.5">
-          Upload a photo or scan of the petty-cash register / voucher / format you already use. Claude vision will read the layout (columns, headers, signature blocks) and create a reusable template. Reports you print after this will follow your format with Loglinkr data filled in. <span style="color:var(--slate-500)">~₹3 per scan.</span>
+          Upload a photo or scan of the ${label.toLowerCase()} you already use. Claude vision will read the layout (columns, headers, signature blocks) and create a reusable template. Documents you print after this will follow your format with Loglinkr data filled in. <span style="color:var(--slate-500)">~₹3 per scan.</span>
         </div>
         <div class="field">
           <label>Scan / photo</label>
@@ -11623,7 +11741,7 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
           </select>
           ${templates.length === 0 && html`<div style="font-size:10px;color:var(--slate-500);margin-top:4px">No custom formats yet. Tap "+ Upload custom format" to scan one of your existing registers.</div>`}
         </div>
-        ${uploadOpen && html`<${PettyCashTemplateUploadModal} plant=${plant} me=${me} onClose=${() => setUploadOpen(false)} onSaved=${async () => { setUploadOpen(false); await refreshTemplates(); }} />`}
+        ${uploadOpen && html`<${RecordTemplateUploadModal} plant=${plant} me=${me} source="petty_cash" sourceLabel="Petty Cash Format" onClose=${() => setUploadOpen(false)} onSaved=${async () => { setUploadOpen(false); await refreshTemplates(); }} />`}
         <div style="background:var(--slate-50);padding:12px 14px;border-radius:8px;margin-bottom:14px">
           <div style="font-size:11px;color:var(--slate-500);margin-bottom:4px">${range.label}${range.from && range.to ? ' · ' + range.from + ' → ' + range.to : ''}</div>
           ${fetching
@@ -15043,7 +15161,7 @@ function SalesDocMakerModule({ plant, me, navAction }) {
     }
   }, [tab, plant.id]);
 
-  if (view) return html`<${SalesDocPreview} doc=${view} plant=${plant} customers=${customers} vendors=${vendors} onClose=${() => setView(null)} />`;
+  if (view) return html`<${SalesDocPreview} doc=${view} plant=${plant} me=${me} customers=${customers} vendors=${vendors} onClose=${() => setView(null)} />`;
 
   const META = {
     invoice_out:           { ico:'🧾', label:'Tax Invoice' },
@@ -15484,7 +15602,57 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCount
   `;
 }
 
-function PoPackingPreview({ doc, plant, customers, vendors, onClose }) {
+// Shared format-picker bar shown above sales-doc previews. Lists saved AI
+// templates for this doc_type, lets the user open the doc in their own
+// custom format (via the rt* renderer in a new window) or fall back to the
+// hardcoded Loglinkr layout and hit print. The "+ Upload" button opens the
+// generic RecordTemplateUploadModal scoped to this doc_type.
+function DocFormatBar({ plant, me, doc, party, isInvoice, onPrintDefault }) {
+  const sourceCfg = DOC_SOURCE_LABEL[doc.doc_type];
+  const source = sourceCfg?.source;
+  const label = sourceCfg?.label || 'Document format';
+  const [templates, setTemplates] = useState([]);
+  const [templateId, setTemplateId] = useState('default');
+  const [uploadOpen, setUploadOpen] = useState(false);
+
+  const refresh = useCallback(async () => {
+    if (!source) return;
+    const { data } = await sb.from('mcp_record_templates')
+      .select('id, name, config, ai_confidence, created_at')
+      .eq('plant_id', plant.id).eq('source', source).eq('active', true)
+      .order('created_at', { ascending: false });
+    setTemplates(data || []);
+  }, [plant.id, source]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const print = () => {
+    if (templateId === 'default') { onPrintDefault(); return; }
+    const tpl = templates.find(t => t.id === templateId);
+    if (!tpl) { onPrintDefault(); return; }
+    const ctx = rtBuildDocCtx({ doc, plant, party, isInvoice });
+    const docHtml = rtRenderDocument(tpl.config, ctx);
+    const w = window.open('', '_blank');
+    if (!w) { alert('Pop-up blocked — allow pop-ups so the document can open.'); return; }
+    w.document.write(docHtml);
+    w.document.close();
+  };
+
+  if (!source) return null;
+  return html`
+    <div class="card" style="padding:10px 12px;margin-bottom:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500);font-weight:700">Format</div>
+      <select value=${templateId} onChange=${e => setTemplateId(e.target.value)} style="flex:1;min-width:160px;padding:6px 10px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white;font-family:inherit">
+        <option value="default">Loglinkr default layout</option>
+        ${templates.map(t => html`<option key=${t.id} value=${t.id}>${t.name}${t.ai_confidence ? ' · ' + t.ai_confidence : ''}</option>`)}
+      </select>
+      <button type="button" onClick=${() => setUploadOpen(true)} style="background:none;border:1px dashed var(--teal-400);color:var(--teal-700);cursor:pointer;font-size:11px;font-weight:600;padding:6px 10px;border-radius:5px">🤖 + Upload custom format</button>
+      <button class="btn small" onClick=${print}>🖨 Print</button>
+      ${uploadOpen && html`<${RecordTemplateUploadModal} plant=${plant} me=${me} source=${source} sourceLabel=${label} onClose=${() => setUploadOpen(false)} onSaved=${async () => { setUploadOpen(false); await refresh(); }} />`}
+    </div>
+  `;
+}
+
+function PoPackingPreview({ doc, plant, me, customers, vendors, onClose }) {
   const isPo = doc.doc_type === 'po';
   const party = (isPo ? (vendors||[]) : (customers||[])).find(p => p.id === doc.vendor_id) || doc.raw_extraction?.party || null;
   const items = Array.isArray(doc.items) ? doc.items : [];
@@ -15494,8 +15662,8 @@ function PoPackingPreview({ doc, plant, customers, vendors, onClose }) {
     <div class="page-header" style="display:flex;align-items:center;gap:10px">
       <button class="btn ghost small" onClick=${onClose} style="padding:6px 10px">← Back</button>
       <div style="flex:1"><h1 style="font-size:18px">${isPo?'🛒 Purchase Order':'📋 Packing List'} · ${doc.doc_number}</h1></div>
-      <button class="btn small" onClick=${printIt}>🖨 Print</button>
     </div>
+    <${DocFormatBar} plant=${plant} me=${me} doc=${doc} party=${party} isInvoice=${false} onPrintDefault=${printIt} />
     <style>@media print{body{background:white!important}.tabbar,.page-header,.auth-tabs{display:none!important}.print-doc{box-shadow:none!important;border:1px solid #000!important}}</style>
     <div class="card print-doc" style="padding:24px;font-family:'Segoe UI',Arial,sans-serif;max-width:780px;margin:0 auto;background:white;border:1px solid var(--slate-300)">
       <div style="text-align:center;border-bottom:2px solid #000;padding-bottom:12px;margin-bottom:14px">
@@ -15558,10 +15726,10 @@ function PoPackingPreview({ doc, plant, customers, vendors, onClose }) {
   `;
 }
 
-function SalesDocPreview({ doc, plant, customers, vendors, onClose }) {
+function SalesDocPreview({ doc, plant, me, customers, vendors, onClose }) {
   // PO and Packing List get their own print layout; DC/Invoice path below is unchanged.
   if (doc.doc_type === 'po' || doc.doc_type === 'packing_list') {
-    return html`<${PoPackingPreview} doc=${doc} plant=${plant} customers=${customers} vendors=${vendors} onClose=${onClose} />`;
+    return html`<${PoPackingPreview} doc=${doc} plant=${plant} me=${me} customers=${customers} vendors=${vendors} onClose=${onClose} />`;
   }
   const isInvoice = doc.doc_type === 'invoice_out';
   const cust = customers.find(c => c.id === doc.vendor_id) || (doc.raw_extraction?.customer || null);
@@ -15573,8 +15741,8 @@ function SalesDocPreview({ doc, plant, customers, vendors, onClose }) {
     <div class="page-header" style="display:flex;align-items:center;gap:10px">
       <button class="btn ghost small" onClick=${onClose} style="padding:6px 10px">← Back</button>
       <div style="flex:1"><h1 style="font-size:18px">${isInvoice ? '🧾 Tax Invoice' : '📦 Delivery Challan'} · ${doc.doc_number}</h1></div>
-      <button class="btn small" onClick=${printIt}>🖨 Print</button>
     </div>
+    <${DocFormatBar} plant=${plant} me=${me} doc=${doc} party=${cust} isInvoice=${isInvoice} onPrintDefault=${printIt} />
 
     <style>
       @media print {
