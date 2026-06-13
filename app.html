@@ -15199,6 +15199,158 @@ function ExpenseModal({ plant, me, vendors, projects, editTarget, onClose, onSav
   `;
 }
 
+// Filterable, searchable list of recently created sales documents. Lets
+// Marvel find an old DC / PO by number, party name, item name, date range
+// or doc type without scrolling. Filters work in-memory against the
+// up-to-500-row recent window the module already fetches.
+function SalesDocFilteredList({ recent, loading, META, onView }) {
+  const [q, setQ] = useState('');
+  const [docType, setDocType] = useState('all');
+  const [period, setPeriod] = useState('all');
+  const [partyFilter, setPartyFilter] = useState('all');
+  const [sortBy, setSortBy] = useState('newest');
+
+  const TYPE_PILLS = [
+    { key:'all',                ico:'📃', label:'All' },
+    { key:'dc_out',             ico:'📦', label:'DC' },
+    { key:'dc_out_returnable',  ico:'🔁', label:'RDC' },
+    { key:'invoice_out',        ico:'🧾', label:'Invoice' },
+    { key:'po',                 ico:'🛒', label:'PO' },
+    { key:'packing_list',       ico:'📋', label:'Packing' },
+  ];
+
+  const today = new Date();
+  const toISO = (d) => d.toISOString().slice(0, 10);
+  const range = (() => {
+    if (period === 'this_month') {
+      return { from: toISO(new Date(today.getFullYear(), today.getMonth(), 1)), to: toISO(new Date(today.getFullYear(), today.getMonth() + 1, 0)) };
+    }
+    if (period === 'last_month') {
+      return { from: toISO(new Date(today.getFullYear(), today.getMonth() - 1, 1)), to: toISO(new Date(today.getFullYear(), today.getMonth(), 0)) };
+    }
+    if (period === '90d') {
+      const from = new Date(today); from.setDate(today.getDate() - 90);
+      return { from: toISO(from), to: toISO(today) };
+    }
+    if (period === 'ytd') {
+      return { from: toISO(new Date(today.getFullYear(), 0, 1)), to: toISO(today) };
+    }
+    return null;
+  })();
+
+  // Sorted, unique party names for the dropdown -- pulled from doc snapshots
+  // so we see every party that ever issued a doc, even ones removed since.
+  const parties = useMemo(() => {
+    const set = new Set();
+    for (const d of recent) if (d.vendor_name_raw) set.add(d.vendor_name_raw);
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [recent]);
+
+  // Apply filters + search + sort in memory.
+  const filtered = useMemo(() => {
+    const qn = q.trim().toLowerCase();
+    let out = recent;
+    if (docType !== 'all') out = out.filter(d => d.doc_type === docType);
+    if (range)              out = out.filter(d => d.doc_date >= range.from && d.doc_date <= range.to);
+    if (partyFilter !== 'all') out = out.filter(d => d.vendor_name_raw === partyFilter);
+    if (qn) {
+      out = out.filter(d => {
+        if ((d.doc_number || '').toLowerCase().includes(qn)) return true;
+        if ((d.vendor_name_raw || '').toLowerCase().includes(qn)) return true;
+        if ((d.notes || '').toLowerCase().includes(qn)) return true;
+        if (Array.isArray(d.items)) {
+          for (const it of d.items) {
+            if ((it.name || '').toLowerCase().includes(qn)) return true;
+            if ((it.hsn  || '').toLowerCase().includes(qn)) return true;
+          }
+        }
+        return false;
+      });
+    }
+    if (sortBy === 'oldest')         out = [...out].sort((a, b) => (a.doc_date || '').localeCompare(b.doc_date || ''));
+    else if (sortBy === 'amount_desc') out = [...out].sort((a, b) => (b.total_value || 0) - (a.total_value || 0));
+    else if (sortBy === 'amount_asc')  out = [...out].sort((a, b) => (a.total_value || 0) - (b.total_value || 0));
+    else /* newest */                  out = [...out].sort((a, b) => (b.doc_date || '').localeCompare(a.doc_date || ''));
+    return out;
+  }, [recent, q, docType, range, partyFilter, sortBy]);
+
+  const countByType = useMemo(() => {
+    const m = { all: recent.length };
+    for (const d of recent) m[d.doc_type] = (m[d.doc_type] || 0) + 1;
+    return m;
+  }, [recent]);
+
+  const totalValue = filtered.reduce((s, d) => s + (parseFloat(d.total_value) || 0), 0);
+  const anyFilterActive = q.trim() || docType !== 'all' || period !== 'all' || partyFilter !== 'all';
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+  if (recent.length === 0) return html`<div class="card"><div class="empty"><div class="icon">📤</div><div style="font-size:13px">No documents made yet. Tap a + tab above to create a DC, Invoice, PO or Packing list.</div></div></div>`;
+
+  return html`
+    <div style="margin-bottom:10px">
+      <input type="search" value=${q} onChange=${e => setQ(e.target.value)} placeholder="🔍 Search doc number, party, item, HSN, notes…"
+        style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px;font-family:inherit;background:white" />
+    </div>
+
+    <div style="display:flex;gap:6px;margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
+      ${TYPE_PILLS.map(p => html`
+        <button key=${p.key} type="button" onClick=${() => setDocType(p.key)}
+          style=${'flex:0 0 auto;padding:6px 12px;border-radius:999px;border:1px solid '+(docType===p.key?'var(--teal-500)':'var(--slate-200)')+';background:'+(docType===p.key?'var(--teal-50)':'white')+';color:'+(docType===p.key?'var(--teal-800)':'var(--slate-700)')+';font-size:11px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap'}>
+          ${p.ico} ${p.label}${countByType[p.key] != null ? ' · ' + countByType[p.key] : ''}
+        </button>
+      `)}
+    </div>
+
+    <div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">
+      <select value=${period} onChange=${e => setPeriod(e.target.value)} style="padding:6px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white;font-family:inherit">
+        <option value="all">All dates</option>
+        <option value="this_month">This month</option>
+        <option value="last_month">Last month</option>
+        <option value="90d">Last 90 days</option>
+        <option value="ytd">Year to date</option>
+      </select>
+      <select value=${partyFilter} onChange=${e => setPartyFilter(e.target.value)} style="padding:6px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white;font-family:inherit;max-width:200px">
+        <option value="all">All parties · ${parties.length}</option>
+        ${parties.map(p => html`<option key=${p} value=${p}>${p}</option>`)}
+      </select>
+      <select value=${sortBy} onChange=${e => setSortBy(e.target.value)} style="padding:6px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white;font-family:inherit">
+        <option value="newest">Newest first</option>
+        <option value="oldest">Oldest first</option>
+        <option value="amount_desc">Amount ↓</option>
+        <option value="amount_asc">Amount ↑</option>
+      </select>
+      ${anyFilterActive && html`<button type="button" onClick=${() => { setQ(''); setDocType('all'); setPeriod('all'); setPartyFilter('all'); }}
+        style="padding:6px 10px;border:1px solid var(--rose-300);background:var(--rose-50);color:var(--rose-700);border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;font-family:inherit">✕ Clear</button>`}
+    </div>
+
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;padding:0 4px">
+      <div style="font-size:12px;color:var(--slate-600)">
+        ${filtered.length} of ${recent.length}${recent.length === 500 ? '+' : ''} doc${filtered.length === 1 ? '' : 's'}
+      </div>
+      ${totalValue > 0 && html`<div style="font-size:12px;color:var(--slate-600)">Total · <b style="color:var(--slate-900)">₹${fmtNum(totalValue.toFixed(0))}</b></div>`}
+    </div>
+
+    ${filtered.length === 0
+      ? html`<div class="card"><div class="empty"><div class="icon">🔍</div><div style="font-size:13px">No documents match these filters.</div></div></div>`
+      : filtered.map(d => { const m = META[d.doc_type] || { ico:'📄', label:d.doc_type }; return html`
+        <div class="card" key=${d.id} style="margin-bottom:6px;padding:10px 12px;cursor:pointer" onClick=${() => onView(d)}>
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:13px;font-weight:600">${m.ico} ${d.doc_number}</div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+                ${m.label} · ${d.doc_date}${d.vendor_name_raw ? ' · ' + d.vendor_name_raw : ''} · ${Array.isArray(d.items) ? d.items.length : 0} item${(d.items?.length||0)===1?'':'s'}
+              </div>
+            </div>
+            <div style="text-align:right;flex-shrink:0">
+              ${d.total_value && html`<div style="font-size:14px;font-weight:600">₹${fmtNum(d.total_value)}</div>`}
+              <div style="font-size:11px;color:var(--teal-600);margin-top:2px">↗ Open</div>
+            </div>
+          </div>
+        </div>
+      `; })}
+  `;
+}
+
 function SalesDocMakerModule({ plant, me, navAction }) {
   const [tab, setTab] = useState('list'); // list | new_dc | new_invoice | new_po | new_packing
   // Home shortcuts (DC / PO) deep-link straight to the right sub-tab. Pages stay
@@ -15223,7 +15375,7 @@ function SalesDocMakerModule({ plant, me, navAction }) {
         .in('doc_type', ['invoice_out','dc_out','dc_out_returnable','po','packing_list'])
         .eq('extracted_by_ai', false)
         .order('created_at', { ascending: false })
-        .limit(100),
+        .limit(500),
       sb.from('mcp_sched_customers').select('id, name, short_code, gstin, address, city, contact_person, contact_phone, contact_email').eq('plant_id', plant.id).order('name'),
       sb.from('mcp_logistics_vendors').select('id, name, gstin, address, city, phone, email').eq('plant_id', plant.id).order('name'),
     ]);
@@ -15307,27 +15459,7 @@ function SalesDocMakerModule({ plant, me, navAction }) {
         onSaved=${(doc) => { setTab('list'); refresh(); setView(doc); }} onCancel=${() => setTab('list')} />
     `}
 
-    ${tab === 'list' && html`
-      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
-        recent.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📤</div><div style="font-size:13px">No documents made yet. Tap a + tab above to create a DC, Invoice, PO or Packing list.</div></div></div>` :
-        recent.map(d => { const m = META[d.doc_type] || { ico:'📄', label:d.doc_type }; return html`
-          <div class="card" key=${d.id} style="margin-bottom:6px;padding:10px 12px;cursor:pointer" onClick=${() => setView(d)}>
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
-              <div style="flex:1;min-width:0">
-                <div style="font-size:13px;font-weight:600">${m.ico} ${d.doc_number}</div>
-                <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
-                  ${m.label} · ${d.doc_date}${d.vendor_name_raw ? ' · ' + d.vendor_name_raw : ''} · ${Array.isArray(d.items) ? d.items.length : 0} item${(d.items?.length||0)===1?'':'s'}
-                </div>
-              </div>
-              <div style="text-align:right;flex-shrink:0">
-                ${d.total_value && html`<div style="font-size:14px;font-weight:600">₹${fmtNum(d.total_value)}</div>`}
-                <div style="font-size:11px;color:var(--teal-600);margin-top:2px">↗ Print</div>
-              </div>
-            </div>
-          </div>
-        `; })
-      }
-    `}
+    ${tab === 'list' && html`<${SalesDocFilteredList} recent=${recent} loading=${loading} META=${META} onView=${setView} />`}
   `;
 }
 
