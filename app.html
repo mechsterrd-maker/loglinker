@@ -15171,6 +15171,14 @@ function SalesDocMakerModule({ plant, me, navAction }) {
     packing_list:          { ico:'📋', label:'Packing List' },
   };
 
+  // Map every "new_*" tab to the canonical doc_type so the format manager
+  // (and any future per-tab UI) can scope itself correctly.
+  const TAB_DOC_TYPE = {
+    new_dc: 'dc_out', new_rdc: 'dc_out_returnable', new_invoice: 'invoice_out',
+    new_po: 'po', new_packing: 'packing_list',
+  };
+  const activeDocType = TAB_DOC_TYPE[tab];
+
   return html`
     <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
       <div><h1>📤 Make Documents</h1><div class="sub">DC · Invoice · PO · Packing list · continuous numbering per plant</div></div>
@@ -15184,6 +15192,8 @@ function SalesDocMakerModule({ plant, me, navAction }) {
       <button class=${'auth-tab' + (tab==='new_po'?' active':'')} onClick=${() => setTab('new_po')}>+ PO</button>
       <button class=${'auth-tab' + (tab==='new_packing'?' active':'')} onClick=${() => setTab('new_packing')}>+ Packing</button>
     </div>
+
+    ${activeDocType && html`<${DocFormatManager} plant=${plant} me=${me} docType=${activeDocType} />`}
 
     ${(tab === 'new_dc' || tab === 'new_rdc' || tab === 'new_invoice') && html`
       <${SalesDocCreateForm} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber} customers=${customers}
@@ -15599,6 +15609,48 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCount
         <button class="btn" disabled=${busy} style="flex:1">${busy ? 'Saving…' : (isInvoice ? '🧾 Create Invoice' : '📦 Create DC')}</button>
       </div>
     </form>
+  `;
+}
+
+// Format manager strip shown on every "+ DC / RDC / Invoice / PO / Packing"
+// create tab. Lets the user upload a custom format BEFORE they save any
+// document — once saved, the format becomes selectable on every preview of
+// that doc kind. Pure manager UI: no print button, no per-doc context.
+function DocFormatManager({ plant, me, docType }) {
+  const sourceCfg = DOC_SOURCE_LABEL[docType];
+  const source = sourceCfg?.source;
+  const label = sourceCfg?.label || 'Document format';
+  const [templates, setTemplates] = useState([]);
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    if (!source) return;
+    setLoading(true);
+    const { data } = await sb.from('mcp_record_templates')
+      .select('id, name, ai_confidence, created_at')
+      .eq('plant_id', plant.id).eq('source', source).eq('active', true)
+      .order('created_at', { ascending: false });
+    setTemplates(data || []);
+    setLoading(false);
+  }, [plant.id, source]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  if (!source) return null;
+  return html`
+    <div class="card" style="padding:10px 12px;margin-bottom:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--teal-50);border:1px solid var(--teal-200)">
+      <div style="flex:1;min-width:200px">
+        <div style="font-size:11px;font-weight:700;color:var(--teal-800)">🤖 ${label}</div>
+        <div style="font-size:11px;color:var(--slate-600);margin-top:2px">
+          ${loading ? 'Loading saved formats…' :
+            templates.length === 0
+              ? 'No custom format yet. Upload a scan of the format you already use and AI will rebuild it for you.'
+              : templates.length + ' saved format' + (templates.length === 1 ? '' : 's') + ': ' + templates.map(t => t.name).join(', ')}
+        </div>
+      </div>
+      <button type="button" onClick=${() => setUploadOpen(true)} style="background:white;border:1px dashed var(--teal-500);color:var(--teal-700);cursor:pointer;font-size:12px;font-weight:700;padding:8px 14px;border-radius:6px">🤖 + Upload custom format</button>
+      ${uploadOpen && html`<${RecordTemplateUploadModal} plant=${plant} me=${me} source=${source} sourceLabel=${label} onClose=${() => setUploadOpen(false)} onSaved=${async () => { setUploadOpen(false); await refresh(); }} />`}
+    </div>
   `;
 }
 
