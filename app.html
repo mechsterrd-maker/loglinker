@@ -11032,6 +11032,283 @@ function PettyCashModule({ plant, me }) {
   `;
 }
 
+// =================================================================
+// AI-built record templates -- shared helpers used by the petty cash
+// report (and any future module that adds template support).
+// =================================================================
+
+// Map a template "data_hint" string to a concrete value from the report
+// context. ctx = { plant, range, summary, txn?, row_num? }.
+function rtResolveValue(hint, ctx) {
+  if (!hint) return '';
+  if (hint === 'row_num') return ctx.row_num ?? '';
+  if (hint === 'today') return new Date().toLocaleDateString();
+  if (hint === 'now') return new Date().toLocaleString();
+  const idx = hint.indexOf('.');
+  if (idx < 0) return '';
+  const scope = hint.slice(0, idx);
+  const key   = hint.slice(idx + 1);
+  if (scope === 'txn' && ctx.txn) {
+    const t = ctx.txn;
+    if (key === 'amount')           return t.amount;
+    if (key === 'txn_type_label')   return ({ topup:'Top-up', expense:'Expense', advance_given:'Advance', advance_returned:'Returned' }[t.txn_type] || t.txn_type);
+    if (key === 'party_name')       return t.party?.full_name || t.party_name || '';
+    if (key === 'vendor_name')      return t.vendor_name || '';
+    if (key === 'book_name')        return t.book?.name || '';
+    if (key === 'created_by_name')  return t.creator?.full_name || '';
+    return t[key] ?? '';
+  }
+  if (scope === 'summary' && ctx.summary) return ctx.summary[key] ?? 0;
+  if (scope === 'plant'   && ctx.plant)   return ctx.plant[key]   ?? '';
+  if (scope === 'range'   && ctx.range)   return ctx.range[key]   ?? '';
+  return '';
+}
+
+function rtFormatValue(val, format) {
+  if (val == null || val === '') return '';
+  if (format === 'currency') return '₹' + fmtNum(Number(val).toFixed(0));
+  if (format === 'date') return String(val);
+  if (format === 'number') return fmtNum(val);
+  return String(val);
+}
+
+function rtEsc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+
+// Render a single header / footer block (title / kv_grid / signature_grid /
+// divider / static_text) to HTML. Unknown block types return ''.
+function rtRenderBlock(block, ctx) {
+  if (!block || !block.type) return '';
+  if (block.type === 'title')   return '<h1 class="rt-title">' + rtEsc(block.text || '') + '</h1>';
+  if (block.type === 'divider') return '<hr class="rt-divider">';
+  if (block.type === 'static_text') return '<p class="rt-static">' + rtEsc(block.text || '') + '</p>';
+  if (block.type === 'kv_grid') {
+    const items = Array.isArray(block.items) ? block.items : [];
+    return '<div class="rt-kv">' + items.map(it => {
+      const v = it.kind === 'data_field' ? rtFormatValue(rtResolveValue(it.data_hint, ctx), it.format) : (it.value || '');
+      return '<div class="rt-kv-item"><span class="rt-kv-lbl">' + rtEsc(it.label || '') + ':</span> <span class="rt-kv-val">' + rtEsc(v) + '</span></div>';
+    }).join('') + '</div>';
+  }
+  if (block.type === 'signature_grid') {
+    const items = Array.isArray(block.items) ? block.items : [];
+    return '<div class="rt-sig">' + items.map(it =>
+      '<div class="rt-sig-block"><div class="rt-sig-line"></div><div class="rt-sig-lbl">' + rtEsc(it.label || '') + '</div></div>'
+    ).join('') + '</div>';
+  }
+  return '';
+}
+
+// Render the table portion of the template (header + body + total row).
+function rtRenderTable(table, ctx) {
+  if (!table || !Array.isArray(table.columns) || table.columns.length === 0) return '';
+  const cols = table.columns;
+  const totalHintIdx = table.show_total_row && table.total_column_hint
+    ? cols.findIndex(c => c.data_hint === table.total_column_hint) : -1;
+  let html = '<table class="rt-table">';
+  if (table.title) html += '<caption class="rt-table-cap">' + rtEsc(table.title) + '</caption>';
+  html += '<thead><tr>';
+  for (const c of cols) {
+    const w = c.width_pct ? ('width:' + c.width_pct + '%;') : '';
+    html += '<th style="text-align:' + (c.align || 'left') + ';' + w + '">' + rtEsc(c.label || '') + '</th>';
+  }
+  html += '</tr></thead><tbody>';
+  for (let i = 0; i < (ctx.rows || []).length; i++) {
+    const row = ctx.rows[i];
+    const rctx = Object.assign({}, ctx, { txn: row, row_num: i + 1 });
+    html += '<tr>';
+    for (const c of cols) {
+      const raw = rtResolveValue(c.data_hint, rctx);
+      html += '<td style="text-align:' + (c.align || 'left') + '">' + rtEsc(rtFormatValue(raw, c.format)) + '</td>';
+    }
+    html += '</tr>';
+  }
+  if (totalHintIdx >= 0) {
+    const total = (ctx.rows || []).reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
+    html += '<tr class="rt-total">';
+    for (let i = 0; i < cols.length; i++) {
+      if (i === totalHintIdx) {
+        html += '<td style="text-align:' + (cols[i].align || 'right') + ';font-weight:700">' + rtFormatValue(total, 'currency') + '</td>';
+      } else if (i === 0) {
+        html += '<td colspan="' + totalHintIdx + '" style="text-align:right;font-weight:700">Total</td>';
+      } else if (i < totalHintIdx) {
+        // already covered by colspan
+      } else {
+        html += '<td></td>';
+      }
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+const RT_PRINT_CSS = `
+  *,*:before,*:after{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#0f172a;margin:0;padding:18px;font-size:12px;line-height:1.4}
+  .rt-title{font-size:22px;margin:0 0 6px 0;text-transform:uppercase;letter-spacing:0.04em;text-align:center}
+  .rt-divider{border:none;border-top:1px solid #cbd5e1;margin:8px 0}
+  .rt-static{margin:8px 0;font-size:11px;color:#475569}
+  .rt-kv{display:grid;grid-template-columns:repeat(2,1fr);gap:6px 18px;font-size:11px;margin:10px 0 14px}
+  .rt-kv-lbl{font-weight:700;color:#64748b}
+  .rt-kv-val{color:#0f172a}
+  .rt-table{width:100%;border-collapse:collapse;margin:12px 0;font-size:11px}
+  .rt-table-cap{font-size:12px;font-weight:700;text-align:left;padding:6px 0;color:#475569;caption-side:top}
+  .rt-table th{background:#f1f5f9;text-align:left;padding:5px 6px;border:1px solid #cbd5e1;font-size:9px;text-transform:uppercase;letter-spacing:0.04em}
+  .rt-table td{padding:4px 6px;border:1px solid #e2e8f0;font-size:11px}
+  .rt-total{background:#f1f5f9;font-weight:700}
+  .rt-sig{display:grid;grid-template-columns:repeat(3,1fr);gap:32px;margin-top:40px;page-break-inside:avoid}
+  .rt-sig-block{text-align:center;font-size:11px}
+  .rt-sig-line{border-top:1px solid #0f172a;margin-bottom:4px;padding-top:48px}
+  .rt-sig-lbl{font-weight:600;color:#475569}
+  .rt-btn{position:fixed;top:12px;right:12px;padding:9px 16px;background:#0d9488;color:white;border:none;border-radius:6px;font-weight:700;cursor:pointer;font-size:13px;box-shadow:0 2px 6px rgba(0,0,0,0.15)}
+  @media print{.rt-btn{display:none}body{padding:12mm 14mm}}
+`;
+
+// Render a complete template to standalone HTML (the document opened in the
+// "Save as PDF" window). rows[] is the iterated record list (transactions
+// for petty cash, NCR rows for NCR log, etc.).
+function rtRenderDocument(template, ctx) {
+  const headers = (template.header_blocks || []).map(b => rtRenderBlock(b, ctx)).join('');
+  const table   = rtRenderTable(template.table, ctx);
+  const footers = (template.footer_blocks || []).map(b => rtRenderBlock(b, ctx)).join('');
+  const docTitle = template.title || 'Report';
+  return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + rtEsc(docTitle) + '</title><style>' + RT_PRINT_CSS + '</style></head><body>' +
+    '<button class="rt-btn" onclick="window.print()">🖨 Save as PDF / Print</button>' +
+    headers + table + footers +
+    '</body></html>';
+}
+
+// =================================================================
+// PettyCashTemplateUploadModal -- pick image, send to Claude vision,
+// preview the extracted template, save with a name.
+// =================================================================
+function PettyCashTemplateUploadModal({ plant, me, onClose, onSaved }) {
+  const [file, setFile] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState('');
+  const [extracted, setExtracted] = useState(null);
+  const [confidence, setConfidence] = useState('');
+  const [notes, setNotes] = useState('');
+  const [name, setName] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const pickFile = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (!f.type.startsWith('image/')) { setError('Pick an image (JPG / PNG / HEIC / PDF page export).'); return; }
+    if (f.size > 6 * 1024 * 1024) { setError('Image is over 6 MB. Shrink it first.'); return; }
+    setError('');
+    setFile(f);
+    setPreviewUrl(URL.createObjectURL(f));
+    setExtracted(null);
+  };
+
+  const extract = async () => {
+    if (!file) return;
+    setBusy(true); setError('');
+    try {
+      const buf = await file.arrayBuffer();
+      let b64 = '';
+      const bytes = new Uint8Array(buf);
+      for (let i = 0; i < bytes.byteLength; i += 0x8000) {
+        b64 += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      }
+      b64 = btoa(b64);
+      const { data, error: err } = await sb.functions.invoke('analyze-record-template', {
+        body: { image_b64: b64, image_mime: file.type, source: 'petty_cash', plant_id: plant.id },
+      });
+      if (err) throw err;
+      if (data?.error) throw new Error(data.error);
+      setExtracted(data.template);
+      setConfidence(data.confidence || 'medium');
+      setNotes(data.notes || data.template?.notes || '');
+      if (!name && data.template?.title) setName(data.template.title);
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const save = async () => {
+    if (!extracted) return;
+    if (!name.trim()) { setError('Give the format a name.'); return; }
+    setBusy(true); setError('');
+    try {
+      const payload = {
+        plant_id: plant.id,
+        name: name.trim(),
+        source: 'petty_cash',
+        config: extracted,
+        ai_model: 'claude-sonnet-4',
+        ai_confidence: confidence,
+        created_by: me.id,
+      };
+      const { error: err } = await sb.from('mcp_record_templates').insert(payload);
+      if (err) throw err;
+      showToast('✓ Format saved');
+      onSaved && onSaved();
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const cols = extracted?.table?.columns || [];
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:640px;max-height:92vh;overflow-y:auto">
+        <div class="modal-header">
+          <div class="modal-title">🤖 Upload Format</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div style="font-size:12px;color:var(--slate-600);margin-bottom:12px;line-height:1.5">
+          Upload a photo or scan of the petty-cash register / voucher / format you already use. Claude vision will read the layout (columns, headers, signature blocks) and create a reusable template. Reports you print after this will follow your format with Loglinkr data filled in. <span style="color:var(--slate-500)">~₹3 per scan.</span>
+        </div>
+        <div class="field">
+          <label>Scan / photo</label>
+          <input type="file" accept="image/*" onChange=${pickFile} style="font-size:13px" />
+        </div>
+        ${previewUrl && html`
+          <div style="margin-bottom:12px;text-align:center;background:var(--slate-50);padding:8px;border-radius:8px">
+            <img src=${previewUrl} style="max-width:100%;max-height:200px;border-radius:4px;border:1px solid var(--slate-200)" />
+          </div>
+        `}
+        ${file && !extracted && html`
+          <button class="btn" disabled=${busy} onClick=${extract} style="width:100%;margin-bottom:12px">${busy ? '… reading layout' : '🤖 Extract format with AI'}</button>
+        `}
+        ${error && html`<div style="background:#fef2f2;border:1px solid var(--rose-300);padding:10px;border-radius:6px;color:var(--rose-700);font-size:12px;margin-bottom:12px">⚠ ${error}</div>`}
+        ${extracted && html`
+          <div style="background:var(--teal-50);border:1px solid var(--teal-200);padding:12px;border-radius:8px;margin-bottom:12px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+              <div style="font-weight:700;font-size:13px;color:var(--teal-800)">✓ AI extracted the layout</div>
+              <span style=${'font-size:10px;padding:2px 8px;border-radius:999px;background:'+(confidence==='high'?'#bbf7d0':confidence==='low'?'#fecaca':'#fde68a')+';font-weight:700;text-transform:uppercase'}>${confidence} confidence</span>
+            </div>
+            <div style="font-size:11px;color:var(--slate-700);margin-bottom:6px"><b>${rtEsc(extracted.title || '—')}</b> · ${cols.length} column${cols.length===1?'':'s'} · ${(extracted.header_blocks||[]).length} header block${(extracted.header_blocks||[]).length===1?'':'s'} · ${(extracted.footer_blocks||[]).length} footer block${(extracted.footer_blocks||[]).length===1?'':'s'}</div>
+            ${cols.length > 0 && html`
+              <div style="margin-top:8px">
+                <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500);font-weight:700;margin-bottom:4px">Columns</div>
+                <div style="display:flex;flex-wrap:wrap;gap:4px">
+                  ${cols.map((c, i) => html`<span key=${i} style="font-size:10px;background:white;border:1px solid var(--slate-200);padding:3px 7px;border-radius:4px"><b>${rtEsc(c.label)}</b>${c.data_hint ? html` <span style="color:var(--slate-500)">→ ${rtEsc(c.data_hint)}</span>` : html` <span style="color:var(--rose-600)">⚠ no mapping</span>`}</span>`)}
+                </div>
+              </div>
+            `}
+            ${notes && html`<div style="margin-top:8px;font-size:10px;color:var(--slate-600);font-style:italic">${rtEsc(notes)}</div>`}
+          </div>
+          <div class="field">
+            <label>Format name</label>
+            <input type="text" value=${name} onChange=${e=>setName(e.target.value)} placeholder="e.g. Krishna PCV Register" style="font-size:13px" />
+          </div>
+          <button class="btn" disabled=${busy || !name.trim()} onClick=${save} style="width:100%">${busy ? 'Saving…' : '✓ Save format'}</button>
+        `}
+      </div>
+    </div>
+  `;
+}
+
 function PettyCashReportModal({ plant, me, books, balances, onClose }) {
   const [period, setPeriod] = useState('this_month');
   const [customFrom, setCustomFrom] = useState('');
@@ -11039,6 +11316,18 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
   const [filtered, setFiltered] = useState([]);
   const [preTxns, setPreTxns] = useState([]); // everything BEFORE range.from, for opening-balance math
   const [fetching, setFetching] = useState(false);
+  const [templates, setTemplates] = useState([]);
+  const [templateId, setTemplateId] = useState('default');
+  const [uploadOpen, setUploadOpen] = useState(false);
+
+  const refreshTemplates = useCallback(async () => {
+    const { data } = await sb.from('mcp_record_templates')
+      .select('id, name, config, ai_confidence, created_at')
+      .eq('plant_id', plant.id).eq('source', 'petty_cash').eq('active', true)
+      .order('created_at', { ascending: false });
+    setTemplates(data || []);
+  }, [plant.id]);
+  useEffect(() => { refreshTemplates(); }, [refreshTemplates]);
 
   const toISO = (d) => d.toISOString().slice(0, 10);
   const today = new Date();
@@ -11181,6 +11470,29 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
   };
 
   const openPDF = () => {
+    // If a custom template is selected, render via the template engine instead
+    // of the built-in Loglinkr layout.
+    if (templateId !== 'default') {
+      const tpl = templates.find(t => t.id === templateId);
+      if (tpl) {
+        const ctx = {
+          plant,
+          range,
+          rows: filtered,
+          summary: {
+            opening: openingTotal, closing: closingTotal,
+            totalIn, totalOut, totalExpense, totalAdvance, totalReturn, totalTopup,
+            net, count: filtered.length,
+          },
+        };
+        const doc = rtRenderDocument(tpl.config, ctx);
+        const w = window.open('', '_blank');
+        if (!w) { alert('Pop-up blocked — allow pop-ups so the report can open.'); return; }
+        w.document.write(doc);
+        w.document.close();
+        return;
+      }
+    }
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
     const txnRows = filtered.map(t => {
       const sign = (t.txn_type === 'topup' || t.txn_type === 'advance_returned') ? '+' : '−';
@@ -11300,6 +11612,18 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
             </div>
           `}
         </div>
+        <div style="margin-bottom:14px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500);font-weight:700">Format</div>
+            <button type="button" onClick=${() => setUploadOpen(true)} style="background:none;border:none;color:var(--teal-700);cursor:pointer;font-size:11px;font-weight:600">🤖 + Upload custom format</button>
+          </div>
+          <select value=${templateId} onChange=${e => setTemplateId(e.target.value)} style="width:100%;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px;background:white;font-family:inherit">
+            <option value="default">Loglinkr default layout</option>
+            ${templates.map(t => html`<option key=${t.id} value=${t.id}>${t.name}${t.ai_confidence ? ' · ' + t.ai_confidence + ' confidence' : ''}</option>`)}
+          </select>
+          ${templates.length === 0 && html`<div style="font-size:10px;color:var(--slate-500);margin-top:4px">No custom formats yet. Tap "+ Upload custom format" to scan one of your existing registers.</div>`}
+        </div>
+        ${uploadOpen && html`<${PettyCashTemplateUploadModal} plant=${plant} me=${me} onClose=${() => setUploadOpen(false)} onSaved=${async () => { setUploadOpen(false); await refreshTemplates(); }} />`}
         <div style="background:var(--slate-50);padding:12px 14px;border-radius:8px;margin-bottom:14px">
           <div style="font-size:11px;color:var(--slate-500);margin-bottom:4px">${range.label}${range.from && range.to ? ' · ' + range.from + ' → ' + range.to : ''}</div>
           ${fetching
