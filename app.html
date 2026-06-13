@@ -11037,6 +11037,7 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
   const [filtered, setFiltered] = useState([]);
+  const [preTxns, setPreTxns] = useState([]); // everything BEFORE range.from, for opening-balance math
   const [fetching, setFetching] = useState(false);
 
   const toISO = (d) => d.toISOString().slice(0, 10);
@@ -11069,23 +11070,31 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
   })();
 
   // Always fetch fresh data for the chosen range so the report isn't capped
-  // by the in-memory list (limit 300). Re-runs whenever the from/to changes.
+  // by the in-memory list (limit 300). We also fetch every transaction BEFORE
+  // the period start so we can compute the period's opening balance properly
+  // (book.opening_balance + all pre-period activity, per book).
   useEffect(() => {
-    if (!range.from || !range.to) { setFiltered([]); return; }
+    if (!range.from || !range.to) { setFiltered([]); setPreTxns([]); return; }
     let aborted = false;
     setFetching(true);
-    sb.from('mcp_petty_cash_txns')
-      .select('*, book:book_id(name), party:party_user_id(full_name), creator:created_by(full_name)')
-      .eq('plant_id', plant.id)
-      .gte('txn_date', range.from)
-      .lte('txn_date', range.to)
-      .order('txn_date')
-      .order('created_at')
-      .then(({ data }) => {
-        if (aborted) return;
-        setFiltered(data || []);
-        setFetching(false);
-      });
+    (async () => {
+      const [inRangeRes, beforeRes] = await Promise.all([
+        sb.from('mcp_petty_cash_txns')
+          .select('*, book:book_id(name), party:party_user_id(full_name), creator:created_by(full_name)')
+          .eq('plant_id', plant.id)
+          .gte('txn_date', range.from)
+          .lte('txn_date', range.to)
+          .order('txn_date').order('created_at'),
+        sb.from('mcp_petty_cash_txns')
+          .select('book_id, txn_type, amount')
+          .eq('plant_id', plant.id)
+          .lt('txn_date', range.from),
+      ]);
+      if (aborted) return;
+      setFiltered(inRangeRes.data || []);
+      setPreTxns(beforeRes.data || []);
+      setFetching(false);
+    })();
     return () => { aborted = true; };
   }, [plant.id, range.from, range.to]);
 
@@ -11097,6 +11106,24 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
   const totalIn = totalTopup + totalReturn;
   const totalOut = totalExpense + totalAdvance;
   const net = totalIn - totalOut;
+
+  // Per-book opening balance at the START of the period:
+  // book.opening_balance (set when the book was created) + every txn before
+  // range.from. Closing = opening + in-period activity.
+  const signOf = (typ) => (typ === 'topup' || typ === 'advance_returned') ? 1 : -1;
+  const perBook = (books || []).map(b => {
+    let opening = parseFloat(b.opening_balance || 0);
+    for (const t of preTxns) {
+      if (t.book_id !== b.id) continue;
+      opening += signOf(t.txn_type) * parseFloat(t.amount || 0);
+    }
+    const myFiltered = filtered.filter(t => t.book_id === b.id);
+    const bIn  = myFiltered.filter(t => t.txn_type === 'topup' || t.txn_type === 'advance_returned').reduce((s, t) => s + parseFloat(t.amount), 0);
+    const bOut = myFiltered.filter(t => t.txn_type === 'expense' || t.txn_type === 'advance_given').reduce((s, t) => s + parseFloat(t.amount), 0);
+    return { id: b.id, name: b.name, opening, inAmt: bIn, outAmt: bOut, closing: opening + bIn - bOut };
+  });
+  const openingTotal = perBook.reduce((s, b) => s + b.opening, 0);
+  const closingTotal = openingTotal + net;
 
   const labelOf = (t) => ({ topup: 'Top-up', expense: 'Expense', advance_given: 'Advance', advance_returned: 'Returned' }[t] || t);
 
@@ -11127,7 +11154,22 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
       t.creator?.full_name || '',
     ].map(v => '"' + String(v ?? '').replace(/"/g, '""') + '"').join(','));
     const totalsRow = ['"' + range.label + '"', '', '', '', '', '', '', '"Net"', '"' + net.toFixed(2) + '"', '', ''].join(',');
-    const csv = [cols.map(c => '"' + c + '"').join(','), ...rows, '', totalsRow].join('\n');
+    // Summary block prepended to the CSV so the opening balance, in, out and
+    // closing are obvious without re-summing everything in Excel.
+    const summary = [
+      ['"Petty Cash Report"'].join(','),
+      ['"Plant"', '"' + plant.name.replace(/"/g, '""') + '"'].join(','),
+      ['"Period"', '"' + range.label + '"'].join(','),
+      ['"From"', '"' + range.from + '"'].join(','),
+      ['"To"', '"' + range.to + '"'].join(','),
+      ['"Opening balance"', '"' + openingTotal.toFixed(2) + '"'].join(','),
+      ['"Cash in (top-up + returned)"', '"' + totalIn.toFixed(2) + '"'].join(','),
+      ['"Cash out (expense + advances given)"', '"' + totalOut.toFixed(2) + '"'].join(','),
+      ['"Net"', '"' + net.toFixed(2) + '"'].join(','),
+      ['"Closing balance"', '"' + closingTotal.toFixed(2) + '"'].join(','),
+      '',
+    ].join('\n');
+    const csv = summary + '\n' + [cols.map(c => '"' + c + '"').join(','), ...rows, '', totalsRow].join('\n');
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -11157,9 +11199,19 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
     const catRows = catTotals.map(([cat, amt]) =>
       '<tr><td>' + esc(cat) + '</td><td class="num">₹' + fmtNum(amt.toFixed(0)) + '</td></tr>'
     ).join('');
-    const bookRows = (balances || []).map(b =>
-      '<tr><td>' + esc(b.name) + '</td><td class="num">₹' + fmtNum(parseFloat(b.current_balance || 0).toFixed(0)) + '</td></tr>'
+    // Per-book opening → in → out → closing
+    const bookRows = perBook.map(b =>
+      '<tr><td>' + esc(b.name) + '</td>' +
+      '<td class="num">₹' + fmtNum(b.opening.toFixed(0)) + '</td>' +
+      '<td class="num" style="color:#047857">+₹' + fmtNum(b.inAmt.toFixed(0)) + '</td>' +
+      '<td class="num" style="color:#b91c1c">−₹' + fmtNum(b.outAmt.toFixed(0)) + '</td>' +
+      '<td class="num" style="font-weight:700">₹' + fmtNum(b.closing.toFixed(0)) + '</td></tr>'
     ).join('');
+    const bookTotalRow = '<tr class="net"><td>Total · ' + perBook.length + ' book' + (perBook.length === 1 ? '' : 's') + '</td>' +
+      '<td class="num">₹' + fmtNum(openingTotal.toFixed(0)) + '</td>' +
+      '<td class="num" style="color:#047857">+₹' + fmtNum(totalIn.toFixed(0)) + '</td>' +
+      '<td class="num" style="color:#b91c1c">−₹' + fmtNum(totalOut.toFixed(0)) + '</td>' +
+      '<td class="num">₹' + fmtNum(closingTotal.toFixed(0)) + '</td></tr>';
     const docHtml = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Petty Cash · ' + esc(range.label) + ' · ' + esc(plant.name) + '</title>' +
       '<style>' +
       '  *,*:before,*:after{box-sizing:border-box}' +
@@ -11191,11 +11243,15 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
       '  <div class="stat"><div class="lbl">Advances returned</div><div class="val">₹' + fmtNum(totalReturn.toFixed(0)) + '</div></div>' +
       '</div>' +
       '<div class="grid2">' +
+      '  <div class="stat"><div class="lbl">Opening balance</div><div class="val">₹' + fmtNum(openingTotal.toFixed(0)) + '</div></div>' +
+      '  <div class="stat"><div class="lbl">Closing balance</div><div class="val" style="color:' + (closingTotal >= openingTotal ? '#047857' : '#b91c1c') + '">₹' + fmtNum(closingTotal.toFixed(0)) + '</div></div>' +
+      '</div>' +
+      '<div class="grid2">' +
       '  <div class="stat"><div class="lbl">Cash in</div><div class="val" style="color:#047857">+₹' + fmtNum(totalIn.toFixed(0)) + '</div></div>' +
       '  <div class="stat"><div class="lbl">Cash out</div><div class="val" style="color:#b91c1c">−₹' + fmtNum(totalOut.toFixed(0)) + '</div></div>' +
       '</div>' +
       (catTotals.length ? '<h2>Expense by category</h2><table><thead><tr><th>Category</th><th class="num">Amount</th></tr></thead><tbody>' + catRows + '</tbody></table>' : '') +
-      (bookRows ? '<h2>Closing balances by book</h2><table><thead><tr><th>Book</th><th class="num">Balance now</th></tr></thead><tbody>' + bookRows + '</tbody></table>' : '') +
+      (bookRows ? '<h2>Book statement · opening → closing</h2><table><thead><tr><th>Book</th><th class="num">Opening</th><th class="num">In</th><th class="num">Out</th><th class="num">Closing</th></tr></thead><tbody>' + bookRows + bookTotalRow + '</tbody></table>' : '') +
       '<h2>All transactions · ' + filtered.length + '</h2>' +
       (filtered.length === 0
         ? '<p style="color:#64748b;font-size:12px">No transactions in this period.</p>'
@@ -11249,8 +11305,11 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
           ${fetching
             ? html`<div style="font-size:13px;color:var(--slate-500)">Loading transactions…</div>`
             : html`<div>
-                <div style="font-size:13px;font-weight:700">${filtered.length} transaction${filtered.length === 1 ? '' : 's'}</div>
-                <div style="font-size:11px;color:var(--slate-600);margin-top:4px">+₹${fmtNum(totalIn.toFixed(0))} in · −₹${fmtNum(totalOut.toFixed(0))} out · net ${net >= 0 ? '+' : '−'}₹${fmtNum(Math.abs(net).toFixed(0))}</div>
+                <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
+                  <div style="font-size:13px;font-weight:700">${filtered.length} transaction${filtered.length === 1 ? '' : 's'}</div>
+                  <div style="font-size:11px;color:var(--slate-500)">Opening ₹${fmtNum(openingTotal.toFixed(0))} → Closing ₹${fmtNum(closingTotal.toFixed(0))}</div>
+                </div>
+                <div style="font-size:11px;color:var(--slate-600)">+₹${fmtNum(totalIn.toFixed(0))} in · −₹${fmtNum(totalOut.toFixed(0))} out · net ${net >= 0 ? '+' : '−'}₹${fmtNum(Math.abs(net).toFixed(0))}</div>
               </div>`}
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
