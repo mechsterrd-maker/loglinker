@@ -1446,6 +1446,7 @@ const MORE_GROUPS = [
     sub: 'Money flow · sales / vendor / GRN',
     items: [
       { key:'sales_docs',          icon:'📤', label:'Make Documents',            sub:'DC · Invoice · PO · Packing list · per-plant continuous numbering' },
+      { key:'doc_formats',         icon:'🎨', label:'Doc Formats',               sub:'AI-built print templates for every document type' },
       { key:'documents',           icon:'📄', label:'Documents · Bills',         sub:'OCR vendor invoices/DCs, payments, vendors' },
       { key:'movements',           icon:'🔀', label:'Movements',                 sub:'In/out material flow, GRN verification' },
       { key:'expenses',            icon:'💸', label:'Expense Ledger',            sub:'All business expenses, category-wise, monthly rollup' },
@@ -1655,6 +1656,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${tab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} /></${Page}>
+      <${Page} active=${tab === 'doc_formats'}><${DocFormatsModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'projects'}><${ProjectTracker} plant=${plant} me=${me} myPerms=${myPerms} go=${go} /></${Page}>
       <${Page} active=${tab === 'cutting'}><${CuttingPlanner} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'expenses'}><${ExpenseLedger} plant=${plant} me=${me} /></${Page}>
@@ -6432,6 +6434,7 @@ const RBAC_MODULES = [
   { key:'mom', label:'Minutes of Meeting', group:'projects' },
   { key:'documents', label:'Documents · Bills', group:'commercial' },
   { key:'sales_docs', label:'Make Documents (DC/Invoice/PO)', group:'commercial' },
+  { key:'doc_formats', label:'Doc Formats', group:'commercial' },
   { key:'movements', label:'Material Movements', group:'commercial' },
   { key:'expenses', label:'Expense Ledger', group:'commercial' },
   { key:'petty_cash', label:'Petty Cash', group:'commercial' },
@@ -11206,6 +11209,7 @@ const DOC_SOURCE_LABEL = {
   packing_list:       { source: 'packing_list',       label: 'Packing List format' },
   job_work_dc_out:    { source: 'job_work_dc_out',    label: 'Job-work DC (out) format' },
   job_work_dc_in:     { source: 'job_work_dc_in',     label: 'Job-work DC (in) format' },
+  petty_cash:         { source: 'petty_cash',         label: 'Petty Cash format' },
   quote:              { source: 'quote',              label: 'Quotation format' },
 };
 
@@ -11518,16 +11522,25 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
   const [fetching, setFetching] = useState(false);
   const [templates, setTemplates] = useState([]);
   const [templateId, setTemplateId] = useState('default');
+  const [userPickedTpl, setUserPickedTpl] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
 
   const refreshTemplates = useCallback(async () => {
     const { data } = await sb.from('mcp_record_templates')
-      .select('id, name, config, ai_confidence, created_at')
+      .select('id, name, config, ai_confidence, is_default, created_at')
       .eq('plant_id', plant.id).eq('source', 'petty_cash').eq('active', true)
       .order('created_at', { ascending: false });
     setTemplates(data || []);
   }, [plant.id]);
   useEffect(() => { refreshTemplates(); }, [refreshTemplates]);
+
+  // Auto-pick the default (or most recent) template until the user
+  // explicitly chooses something from the dropdown.
+  useEffect(() => {
+    if (userPickedTpl || !templates.length) return;
+    const def = templates.find(t => t.is_default);
+    setTemplateId((def || templates[0]).id);
+  }, [templates, userPickedTpl]);
 
   const toISO = (d) => d.toISOString().slice(0, 10);
   const today = new Date();
@@ -11817,7 +11830,7 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
             <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500);font-weight:700">Format</div>
             <button type="button" onClick=${() => setUploadOpen(true)} style="background:none;border:none;color:var(--teal-700);cursor:pointer;font-size:11px;font-weight:600">🤖 + Upload custom format</button>
           </div>
-          <select value=${templateId} onChange=${e => setTemplateId(e.target.value)} style="width:100%;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px;background:white;font-family:inherit">
+          <select value=${templateId} onChange=${e => { setUserPickedTpl(true); setTemplateId(e.target.value); }} style="width:100%;padding:8px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px;background:white;font-family:inherit">
             <option value="default">Loglinkr default layout</option>
             ${templates.map(t => html`<option key=${t.id} value=${t.id}>${t.name}${t.ai_confidence ? ' · ' + t.ai_confidence + ' confidence' : ''}</option>`)}
           </select>
@@ -15755,17 +15768,27 @@ function DocFormatBar({ plant, me, doc, party, isInvoice, onPrintDefault }) {
   const label = sourceCfg?.label || 'Document format';
   const [templates, setTemplates] = useState([]);
   const [templateId, setTemplateId] = useState('default');
+  const [userPicked, setUserPicked] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     if (!source) return;
     const { data } = await sb.from('mcp_record_templates')
-      .select('id, name, config, ai_confidence, created_at')
+      .select('id, name, config, ai_confidence, is_default, created_at')
       .eq('plant_id', plant.id).eq('source', source).eq('active', true)
       .order('created_at', { ascending: false });
     setTemplates(data || []);
   }, [plant.id, source]);
   useEffect(() => { refresh(); }, [refresh]);
+
+  // Auto-pick: explicit is_default first, else most recently uploaded.
+  // Stop auto-picking after the user manually chooses something.
+  useEffect(() => {
+    if (userPicked) return;
+    if (!templates.length) return;
+    const def = templates.find(t => t.is_default);
+    setTemplateId((def || templates[0]).id);
+  }, [templates, userPicked]);
 
   const print = () => {
     if (templateId === 'default') { onPrintDefault(); return; }
@@ -15783,14 +15806,158 @@ function DocFormatBar({ plant, me, doc, party, isInvoice, onPrintDefault }) {
   return html`
     <div class="card" style="padding:10px 12px;margin-bottom:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
       <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500);font-weight:700">Format</div>
-      <select value=${templateId} onChange=${e => setTemplateId(e.target.value)} style="flex:1;min-width:160px;padding:6px 10px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white;font-family:inherit">
+      <select value=${templateId} onChange=${e => { setUserPicked(true); setTemplateId(e.target.value); }} style="flex:1;min-width:160px;padding:6px 10px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white;font-family:inherit">
         <option value="default">Loglinkr default layout</option>
-        ${templates.map(t => html`<option key=${t.id} value=${t.id}>${t.name}${t.ai_confidence ? ' · ' + t.ai_confidence : ''}</option>`)}
+        ${templates.map(t => html`<option key=${t.id} value=${t.id}>${t.name}${t.is_default ? ' · default' : ''}${t.ai_confidence ? ' · ' + t.ai_confidence : ''}</option>`)}
       </select>
-      <button type="button" onClick=${() => setUploadOpen(true)} style="background:none;border:1px dashed var(--teal-400);color:var(--teal-700);cursor:pointer;font-size:11px;font-weight:600;padding:6px 10px;border-radius:5px">🤖 + Upload custom format</button>
+      <button type="button" onClick=${() => setUploadOpen(true)} style="background:none;border:1px dashed var(--teal-400);color:var(--teal-700);cursor:pointer;font-size:11px;font-weight:600;padding:6px 10px;border-radius:5px">🤖 + Upload</button>
       <button class="btn small" onClick=${print}>🖨 Print</button>
       ${uploadOpen && html`<${RecordTemplateUploadModal} plant=${plant} me=${me} source=${source} sourceLabel=${label} onClose=${() => setUploadOpen(false)} onSaved=${async () => { setUploadOpen(false); await refresh(); }} />`}
     </div>
+  `;
+}
+
+// =================================================================
+// DocFormatsModule -- standalone manager for every AI-built print template.
+// Tabs per source (DC / RDC / PO / Invoice / Packing / JW / Quote /
+// Petty Cash); each tab lists saved formats with preview / set-default /
+// delete actions plus an Upload button.
+// =================================================================
+function DocFormatsModule({ plant, me }) {
+  const SOURCES = [
+    { key:'dc_out',            ico:'📦', label:'Delivery Challan' },
+    { key:'dc_out_returnable', ico:'🔁', label:'Returnable DC' },
+    { key:'invoice_out',       ico:'🧾', label:'Tax Invoice' },
+    { key:'po',                ico:'🛒', label:'Purchase Order' },
+    { key:'packing_list',      ico:'📋', label:'Packing List' },
+    { key:'job_work_dc_out',   ico:'🏭', label:'JW DC Out' },
+    { key:'job_work_dc_in',    ico:'🏭', label:'JW DC In' },
+    { key:'quote',             ico:'💬', label:'Quotation' },
+    { key:'petty_cash',        ico:'💵', label:'Petty Cash' },
+  ];
+  const [tab, setTab] = useState('dc_out');
+  const [templates, setTemplates] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [previewing, setPreviewing] = useState(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('mcp_record_templates')
+      .select('id, source, name, config, ai_confidence, is_default, created_at, created_by, ai_model')
+      .eq('plant_id', plant.id).eq('active', true)
+      .order('source').order('created_at', { ascending: false });
+    setTemplates(data || []);
+    setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const setDefault = async (tpl) => {
+    // Clear any existing default for this source, then mark this one.
+    await sb.from('mcp_record_templates')
+      .update({ is_default: false })
+      .eq('plant_id', plant.id).eq('source', tpl.source).eq('is_default', true);
+    const { error } = await sb.from('mcp_record_templates')
+      .update({ is_default: true })
+      .eq('id', tpl.id);
+    if (error) { showToast('Failed: ' + error.message); return; }
+    showToast('✓ Default format set');
+    refresh();
+  };
+
+  const deactivate = async (tpl) => {
+    if (!confirm('Delete "' + tpl.name + '"? Existing documents stay; future prints can pick another format.')) return;
+    const { error } = await sb.from('mcp_record_templates')
+      .update({ active: false, is_default: false }).eq('id', tpl.id);
+    if (error) { showToast('Failed: ' + error.message); return; }
+    showToast('🗑 Format deleted');
+    refresh();
+  };
+
+  // Preview with sample data so the format can be eyeballed without an
+  // actual saved document.
+  const preview = (tpl) => {
+    const sample = { name: 'SAMPLE PART NAME', hsn: '8400', qty: 10, uom: 'nos', rate: 100, amount: 1000, grade: 'EN-19', batch: 'B-001' };
+    const ctx = tpl.source === 'petty_cash'
+      ? {
+          plant,
+          range: { from: new Date().toISOString().slice(0,10), to: new Date().toISOString().slice(0,10), label: 'Sample period' },
+          summary: { opening: 5000, closing: 4200, totalIn: 1000, totalOut: 1800, totalExpense: 1500, totalAdvance: 300, totalReturn: 0, totalTopup: 1000, net: -800, count: 3 },
+          rows: [
+            { txn_date: '2026-01-01', txn_no: 'PC/0001', txn_type: 'expense', amount: 1500, description: 'Tea & snacks', category: 'office' },
+            { txn_date: '2026-01-02', txn_no: 'PC/0002', txn_type: 'topup',   amount: 1000, description: 'Top-up from bank' },
+            { txn_date: '2026-01-03', txn_no: 'PC/0003', txn_type: 'advance_given', amount: 300, description: 'Travel advance', party_name: 'Ramesh' },
+          ],
+        }
+      : {
+          plant,
+          doc: { doc_number: 'SAMPLE/0001', doc_date: new Date().toISOString().slice(0,10), customer_name: 'Sample Customer Pvt Ltd', customer_gstin: '33AAACS0000A1Z5', customer_address: 'No.12, Sample Street, Chennai-600001', vendor_name: 'Sample Vendor', vehicle_no: 'TN-00-XX-0000', total_value: 12000, taxable_value: 10169, tax_amount: 1831, cgst_amount: 916, sgst_amount: 915 },
+          rows: [sample, { ...sample, name: 'SAMPLE PART NAME B', qty: 5, amount: 500 }],
+        };
+    const docHtml = rtRenderDocument(tpl.config, ctx);
+    const w = window.open('', '_blank');
+    if (!w) { alert('Pop-up blocked.'); return; }
+    w.document.write(docHtml); w.document.close();
+  };
+
+  const forTab = templates.filter(t => t.source === tab);
+  const countBySource = SOURCES.map(s => [s.key, templates.filter(t => t.source === s.key).length]);
+  const sourceCountMap = Object.fromEntries(countBySource);
+  const sourceCfgFor = (key) => DOC_SOURCE_LABEL[key] || { source: key, label: SOURCES.find(s => s.key === key)?.label || key };
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
+      <div><h1>🎨 Doc Formats</h1><div class="sub">AI-built print templates · per doc type · upload your own format and AI mirrors the layout</div></div>
+      <button class="btn small" onClick=${() => setUploadOpen(true)}>🤖 + Upload format</button>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:12px;overflow-x:auto;flex-wrap:nowrap">
+      ${SOURCES.map(s => html`
+        <button key=${s.key} class=${'auth-tab' + (tab===s.key?' active':'')} onClick=${() => setTab(s.key)}>
+          ${s.ico} ${s.label}${sourceCountMap[s.key] ? html` · ${sourceCountMap[s.key]}` : ''}
+        </button>
+      `)}
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      forTab.length === 0 ? html`
+        <div class="card">
+          <div class="empty">
+            <div class="icon">🎨</div>
+            <div style="font-size:13px;margin-bottom:8px">No ${SOURCES.find(s=>s.key===tab)?.label || tab} formats yet.</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-bottom:12px">Upload a photo of the format your plant already uses — AI rebuilds the layout as a print template.</div>
+            <button class="btn small" onClick=${() => setUploadOpen(true)}>🤖 + Upload format</button>
+          </div>
+        </div>
+      ` :
+      html`<div>${forTab.map(t => html`
+        <div class="card" key=${t.id} style="margin-bottom:8px;padding:12px 14px">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap">
+            <div style="flex:1;min-width:200px">
+              <div style="font-size:14px;font-weight:700;display:flex;align-items:center;gap:6px">
+                ${t.name}
+                ${t.is_default && html`<span class="badge teal" style="font-size:9px">★ DEFAULT</span>`}
+                ${t.ai_confidence && html`<span style=${'font-size:9px;padding:2px 7px;border-radius:999px;background:'+(t.ai_confidence==='high'?'#bbf7d0':t.ai_confidence==='low'?'#fecaca':'#fde68a')+';font-weight:700;text-transform:uppercase'}>${t.ai_confidence}</span>`}
+                ${t.config?.html && html`<span class="badge teal" style="font-size:9px;background:var(--slate-100);color:var(--slate-600)">HTML</span>`}
+              </div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:3px">
+                ${t.config?.title || '—'} · ${t.ai_model || 'AI'} · ${new Date(t.created_at).toLocaleDateString()}
+              </div>
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <button class="btn ghost small" onClick=${() => preview(t)} style="padding:6px 10px;font-size:11px">👁 Preview</button>
+              ${!t.is_default && html`<button class="btn ghost small" onClick=${() => setDefault(t)} style="padding:6px 10px;font-size:11px">★ Set default</button>`}
+              <button class="btn ghost small" onClick=${() => deactivate(t)} style="padding:6px 10px;font-size:11px;color:var(--rose-600)">🗑 Delete</button>
+            </div>
+          </div>
+        </div>
+      `)}</div>`}
+
+    ${uploadOpen && html`<${RecordTemplateUploadModal}
+      plant=${plant} me=${me}
+      source=${tab} sourceLabel=${sourceCfgFor(tab).label}
+      onClose=${() => setUploadOpen(false)}
+      onSaved=${async () => { setUploadOpen(false); await refresh(); }} />`}
   `;
 }
 
