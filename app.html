@@ -353,7 +353,9 @@ body{
 
 @media (min-width: 768px){
   .app{max-width:none;padding-bottom:32px}
-  .page{max-width:1024px;padding:24px 32px 60px;margin:0 auto}
+  /* Use most of the viewport on tablet+; modest side padding keeps text from
+     hugging the edge but no longer leaves half the screen empty. */
+  .page{max-width:none;padding:24px 5vw 60px;margin:0 auto}
   .topnav-desktop{
     display:flex;align-items:center;gap:24px;
     padding:10px 24px;
@@ -391,7 +393,10 @@ body{
 }
 
 @media (min-width: 1200px){
-  .page{max-width:1280px;padding:28px 40px 60px}
+  /* Cap at 1600px so prose stays readable on ultra-wide monitors, but
+     this is wider than the previous 1280px and the side padding scales
+     with the viewport so dashboards feel full-screen. */
+  .page{max-width:1600px;padding:28px 48px 60px}
   .topnav-desktop{padding:12px 40px}
   .topnav-desktop .nav-tab{padding:8px 16px;font-size:14px}
 }
@@ -5691,15 +5696,28 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
   };
 
   // Voice notes via MediaRecorder → upload as an attachment.
+  // Browser-MIME compatibility matters here: Safari can ONLY play back mp4/aac;
+  // Chrome/Firefox happily produce webm/opus. Pick a recorder MIME that the
+  // current browser supports for playback, so the user can play back their own
+  // recording at minimum. Order: mp4 (Safari + new Chrome) → webm.
+  const pickRecorderMime = () => {
+    const candidates = ['audio/mp4', 'audio/mp4;codecs=mp4a.40.2', 'audio/webm;codecs=opus', 'audio/webm'];
+    for (const c of candidates) {
+      try { if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(c)) return c; } catch (_) { /* ignore */ }
+    }
+    return '';
+  };
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const rec = new MediaRecorder(stream);
+      const preferredMime = pickRecorderMime();
+      const rec = preferredMime ? new MediaRecorder(stream, { mimeType: preferredMime }) : new MediaRecorder(stream);
       recChunksRef.current = [];
       rec.ondataavailable = e => { if (e.data.size > 0) recChunksRef.current.push(e.data); };
       rec.onstop = async () => {
         stream.getTracks().forEach(t => t.stop());
-        const blob = new Blob(recChunksRef.current, { type: rec.mimeType || 'audio/webm' });
+        const mime = rec.mimeType || preferredMime || 'audio/webm';
+        const blob = new Blob(recChunksRef.current, { type: mime });
         const dur = Math.round((Date.now() - recStartRef.current) / 1000);
         await sendVoiceNote(blob, dur);
       };
@@ -5722,11 +5740,15 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
     setUploading(true);
     try {
       const ts = Date.now();
-      const path = plant.id + '/' + activeGroup.id + '/' + user.id + '-' + ts + '.webm';
-      const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, blob, { contentType: blob.type || 'audio/webm' });
+      // Derive the file extension from the actual blob MIME so Supabase storage
+      // serves the right Content-Type and the <audio> tag can decode it.
+      const mime = blob.type || 'audio/webm';
+      const ext = mime.includes('mp4') ? 'm4a' : (mime.includes('ogg') ? 'ogg' : 'webm');
+      const path = plant.id + '/' + activeGroup.id + '/' + user.id + '-' + ts + '.' + ext;
+      const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, blob, { contentType: mime });
       if (upErr) throw upErr;
       const { data: { publicUrl } } = sb.storage.from('chat-attachments').getPublicUrl(path);
-      const att = [{ url: publicUrl, path, type: blob.type || 'audio/webm', name: 'Voice note', isVoice: true, duration: durationSec }];
+      const att = [{ url: publicUrl, path, type: mime, name: 'Voice note', isVoice: true, duration: durationSec }];
       const { data: inserted, error } = await sb.from('chat_messages').insert({
         plant_id: plant.id, group_id: activeGroup.id, sender_id: user.id, body: null, attachments: att,
       }).select().single();
@@ -5855,7 +5877,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
                     return html`<div>${renderBody(m.body)}</div>`;
                   })()}
                   ${atts.map((a, i) => a.isVoice
-                    ? html`<audio key=${i} controls preload="none" src=${a.url} style="max-width:240px;height:38px;margin-top:4px"></audio>`
+                    ? html`<audio key=${i} controls preload="metadata" playsInline style="max-width:240px;height:38px;margin-top:4px"><source src=${a.url} type=${a.type || 'audio/mp4'} /><a href=${a.url} target="_blank" rel="noopener">Open voice note</a></audio>`
                     : a.isImage
                     ? html`<a href=${a.url} target="_blank" rel="noopener" key=${i}><img class="attached-img" src=${a.url} alt=${a.name || 'image'} /></a>`
                     : html`<a href=${a.url} target="_blank" rel="noopener" class="file-attached" key=${i}>📎 ${a.name || 'file'}</a>`
