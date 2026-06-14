@@ -16779,6 +16779,55 @@ function JobworkReceiveModal({ plant, me, line, onClose, onSaved }) {
 // =================================================================
 // MOM MODULE (Minutes of Meeting · internal / customer / supplier)
 // =================================================================
+// In-browser audio compressor that runs offline before we upload to Whisper.
+// Decodes any format the browser supports (mp3/m4a/wav/aac/ogg/webm/flac),
+// downmixes to mono, resamples to 16 kHz via OfflineAudioContext (Whisper's
+// native sample rate -- no accuracy loss) and re-encodes to mp3 at 32 kbps
+// via lamejs. Typical 60-min 64 kbps phone recording goes from ~28 MB to
+// ~14 MB; a WAV master goes from hundreds of MB to single digits.
+async function compressAudioForWhisper(file, onProgress) {
+  const targetSampleRate = 16000;
+  const targetBitrate = 32;
+  onProgress && onProgress('decoding');
+  const ab = await file.arrayBuffer();
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const decodeCtx = new Ctx();
+  let decoded;
+  try {
+    decoded = await decodeCtx.decodeAudioData(ab.slice(0));
+  } finally {
+    decodeCtx.close && decodeCtx.close();
+  }
+  onProgress && onProgress('resampling');
+  // Mono 16 kHz target. OfflineAudioContext processes ~5-10x real time.
+  const totalSamples = Math.max(1, Math.ceil(decoded.duration * targetSampleRate));
+  const offlineCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, totalSamples, targetSampleRate);
+  const src = offlineCtx.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offlineCtx.destination);
+  src.start();
+  const monoBuffer = await offlineCtx.startRendering();
+  const floats = monoBuffer.getChannelData(0);
+  const int16 = new Int16Array(floats.length);
+  for (let i = 0; i < floats.length; i++) {
+    const s = Math.max(-1, Math.min(1, floats[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  onProgress && onProgress('encoding');
+  const lamejs = await import('https://esm.sh/@breezystack/lamejs@1.2.7');
+  const encoder = new lamejs.Mp3Encoder(1, targetSampleRate, targetBitrate);
+  const blockSize = 1152;
+  const chunks = [];
+  for (let i = 0; i < int16.length; i += blockSize) {
+    const block = int16.subarray(i, Math.min(i + blockSize, int16.length));
+    const buf = encoder.encodeBuffer(block);
+    if (buf.length > 0) chunks.push(buf);
+  }
+  const tail = encoder.flush();
+  if (tail.length > 0) chunks.push(tail);
+  return new Blob(chunks, { type: 'audio/mpeg' });
+}
+
 // =================================================================
 // VoiceNotesModule -- upload a meeting recording (Tamil / Hindi / mixed),
 // Whisper translates to English, Claude pulls out summary + decisions +
@@ -16805,6 +16854,9 @@ function VoiceNotesModule({ plant, me }) {
   const [users, setUsers] = useState([]);
   const [savedMeetingId, setSavedMeetingId] = useState(null);
   const [savingMeeting, setSavingMeeting] = useState(false);
+  const [originalFile, setOriginalFile] = useState(null);
+  const [compressing, setCompressing] = useState(false);
+  const [compressStage, setCompressStage] = useState('');
   const fileRef = useRef(null);
 
   useEffect(() => {
@@ -16812,19 +16864,19 @@ function VoiceNotesModule({ plant, me }) {
       .then(({ data }) => setUsers(data || []));
   }, [plant.id]);
 
-  const pickFile = (e) => {
+  const pickFile = async (e) => {
     const f = e.target.files?.[0];
     if (!f) return;
     if (!f.type.startsWith('audio/') && !/\.(mp3|m4a|wav|ogg|webm|mp4|aac|flac)$/i.test(f.name)) {
-      setError('Pick an audio file (mp3 / m4a / wav / aac).');
+      setError('Pick an audio file (mp3 / m4a / wav / aac / ogg).');
       return;
     }
-    if (f.size > 25 * 1024 * 1024) {
-      setError('Audio is over 25 MB. Compress to ~64 kbps mp3 or split the recording.');
+    if (f.size > 200 * 1024 * 1024) {
+      setError('Audio is over 200 MB. Even after compression that would take forever to upload — split the recording first.');
       return;
     }
     setError('');
-    setFile(f);
+    setOriginalFile(f);
     setExtraction(null);
     setTranscript('');
     setActionItems([]);
@@ -16832,6 +16884,33 @@ function VoiceNotesModule({ plant, me }) {
     setSummary('');
     setDecisions('');
     setSavedMeetingId(null);
+
+    // Always run the offline compressor: drops bitrate to 32 kbps mono 16 kHz
+    // (Whisper's native rate, no accuracy hit) and shrinks files ~3-10x.
+    setCompressing(true);
+    setCompressStage('decoding');
+    try {
+      const compressed = await compressAudioForWhisper(f, setCompressStage);
+      const baseName = (f.name || 'meeting').replace(/\.[^.]+$/, '');
+      const out = new File([compressed], baseName + '.mp3', { type: 'audio/mpeg' });
+      if (out.size > 25 * 1024 * 1024) {
+        setError('After compression the file is still over 25 MB (' + (out.size/1024/1024).toFixed(1) + ' MB). Whisper hard-caps at 25 MB ≈ 50 min of speech — split the recording.');
+        setFile(null);
+      } else {
+        setFile(out);
+      }
+    } catch (err) {
+      // Fall back to original if it already fits.
+      if (f.size <= 25 * 1024 * 1024) {
+        setFile(f);
+      } else {
+        setError('Could not compress this file (' + (err.message || err) + '). It is over 25 MB so Whisper will reject it — try re-exporting as mp3.');
+        setFile(null);
+      }
+    } finally {
+      setCompressing(false);
+      setCompressStage('');
+    }
   };
 
   const extract = async () => {
@@ -16919,9 +16998,10 @@ function VoiceNotesModule({ plant, me }) {
   };
 
   const reset = () => {
-    setFile(null); setExtraction(null); setTranscript(''); setActionItems([]);
+    setFile(null); setOriginalFile(null); setExtraction(null); setTranscript(''); setActionItems([]);
     setSubject(''); setSummary(''); setDecisions(''); setSavedMeetingId(null);
     setHintSubject(''); setExternalOrgName(''); setPhase('idle');
+    setCompressing(false); setCompressStage('');
     if (fileRef.current) fileRef.current.value = '';
   };
 
@@ -16939,22 +17019,34 @@ function VoiceNotesModule({ plant, me }) {
         <button class="btn small" onClick=${reset}>+ Upload another recording</button>
       </div>
     ` : html`
-      ${phase === 'idle' && !file && html`
+      ${phase === 'idle' && !originalFile && html`
         <div class="card" style="padding:18px">
           <div class="field">
-            <label>Meeting recording (mp3 / m4a / wav · max 25 MB ≈ 25 min)</label>
+            <label>Meeting recording (mp3 / m4a / wav / aac / ogg)</label>
             <input ref=${fileRef} type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg,.webm" onChange=${pickFile} style="font-size:13px" />
-            <div style="font-size:11px;color:var(--slate-500);margin-top:6px">Bigger than 25 MB? Compress to 64 kbps mono mp3 with any audio tool (covers ~50 min in 25 MB).</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:6px">Auto-compressed to 32 kbps mono mp3 in your browser before upload. ~3-10x smaller, no accuracy loss (Whisper runs at 16 kHz mono anyway). Source files up to 200 MB are fine.</div>
           </div>
         </div>
       `}
 
-      ${file && phase === 'idle' && html`
+      ${originalFile && compressing && html`
+        <div class="card" style="padding:20px;text-align:center">
+          <div class="spinner" style="margin:0 auto 12px"></div>
+          <div style="font-size:13px;font-weight:600">${compressStage === 'decoding' ? 'Reading audio…' : compressStage === 'resampling' ? 'Downmixing to mono 16 kHz…' : compressStage === 'encoding' ? 'Encoding mp3…' : 'Compressing…'}</div>
+          <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Original: ${(originalFile.size/1024/1024).toFixed(1)} MB · runs entirely in your browser, no upload yet.</div>
+        </div>
+      `}
+
+      ${file && !compressing && phase === 'idle' && html`
         <div class="card" style="padding:14px;margin-bottom:12px">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-            <div>
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
+            <div style="flex:1;min-width:0">
               <div style="font-size:14px;font-weight:600">🎵 ${file.name}</div>
-              <div style="font-size:11px;color:var(--slate-500)">${(file.size/1024/1024).toFixed(1)} MB · ${file.type || 'audio'}</div>
+              <div style="font-size:11px;color:var(--slate-500)">
+                ${originalFile && originalFile.size !== file.size ? html`
+                  <span style="color:var(--teal-600);font-weight:600">${(file.size/1024/1024).toFixed(1)} MB</span> after compression · was ${(originalFile.size/1024/1024).toFixed(1)} MB · <b>${Math.round((1 - file.size/originalFile.size) * 100)}% smaller</b>
+                ` : html`${(file.size/1024/1024).toFixed(1)} MB · ${file.type || 'audio'}`}
+              </div>
             </div>
             <button type="button" class="btn ghost small" onClick=${reset} style="padding:4px 10px;font-size:11px">✕ Change</button>
           </div>
