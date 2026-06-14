@@ -2025,33 +2025,37 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
 // This one positions itself off the trigger's bounding rect and clamps to the
 // actual visible viewport — so it can't escape the screen on either axis.
 function MoreDropdown({ plant, myPerms, tab, navOpenGroups, toggleNavGroup, onPick, onClose }) {
-  const [pos, setPos] = useState(null); // {top, right, maxHeight, width}
+  // Sensible default so we render even if the positioning effect fails to
+  // measure (e.g. ResizeObserver not ready, trigger not yet in DOM on
+  // first paint). Without a fallback the dropdown could stay invisible.
+  const fallback = { top: 60, right: 16, width: Math.min(360, (typeof window !== 'undefined' ? window.innerWidth : 360) - 16), maxHeight: 480 };
+  const [pos, setPos] = useState(fallback);
   useEffect(() => {
     const place = () => {
-      // The trigger is the previous sibling button inside .nav-more-wrap.
-      const wrap = document.querySelector('.nav-more-wrap');
-      const btn  = wrap?.querySelector('button.nav-tab');
-      if (!btn) return;
-      const r = btn.getBoundingClientRect();
-      const vw = window.innerWidth, vh = window.innerHeight;
-      const gap = 6, margin = 8;
-      // Width: 340 if it fits, else clamp to visible width.
-      const width = Math.min(360, vw - margin * 2);
-      // Right anchor: trigger's right edge, clamped so the LEFT edge stays on-screen.
-      let right = Math.max(margin, vw - r.right);
-      if (right + width > vw - margin) right = Math.max(margin, vw - margin - width);
-      // Vertical: below trigger; if not enough room, leave a margin and let it scroll.
-      const top = Math.round(r.bottom + gap);
-      const maxHeight = Math.max(220, vh - top - margin);
-      setPos({ top, right, width, maxHeight });
+      try {
+        const wrap = document.querySelector('.nav-more-wrap');
+        const btn  = wrap?.querySelector('button.nav-tab');
+        if (!btn) return;
+        const r = btn.getBoundingClientRect();
+        const vw = window.innerWidth, vh = window.innerHeight;
+        const gap = 6, margin = 8;
+        const width = Math.min(360, vw - margin * 2);
+        let right = Math.max(margin, vw - r.right);
+        if (right + width > vw - margin) right = Math.max(margin, vw - margin - width);
+        const top = Math.round(r.bottom + gap);
+        const maxHeight = Math.max(220, vh - top - margin);
+        setPos({ top, right, width, maxHeight });
+      } catch (_) { /* fall back to default position */ }
     };
+    // Run once now and again on the next animation frame to cover the case
+    // where the trigger button hasn't laid out yet at first mount.
     place();
+    const raf = requestAnimationFrame(place);
     const onResize = () => place();
     window.addEventListener('resize', onResize);
     window.addEventListener('scroll', onResize, true);
-    return () => { window.removeEventListener('resize', onResize); window.removeEventListener('scroll', onResize, true); };
+    return () => { cancelAnimationFrame(raf); window.removeEventListener('resize', onResize); window.removeEventListener('scroll', onResize, true); };
   }, []);
-  if (!pos) return null;
 
   return html`
     <div data-more-dropdown style=${'position:fixed;top:'+pos.top+'px;right:'+pos.right+'px;width:'+pos.width+'px;max-height:'+pos.maxHeight+'px;background:white;border:1px solid var(--slate-200);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.12);overflow-y:auto;overflow-x:hidden;z-index:9999;padding:4px 0;overscroll-behavior:contain'}>
@@ -8581,7 +8585,7 @@ function More({ plant, me, myPerms, user, logout, setTab, activeUnit, accessible
       <div class="card-row"><span class="label">City</span><span class="value">${plant.city}</span></div>
       <div class="card-row"><span class="label">GSTIN</span><span class="value mono">${plant.gstin || '—'}</span></div>
       <div class="card-row"><span class="label">IATF</span><span class="value">${plant.iatf_certified ? html`<span class="badge emerald">Yes</span>` : 'No'}</span></div>
-      <div class="card-row"><span class="label">Tier</span><span class="value"><span class="badge teal">${plant.subscription_tier.toUpperCase()}</span></span></div>
+      <div class="card-row"><span class="label">Tier</span><span class="value"><span class="badge teal">${(plant.subscription_tier || 'lite').toUpperCase()}</span></span></div>
       ${(me.role === 'admin' || me.role === 'plant_head') && html`
         <div class="card-row" style="border-top:1px solid var(--slate-100);padding-top:8px;margin-top:4px">
           <span class="label">IATF modules</span>
@@ -16008,7 +16012,7 @@ function SalesDocMakerModule({ plant, me, navAction }) {
         (More → Commercial → Doc Formats), not inside DC creation. */ ''}
 
     ${(tab === 'new_dc' || tab === 'new_rdc' || tab === 'new_invoice') && html`
-      <${SalesDocCreateForm} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber} customers=${customers} vendors=${vendors}
+      <${SalesDocCreateForm} key=${docKind} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber} customers=${customers} vendors=${vendors}
         onCounterChanged=${() => {
           // The "Set starting number" panel inside the form just bumped the
           // counter; refetch the peek so the displayed number reflects it.
@@ -16019,7 +16023,7 @@ function SalesDocMakerModule({ plant, me, navAction }) {
     `}
 
     ${(tab === 'new_po' || tab === 'new_packing') && html`
-      <${PoPackingForm} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber}
+      <${PoPackingForm} key=${docKind} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber}
         customers=${customers} vendors=${vendors}
         onSaved=${(doc) => { setTab('list'); refresh(); setView(doc); }} onCancel=${() => setTab('list')} />
     `}
