@@ -15983,14 +15983,30 @@ function SalesDocMakerModule({ plant, me, navAction }) {
   // Per session decision: hide the Tax Invoice option for all fab plants.
   const fab = isFab(plant);
   const showInvoice = !fab;
+  // Prefetch the next-number peek for every kind in parallel when the module
+  // mounts. By the time the user clicks any tab the answer is already in the
+  // cache, so the doc number never flashes a loading placeholder. We still
+  // re-fetch a particular kind on demand after a save (it gets evicted from
+  // the cache then), so the displayed number always reflects the live counter.
+  useEffect(() => {
+    if (!plant?.id) return;
+    let cancelled = false;
+    const KINDS = ['dc', 'rdc', 'po', 'packing', 'invoice'];
+    Promise.all(KINDS.map(k => sb.rpc('peek_next_logistics_doc_number', { p_plant_id: plant.id, p_doc_kind: k }).then(({ data }) => [k, data || '—'])))
+      .then(pairs => { if (!cancelled) setPreviewByKind(Object.fromEntries(pairs)); });
+    return () => { cancelled = true; };
+  }, [plant?.id]);
+
+  // Per-tab fallback re-fetch: if the prefetch hasn't completed yet (slow
+  // network) or a kind was evicted after save, this catches that kind up.
   useEffect(() => {
     const kind = TAB_KIND[tab];
-    if (!kind) return;
+    if (!kind || previewByKind[kind]) return;
     let cancelled = false;
     sb.rpc('peek_next_logistics_doc_number', { p_plant_id: plant.id, p_doc_kind: kind })
       .then(({ data }) => { if (!cancelled) setPreviewByKind(prev => ({ ...prev, [kind]: data || '—' })); });
     return () => { cancelled = true; };
-  }, [tab, plant.id]);
+  }, [tab, plant?.id]);
 
   if (view) return html`<${SalesDocPreview} doc=${view} plant=${plant} me=${me} customers=${customers} vendors=${vendors} onClose=${() => setView(null)} />`;
 
