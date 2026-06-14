@@ -5036,16 +5036,39 @@ function PendingTasksPanel({ plant, setTab }) {
 function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAction, setTab }) {
   const [groups, setGroups] = useState([]);
   const [activeGroup, setActiveGroup] = useState(null);
-  // Home "Upload Bill" shortcut: if a chat group is already open, pop the file
-  // picker so they can snap a bill immediately. If none is open, land on the
-  // chat list and let them pick a group first (graceful fallback).
+  // Home "Upload Bill" shortcut: route to the OCR-enabled chat group (where
+  // ai_logistics_enabled = true) and pop its file picker. If there isn't one,
+  // fall back to the chat list with a hint so the user can enable AI on a
+  // group via settings.
   useEffect(() => {
     if (navAction?.sub !== 'upload_bill') return;
-    const t = setTimeout(() => {
-      const inp = document.getElementById('chatFileInput');
-      if (inp) inp.click();
-    }, 300);
-    return () => clearTimeout(t);
+    let cancelled = false;
+    (async () => {
+      // Find an AI-enabled group the user can post in.
+      const { data: aiGroups } = await sb.from('chat_groups')
+        .select('id, name, members, ai_logistics_enabled')
+        .eq('plant_id', plant.id)
+        .eq('ai_logistics_enabled', true)
+        .contains('members', [user.id])
+        .limit(1);
+      if (cancelled) return;
+      const target = (aiGroups || [])[0];
+      if (target) {
+        // Switch to it, then auto-click the file picker once the thread renders.
+        setActiveGroup(target);
+        setTimeout(() => {
+          if (cancelled) return;
+          const inp = document.getElementById('chatFileInput');
+          if (inp) inp.click();
+        }, 350);
+      } else {
+        // No OCR group exists for this user. Stay on the chat list and show a
+        // toast pointing the user at group settings.
+        setActiveGroup(null);
+        showToast('No OCR group found. Open a group → ⚙ → enable AI Document Extraction first.');
+      }
+    })();
+    return () => { cancelled = true; };
   }, [navAction?.ts]);
   const deepLinkAppliedRef = useRef(false);
   const [messages, setMessages] = useState([]);
