@@ -6628,47 +6628,69 @@ function RolesTab({ plant, me }) {
   useEffect(() => { refresh(); }, [refresh]);
 
   if (roles === null) return html`<div class="loader"><div class="spinner"></div></div>`;
-  const builtins = roles.filter(r => r.is_builtin);
-  const customs  = roles.filter(r => !r.is_builtin);
+
+  // One ranked hierarchy: top = most oversight (MD / CEO / Management), bottom
+  // = Operator. Order is driven by sort_order; ties fall back to name. Both
+  // built-in and custom roles sit in the same ladder so the org chart reads
+  // top-to-bottom.
+  const ordered = [...roles].sort((a, b) =>
+    ((a.sort_order ?? 999) - (b.sort_order ?? 999)) || (a.display_name || '').localeCompare(b.display_name || ''));
+
+  // Swap sort_order with the neighbour in the given direction (-1 up, +1 down).
+  const move = async (idx, dir) => {
+    const j = idx + dir;
+    if (j < 0 || j >= ordered.length) return;
+    const a = ordered[idx], b = ordered[j];
+    const aOrder = a.sort_order ?? idx;
+    const bOrder = b.sort_order ?? j;
+    setErr('');
+    const [r1, r2] = await Promise.all([
+      sb.rpc('update_plant_role', { p_role_id: a.id, p_display_name: null, p_description: null, p_is_active: null, p_sort_order: bOrder }),
+      sb.rpc('update_plant_role', { p_role_id: b.id, p_display_name: null, p_description: null, p_is_active: null, p_sort_order: aOrder }),
+    ]);
+    if (r1.error || r2.error) { setErr((r1.error || r2.error).message); return; }
+    await refresh();
+  };
+
+  const del = async (r) => {
+    if (r.member_count > 0) { alert('This role has ' + r.member_count + ' member(s). Reassign them to another role first, then delete.'); return; }
+    if (!confirm('Delete the "' + r.display_name + '" role permanently?')) return;
+    const { error } = await sb.rpc('delete_plant_role', { p_role_id: r.id });
+    if (error) { alert('Delete failed: ' + error.message); return; }
+    showToast('🗑 Role deleted');
+    await refresh();
+  };
 
   return html`
-    <div class="card" style="background:var(--amber-50);border-color:var(--amber-200);padding:10px 14px;margin-bottom:12px">
-      <div style="font-size:12px;color:var(--amber-800);line-height:1.55">
-        <strong>⚡ Phase 1 — visibility only.</strong> Hidden modules disappear from the menu, but backend enforcement
-        (RPC + database) ships in Phase 2. Until then, a determined user with browser tools could still call APIs directly.
-        Use this for layout / day-to-day clarity, not yet as a security boundary.
+    <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);padding:10px 14px;margin-bottom:12px">
+      <div style="font-size:12px;color:var(--teal-800);line-height:1.55">
+        <strong>🏛 Role hierarchy.</strong> Top = most oversight (e.g. MD / CEO / Management), bottom = Operator.
+        Use ↑ ↓ to set the chain of command, <b>Rename</b> any role's label, and grant each one its module access via <b>Edit</b>.
+        A monitoring role (MD/CEO) is simply a top role with <b>View</b> ticked across the modules it should watch.
       </div>
     </div>
     ${err && html`<div class="alert error">${err}</div>`}
 
-    <div class="section-h">Built-in roles${builtins.length ? ' · ' + builtins.length : ''}</div>
-    ${builtins.map(r => html`
+    <div class="section-h">Roles · ${ordered.length}<button class="btn small" onClick=${() => setCreating(true)}>+ New role</button></div>
+    ${ordered.map((r, idx) => html`
       <div class="list-item" key=${r.id}>
-        <div class="list-item-row">
-          <div class="list-item-main">
-            <div class="list-item-title">${r.display_name} <span style="color:var(--slate-400);font-weight:400;font-size:12px">· ${r.slug}</span></div>
-            <div class="list-item-sub">${r.description || ''} · ${r.member_count} user${r.member_count === 1 ? '' : 's'} · ${r.permissions.length} permission${r.permissions.length === 1 ? '' : 's'}</div>
+        <div class="list-item-row" style="gap:8px">
+          <div style="display:flex;flex-direction:column;gap:2px">
+            <button class="btn small ghost" style="padding:0 7px;line-height:1.4;font-size:12px" disabled=${idx === 0} onClick=${() => move(idx, -1)} title="Move up">↑</button>
+            <button class="btn small ghost" style="padding:0 7px;line-height:1.4;font-size:12px" disabled=${idx === ordered.length - 1} onClick=${() => move(idx, 1)} title="Move down">↓</button>
           </div>
-          <button class="btn small ghost" onClick=${() => setEditTarget(r)}>View</button>
-        </div>
-      </div>
-    `)}
-
-    <div class="section-h" style="margin-top:18px">Custom roles${customs.length ? ' · ' + customs.length : ''}<button class="btn small" onClick=${() => setCreating(true)}>+ New role</button></div>
-    ${customs.length === 0 && html`
-      <div class="card" style="text-align:center;color:var(--slate-500);font-size:13px;padding:18px">
-        No custom roles yet. Built-in roles cover most plants — add a custom one only when you need a finer slice
-        (e.g. <strong>Purchase Officer</strong> who can input bills but not see Sales).
-      </div>
-    `}
-    ${customs.map(r => html`
-      <div class="list-item" key=${r.id}>
-        <div class="list-item-row">
-          <div class="list-item-main">
-            <div class="list-item-title">${r.display_name} <span style="color:var(--slate-400);font-weight:400;font-size:12px">· ${r.slug}</span></div>
-            <div class="list-item-sub">${r.description || ''} · ${r.member_count} user${r.member_count === 1 ? '' : 's'} · ${r.permissions.length} permission${r.permissions.length === 1 ? '' : 's'}</div>
+          <div style="font-size:11px;font-weight:700;color:var(--slate-400);min-width:18px;text-align:center">${idx + 1}</div>
+          <div class="list-item-main" style="flex:1">
+            <div class="list-item-title">
+              ${r.display_name}
+              <span class=${'badge ' + (r.is_builtin ? '' : 'teal')} style="font-size:9px;margin-left:4px">${r.is_builtin ? 'built-in' : 'custom'}</span>
+            </div>
+            <div class="list-item-sub">${r.member_count} user${r.member_count === 1 ? '' : 's'} · ${r.permissions.length} permission${r.permissions.length === 1 ? '' : 's'}${r.description ? ' · ' + r.description : ''}</div>
           </div>
-          <button class="btn small" onClick=${() => setEditTarget(r)}>Edit</button>
+          <div style="display:flex;gap:6px">
+            <button class="btn small" onClick=${() => setEditTarget(r)}>${r.is_builtin && (r.slug === 'plant_head' || r.slug === 'admin') ? 'View' : 'Edit'}</button>
+            ${!r.is_builtin && html`<button class="btn small ghost" style="color:var(--rose-600)" onClick=${() => del(r)} title="Delete role">🗑</button>`}
+          </div>
         </div>
       </div>
     `)}
@@ -6730,7 +6752,9 @@ function RoleEditModal({ plant, role, onClose, onSaved }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const readOnly = role.is_builtin && (role.slug === 'plant_head' || role.slug === 'admin');
-  const renameLocked = role.is_builtin;
+  // Display-name (label) is editable for every role -- code references the
+  // immutable slug, not the label, so relabelling a built-in is safe.
+  const renameLocked = false;
 
   const toggle = (modKey, action) => {
     if (readOnly) return;
@@ -6787,7 +6811,7 @@ function RoleEditModal({ plant, role, onClose, onSaved }) {
         `}
         ${role.is_builtin && !readOnly && html`
           <div class="card" style="background:var(--slate-50);padding:10px 14px;font-size:12px;color:var(--slate-600);margin-bottom:10px">
-            ℹ️ This is a built-in role. The name is fixed; permissions are editable.
+            ℹ️ Built-in role. You can rename the label (e.g. "Management" → "MD") and set permissions; the internal id (<code>${role.slug}</code>) stays fixed.
           </div>
         `}
         <div class="field"><label>Display name</label><input type="text" value=${displayName} onInput=${e => setDisplayName(e.target.value)} disabled=${renameLocked} /></div>
