@@ -17656,6 +17656,102 @@ function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
   const totalItems = actionItems.length;
   const doneItems = actionItems.filter(a => a.status === 'completed' || a.status === 'cancelled').length;
 
+  // Open a standalone print-ready window for the MoM. Marvel asked
+  // specifically for the action-items PDF; we include the full meeting
+  // header + minutes + decisions + attendees so it's a one-page audit doc.
+  const openPDF = () => {
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+    const typeLabel = m.meeting_type === 'customer' ? 'Customer meeting' : m.meeting_type === 'supplier' ? 'Supplier meeting' : 'Internal meeting';
+    const statusBadge = (s) => {
+      if (s === 'completed') return '<span style="background:#d1fae5;color:#065f46;padding:2px 8px;border-radius:999px;font-size:9px;font-weight:700;text-transform:uppercase">closed</span>';
+      if (s === 'cancelled') return '<span style="background:#e5e7eb;color:#4b5563;padding:2px 8px;border-radius:999px;font-size:9px;font-weight:700;text-transform:uppercase">cancelled</span>';
+      return '<span style="background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:999px;font-size:9px;font-weight:700;text-transform:uppercase">open</span>';
+    };
+    const ownerOf = (a) => a.owner?.full_name || a.owner_external_name || '—';
+    const actionRows = actionItems.length === 0
+      ? '<tr><td colspan="5" style="text-align:center;color:#64748b;padding:20px;font-style:italic">No action points captured.</td></tr>'
+      : actionItems.map((a, i) =>
+          '<tr>' +
+          '<td style="text-align:center">' + (i + 1) + '</td>' +
+          '<td>' + esc(a.description || '') + (a.closure_notes ? '<br/><span style="color:#64748b;font-size:10px">Closure: ' + esc(a.closure_notes) + '</span>' : '') + '</td>' +
+          '<td>' + esc(ownerOf(a)) + '</td>' +
+          '<td style="text-align:center">' + esc(a.due_date || '—') + '</td>' +
+          '<td style="text-align:center">' + statusBadge(a.status) + '</td>' +
+          '</tr>'
+        ).join('');
+    const minutesBlock = m.minutes
+      ? '<h2>Minutes / Discussion</h2><div class="block">' + esc(m.minutes).replace(/\n/g, '<br/>') + '</div>'
+      : '';
+    const decisionsBlock = m.decisions
+      ? '<h2>Decisions</h2><div class="block">' + esc(m.decisions).replace(/\n/g, '<br/>') + '</div>'
+      : '';
+    const agendaBlock = m.agenda
+      ? '<h2>Agenda</h2><div class="block">' + esc(m.agenda).replace(/\n/g, '<br/>') + '</div>'
+      : '';
+    const intLine = intAttendees.length > 0 ? '<b>Internal:</b> ' + intAttendees.map(u => esc(u.full_name)).join(', ') : '';
+    const extLine = extAttendees.length > 0 ? '<b>External:</b> ' + extAttendees.map(a => esc(a.name) + (a.role ? ' (' + esc(a.role) + ')' : '')).join(', ') : '';
+    const attendeesLine = [intLine, extLine].filter(Boolean).join(' &nbsp;·&nbsp; ');
+    const docHtml = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>MOM · ' + esc(m.mom_no || m.subject) + '</title>' +
+      '<style>' +
+      '  @page { size: A4; margin: 12mm 14mm }' +
+      '  *,*:before,*:after{box-sizing:border-box}' +
+      '  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#0f172a;margin:0;padding:18px;font-size:12px;line-height:1.45}' +
+      '  h1{font-size:20px;margin:0 0 2px 0;letter-spacing:-0.01em}' +
+      '  .sub{color:#64748b;font-size:11px;margin-bottom:14px}' +
+      '  h2{font-size:13px;margin:18px 0 6px 0;border-bottom:1px solid #cbd5e1;padding-bottom:3px}' +
+      '  .meta-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px;font-size:11px}' +
+      '  .meta-item{padding:6px 8px;border:1px solid #cbd5e1;border-radius:5px}' +
+      '  .meta-item .lbl{font-size:9px;text-transform:uppercase;color:#64748b;font-weight:700}' +
+      '  .meta-item .val{font-weight:600;margin-top:1px;color:#0f172a}' +
+      '  .block{padding:8px 10px;border-left:3px solid #cbd5e1;background:#f8fafc;border-radius:0 4px 4px 0;font-size:12px;white-space:pre-wrap}' +
+      '  table{width:100%;border-collapse:collapse;margin-bottom:10px;font-size:11px}' +
+      '  th{background:#f1f5f9;text-align:left;padding:6px 8px;border:1px solid #cbd5e1;font-size:10px;text-transform:uppercase;letter-spacing:0.04em}' +
+      '  td{padding:6px 8px;border:1px solid #e2e8f0;vertical-align:top}' +
+      '  .meta{display:flex;justify-content:space-between;font-size:10px;color:#64748b;margin-top:24px;border-top:1px solid #cbd5e1;padding-top:8px}' +
+      '  .signrow{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;margin-top:36px;font-size:11px;page-break-inside:avoid}' +
+      '  .signrow .box{border-top:1px solid #0f172a;padding-top:6px;text-align:center;color:#475569;font-weight:600}' +
+      '  .btn{position:fixed;top:12px;right:12px;padding:9px 16px;background:#0d9488;color:white;border:none;border-radius:6px;font-weight:700;cursor:pointer;font-size:13px;box-shadow:0 2px 6px rgba(0,0,0,0.15)}' +
+      '  @media print{.btn{display:none}body{padding:0}}' +
+      '</style></head><body>' +
+      '<button class="btn" onclick="window.print()">🖨 Save as PDF / Print</button>' +
+      '<h1>' + esc(plant.legal_name || plant.name) + '</h1>' +
+      '<div class="sub">Minutes of Meeting · ' + esc(typeLabel) + (m.mom_no ? ' · ' + esc(m.mom_no) : '') + '</div>' +
+      '<h2 style="border:none;margin-top:4px;padding:0;font-size:16px">' + esc(m.subject) + '</h2>' +
+      '<div class="meta-grid">' +
+      '  <div class="meta-item"><div class="lbl">Date</div><div class="val">' + esc(m.meeting_date) + (m.meeting_time ? ' ' + esc(m.meeting_time.slice(0,5)) : '') + '</div></div>' +
+      '  <div class="meta-item"><div class="lbl">Type</div><div class="val">' + esc(typeLabel) + '</div></div>' +
+      '  <div class="meta-item"><div class="lbl">Location</div><div class="val">' + esc(m.location || '—') + '</div></div>' +
+      '  <div class="meta-item"><div class="lbl">Status</div><div class="val">' + esc((m.status || 'draft').toUpperCase()) + '</div></div>' +
+      '</div>' +
+      (m.external_org_name || attendeesLine ? '<div style="font-size:11px;margin-bottom:14px">' +
+        (m.external_org_name ? '<b>With:</b> ' + esc(m.external_org_name) + (attendeesLine ? ' &nbsp;·&nbsp; ' : '') : '') +
+        attendeesLine +
+        '</div>' : '') +
+      agendaBlock + minutesBlock + decisionsBlock +
+      '<h2>Action points · ' + actionItems.length + (actionItems.length === 0 ? '' : ' · ' + doneItems + ' closed / ' + (actionItems.length - doneItems) + ' open') + '</h2>' +
+      '<table>' +
+      '  <thead><tr>' +
+      '    <th style="width:30px;text-align:center">#</th>' +
+      '    <th>Action</th>' +
+      '    <th style="width:140px">Owner</th>' +
+      '    <th style="width:90px;text-align:center">Due</th>' +
+      '    <th style="width:80px;text-align:center">Status</th>' +
+      '  </tr></thead>' +
+      '  <tbody>' + actionRows + '</tbody>' +
+      '</table>' +
+      '<div class="signrow">' +
+      '  <div class="box">Prepared by</div>' +
+      '  <div class="box">Reviewed by</div>' +
+      '  <div class="box">Approved by</div>' +
+      '</div>' +
+      '<div class="meta"><span>' + esc(plant.name) + ' · MoM Report</span><span>Generated ' + esc(new Date().toLocaleString()) + '</span></div>' +
+      '</body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { alert('Pop-up blocked — allow pop-ups so the PDF can open.'); return; }
+    w.document.write(docHtml);
+    w.document.close();
+  };
+
   return html`
     <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
@@ -17663,6 +17759,7 @@ function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
         <h1 style="font-size:18px">${emoji} ${m.subject}</h1>
         <div class="sub">${m.mom_no} · ${m.meeting_date} ${m.external_org_name ? ' · ' + m.external_org_name : ''}</div>
       </div>
+      <button class="btn small" onClick=${openPDF} style="padding:5px 12px;font-size:12px" title="Download / print MoM as PDF">🖨 PDF</button>
       <select value=${m.status} onChange=${e => update({ status: e.target.value })} disabled=${busy} style="padding:5px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px">
         <option value="draft">Draft</option><option value="published">Published</option><option value="closed">Closed</option>
       </select>
