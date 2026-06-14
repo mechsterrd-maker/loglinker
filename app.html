@@ -1547,17 +1547,27 @@ function isProjectRestricted(myPerms) {
   return true;
 }
 
-// My-profile editor. Opened by tapping the header avatar (which previously
-// logged you out instantly). Edit name / phone / email, upload a photo, or
-// sign out from here.
-function ProfileModal({ me, user, logout, onClose, onSaved }) {
+// My-profile editor. Opened by tapping the header avatar. Edit identity +
+// emergency info + photo, change login password, or sign out.
+const BLOOD_GROUPS = ['', 'A+', 'A-', 'B+', 'B-', 'O+', 'O-', 'AB+', 'AB-'];
+function ProfileModal({ me, user, plant, activeUnit, logout, onClose, onSaved }) {
   const [fullName, setFullName] = useState(me.full_name || '');
   const [phone, setPhone] = useState(me.phone || '');
   const [email, setEmail] = useState(me.email || '');
+  const [designation, setDesignation] = useState(me.designation || '');
+  const [department, setDepartment] = useState(me.department || '');
+  const [bloodGroup, setBloodGroup] = useState(me.blood_group || '');
+  const [ecName, setEcName] = useState(me.emergency_contact_name || '');
+  const [ecPhone, setEcPhone] = useState(me.emergency_contact_phone || '');
   const [avatarUrl, setAvatarUrl] = useState(me.avatar_url || '');
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [err, setErr] = useState('');
+  // Change-password sub-section
+  const [pwOpen, setPwOpen] = useState(false);
+  const [pw1, setPw1] = useState('');
+  const [pw2, setPw2] = useState('');
+  const [pwBusy, setPwBusy] = useState(false);
 
   const pickPhoto = async (e) => {
     const f = e.target.files?.[0];
@@ -1584,6 +1594,11 @@ function ProfileModal({ me, user, logout, onClose, onSaved }) {
         full_name: fullName.trim(),
         phone: phone.trim() || null,
         email: email.trim() || null,
+        designation: designation.trim() || null,
+        department: department.trim() || null,
+        blood_group: bloodGroup || null,
+        emergency_contact_name: ecName.trim() || null,
+        emergency_contact_phone: ecPhone.trim() || null,
         avatar_url: avatarUrl || null,
       }).eq('id', me.id);
       if (error) throw error;
@@ -1593,17 +1608,33 @@ function ProfileModal({ me, user, logout, onClose, onSaved }) {
     finally { setBusy(false); }
   };
 
+  const changePassword = async () => {
+    if (pw1.length < 6) { setErr('Password must be at least 6 characters.'); return; }
+    if (pw1 !== pw2) { setErr('Passwords do not match.'); return; }
+    setPwBusy(true); setErr('');
+    try {
+      const { error } = await sb.auth.updateUser({ password: pw1 });
+      if (error) throw error;
+      showToast('✓ Password changed');
+      setPw1(''); setPw2(''); setPwOpen(false);
+    } catch (e) { setErr(e.message || String(e)); }
+    finally { setPwBusy(false); }
+  };
+
   const initials = (fullName || me.email || '?').split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
+  const roleLabel = (me.role || '').replace(/_/g, ' ');
+  const memberSince = me.created_at ? new Date(me.created_at).toLocaleDateString('en-IN', { month: 'short', year: 'numeric' }) : '—';
+  const lbl = (t) => html`<div style="font-size:10px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500);font-weight:700;margin:12px 0 6px">${t}</div>`;
 
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div class="modal" style="max-width:440px">
+      <div class="modal" style="max-width:460px;max-height:92vh;overflow-y:auto">
         <div class="modal-header">
           <div class="modal-title">👤 My Profile</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
         ${err && html`<div class="alert error">${err}</div>`}
-        <div style="display:flex;flex-direction:column;align-items:center;gap:8px;margin-bottom:14px">
+        <div style="display:flex;flex-direction:column;align-items:center;gap:8px;margin-bottom:8px">
           <div style="width:84px;height:84px;border-radius:50%;background:var(--teal-100);color:var(--teal-700);display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700;overflow:hidden">
             ${avatarUrl ? html`<img src=${avatarUrl} style="width:100%;height:100%;object-fit:cover" />` : initials}
           </div>
@@ -1613,13 +1644,52 @@ function ProfileModal({ me, user, logout, onClose, onSaved }) {
           </label>
           ${avatarUrl && html`<button type="button" onClick=${() => setAvatarUrl('')} style="background:none;border:none;color:var(--rose-600);font-size:11px;cursor:pointer">Remove photo</button>`}
         </div>
+
+        ${/* Read-only identity block */ ''}
+        <div style="background:var(--slate-50);border:1px solid var(--slate-200);border-radius:8px;padding:10px 12px;display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;font-size:12px;margin-bottom:6px">
+          <div><span style="color:var(--slate-500)">Role</span><br/><b style="text-transform:capitalize">${roleLabel || '—'}</b></div>
+          <div><span style="color:var(--slate-500)">Employee ID</span><br/><b>${me.employee_id || '—'}</b></div>
+          <div><span style="color:var(--slate-500)">Plant · Unit</span><br/><b>${plant?.name || '—'}${activeUnit?.unit_name ? ' · ' + activeUnit.unit_name : ''}</b></div>
+          <div><span style="color:var(--slate-500)">Member since</span><br/><b>${memberSince}</b></div>
+        </div>
+
+        ${lbl('Contact')}
         <div class="field"><label>Full name *</label><input type="text" value=${fullName} onInput=${e => setFullName(e.target.value)} /></div>
         <div class="field-row" style="display:flex;gap:10px">
           <div class="field" style="flex:1"><label>Phone</label><input type="tel" value=${phone} onInput=${e => setPhone(e.target.value)} placeholder="+91…" /></div>
           <div class="field" style="flex:1"><label>Email</label><input type="email" value=${email} onInput=${e => setEmail(e.target.value)} /></div>
         </div>
-        <button class="btn" onClick=${save} disabled=${busy || uploading} style="width:100%;margin-top:4px">${busy ? 'Saving…' : '✓ Save profile'}</button>
-        <button class="btn ghost" onClick=${logout} style="width:100%;margin-top:8px;color:var(--rose-600)">Log out</button>
+        <div class="field-row" style="display:flex;gap:10px">
+          <div class="field" style="flex:1"><label>Designation</label><input type="text" value=${designation} onInput=${e => setDesignation(e.target.value)} placeholder="e.g. Plant Engineer" /></div>
+          <div class="field" style="flex:1"><label>Department</label><input type="text" value=${department} onInput=${e => setDepartment(e.target.value)} placeholder="e.g. Production" /></div>
+        </div>
+
+        ${lbl('Emergency')}
+        <div class="field-row" style="display:flex;gap:10px">
+          <div class="field" style="flex:0 0 110px"><label>Blood group</label>
+            <select value=${bloodGroup} onChange=${e => setBloodGroup(e.target.value)}>
+              ${BLOOD_GROUPS.map(g => html`<option key=${g} value=${g}>${g || '—'}</option>`)}
+            </select>
+          </div>
+          <div class="field" style="flex:1"><label>Emergency contact</label><input type="text" value=${ecName} onInput=${e => setEcName(e.target.value)} placeholder="Name" /></div>
+        </div>
+        <div class="field"><label>Emergency phone</label><input type="tel" value=${ecPhone} onInput=${e => setEcPhone(e.target.value)} placeholder="+91…" /></div>
+
+        <button class="btn" onClick=${save} disabled=${busy || uploading} style="width:100%;margin-top:6px">${busy ? 'Saving…' : '✓ Save profile'}</button>
+
+        ${lbl('Security')}
+        ${!pwOpen
+          ? html`<button class="btn ghost" onClick=${() => { setErr(''); setPwOpen(true); }} style="width:100%">🔑 Change password</button>`
+          : html`
+            <div class="field"><label>New password</label><input type="password" value=${pw1} onInput=${e => setPw1(e.target.value)} placeholder="min 6 characters" /></div>
+            <div class="field"><label>Confirm password</label><input type="password" value=${pw2} onInput=${e => setPw2(e.target.value)} /></div>
+            <div style="display:flex;gap:6px">
+              <button class="btn ghost" onClick=${() => { setPwOpen(false); setPw1(''); setPw2(''); }} style="flex:1">Cancel</button>
+              <button class="btn" onClick=${changePassword} disabled=${pwBusy} style="flex:2">${pwBusy ? 'Saving…' : 'Update password'}</button>
+            </div>
+          `}
+
+        <button class="btn ghost" onClick=${logout} style="width:100%;margin-top:14px;color:var(--rose-600)">Log out</button>
       </div>
     </div>
   `;
@@ -1700,7 +1770,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
           </div>
         </div>
       </div>
-      ${profileOpen && html`<${ProfileModal} me=${me} user=${user} logout=${logout} onClose=${() => setProfileOpen(false)} onSaved=${() => { setProfileOpen(false); reload && reload(); }} />`}
+      ${profileOpen && html`<${ProfileModal} me=${me} user=${user} plant=${plant} activeUnit=${activeUnit} logout=${logout} onClose=${() => setProfileOpen(false)} onSaved=${() => { setProfileOpen(false); reload && reload(); }} />`}
 
       <${Page} active=${tab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} /></${Page}>
       <${Page} active=${tab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
