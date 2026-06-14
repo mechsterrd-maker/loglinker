@@ -16779,16 +16779,10 @@ function JobworkReceiveModal({ plant, me, line, onClose, onSaved }) {
 // =================================================================
 // MOM MODULE (Minutes of Meeting · internal / customer / supplier)
 // =================================================================
-// In-browser audio compressor that runs offline before we upload to Whisper.
-// Decodes any format the browser supports (mp3/m4a/wav/aac/ogg/webm/flac),
-// downmixes to mono, resamples to 16 kHz via OfflineAudioContext (Whisper's
-// native sample rate -- no accuracy loss) and re-encodes to mp3 at 32 kbps
-// via lamejs. Typical 60-min 64 kbps phone recording goes from ~28 MB to
-// ~14 MB; a WAV master goes from hundreds of MB to single digits.
-async function compressAudioForWhisper(file, onProgress) {
-  const targetSampleRate = 16000;
-  const targetBitrate = 32;
-  onProgress && onProgress('decoding');
+// Decode any format the browser supports (mp3/m4a/wav/aac/ogg/webm/flac) and
+// return mono 16 kHz Float32 samples. Whisper runs at 16 kHz mono internally
+// so downsampling here is loss-free.
+async function decodeToMono16k(file) {
   const ab = await file.arrayBuffer();
   const Ctx = window.AudioContext || window.webkitAudioContext;
   const decodeCtx = new Ctx();
@@ -16798,8 +16792,7 @@ async function compressAudioForWhisper(file, onProgress) {
   } finally {
     decodeCtx.close && decodeCtx.close();
   }
-  onProgress && onProgress('resampling');
-  // Mono 16 kHz target. OfflineAudioContext processes ~5-10x real time.
+  const targetSampleRate = 16000;
   const totalSamples = Math.max(1, Math.ceil(decoded.duration * targetSampleRate));
   const offlineCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, totalSamples, targetSampleRate);
   const src = offlineCtx.createBufferSource();
@@ -16807,10 +16800,41 @@ async function compressAudioForWhisper(file, onProgress) {
   src.connect(offlineCtx.destination);
   src.start();
   const monoBuffer = await offlineCtx.startRendering();
-  const floats = monoBuffer.getChannelData(0);
-  const int16 = new Int16Array(floats.length);
-  for (let i = 0; i < floats.length; i++) {
-    const s = Math.max(-1, Math.min(1, floats[i]));
+  return monoBuffer.getChannelData(0); // Float32Array
+}
+
+// In-browser compressor + concatenator. Takes one or many audio files (parts
+// of a split recording), decodes each, splices the samples end-to-end in
+// the order given, and encodes the combined stream to a single mp3 at
+// 32 kbps mono 16 kHz. Typical 60-min total goes to ~14 MB, comfortably
+// under Whisper's 25 MB hard cap.
+async function compressAudioForWhisper(filesIn, onProgress) {
+  const files = Array.isArray(filesIn) ? filesIn : [filesIn];
+  const targetSampleRate = 16000;
+  const targetBitrate = 32;
+  const parts = [];
+  let total = 0;
+  for (let i = 0; i < files.length; i++) {
+    onProgress && onProgress('decoding', { current: i + 1, total: files.length });
+    const samples = await decodeToMono16k(files[i]);
+    parts.push(samples);
+    total += samples.length;
+  }
+  // Splice parts together; insert 0.5 s silence between each so the AI can
+  // tell parts apart in the transcript.
+  const gap = Math.round(targetSampleRate * 0.5);
+  const totalWithGaps = total + Math.max(0, parts.length - 1) * gap;
+  onProgress && onProgress('resampling');
+  const combined = new Float32Array(totalWithGaps);
+  let off = 0;
+  for (let i = 0; i < parts.length; i++) {
+    combined.set(parts[i], off);
+    off += parts[i].length;
+    if (i < parts.length - 1) off += gap;
+  }
+  const int16 = new Int16Array(combined.length);
+  for (let i = 0; i < combined.length; i++) {
+    const s = Math.max(-1, Math.min(1, combined[i]));
     int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
   onProgress && onProgress('encoding');
@@ -16854,7 +16878,10 @@ function VoiceNotesModule({ plant, me }) {
   const [users, setUsers] = useState([]);
   const [savedMeetingId, setSavedMeetingId] = useState(null);
   const [savingMeeting, setSavingMeeting] = useState(false);
-  const [originalFile, setOriginalFile] = useState(null);
+  // originalFiles is an ordered list of the raw recordings the user picked
+  // (one or many parts of a split recording). They get decoded and spliced
+  // into a single mp3 before upload.
+  const [originalFiles, setOriginalFiles] = useState([]);
   const [compressing, setCompressing] = useState(false);
   const [compressStage, setCompressStage] = useState('');
   const fileRef = useRef(null);
@@ -16864,19 +16891,8 @@ function VoiceNotesModule({ plant, me }) {
       .then(({ data }) => setUsers(data || []));
   }, [plant.id]);
 
-  const pickFile = async (e) => {
-    const f = e.target.files?.[0];
-    if (!f) return;
-    if (!f.type.startsWith('audio/') && !/\.(mp3|m4a|wav|ogg|webm|mp4|aac|flac)$/i.test(f.name)) {
-      setError('Pick an audio file (mp3 / m4a / wav / aac / ogg).');
-      return;
-    }
-    if (f.size > 200 * 1024 * 1024) {
-      setError('Audio is over 200 MB. Even after compression that would take forever to upload — split the recording first.');
-      return;
-    }
+  const runCompression = async (files) => {
     setError('');
-    setOriginalFile(f);
     setExtraction(null);
     setTranscript('');
     setActionItems([]);
@@ -16884,33 +16900,67 @@ function VoiceNotesModule({ plant, me }) {
     setSummary('');
     setDecisions('');
     setSavedMeetingId(null);
+    setOriginalFiles(files);
+    if (files.length === 0) { setFile(null); return; }
 
-    // Always run the offline compressor: drops bitrate to 32 kbps mono 16 kHz
-    // (Whisper's native rate, no accuracy hit) and shrinks files ~3-10x.
     setCompressing(true);
     setCompressStage('decoding');
     try {
-      const compressed = await compressAudioForWhisper(f, setCompressStage);
-      const baseName = (f.name || 'meeting').replace(/\.[^.]+$/, '');
-      const out = new File([compressed], baseName + '.mp3', { type: 'audio/mpeg' });
+      const compressed = await compressAudioForWhisper(files, (stage, info) => {
+        setCompressStage(stage + (info ? ' (' + info.current + '/' + info.total + ')' : ''));
+      });
+      const baseName = (files[0].name || 'meeting').replace(/\.[^.]+$/, '');
+      const outName = files.length > 1 ? baseName + '-and-' + (files.length - 1) + '-more.mp3' : baseName + '.mp3';
+      const out = new File([compressed], outName, { type: 'audio/mpeg' });
       if (out.size > 25 * 1024 * 1024) {
-        setError('After compression the file is still over 25 MB (' + (out.size/1024/1024).toFixed(1) + ' MB). Whisper hard-caps at 25 MB ≈ 50 min of speech — split the recording.');
+        setError('Combined file is ' + (out.size/1024/1024).toFixed(1) + ' MB after compression -- Whisper hard-caps at 25 MB (~100 min mono mp3). Try fewer parts or compress source files further.');
         setFile(null);
       } else {
         setFile(out);
       }
     } catch (err) {
-      // Fall back to original if it already fits.
-      if (f.size <= 25 * 1024 * 1024) {
-        setFile(f);
-      } else {
-        setError('Could not compress this file (' + (err.message || err) + '). It is over 25 MB so Whisper will reject it — try re-exporting as mp3.');
-        setFile(null);
-      }
+      setError('Could not compress this audio (' + (err.message || err) + '). Try re-exporting each part as mp3 / m4a first.');
+      setFile(null);
     } finally {
       setCompressing(false);
       setCompressStage('');
     }
+  };
+
+  const pickFile = async (e) => {
+    const list = Array.from(e.target.files || []);
+    if (list.length === 0) return;
+    for (const f of list) {
+      if (!f.type.startsWith('audio/') && !/\.(mp3|m4a|wav|ogg|webm|mp4|aac|flac)$/i.test(f.name)) {
+        setError('All files must be audio (mp3 / m4a / wav / aac / ogg). "' + f.name + '" isn\'t.');
+        return;
+      }
+      if (f.size > 200 * 1024 * 1024) {
+        setError('"' + f.name + '" is over 200 MB. Split it further or compress before uploading.');
+        return;
+      }
+    }
+    await runCompression(list);
+  };
+
+  const removePart = async (idx) => {
+    const next = originalFiles.filter((_, i) => i !== idx);
+    await runCompression(next);
+  };
+
+  const movePart = async (idx, dir) => {
+    const next = originalFiles.slice();
+    const j = idx + dir;
+    if (j < 0 || j >= next.length) return;
+    [next[idx], next[j]] = [next[j], next[idx]];
+    await runCompression(next);
+  };
+
+  const addMoreFiles = async (e) => {
+    const list = Array.from(e.target.files || []);
+    if (list.length === 0) return;
+    e.target.value = '';
+    await runCompression([...originalFiles, ...list]);
   };
 
   const extract = async () => {
@@ -16998,7 +17048,7 @@ function VoiceNotesModule({ plant, me }) {
   };
 
   const reset = () => {
-    setFile(null); setOriginalFile(null); setExtraction(null); setTranscript(''); setActionItems([]);
+    setFile(null); setOriginalFiles([]); setExtraction(null); setTranscript(''); setActionItems([]);
     setSubject(''); setSummary(''); setDecisions(''); setSavedMeetingId(null);
     setHintSubject(''); setExternalOrgName(''); setPhase('idle');
     setCompressing(false); setCompressStage('');
@@ -17019,43 +17069,63 @@ function VoiceNotesModule({ plant, me }) {
         <button class="btn small" onClick=${reset}>+ Upload another recording</button>
       </div>
     ` : html`
-      ${phase === 'idle' && !originalFile && html`
+      ${phase === 'idle' && originalFiles.length === 0 && html`
         <div class="card" style="padding:18px">
           <div class="field">
-            <label>Meeting recording (mp3 / m4a / wav / aac / ogg)</label>
-            <input ref=${fileRef} type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg,.webm" onChange=${pickFile} style="font-size:13px" />
-            <div style="font-size:11px;color:var(--slate-500);margin-top:6px">Auto-compressed to 32 kbps mono mp3 in your browser before upload. ~3-10x smaller, no accuracy loss (Whisper runs at 16 kHz mono anyway). Source files up to 200 MB are fine.</div>
+            <label>Meeting recording — pick one or many parts (mp3 / m4a / wav / aac / ogg)</label>
+            <input ref=${fileRef} type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg,.webm" multiple onChange=${pickFile} style="font-size:13px" />
+            <div style="font-size:11px;color:var(--slate-500);margin-top:6px">Multi-pick supported — if your recording is split across files (Part 1 / Part 2…), pick them all and we'll stitch them in order before transcribing. Auto-compressed to 32 kbps mono mp3 in your browser (~3-10× smaller, no accuracy loss).</div>
           </div>
         </div>
       `}
 
-      ${originalFile && compressing && html`
-        <div class="card" style="padding:20px;text-align:center">
-          <div class="spinner" style="margin:0 auto 12px"></div>
-          <div style="font-size:13px;font-weight:600">${compressStage === 'decoding' ? 'Reading audio…' : compressStage === 'resampling' ? 'Downmixing to mono 16 kHz…' : compressStage === 'encoding' ? 'Encoding mp3…' : 'Compressing…'}</div>
-          <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Original: ${(originalFile.size/1024/1024).toFixed(1)} MB · runs entirely in your browser, no upload yet.</div>
-        </div>
-      `}
-
-      ${file && !compressing && phase === 'idle' && html`
+      ${originalFiles.length > 0 && html`
         <div class="card" style="padding:14px;margin-bottom:12px">
-          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
-            <div style="flex:1;min-width:0">
-              <div style="font-size:14px;font-weight:600">🎵 ${file.name}</div>
-              <div style="font-size:11px;color:var(--slate-500)">
-                ${originalFile && originalFile.size !== file.size ? html`
-                  <span style="color:var(--teal-600);font-weight:600">${(file.size/1024/1024).toFixed(1)} MB</span> after compression · was ${(originalFile.size/1024/1024).toFixed(1)} MB · <b>${Math.round((1 - file.size/originalFile.size) * 100)}% smaller</b>
-                ` : html`${(file.size/1024/1024).toFixed(1)} MB · ${file.type || 'audio'}`}
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <div style="font-size:13px;font-weight:700">🎵 ${originalFiles.length} part${originalFiles.length === 1 ? '' : 's'} · stitched in order</div>
+            <button type="button" class="btn ghost small" onClick=${reset} style="padding:4px 10px;font-size:11px">✕ Start over</button>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:8px">
+            ${originalFiles.map((f, idx) => html`
+              <div key=${idx} style="display:flex;align-items:center;gap:6px;padding:6px 8px;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:5px">
+                <span style="font-size:11px;font-weight:700;color:var(--teal-700);min-width:22px">${idx + 1}.</span>
+                <div style="flex:1;min-width:0;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${f.name}</div>
+                <span style="font-size:11px;color:var(--slate-500);flex-shrink:0">${(f.size/1024/1024).toFixed(1)} MB</span>
+                <div style="display:flex;gap:2px">
+                  <button type="button" onClick=${() => movePart(idx, -1)} disabled=${idx === 0 || compressing} title="Move up" style="padding:2px 6px;border:1px solid var(--slate-200);background:white;border-radius:4px;font-size:11px;cursor:pointer;${idx===0?'opacity:0.3':''}">↑</button>
+                  <button type="button" onClick=${() => movePart(idx, 1)} disabled=${idx === originalFiles.length - 1 || compressing} title="Move down" style="padding:2px 6px;border:1px solid var(--slate-200);background:white;border-radius:4px;font-size:11px;cursor:pointer;${idx===originalFiles.length-1?'opacity:0.3':''}">↓</button>
+                  <button type="button" onClick=${() => removePart(idx)} disabled=${compressing} title="Remove part" style="padding:2px 6px;border:1px solid var(--rose-300);background:var(--rose-50);color:var(--rose-700);border-radius:4px;font-size:11px;cursor:pointer">✕</button>
+                </div>
               </div>
+            `)}
+          </div>
+          <label style="display:block;font-size:11px;color:var(--teal-700);cursor:pointer;font-weight:600;margin-bottom:8px">
+            + Add another part
+            <input type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg,.webm" multiple onChange=${addMoreFiles} style="display:none" />
+          </label>
+
+          ${compressing && html`
+            <div style="padding:14px;text-align:center;background:var(--slate-50);border-radius:6px;margin-bottom:8px">
+              <div class="spinner" style="margin:0 auto 8px"></div>
+              <div style="font-size:12px;font-weight:600">${compressStage.startsWith('decoding') ? 'Reading audio…' : compressStage === 'resampling' ? 'Downmixing & stitching…' : compressStage === 'encoding' ? 'Encoding combined mp3…' : 'Processing…'} <span style="font-weight:400;color:var(--slate-500)">${compressStage.match(/\(.+\)/)?.[0] || ''}</span></div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Runs entirely in your browser, no upload yet.</div>
             </div>
-            <button type="button" class="btn ghost small" onClick=${reset} style="padding:4px 10px;font-size:11px">✕ Change</button>
-          </div>
-          <div class="field">
-            <label>Subject hint (optional)</label>
-            <input type="text" value=${hintSubject} onInput=${e => setHintSubject(e.target.value)} placeholder="e.g. Weekly review with Marvel · production update" style="font-size:13px" />
-            <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Helps Whisper transcribe technical words (PDC, NCR, customer names) more accurately.</div>
-          </div>
-          <button class="btn" disabled=${busy} onClick=${extract} style="width:100%;margin-top:8px">${busy ? '…' : '🤖 Translate & extract action items'}</button>
+          `}
+
+          ${file && !compressing && html`
+            <div style="background:var(--teal-50);border:1px solid var(--teal-200);padding:10px 12px;border-radius:6px;margin-bottom:10px;font-size:12px">
+              ✓ Ready to upload · <b>${(file.size/1024/1024).toFixed(1)} MB</b> stitched mp3 · was <b>${(originalFiles.reduce((s, f) => s + f.size, 0)/1024/1024).toFixed(1)} MB</b> across ${originalFiles.length} part${originalFiles.length===1?'':'s'} · <b style="color:var(--teal-700)">${Math.round((1 - file.size / Math.max(1, originalFiles.reduce((s, f) => s + f.size, 0))) * 100)}% smaller</b>
+            </div>
+          `}
+
+          ${file && !compressing && html`
+            <div class="field">
+              <label>Subject hint (optional)</label>
+              <input type="text" value=${hintSubject} onInput=${e => setHintSubject(e.target.value)} placeholder="e.g. Weekly review with Marvel · production update" style="font-size:13px" />
+              <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Helps Whisper transcribe technical words (PDC, NCR, customer names) more accurately.</div>
+            </div>
+            <button class="btn" disabled=${busy} onClick=${extract} style="width:100%;margin-top:8px">${busy ? '…' : '🤖 Translate & extract action items'}</button>
+          `}
         </div>
       `}
 
