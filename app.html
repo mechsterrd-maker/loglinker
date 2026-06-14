@@ -15976,9 +15976,14 @@ function SalesDocMakerModule({ plant, me, navAction }) {
   const showInvoice = !fab;
   useEffect(() => {
     const kind = TAB_KIND[tab];
-    if (kind) {
-      sb.rpc('peek_next_logistics_doc_number', { p_plant_id: plant.id, p_doc_kind: kind }).then(({ data }) => setPreviewNumber(data || '—'));
-    }
+    if (!kind) return;
+    // Reset to a placeholder immediately so the user never sees a stale
+    // number from the previous tab (PO peek answering on the RDC tab etc.).
+    setPreviewNumber('…');
+    let cancelled = false;
+    sb.rpc('peek_next_logistics_doc_number', { p_plant_id: plant.id, p_doc_kind: kind })
+      .then(({ data }) => { if (!cancelled) setPreviewNumber(data || '—'); });
+    return () => { cancelled = true; };
   }, [tab, plant.id]);
 
   if (view) return html`<${SalesDocPreview} doc=${view} plant=${plant} me=${me} customers=${customers} vendors=${vendors} onClose=${() => setView(null)} />`;
@@ -16354,7 +16359,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
         created_by: me.id,
       }).select('*').single();
       if (error) throw error;
-      showToast((isInvoice ? '🧾 Invoice ' : '📦 DC ') + docNo + ' created');
+      showToast((isInvoice ? '🧾 Invoice ' : (isReturnable ? '🔁 RDC ' : '📦 DC ')) + docNo + ' created');
       onSaved(doc);
     } catch (e) { setErr(e.message); } finally { setBusy(false); }
   };
@@ -16465,7 +16470,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
 
       <div style="display:flex;gap:6px">
         <button type="button" class="btn ghost" onClick=${onCancel} style="padding:8px 16px">Cancel</button>
-        <button class="btn" disabled=${busy} style="flex:1">${busy ? 'Saving…' : (isInvoice ? '🧾 Create Invoice' : '📦 Create DC')}</button>
+        <button class="btn" disabled=${busy} style="flex:1">${busy ? 'Saving…' : (isInvoice ? '🧾 Create Invoice' : (isReturnable ? '🔁 Create RDC' : '📦 Create DC'))}</button>
       </div>
     </form>
     ${addPartyOpen && (partyType === 'vendor'
