@@ -1547,9 +1547,88 @@ function isProjectRestricted(myPerms) {
   return true;
 }
 
+// My-profile editor. Opened by tapping the header avatar (which previously
+// logged you out instantly). Edit name / phone / email, upload a photo, or
+// sign out from here.
+function ProfileModal({ me, user, logout, onClose, onSaved }) {
+  const [fullName, setFullName] = useState(me.full_name || '');
+  const [phone, setPhone] = useState(me.phone || '');
+  const [email, setEmail] = useState(me.email || '');
+  const [avatarUrl, setAvatarUrl] = useState(me.avatar_url || '');
+  const [busy, setBusy] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [err, setErr] = useState('');
+
+  const pickPhoto = async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (!f.type.startsWith('image/')) { setErr('Pick an image file.'); return; }
+    if (f.size > 5 * 1024 * 1024) { setErr('Image over 5 MB — pick a smaller one.'); return; }
+    setErr(''); setUploading(true);
+    try {
+      const ext = (f.name.split('.').pop() || 'jpg').toLowerCase();
+      const path = 'avatars/' + me.id + '-' + Date.now() + '.' + ext;
+      const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, f, { upsert: true, contentType: f.type });
+      if (upErr) throw upErr;
+      const { data } = sb.storage.from('chat-attachments').getPublicUrl(path);
+      setAvatarUrl(data.publicUrl);
+    } catch (e2) { setErr('Upload failed: ' + (e2.message || e2)); }
+    finally { setUploading(false); }
+  };
+
+  const save = async () => {
+    if (!fullName.trim()) { setErr('Name is required.'); return; }
+    setBusy(true); setErr('');
+    try {
+      const { error } = await sb.from('users').update({
+        full_name: fullName.trim(),
+        phone: phone.trim() || null,
+        email: email.trim() || null,
+        avatar_url: avatarUrl || null,
+      }).eq('id', me.id);
+      if (error) throw error;
+      showToast('✓ Profile updated');
+      onSaved && onSaved();
+    } catch (e) { setErr(e.message || String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const initials = (fullName || me.email || '?').split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:440px">
+        <div class="modal-header">
+          <div class="modal-title">👤 My Profile</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div style="display:flex;flex-direction:column;align-items:center;gap:8px;margin-bottom:14px">
+          <div style="width:84px;height:84px;border-radius:50%;background:var(--teal-100);color:var(--teal-700);display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700;overflow:hidden">
+            ${avatarUrl ? html`<img src=${avatarUrl} style="width:100%;height:100%;object-fit:cover" />` : initials}
+          </div>
+          <label style="font-size:12px;color:var(--teal-700);font-weight:600;cursor:pointer">
+            ${uploading ? 'Uploading…' : (avatarUrl ? '📷 Change photo' : '📷 Upload photo')}
+            <input type="file" accept="image/*" onChange=${pickPhoto} style="display:none" />
+          </label>
+          ${avatarUrl && html`<button type="button" onClick=${() => setAvatarUrl('')} style="background:none;border:none;color:var(--rose-600);font-size:11px;cursor:pointer">Remove photo</button>`}
+        </div>
+        <div class="field"><label>Full name *</label><input type="text" value=${fullName} onInput=${e => setFullName(e.target.value)} /></div>
+        <div class="field-row" style="display:flex;gap:10px">
+          <div class="field" style="flex:1"><label>Phone</label><input type="tel" value=${phone} onInput=${e => setPhone(e.target.value)} placeholder="+91…" /></div>
+          <div class="field" style="flex:1"><label>Email</label><input type="email" value=${email} onInput=${e => setEmail(e.target.value)} /></div>
+        </div>
+        <button class="btn" onClick=${save} disabled=${busy || uploading} style="width:100%;margin-top:4px">${busy ? 'Saving…' : '✓ Save profile'}</button>
+        <button class="btn ghost" onClick=${logout} style="width:100%;margin-top:8px;color:var(--rose-600)">Log out</button>
+      </div>
+    </div>
+  `;
+}
+
 function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessibleUnits, activeUnit, switchUnit }) {
   const initials = (me.full_name || user.email).split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
   const [unreadCount, setUnreadCount] = useState(0);
+  const [profileOpen, setProfileOpen] = useState(false);
   // navAction: a one-shot deep-link signal so Home shortcuts can land a user on
   // a specific sub-screen (e.g. Make Documents → New PO), not just a tab. Pages
   // stay mounted (hidden via CSS), so target components react via useEffect on
@@ -1595,7 +1674,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
 
   return html`
     <div class="app">
-      <${TopNavDesktop} plant=${plant} me=${me} myPerms=${myPerms} initials=${initials} tab=${tab} setTab=${setTab} logout=${logout} unreadCount=${unreadCount} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />
+      <${TopNavDesktop} plant=${plant} me=${me} myPerms=${myPerms} initials=${initials} tab=${tab} setTab=${setTab} logout=${logout} onProfile=${() => setProfileOpen(true)} unreadCount=${unreadCount} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />
 
       <div class="topbar">
         <div class="topbar-left">
@@ -1616,9 +1695,12 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
           })() : html`
             <span style="font-size:10px;color:var(--rose-600);padding:4px 8px;background:var(--rose-50);border-radius:6px" title="No unit access — run fix-unit-access.sql">⚠ No units</span>
           `}
-          <div class="topbar-user" onClick=${logout} title="Log out">${initials}</div>
+          <div class="topbar-user" onClick=${() => setProfileOpen(true)} title="My profile" style="overflow:hidden">
+            ${me.avatar_url ? html`<img src=${me.avatar_url} style="width:100%;height:100%;object-fit:cover;border-radius:50%" />` : initials}
+          </div>
         </div>
       </div>
+      ${profileOpen && html`<${ProfileModal} me=${me} user=${user} logout=${logout} onClose=${() => setProfileOpen(false)} onSaved=${() => { setProfileOpen(false); reload && reload(); }} />`}
 
       <${Page} active=${tab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} /></${Page}>
       <${Page} active=${tab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -1684,7 +1766,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   `;
 }
 
-function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, unreadCount, accessibleUnits, activeUnit, switchUnit }) {
+function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onProfile, unreadCount, accessibleUnits, activeUnit, switchUnit }) {
   const [moreOpen, setMoreOpen] = useState(false);
   const [navOpenGroups, setNavOpenGroups] = useState({});
   const toggleNavGroup = (key) => setNavOpenGroups(prev => ({ ...prev, [key]: !prev[key] }));
@@ -1785,7 +1867,9 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, unre
       })() : html`
         <span style="font-size:11px;color:var(--rose-600);padding:5px 10px;background:var(--rose-50);border-radius:6px;margin-right:10px;border:1px solid var(--rose-200)" title="No unit access — run recovery-multiunit.sql">⚠ No unit access</span>
       `}
-      <div class="user-avatar" onClick=${logout} title=${'Log out (' + (me.full_name || me.email) + ')'}>${initials}</div>
+      <div class="user-avatar" onClick=${() => onProfile ? onProfile() : logout()} title=${'My profile (' + (me.full_name || me.email) + ')'} style="overflow:hidden">
+        ${me.avatar_url ? html`<img src=${me.avatar_url} style="width:100%;height:100%;object-fit:cover;border-radius:50%" />` : initials}
+      </div>
     </div>
   `;
 }
