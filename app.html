@@ -5065,6 +5065,15 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
   const [newTaskInGroup, setNewTaskInGroup] = useState(false);
   const [meetingMenu, setMeetingMenu] = useState(false);
   const [activeMeeting, setActiveMeeting] = useState(null); // url being joined inline
+  // WhatsApp-parity: reply, search, mentions autocomplete, voice notes
+  const [replyTo, setReplyTo] = useState(null);          // message being replied to
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQ, setSearchQ] = useState('');
+  const [mentionQuery, setMentionQuery] = useState(null); // active @mention token or null
+  const [recording, setRecording] = useState(false);
+  const recRef = useRef(null);
+  const recChunksRef = useRef([]);
+  const recStartRef = useRef(0);
 
   useEffect(() => { loadGroups(); }, []);
 
@@ -5133,6 +5142,15 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
       .subscribe();
     return () => { sb.removeChannel(channel); };
   }, [plant?.id, user.id, activeGroup?.id]);
+
+  // Member names for @mention autocomplete + resolution.
+  const [groupMembers, setGroupMembers] = useState([]);
+  useEffect(() => {
+    setReplyTo(null); setSearchOpen(false); setSearchQ(''); setMentionQuery(null);
+    const ids = activeGroup?.members || [];
+    if (ids.length === 0) { setGroupMembers([]); return; }
+    sb.from('users').select('id, full_name').in('id', ids).then(({ data }) => setGroupMembers(data || []));
+  }, [activeGroup?.id]);
 
   useEffect(() => {
     if (!activeGroup) return;
@@ -5296,8 +5314,9 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
       setMessages([]);
       return;
     }
-    // Reverse so render order is oldest → newest (newest at bottom)
-    const messages = (msgs || []).slice().reverse();
+    // Reverse so render order is oldest → newest (newest at bottom). Drop
+    // anything the current user deleted just for themselves.
+    const messages = (msgs || []).slice().reverse().filter(m => !(m.deleted_for || []).includes(user.id));
 
     // Manually fetch sender names (only from active users in our plant)
     const senderIds = [...new Set(messages.map(m => m.sender_id).filter(Boolean))];
@@ -5308,6 +5327,27 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
     }
     for (const m of messages) {
       m.users = m.sender_id ? (senderMap[m.sender_id] || { full_name: 'Unknown user' }) : null;
+    }
+
+    // Resolve reply-to previews (target may be outside the loaded window).
+    const byId = {}; for (const m of messages) byId[m.id] = m;
+    const replyIds = [...new Set(messages.map(m => m.reply_to_message_id).filter(id => id && !byId[id]))];
+    const replyMap = {};
+    if (replyIds.length > 0) {
+      const { data: reps } = await sb.from('chat_messages').select('id, body, sender_id, attachments').in('id', replyIds);
+      const repSenderIds = [...new Set((reps || []).map(r => r.sender_id).filter(Boolean))];
+      const repSenders = {};
+      if (repSenderIds.length > 0) {
+        const { data: rs } = await sb.from('users').select('id, full_name').in('id', repSenderIds);
+        (rs || []).forEach(u => { repSenders[u.id] = u; });
+      }
+      (reps || []).forEach(r => { r.users = repSenders[r.sender_id] || { full_name: '?' }; replyMap[r.id] = r; });
+    }
+    for (const m of messages) {
+      if (m.reply_to_message_id) {
+        const t = byId[m.reply_to_message_id] || replyMap[m.reply_to_message_id];
+        if (t) m._replyTo = { name: t.users?.full_name || '?', body: t.body, hasImg: Array.isArray(t.attachments) && t.attachments[0]?.isImage };
+      }
     }
 
     // Fetch extraction status for these messages (if any have images)
@@ -5517,6 +5557,18 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
       setUploading(false);
     }
 
+    // Resolve @mentions in the body against group members (longest names first
+    // so "@John Smith" matches before "@John").
+    const mentionIds = [];
+    if (body) {
+      const lower = body.toLowerCase();
+      for (const mem of [...groupMembers].sort((a, b) => (b.full_name || '').length - (a.full_name || '').length)) {
+        if (mem.full_name && lower.includes('@' + mem.full_name.toLowerCase())) mentionIds.push(mem.id);
+      }
+    }
+    const replyId = replyTo?.id || null;
+    const replySnap = replyTo ? { name: replyTo.users?.full_name || '?', body: replyTo.body, hasImg: Array.isArray(replyTo.attachments) && replyTo.attachments[0]?.isImage } : null;
+
     const localId = 'local-' + Date.now();
     const optimisticMsg = {
       id: localId,
@@ -5525,6 +5577,9 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
       sender_id: user.id,
       body: body || null,
       attachments,
+      reply_to_message_id: replyId,
+      mentions: mentionIds,
+      _replyTo: replySnap,
       users: { full_name: me.full_name },
       created_at: new Date().toISOString(),
       _pending: true
@@ -5534,6 +5589,8 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
     setMessages(prev => [...prev, optimisticMsg]);
     setInput('');
     setAttachment(null);
+    setReplyTo(null);
+    setMentionQuery(null);
     // RBAC: clear the project + stage tags so they don't carry into the next bill
     setAttachmentProject('');
     setAttachmentStage('');
@@ -5548,7 +5605,9 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
       group_id: activeGroup.id,
       sender_id: user.id,
       body: body || null,
-      attachments: attachments
+      attachments: attachments,
+      reply_to_message_id: replyId,
+      mentions: mentionIds.length ? mentionIds : null,
     }).select().single();
 
     if (error) {
@@ -5558,7 +5617,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
     }
 
     // Replace optimistic with real (so realtime won't double-add)
-    setMessages(prev => prev.map(m => m.id === localId ? {...inserted, users: { full_name: me.full_name }} : m));
+    setMessages(prev => prev.map(m => m.id === localId ? {...inserted, users: { full_name: me.full_name }, _replyTo: replySnap} : m));
 
     // Auto-extract documents — ONLY in groups with AI flag enabled (saves API cost)
     if (inserted && attachments.length > 0 && attachments[0].isImage && activeGroup?.ai_logistics_enabled) {
@@ -5597,6 +5656,119 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
     }
   };
 
+  // ── Message interactions (reactions / star / pin / delete-for-me) ──
+  // Optimistic local update + RPC; reload on failure to resync.
+  const patchMsg = (id, patch) => setMessages(prev => prev.map(m => m.id === id ? { ...m, ...(typeof patch === 'function' ? patch(m) : patch) } : m));
+  const toggleReaction = async (m, emoji) => {
+    const arr = (m.reactions && m.reactions[emoji]) || [];
+    const have = arr.includes(user.id);
+    const nextArr = have ? arr.filter(x => x !== user.id) : [...arr, user.id];
+    const nextReactions = { ...(m.reactions || {}) };
+    if (nextArr.length) nextReactions[emoji] = nextArr; else delete nextReactions[emoji];
+    patchMsg(m.id, { reactions: nextReactions });
+    const { error } = await sb.rpc('toggle_message_reaction', { p_message_id: m.id, p_emoji: emoji });
+    if (error) loadMessages(activeGroup.id);
+  };
+  const toggleStar = async (m) => {
+    const have = (m.starred_by || []).includes(user.id);
+    patchMsg(m.id, { starred_by: have ? (m.starred_by || []).filter(x => x !== user.id) : [...(m.starred_by || []), user.id] });
+    const { error } = await sb.rpc('toggle_star_message', { p_message_id: m.id });
+    if (error) loadMessages(activeGroup.id);
+    else showToast(have ? 'Unstarred' : '⭐ Starred');
+  };
+  const togglePin = async (m) => {
+    const pinned = !!m.pinned_at;
+    const { data, error } = await sb.rpc('set_message_pin', { p_message_id: m.id, p_pinned: !pinned });
+    if (error || !data?.success) { alert(error?.message || data?.error || 'Failed'); return; }
+    showToast(pinned ? 'Unpinned' : '📌 Pinned');
+    loadMessages(activeGroup.id);
+  };
+  const deleteForMe = async (m) => {
+    patchMsg(m.id, {}); // no-op to keep ref
+    setMessages(prev => prev.filter(x => x.id !== m.id));
+    const { error } = await sb.rpc('delete_message_for_me', { p_message_id: m.id });
+    if (error) loadMessages(activeGroup.id);
+  };
+
+  // Voice notes via MediaRecorder → upload as an attachment.
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const rec = new MediaRecorder(stream);
+      recChunksRef.current = [];
+      rec.ondataavailable = e => { if (e.data.size > 0) recChunksRef.current.push(e.data); };
+      rec.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        const blob = new Blob(recChunksRef.current, { type: rec.mimeType || 'audio/webm' });
+        const dur = Math.round((Date.now() - recStartRef.current) / 1000);
+        await sendVoiceNote(blob, dur);
+      };
+      recStartRef.current = Date.now();
+      rec.start();
+      recRef.current = rec;
+      setRecording(true);
+    } catch (e) { alert('Microphone not available: ' + (e.message || e)); }
+  };
+  const stopRecording = (cancel) => {
+    const rec = recRef.current;
+    if (!rec) { setRecording(false); return; }
+    if (cancel) rec.onstop = () => rec.stream?.getTracks?.().forEach(t => t.stop());
+    rec.stop();
+    recRef.current = null;
+    setRecording(false);
+  };
+  const sendVoiceNote = async (blob, durationSec) => {
+    if (!activeGroup) return;
+    setUploading(true);
+    try {
+      const ts = Date.now();
+      const path = plant.id + '/' + activeGroup.id + '/' + user.id + '-' + ts + '.webm';
+      const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, blob, { contentType: blob.type || 'audio/webm' });
+      if (upErr) throw upErr;
+      const { data: { publicUrl } } = sb.storage.from('chat-attachments').getPublicUrl(path);
+      const att = [{ url: publicUrl, path, type: blob.type || 'audio/webm', name: 'Voice note', isVoice: true, duration: durationSec }];
+      const { data: inserted, error } = await sb.from('chat_messages').insert({
+        plant_id: plant.id, group_id: activeGroup.id, sender_id: user.id, body: null, attachments: att,
+      }).select().single();
+      if (error) throw error;
+      setMessages(prev => [...prev, { ...inserted, users: { full_name: me.full_name } }]);
+      setTimeout(() => { const w = document.getElementById('threadMessages'); if (w) w.scrollTop = w.scrollHeight; }, 30);
+    } catch (e) { alert('Voice note failed: ' + (e.message || e)); }
+    finally { setUploading(false); }
+  };
+
+  // Highlight @mentions in a message body.
+  const renderBody = (body) => {
+    if (!body) return body;
+    if (!/@\w/.test(body)) return body;
+    const parts = body.split(/(@[\w][\w .'-]*)/g);
+    return parts.map((p, i) => {
+      if (p.startsWith('@') && groupMembers.some(mem => ('@' + (mem.full_name || '')).toLowerCase().startsWith(p.toLowerCase().slice(0, (mem.full_name || '').length + 1)))) {
+        return html`<span key=${i} style="color:var(--teal-700);font-weight:600;background:var(--teal-50);border-radius:3px;padding:0 2px">${p}</span>`;
+      }
+      return p;
+    });
+  };
+
+  // Input change with @mention autocomplete detection.
+  const onInputChange = (val) => {
+    setInput(val);
+    const m = val.match(/@([\w .'-]*)$/);
+    setMentionQuery(m ? m[1].toLowerCase() : null);
+  };
+  const pickMention = (mem) => {
+    setInput(prev => prev.replace(/@([\w .'-]*)$/, '@' + mem.full_name + ' '));
+    setMentionQuery(null);
+  };
+
+  const pinnedMsg = messages.find(m => m.pinned_at);
+  const visibleMessages = searchQ.trim()
+    ? messages.filter(m => (m.body || '').toLowerCase().includes(searchQ.trim().toLowerCase()))
+    : messages;
+  const mentionMatches = mentionQuery != null
+    ? groupMembers.filter(mem => (mem.full_name || '').toLowerCase().includes(mentionQuery)).slice(0, 6)
+    : [];
+
   if (activeGroup) {
     return html`
       <div class="chat-thread">
@@ -5607,8 +5779,16 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
             <div style="font-weight:600;font-size:14px">${activeGroup.name}</div>
             <div style="font-size:11px;color:var(--slate-500)">${activeGroup.members.length} member${activeGroup.members.length > 1 ? 's' : ''} · tap for settings</div>
           </div>
+          <button class="thread-back" onClick=${() => { setSearchOpen(o => !o); setSearchQ(''); }} title="Search messages">🔍</button>
           <button class="thread-back" onClick=${() => setGroupSettingsTarget(activeGroup)}>⚙️</button>
         </div>
+        ${searchOpen && html`
+          <div style="padding:8px 12px;border-bottom:1px solid var(--slate-200);background:var(--slate-50)">
+            <input type="search" value=${searchQ} onInput=${e => setSearchQ(e.target.value)} placeholder="Search in this chat…" autoFocus
+              style="width:100%;padding:8px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px;box-sizing:border-box" />
+            ${searchQ.trim() && html`<div style="font-size:11px;color:var(--slate-500);margin-top:4px">${visibleMessages.length} match${visibleMessages.length === 1 ? '' : 'es'}</div>`}
+          </div>
+        `}
         ${groupSettingsTarget && html`<${GroupSettingsModal} plant=${plant} me=${me} user=${user} group=${groupSettingsTarget} onClose=${() => setGroupSettingsTarget(null)} onChanged=${(updatedGroup) => {
           if (updatedGroup === null) {
             // Group deleted or user left
@@ -5621,9 +5801,16 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
             loadGroups();
           }
         }} />`}
+        ${pinnedMsg && html`
+          <div style="background:var(--amber-50);border-bottom:1px solid var(--amber-200);padding:6px 12px;font-size:12px;display:flex;align-items:center;gap:8px">
+            <span>📌</span>
+            <div style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--slate-700)">${pinnedMsg.body || (Array.isArray(pinnedMsg.attachments) && pinnedMsg.attachments[0]?.isVoice ? '🎤 Voice note' : '📎 Attachment')}</div>
+            <button class="msg-action-btn" onClick=${() => togglePin(pinnedMsg)} title="Unpin">×</button>
+          </div>
+        `}
         <div class="thread-messages" id="threadMessages">
-          ${messages.length === 0 ? html`<div class="empty"><div class="icon">💬</div><div style="font-size:13px">No messages yet. Say hi.</div></div>` :
-            messages.map(m => {
+          ${visibleMessages.length === 0 ? html`<div class="empty"><div class="icon">💬</div><div style="font-size:13px">${searchQ.trim() ? 'No messages match your search.' : 'No messages yet. Say hi.'}</div></div>` :
+            visibleMessages.map(m => {
               const isOut = m.sender_id === user.id;
               const atts = Array.isArray(m.attachments) ? m.attachments : [];
               const ex = m._extraction;
@@ -5631,10 +5818,18 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
               const hasImage = atts.length > 0 && atts[0].isImage;
               const canEdit = isOut;
               const canDelete = isOut || me.role === 'plant_head' || me.role === 'admin';
+              const starred = (m.starred_by || []).includes(user.id);
+              const reactionEntries = Object.entries(m.reactions || {});
               return html`
                 <div class=${'msg ' + (isOut ? 'out' : 'in')} key=${m.id}>
                   ${!isOut && html`<div class="who">${m.users?.full_name || '?'}</div>`}
                   ${m.forwarded_from_message_id && html`<div style="font-size:10px;opacity:0.7;font-style:italic">↪️ Forwarded</div>`}
+                  ${m._replyTo && html`
+                    <div style="border-left:3px solid var(--teal-400);background:rgba(0,0,0,0.04);border-radius:4px;padding:4px 8px;margin-bottom:4px;font-size:11px">
+                      <div style="font-weight:600;color:var(--teal-700)">${m._replyTo.name}</div>
+                      <div style="color:var(--slate-600);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:240px">${m._replyTo.hasImg ? '📷 Photo' : (m._replyTo.body || '')}</div>
+                    </div>
+                  `}
                   ${m.body && (() => {
                     // Detect meeting URLs and render with a Join CTA
                     const meetMatch = m.body.match(/https?:\/\/(meet\.jit\.si|meet\.google\.com|[^\s]*zoom\.us|teams\.(?:microsoft|live)\.com|whereby\.com)[^\s]*/);
@@ -5657,9 +5852,11 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
                         </div>
                       `;
                     }
-                    return html`<div>${m.body}</div>`;
+                    return html`<div>${renderBody(m.body)}</div>`;
                   })()}
-                  ${atts.map((a, i) => a.isImage
+                  ${atts.map((a, i) => a.isVoice
+                    ? html`<audio key=${i} controls preload="none" src=${a.url} style="max-width:240px;height:38px;margin-top:4px"></audio>`
+                    : a.isImage
                     ? html`<a href=${a.url} target="_blank" rel="noopener" key=${i}><img class="attached-img" src=${a.url} alt=${a.name || 'image'} /></a>`
                     : html`<a href=${a.url} target="_blank" rel="noopener" class="file-attached" key=${i}>📎 ${a.name || 'file'}</a>`
                   )}
@@ -5677,8 +5874,20 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
                   ${hasImage && !ex && html`
                     <button class="msg-action-btn" style="margin-top:6px" onClick=${() => triggerExtraction(m, atts[0].url)} title="Extract document">📄 Extract as document</button>
                   `}
+                  ${reactionEntries.length > 0 && html`
+                    <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px">
+                      ${reactionEntries.map(([emoji, uids]) => html`
+                        <button key=${emoji} onClick=${() => toggleReaction(m, emoji)}
+                          style=${'border:1px solid '+((uids||[]).includes(user.id)?'var(--teal-400)':'var(--slate-200)')+';background:'+((uids||[]).includes(user.id)?'var(--teal-50)':'white')+';border-radius:999px;padding:1px 7px;font-size:11px;cursor:pointer;line-height:1.6'}>
+                          ${emoji} ${(uids||[]).length}
+                        </button>
+                      `)}
+                    </div>
+                  `}
                   <div class="ts">
-                    ${fmtDate(m.created_at)}${m.edited_at ? ' · edited' : ''}
+                    ${fmtDate(m.created_at)}${m.edited_at ? ' · edited' : ''}${starred ? ' · ⭐' : ''}${m.pinned_at ? ' · 📌' : ''}
+                    <button class="msg-action-btn" onClick=${() => setReplyTo(m)} title="Reply">↩</button>
+                    <button class="msg-action-btn" onClick=${() => toggleReaction(m, '👍')} title="Like 👍">👍</button>
                     <button class="msg-action-btn" onClick=${() => setMsgMenu(m)} title="More">⋯</button>
                   </div>
                 </div>
@@ -5709,29 +5918,64 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
             </div>
           `}
         `}
+        ${replyTo && html`
+          <div style="display:flex;align-items:center;gap:8px;padding:6px 12px;border-top:1px solid var(--slate-200);background:var(--slate-50)">
+            <div style="border-left:3px solid var(--teal-400);padding-left:8px;flex:1;min-width:0">
+              <div style="font-size:11px;font-weight:600;color:var(--teal-700)">Replying to ${replyTo.users?.full_name || '?'}</div>
+              <div style="font-size:11px;color:var(--slate-600);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${replyTo.body || (Array.isArray(replyTo.attachments) && replyTo.attachments[0]?.isImage ? '📷 Photo' : '📎 Attachment')}</div>
+            </div>
+            <button class="msg-action-btn" onClick=${() => setReplyTo(null)} title="Cancel reply">×</button>
+          </div>
+        `}
+        ${mentionMatches.length > 0 && html`
+          <div style="border-top:1px solid var(--slate-200);background:white;max-height:160px;overflow-y:auto">
+            ${mentionMatches.map(mem => html`
+              <div key=${mem.id} onClick=${() => pickMention(mem)} style="padding:8px 14px;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:8px" onMouseOver=${e => e.currentTarget.style.background='var(--slate-100)'} onMouseOut=${e => e.currentTarget.style.background=''}>
+                <span style="color:var(--teal-700);font-weight:700">@</span>${mem.full_name}
+              </div>
+            `)}
+          </div>
+        `}
         <div class="thread-input">
           <input type="file" id="chatFileInput" accept="image/*,video/*,audio/*,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip,.rar,.dwg,.dxf,.step,.stp,.iges,.igs,.stl" style="display:none" onChange=${onPickFile} />
-          <button class="attach" onClick=${() => document.getElementById('chatFileInput').click()} disabled=${uploading} title="Attach">
+          <input type="file" id="chatCameraInput" accept="image/*" capture="environment" style="display:none" onChange=${onPickFile} />
+          <button class="attach" onClick=${() => document.getElementById('chatFileInput').click()} disabled=${uploading || recording} title="Attach">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
           </button>
-          <button class="attach" onClick=${() => setNewTaskInGroup(true)} disabled=${uploading} title="Create task" style="background:var(--teal-50);color:var(--teal-700)">
+          <button class="attach" onClick=${() => document.getElementById('chatCameraInput').click()} disabled=${uploading || recording} title="Camera" style="font-size:15px">📷</button>
+          <button class="attach" onClick=${() => setNewTaskInGroup(true)} disabled=${uploading || recording} title="Create task" style="background:var(--teal-50);color:var(--teal-700)">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
           </button>
-          <button class="attach" onClick=${() => setMeetingMenu(true)} disabled=${uploading} title="Start / share video meeting" style="background:var(--teal-50);color:var(--teal-700);font-size:14px">📹</button>
-          <input type="text" value=${input} onChange=${e => setInput(e.target.value)} onKeyPress=${e => { if (e.key === 'Enter' && !e.shiftKey) send(); }} placeholder=${uploading ? 'Uploading…' : 'Message…'} disabled=${uploading} />
-          <button onClick=${send} disabled=${uploading || (!input.trim() && !attachment)}>${uploading ? '…' : '→'}</button>
+          <button class="attach" onClick=${() => setMeetingMenu(true)} disabled=${uploading || recording} title="Start / share video meeting" style="background:var(--teal-50);color:var(--teal-700);font-size:14px">📹</button>
+          ${recording
+            ? html`
+              <button class="attach" onClick=${() => stopRecording(true)} title="Cancel recording" style="background:var(--slate-100);color:var(--slate-600);font-size:14px">🗑</button>
+              <div style="flex:1;display:flex;align-items:center;gap:6px;color:var(--rose-600);font-size:13px;font-weight:600"><span style="width:8px;height:8px;border-radius:50%;background:var(--rose-500);display:inline-block;animation:pulse 1.5s infinite"></span> Recording…</div>
+              <button onClick=${() => stopRecording(false)} title="Send voice note" style="background:var(--teal-600)">⏹</button>
+            `
+            : html`
+              <input type="text" value=${input} onChange=${e => onInputChange(e.target.value)} onKeyPress=${e => { if (e.key === 'Enter' && !e.shiftKey) { if (mentionMatches.length) { e.preventDefault(); pickMention(mentionMatches[0]); } else send(); } }} placeholder=${uploading ? 'Uploading…' : 'Message…'} disabled=${uploading} />
+              ${(input.trim() || attachment)
+                ? html`<button onClick=${send} disabled=${uploading}>${uploading ? '…' : '→'}</button>`
+                : html`<button class="attach" onClick=${startRecording} disabled=${uploading} title="Record voice note" style="background:var(--teal-50);color:var(--teal-700);font-size:15px">🎤</button>`}
+            `}
         </div>
         ${taskFromMsg && html`<${AssignTaskFromMsgModal} plant=${plant} me=${me} message=${taskFromMsg} group=${activeGroup} onClose=${() => setTaskFromMsg(null)} onSaved=${() => setTaskFromMsg(null)} />`}
         ${newTaskInGroup && html`<${QuickTaskInGroupModal} plant=${plant} me=${me} group=${activeGroup} onClose=${() => setNewTaskInGroup(false)} onSaved=${() => setNewTaskInGroup(false)} />`}
         ${meetingMenu && html`<${MeetingStartMenu} plant=${plant} onClose=${() => setMeetingMenu(false)} onStart=${(url, title) => { setMeetingMenu(false); postMeetingLink(url, title); if (url.includes('meet.jit.si')) setActiveMeeting(url); }} />`}
         ${activeMeeting && html`<${EmbeddedJitsiMeeting} url=${activeMeeting} me=${me} onClose=${() => setActiveMeeting(null)} />`}
         ${msgMenu && html`<${MessageActionMenu}
-          message=${msgMenu} me=${me} group=${activeGroup}
+          message=${msgMenu} me=${me} userId=${user.id} group=${activeGroup}
           onClose=${() => setMsgMenu(null)}
+          onReply=${() => { setReplyTo(msgMenu); setMsgMenu(null); }}
+          onReact=${(emoji) => { toggleReaction(msgMenu, emoji); setMsgMenu(null); }}
+          onStar=${() => { toggleStar(msgMenu); setMsgMenu(null); }}
+          onPin=${() => { togglePin(msgMenu); setMsgMenu(null); }}
+          onDeleteForMe=${() => { deleteForMe(msgMenu); setMsgMenu(null); }}
           onAssignTask=${() => { setTaskFromMsg(msgMenu); setMsgMenu(null); }}
           onEdit=${() => { setEditMsgTarget(msgMenu); setMsgMenu(null); }}
           onDelete=${async () => {
-            if (!confirm('Delete this message? This cannot be undone.')) return;
+            if (!confirm('Delete this message for everyone? This cannot be undone.')) return;
             const { data, error } = await sb.rpc('delete_chat_message', { p_message_id: msgMenu.id });
             if (error || !data?.success) { alert(error?.message || data?.error || 'Failed'); return; }
             setMsgMenu(null);
@@ -27226,10 +27470,13 @@ function QuickItemCreateModal({ plant, prefillName, prefillUom, onClose, onSaved
 }
 
 // ============= MESSAGE ACTION MENU (sheet on tap of ⋯) =============
-function MessageActionMenu({ message, me, group, onClose, onAssignTask, onEdit, onDelete, onForward }) {
+function MessageActionMenu({ message, me, userId, group, onClose, onReply, onReact, onStar, onPin, onDeleteForMe, onAssignTask, onEdit, onDelete, onForward }) {
   const isAuthor = message.sender_id === me.id;
   const canEdit = isAuthor;
   const canDelete = isAuthor || me.role === 'plant_head' || me.role === 'admin';
+  const starred = (message.starred_by || []).includes(userId);
+  const pinned = !!message.pinned_at;
+  const QUICK = ['👍', '❤️', '😂', '😮', '🙏', '✅'];
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal" style="max-width:380px">
@@ -27237,14 +27484,21 @@ function MessageActionMenu({ message, me, group, onClose, onAssignTask, onEdit, 
           <div class="modal-title">Message actions</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
+        <div style="display:flex;justify-content:space-around;gap:4px;margin-bottom:12px;background:var(--slate-50);border-radius:999px;padding:6px">
+          ${QUICK.map(e => html`<button key=${e} onClick=${() => onReact(e)} style="background:none;border:none;font-size:22px;cursor:pointer;line-height:1">${e}</button>`)}
+        </div>
         <div class="card" style="background:var(--slate-50);margin-bottom:14px;font-size:13px;color:var(--slate-700);max-height:120px;overflow:auto">
           ${message.body || '(attachment only)'}
         </div>
         <div style="display:flex;flex-direction:column;gap:8px">
-          <button class="btn ghost" onClick=${onAssignTask}>✓ Assign as task</button>
+          <button class="btn ghost" onClick=${onReply}>↩ Reply</button>
+          <button class="btn ghost" onClick=${onStar}>${starred ? '☆ Unstar' : '⭐ Star'}</button>
+          <button class="btn ghost" onClick=${onPin}>${pinned ? '📌 Unpin' : '📌 Pin'}</button>
           <button class="btn ghost" onClick=${onForward}>↪️ Forward</button>
+          <button class="btn ghost" onClick=${onAssignTask}>✓ Assign as task</button>
           ${canEdit && html`<button class="btn ghost" onClick=${onEdit}>✏️ Edit</button>`}
-          ${canDelete && html`<button class="btn danger" onClick=${onDelete}>🗑️ Delete${!isAuthor ? ' (admin)' : ''}</button>`}
+          <button class="btn ghost" onClick=${onDeleteForMe}>🙈 Delete for me</button>
+          ${canDelete && html`<button class="btn danger" onClick=${onDelete}>🗑️ Delete for everyone${!isAuthor ? ' (admin)' : ''}</button>`}
         </div>
       </div>
     </div>
