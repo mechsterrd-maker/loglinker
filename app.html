@@ -21069,6 +21069,7 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
   const [users, setUsers] = useState([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  const [addCustomerOpen, setAddCustomerOpen] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -21135,11 +21136,15 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
           </div>
           <div class="field">
             <label>Customer</label>
-            <select value=${customerId} onChange=${e => setCustomerId(e.target.value)}>
-              <option value="">— Select customer —</option>
-              ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.code ? ' (' + c.code + ')' : ''}</option>`)}
-            </select>
-            ${customers.length === 0 && html`<p style="font-size:11px;color:var(--slate-500);margin-top:4px">Add customers in Masters → Customers if the list is empty.</p>`}
+            <div style="display:flex;gap:6px;align-items:stretch">
+              <select value=${customerId} onChange=${e => setCustomerId(e.target.value)} style="flex:1">
+                <option value="">— Select customer —</option>
+                ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.code ? ' (' + c.code + ')' : ''}${c.short_code ? ' (' + c.short_code + ')' : ''}</option>`)}
+              </select>
+              <button type="button" onClick=${() => setAddCustomerOpen(true)}
+                style="padding:8px 12px;border:1px dashed var(--teal-400);background:var(--teal-50);color:var(--teal-700);border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;font-family:inherit">+ New</button>
+            </div>
+            ${customers.length === 0 && html`<p style="font-size:11px;color:var(--slate-500);margin-top:4px">No customers yet. Tap <b>+ New</b> to add one without leaving this page.</p>`}
           </div>
           <div class="field-row" style="display:flex;gap:10px">
             <div class="field" style="flex:1">
@@ -21188,6 +21193,17 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
           </button>
         </form>
       </div>
+      ${addCustomerOpen && html`<${CustomerModal} plant=${plant} me=${me} editTarget=${null}
+        onClose=${() => setAddCustomerOpen(false)}
+        onSaved=${(created) => {
+          // Drop the new row into our local list, auto-select it, and close the
+          // nested modal so the user can keep filling in the project.
+          if (created) {
+            setCustomers(prev => [created, ...prev].sort((a, b) => (a.name || '').localeCompare(b.name || '')));
+            setCustomerId(created.id);
+          }
+          setAddCustomerOpen(false);
+        }} />`}
     </div>
   `;
 }
@@ -27899,8 +27915,11 @@ function CustomerModal({ plant, me, editTarget, onClose, onSaved }) {
         const { error } = await sb.from('mcp_sched_customers').update(payload).eq('id', editTarget.id);
         if (error) throw error;
       } else {
-        const { error } = await sb.from('mcp_sched_customers').insert(payload);
+        const { data, error } = await sb.from('mcp_sched_customers').insert(payload).select('*').single();
         if (error) throw error;
+        showToast('Customer added');
+        onSaved(data);
+        return;
       }
       showToast(editTarget ? 'Customer updated' : 'Customer added');
       onSaved();
