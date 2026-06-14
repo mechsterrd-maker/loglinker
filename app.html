@@ -25301,15 +25301,23 @@ function DocumentEditModal({ plant, me, doc, vendors, onClose, onSaved }) {
     ...doc,
     doc_date: doc.doc_date || '',
     due_date: doc.due_date || '',
+    project_id: doc.project_id || '',
   } : {
     doc_type: 'invoice_in',
     doc_number: '', doc_date: new Date().toISOString().slice(0,10), due_date: '',
     vendor_id: '', vendor_name_raw: '', vendor_gstin_raw: '',
     taxable_value: '', tax_amount: '', total_value: '',
-    status: 'pending', notes: '',
+    status: 'pending', notes: '', project_id: '',
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  // Projects for the "tag to project" dropdown -- Marvel: lets you fix a
+  // wrongly-assigned project on a bill, or detach it entirely.
+  const [projects, setProjects] = useState([]);
+  useEffect(() => {
+    sb.from('mcp_projects').select('id, code, name').eq('plant_id', plant.id).order('created_at', { ascending: false })
+      .then(({ data }) => setProjects(data || []));
+  }, [plant.id]);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -25329,6 +25337,7 @@ function DocumentEditModal({ plant, me, doc, vendors, onClose, onSaved }) {
         total_value: form.total_value ? parseFloat(form.total_value) : null,
         status: form.status,
         notes: form.notes || null,
+        project_id: form.project_id || null,
       };
       let result;
       if (doc?.id) {
@@ -25390,6 +25399,13 @@ function DocumentEditModal({ plant, me, doc, vendors, onClose, onSaved }) {
               <option value="closed">Closed</option>
               <option value="cancelled">Cancelled</option>
             </select>
+          </div>
+          <div class="field"><label>Project ${form.project_id ? '' : '(optional)'}</label>
+            <select value=${form.project_id || ''} onChange=${e => setForm({...form, project_id: e.target.value})}>
+              <option value="">— Not linked to a project —</option>
+              ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+            </select>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:3px">Reassign here if this bill was tagged to the wrong project, or clear it to detach.</div>
           </div>
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes || ''} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
           <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (doc?.id ? 'Update' : 'Create')}</button>
