@@ -864,7 +864,7 @@ function AuthScreen({ onAuth, pendingInviteCode }) {
 
       ${hasInvite && invitedPlant && html`
         <div class="alert info" style="margin-bottom:20px">
-          🎉 You've been invited to <strong>${invitedPlant.name}</strong> as ${invitedPlant.role}.
+          🎉 You've been invited to <strong>${invitedPlant.name}</strong> as ${roleLabel(invitedPlant.role)}.
           ${invitedPlant.full_name && html` Welcome, ${invitedPlant.full_name}.`}
           <br/><br/>Sign up below — you'll be added to ${invitedPlant.name} automatically.
         </div>
@@ -1022,7 +1022,7 @@ function Wizard({ user, pendingInvite, onDone }) {
           <h2>Join your plant</h2>
           ${pendingInvite ? html`
             <div class="alert info" style="margin-bottom:16px">
-              You're being added to <strong>${pendingInvite.plants?.name || 'plant'}</strong> as <strong>${pendingInvite.role}</strong>.
+              You're being added to <strong>${pendingInvite.plants?.name || 'plant'}</strong> as <strong>${roleLabel(pendingInvite.role)}</strong>.
               ${pendingInvite.full_name ? html` Welcome, ${pendingInvite.full_name}.` : ''}
             </div>
           ` : html`<p class="sub">Enter the invite code your plant head shared with you.</p>`}
@@ -1547,6 +1547,31 @@ function isProjectRestricted(myPerms) {
   return true;
 }
 
+// ── Role-label resolver ────────────────────────────────────────────────
+// The legacy users.role enum (plant_head/admin/manager/supervisor/operator/
+// toolroom) is shown in many lists. The built-in plant_roles share the same
+// slugs, so once we load the plant's roles we can map each slug to its
+// (possibly renamed) display_name. roleLabel() ALWAYS returns something
+// readable: if no mapping exists it humanises the slug ("plant_head" ->
+// "Plant Head"), so a role can never render blank or "undefined".
+let ROLE_LABEL_MAP = {};
+function roleLabel(slug) {
+  if (slug == null || slug === '') return '';
+  const s = String(slug);
+  return ROLE_LABEL_MAP[s] || s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+async function loadRoleLabels(plantId) {
+  if (!plantId) return;
+  try {
+    const { data } = await sb.rpc('list_plant_roles', { p_plant_id: plantId });
+    if (Array.isArray(data)) {
+      const m = {};
+      for (const r of data) if (r.slug) m[r.slug] = r.display_name;
+      ROLE_LABEL_MAP = m;
+    }
+  } catch (_) { /* keep humanised fallback */ }
+}
+
 // My-profile editor. Opened by tapping the header avatar. Edit identity +
 // emergency info + photo, change login password, or sign out.
 const BLOOD_GROUPS = ['', 'A+', 'A-', 'B+', 'B-', 'O+', 'O-', 'AB+', 'AB-'];
@@ -1622,7 +1647,7 @@ function ProfileModal({ me, user, plant, activeUnit, logout, onClose, onSaved })
   };
 
   const initials = (fullName || me.email || '?').split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
-  const roleLabel = (me.role || '').replace(/_/g, ' ');
+  const myRoleLabel = roleLabel(me.role);
   const memberSince = me.created_at ? new Date(me.created_at).toLocaleDateString('en-IN', { month: 'short', year: 'numeric' }) : '—';
   const lbl = (t) => html`<div style="font-size:10px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500);font-weight:700;margin:12px 0 6px">${t}</div>`;
 
@@ -1647,7 +1672,7 @@ function ProfileModal({ me, user, plant, activeUnit, logout, onClose, onSaved })
 
         ${/* Read-only identity block */ ''}
         <div style="background:var(--slate-50);border:1px solid var(--slate-200);border-radius:8px;padding:10px 12px;display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;font-size:12px;margin-bottom:6px">
-          <div><span style="color:var(--slate-500)">Role</span><br/><b style="text-transform:capitalize">${roleLabel || '—'}</b></div>
+          <div><span style="color:var(--slate-500)">Role</span><br/><b>${myRoleLabel || '—'}</b></div>
           <div><span style="color:var(--slate-500)">Employee ID</span><br/><b>${me.employee_id || '—'}</b></div>
           <div><span style="color:var(--slate-500)">Plant · Unit</span><br/><b>${plant?.name || '—'}${activeUnit?.unit_name ? ' · ' + activeUnit.unit_name : ''}</b></div>
           <div><span style="color:var(--slate-500)">Member since</span><br/><b>${memberSince}</b></div>
@@ -1706,6 +1731,16 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   const [navAction, setNavAction] = useState(null);
   const go = (tabKey, sub) => { setTab(tabKey); setNavAction(sub ? { tab: tabKey, sub, ts: Date.now() } : null); };
 
+  // Load the slug -> display_name map once so role labels (People, profile,
+  // dropdowns, invites) reflect any renamed roles. Bump a version after it
+  // resolves so already-rendered children re-paint with fresh labels.
+  const [, bumpRoleLabels] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    loadRoleLabels(plant?.id).then(() => { if (alive) bumpRoleLabels(v => v + 1); });
+    return () => { alive = false; };
+  }, [plant?.id]);
+
   const recalcUnread = useCallback(async () => {
     if (!plant?.id) return;
     const { data: groups } = await sb.from('chat_groups').select('id, members').contains('members', [user.id]);
@@ -1759,7 +1794,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
             const isManager = me.role === 'plant_head' || me.role === 'admin' || (accessibleUnits || []).some(u => u.role === 'manager' || u.role === 'admin');
             return html`
               <select value=${activeUnit?.unit_id || ''} onChange=${e => isManager && switchUnit(e.target.value)} disabled=${!isManager} title=${isManager ? 'Switch unit' : 'Only managers can switch units'} style="padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:6px;background:${isManager ? 'white' : 'var(--slate-50)'};max-width:140px;cursor:${isManager ? 'pointer' : 'not-allowed'};opacity:${isManager ? 1 : 0.7}">
-                ${accessibleUnits.map(u => html`<option key=${u.unit_id} value=${u.unit_id}>${u.unit_name}${isManager ? ` (${u.role})` : ''}</option>`)}
+                ${accessibleUnits.map(u => html`<option key=${u.unit_id} value=${u.unit_id}>${u.unit_name}${isManager ? ` (${roleLabel(u.role)})` : ''}</option>`)}
               </select>
             `;
           })() : html`
@@ -1931,7 +1966,7 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
         const isManager = me.role === 'plant_head' || me.role === 'admin' || (accessibleUnits || []).some(u => u.role === 'manager' || u.role === 'admin');
         return html`
           <select value=${activeUnit?.unit_id || ''} onChange=${e => isManager && switchUnit(e.target.value)} disabled=${!isManager} title=${isManager ? 'Switch unit' : 'Only managers can switch units'} style="padding:6px 10px;font-size:12px;border:1px solid var(--slate-300);border-radius:6px;background:${isManager ? 'white' : 'var(--slate-50)'};margin-right:10px;font-weight:500;color:${isManager ? 'var(--slate-700)' : 'var(--slate-500)'};cursor:${isManager ? 'pointer' : 'not-allowed'};opacity:${isManager ? 1 : 0.7}">
-            ${accessibleUnits.map(u => html`<option key=${u.unit_id} value=${u.unit_id}>📍 ${u.unit_name}${isManager ? ` (${u.role})` : ''}</option>`)}
+            ${accessibleUnits.map(u => html`<option key=${u.unit_id} value=${u.unit_id}>📍 ${u.unit_name}${isManager ? ` (${roleLabel(u.role)})` : ''}</option>`)}
           </select>
         `;
       })() : html`
@@ -5946,7 +5981,7 @@ function MastersHub({ plant, me, setTab }) {
           <${SectionHeader} icon="🧑‍💼" title="Team (login users)" n=${users.length} addLabel="+ Invite user" onAdd=${() => setTab('people')} />
           <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Login-enabled team members (admin, plant_head, supervisor, qa, store, etc.). To invite a new user, use the full People page.</div>
           ${list.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🧑‍💼</div>No team members</div></div>` :
-            list.map(u => Row({ title: u.full_name, sub: u.phone + (u.email?' · '+u.email:''), badge: u.role, badgeColor: u.role==='admin'||u.role==='plant_head'?'teal':'', onClick: () => setTab('people') }))}
+            list.map(u => Row({ title: u.full_name, sub: u.phone + (u.email?' · '+u.email:''), badge: roleLabel(u.role), badgeColor: u.role==='admin'||u.role==='plant_head'?'teal':'', onClick: () => setTab('people') }))}
         `;
       }
       case 'parts': {
@@ -6182,7 +6217,7 @@ function People({ plant, me, myPerms }) {
             <div class="list-item-row">
               <div class="list-item-main">
                 <div class="list-item-title">${i.full_name}</div>
-                <div class="list-item-sub">${i.role} · code: <span class="mono" style="color:var(--teal-700);font-weight:600">${i.invite_code}</span></div>
+                <div class="list-item-sub">${roleLabel(i.role)} · code: <span class="mono" style="color:var(--teal-700);font-weight:600">${i.invite_code}</span></div>
               </div>
               <span class="badge amber">Pending</span>
             </div>
@@ -6203,7 +6238,7 @@ function People({ plant, me, myPerms }) {
                 <div class="list-item-sub">${u.phone} · ${u.email || 'no email'}</div>
               </div>
               <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
-                <span class=${'badge ' + (u.role === 'plant_head' ? 'teal' : u.status === 'inactive' ? '' : '')}>${u.role}</span>
+                <span class=${'badge ' + (u.role === 'plant_head' ? 'teal' : u.status === 'inactive' ? '' : '')}>${roleLabel(u.role)}</span>
                 ${canAssignRoles && html`<button class="btn small ghost" title="Manage the roles assigned to this user" onClick=${() => setRolesTarget(u)}>👥 Roles</button>`}
                 ${canReset && html`<button class="btn small ghost" title="Issue a one-tap link they can use to set a new password" onClick=${async () => {
                   const { data, error } = await sb.rpc('issue_password_reset', { p_target_user_id: u.id });
@@ -6340,7 +6375,7 @@ function OperatorPicker({ users, value, onChange, machineCategory, required }) {
       `)}
       ${others.length > 0 && html`
         <optgroup label="Also available (supervisor / admin)">
-          ${others.map(o => html`<option key=${o.id} value=${o.id}>${o.full_name} · ${o.role}</option>`)}
+          ${others.map(o => html`<option key=${o.id} value=${o.id}>${o.full_name} · ${roleLabel(o.role)}</option>`)}
         </optgroup>
       `}
     </select>
@@ -6624,6 +6659,8 @@ function RolesTab({ plant, me }) {
     const { data, error } = await sb.rpc('list_plant_roles', { p_plant_id: plant.id });
     if (error) { setErr(error.message); setRoles([]); return; }
     setRoles(data || []);
+    // Keep the global slug -> label map fresh so renames show app-wide.
+    await loadRoleLabels(plant.id);
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
 
@@ -6962,7 +6999,7 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
     const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
     const inviteUrl = baseUrl + '?code=' + createdInvite.invite_code;
     const waMessage = encodeURIComponent(
-      `Hi ${createdInvite.full_name}, you've been invited to join ${plant.name} on Loglinkr as ${createdInvite.role}.\n\nSign up here: ${inviteUrl}\n\nOr enter code: ${createdInvite.invite_code}`
+      `Hi ${createdInvite.full_name}, you've been invited to join ${plant.name} on Loglinkr as ${roleLabel(createdInvite.role)}.\n\nSign up here: ${inviteUrl}\n\nOr enter code: ${createdInvite.invite_code}`
     );
     const waUrl = createdInvite.phone ? 'https://wa.me/' + createdInvite.phone.replace(/\D/g,'') + '?text=' + waMessage : 'https://wa.me/?text=' + waMessage;
 
@@ -7078,7 +7115,7 @@ function InviteViewModal({ invite, onClose, onCancel }) {
   const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
   const inviteUrl = baseUrl + '?code=' + invite.invite_code;
   const waMessage = encodeURIComponent(
-    `Hi ${invite.full_name}, your Loglinkr invite as ${invite.role}:\n\n${inviteUrl}\n\nOr enter code: ${invite.invite_code}`
+    `Hi ${invite.full_name}, your Loglinkr invite as ${roleLabel(invite.role)}:\n\n${inviteUrl}\n\nOr enter code: ${invite.invite_code}`
   );
   const waUrl = invite.phone ? 'https://wa.me/' + invite.phone.replace(/\D/g,'') + '?text=' + waMessage : 'https://wa.me/?text=' + waMessage;
 
@@ -7089,7 +7126,7 @@ function InviteViewModal({ invite, onClose, onCancel }) {
           <div class="modal-title">Invite for ${invite.full_name}</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
-        <div class="card-row"><span class="label">Role</span><span class="value">${invite.role}</span></div>
+        <div class="card-row"><span class="label">Role</span><span class="value">${roleLabel(invite.role)}</span></div>
         <div class="card-row"><span class="label">Phone</span><span class="value mono">${invite.phone}</span></div>
         <div class="invite-code">${invite.invite_code}</div>
         <div class="field" style="margin-top:14px">
@@ -8111,7 +8148,7 @@ function UnitAccessModal({ plant, me, onClose }) {
                       const unit = units.find(u => u.id === g.unit_id);
                       return html`
                         <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;padding:4px 0">
-                          <span style="color:var(--slate-700)">${unit?.name || '?'} · <span class="badge ${g.role === 'manager' || g.role === 'admin' ? 'teal' : ''}">${g.role}</span></span>
+                          <span style="color:var(--slate-700)">${unit?.name || '?'} · <span class="badge ${g.role === 'manager' || g.role === 'admin' ? 'teal' : ''}">${roleLabel(g.role)}</span></span>
                           <button class="btn small ghost" style="padding:2px 8px;font-size:10px;color:var(--rose-600)" onClick=${() => revoke(g.user_id, g.unit_id)}>Revoke</button>
                         </div>
                       `;
@@ -8205,7 +8242,7 @@ function More({ plant, me, myPerms, user, logout, setTab, activeUnit, accessible
       <div class="card-row"><span class="label">Name</span><span class="value">${me.full_name}</span></div>
       <div class="card-row"><span class="label">Email</span><span class="value">${user.email}</span></div>
       <div class="card-row"><span class="label">Phone</span><span class="value mono">${me.phone}</span></div>
-      <div class="card-row"><span class="label">Role</span><span class="value"><span class="badge teal">${me.role}</span></span></div>
+      <div class="card-row"><span class="label">Role</span><span class="value"><span class="badge teal">${roleLabel(me.role)}</span></span></div>
     </div>
 
     <div class="section-h">Plant</div>
@@ -8238,7 +8275,7 @@ function More({ plant, me, myPerms, user, logout, setTab, activeUnit, accessible
       <div class="card-row"><span class="label">Active unit</span><span class="value"><span class="badge teal">${activeUnit?.unit_name || '—'}</span></span></div>
       <div class="card-row"><span class="label">My access</span><span class="value">${(accessibleUnits || []).length} unit${(accessibleUnits || []).length === 1 ? '' : 's'}</span></div>
       ${(accessibleUnits || []).map(u => html`
-        <div class="card-row" key=${u.unit_id}><span class="label">${u.unit_name}</span><span class="value"><span class="badge ${u.role === 'manager' || u.role === 'admin' ? 'teal' : ''}">${u.role}</span></span></div>
+        <div class="card-row" key=${u.unit_id}><span class="label">${u.unit_name}</span><span class="value"><span class="badge ${u.role === 'manager' || u.role === 'admin' ? 'teal' : ''}">${roleLabel(u.role)}</span></span></div>
       `)}
       ${isManager && html`
         <button class="btn small ghost" style="width:100%;margin-top:8px" onClick=${() => setUnitAccessOpen(true)}>Manage unit access →</button>
@@ -8835,7 +8872,7 @@ function TrainingRecordModal({ plant, me, users, skills, onClose, onSaved }) {
         <div class="field"><label>Employee *</label>
           <select value=${f.user_id} onChange=${e => setF({...f, user_id: e.target.value})}>
             <option value="">— select —</option>
-            ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${u.role})</option>`)}
+            ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${roleLabel(u.role)})</option>`)}
           </select>
         </div>
         <div class="field"><label>Skill *</label>
@@ -22022,14 +22059,14 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
             <label>Leader</label>
             <select value=${leaderId} onChange=${e => setLeaderId(e.target.value)}>
               <option value="">— Select leader —</option>
-              ${candidatesFor(false, true).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${u.role})</option>`)}
+              ${candidatesFor(false, true).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${roleLabel(u.role)})</option>`)}
             </select>
           </div>
           <div class="field">
             <label>Manager</label>
             <select value=${managerId} onChange=${e => setManagerId(e.target.value)}>
               <option value="">— Select manager —</option>
-              ${candidatesFor(true, false).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${u.role})</option>`)}
+              ${candidatesFor(true, false).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${roleLabel(u.role)})</option>`)}
             </select>
           </div>
           <div class="field">
@@ -23068,7 +23105,7 @@ function SparePurchaseRequestModal({ plant, me, users, parentAction, machineId, 
           <div class="field"><label>Approver *</label>
             <select required value=${approverId} onChange=${e => setApproverId(e.target.value)}>
               ${approvers.length === 0 ? html`<option value="">— No admin / plant head available —</option>` :
-                approvers.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${u.role})</option>`)}
+                approvers.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${roleLabel(u.role)})</option>`)}
             </select>
           </div>
           <div class="field"><label>Reason / context</label><textarea rows=${3} value=${reason} onChange=${e => setReason(e.target.value)} placeholder="What broke, why these spares, any alternatives"></textarea></div>
@@ -24576,7 +24613,7 @@ function GroupCreateModal({ plant, me, user, onClose, onSaved }) {
                   <div style="width:20px;height:20px;border:2px solid ${selected ? 'var(--teal-600)' : 'var(--slate-300)'};border-radius:6px;display:flex;align-items:center;justify-content:center;background:${selected ? 'var(--teal-600)' : 'transparent'};color:white;font-size:12px;flex-shrink:0">${selected ? '✓' : ''}</div>
                   <div style="flex:1">
                     <div style="font-size:14px;font-weight:500">${u.full_name} ${isSelf ? '(you)' : ''}</div>
-                    <div style="font-size:11px;color:var(--slate-500)">${u.role}</div>
+                    <div style="font-size:11px;color:var(--slate-500)">${roleLabel(u.role)}</div>
                   </div>
                 </div>
               `;
@@ -27448,7 +27485,7 @@ function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
                 <div key=${u.id} onClick=${() => addMember(u.id)} style="padding:8px 10px;cursor:pointer;border-radius:6px;display:flex;justify-content:space-between;align-items:center;${busy ? 'opacity:0.5' : ''}" onMouseOver=${e => e.currentTarget.style.background='var(--slate-100)'} onMouseOut=${e => e.currentTarget.style.background=''}>
                   <div>
                     <div style="font-size:13px;font-weight:500">${u.full_name}</div>
-                    <div style="font-size:11px;color:var(--slate-500)">${u.role}</div>
+                    <div style="font-size:11px;color:var(--slate-500)">${roleLabel(u.role)}</div>
                   </div>
                   <button class="btn small">+ Add</button>
                 </div>
@@ -27466,7 +27503,7 @@ function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
                 <div class="list-item-row">
                   <div class="list-item-main">
                     <div class="list-item-title">${m.full_name}${isMe ? ' (you)' : ''}${isCreator ? ' · 👑 creator' : ''}</div>
-                    <div class="list-item-sub">${m.role}</div>
+                    <div class="list-item-sub">${roleLabel(m.role)}</div>
                   </div>
                   ${(canManage || isMe) && !isCreator && html`<button class="btn small danger" disabled=${busy} onClick=${() => removeMember(m.id)}>${isMe ? 'Leave' : 'Remove'}</button>`}
                 </div>
