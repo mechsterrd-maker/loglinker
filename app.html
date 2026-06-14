@@ -456,6 +456,28 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 // Replace this placeholder with the public key you set as VAPID_PUBLIC_KEY in Supabase secrets.
 const VAPID_PUBLIC_KEY = 'BMckC21eZxtDc1NotXRz706Zj9fiPo_P6daPfJny9Ypp4xuJfj4Y4ubaGVA9DC7nrYIVsFSTuRxGByQvucLngJo';
 
+// ── Auto-refresh pulse ────────────────────────────────────────────────
+// Fires a 'loglinkr-pulse' window event when the user returns to the tab
+// (focus + visibility) or when network reconnects. Modules opt in via the
+// useAutoRefresh(refreshFn) hook below; each pulse re-runs their loader so
+// data is fresh without the user having to reload.
+const __loglinkrPulse = (() => {
+  let last = 0;
+  return () => {
+    const now = Date.now();
+    if (now - last < 1500) return; // dedupe rapid focus/visibility bursts
+    last = now;
+    try { window.dispatchEvent(new CustomEvent('loglinkr-pulse')); } catch (_) {}
+  };
+})();
+if (typeof window !== 'undefined') {
+  window.addEventListener('focus', __loglinkrPulse);
+  window.addEventListener('online', __loglinkrPulse);
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) __loglinkrPulse(); });
+  }
+}
+
 // Service worker registration (PWA + push)
 let swRegistration = null;
 if ('serviceWorker' in navigator) {
@@ -1565,6 +1587,19 @@ function roleLabel(slug) {
   const s = String(slug);
   return ROLE_LABEL_MAP[s] || s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
+// Modules call this once with their refresh function. Whenever the tab
+// regains focus / visibility / network, the hook re-fires the loader, so
+// data stays fresh even when realtime missed an event or the tab was
+// backgrounded long enough for the realtime channel to drop.
+function useAutoRefresh(refresh) {
+  useEffect(() => {
+    if (typeof refresh !== 'function') return;
+    const handler = () => { try { refresh(); } catch (_) {} };
+    window.addEventListener('loglinkr-pulse', handler);
+    return () => window.removeEventListener('loglinkr-pulse', handler);
+  }, [refresh]);
+}
+
 async function loadRoleLabels(plantId) {
   if (!plantId) return;
   try {
@@ -2304,6 +2339,7 @@ function Production({ plant, me }) {
   }, []);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
 
@@ -3302,6 +3338,7 @@ function PartDetail({ plant, me, part, machines, dies, parts, onClose }) {
   }, [part.id]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const createRoute = async () => {
     const { data, error } = await sb.from('mcp_pdc_routes').insert({
@@ -4023,6 +4060,7 @@ function MachineDetail({ plant, me, machine, units, users, dies, parts, onClose 
     setLoading(false);
   }, [machine.id, period]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const filteredEvents = filterType === 'all' ? events : events.filter(e => e.kind === filterType);
 
@@ -4945,6 +4983,7 @@ function PendingTasksPanel({ plant, setTab }) {
   }, [plant.id]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   useEffect(() => {
     const ch = sb.channel('pending-tasks-panel-' + plant.id)
@@ -6180,6 +6219,7 @@ function MastersHub({ plant, me, setTab }) {
     setLoading(false);
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   // Counts for tree badges
   const counts = {
@@ -6952,6 +6992,7 @@ function RolesTab({ plant, me }) {
     await loadRoleLabels(plant.id);
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   if (roles === null) return html`<div class="loader"><div class="spinner"></div></div>`;
 
@@ -8605,6 +8646,7 @@ function CalibrationModule({ plant, me }) {
     setLoading(false);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   // Stats
   const stats = useMemo(() => {
@@ -8926,6 +8968,7 @@ function TrainingModule({ plant, me }) {
     setLoading(false);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const stats = useMemo(() => ({
     total: rows.length,
@@ -9217,6 +9260,7 @@ function PpapModule({ plant, me }) {
     setLoading(false);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const stats = useMemo(() => ({
     total: rows.length,
@@ -9759,6 +9803,7 @@ function LpaModule({ plant, me }) {
     setLoading(false);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const stats = useMemo(() => {
     const last30 = audits.filter(a => {
@@ -10006,6 +10051,7 @@ function MgmtReviewModule({ plant, me }) {
     setLoading(false);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   return html`
     <div class="page-header" style="display:flex;justify-content:space-between;align-items:center">
@@ -10244,6 +10290,7 @@ function CsrModule({ plant, me }) {
     setLoading(false);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const stats = useMemo(() => ({
     total: rows.length,
@@ -10450,6 +10497,7 @@ function SclModule({ plant, me }) {
     setLoading(false);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const stats = useMemo(() => ({
     total: rows.length,
@@ -10663,6 +10711,7 @@ function InternalAuditPlanModule({ plant, me }) {
     setLoading(false);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const stats = useMemo(() => ({
     total: rows.length,
@@ -11154,6 +11203,7 @@ function SupplierChaseModule({ plant, me }) {
     setLoading(false);
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const severityOrder = { critical:0, high:1, medium:2, ok:3, null:4 };
   const sorted = [...rows].sort((a,b) => (severityOrder[a.severity] - severityOrder[b.severity]) || (new Date(a.earliest_need_date||'2999-01-01') - new Date(b.earliest_need_date||'2999-01-01')));
@@ -11298,6 +11348,7 @@ function PettyCashModule({ plant, me }) {
     setLoading(false);
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   useEffect(() => {
     if (!plant?.id) return;
@@ -12649,6 +12700,7 @@ function MachineProductionModule({ plant, me }) {
     setLoading(false);
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   useEffect(() => {
     if (!plant?.id) return;
@@ -12886,6 +12938,7 @@ function ProjectTracker({ plant, me, myPerms, go }) {
     setActiveProject(prev => prev ? (p.data || []).find(x => x.id === prev.id) || prev : prev);
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
   useEffect(() => {
     if (!plant?.id) return;
     const ch = sb.channel('projects-' + plant.id)
@@ -14085,6 +14138,7 @@ function CuttingPlanner({ plant, me }) {
     setLoading(false);
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const newPlan = useCallback((kind = '1d') => {
     if (kind === '2d') {
@@ -15600,6 +15654,7 @@ function ExpenseLedger({ plant, me }) {
     setLoading(false);
   }, [plant.id, month]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
   useEffect(() => {
     if (!plant?.id) return;
     const ch = sb.channel('expenses-' + plant.id)
@@ -15893,6 +15948,7 @@ function SalesDocMakerModule({ plant, me, navAction }) {
     setLoading(false);
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   useEffect(() => {
     if (!plant?.id) return;
@@ -16390,6 +16446,7 @@ function DocFormatManager({ plant, me, docType }) {
     setLoading(false);
   }, [plant.id, source]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   if (!source) return null;
   return html`
@@ -16433,6 +16490,7 @@ function DocFormatBar({ plant, me, doc, party, isInvoice, onPrintDefault, defaul
     setTemplates(data || []);
   }, [plant.id, source]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   // Auto-pick: explicit is_default first, else most recently uploaded.
   // Stop auto-picking after the user manually chooses something.
@@ -16514,6 +16572,7 @@ function DocFormatsModule({ plant, me }) {
     setLoading(false);
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const setDefault = async (tpl) => {
     // Clear any existing default for this source, then mark this one.
@@ -16831,6 +16890,7 @@ function SubContractingModule({ plant, me }) {
   }, [plant.id]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
   useEffect(() => {
     if (!plant?.id) return;
     const ch = sb.channel('jobwork-' + plant.id)
@@ -20415,6 +20475,7 @@ function PmScheduleModule({ plant, me }) {
     setLoading(false);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const stats = useMemo(() => ({
     total: tasks.filter(t => t.active).length,
@@ -20691,6 +20752,7 @@ function QualityObjectivesModule({ plant, me }) {
     setLoading(false);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const stats = useMemo(() => ({
     total: rows.length,
@@ -20921,6 +20983,7 @@ function RiskRegisterModule({ plant, me }) {
     setLoading(false);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const stats = useMemo(() => ({
     total: rows.length,
@@ -21124,6 +21187,7 @@ function ContingencyModule({ plant, me }) {
     setLoading(false);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const stats = useMemo(() => ({
     total: rows.length,
@@ -22570,6 +22634,7 @@ function Quality({ plant, me }) {
   }, [filter, plant.id]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   useEffect(() => {
     if (!plant?.id) return;
@@ -23128,6 +23193,7 @@ function Maintenance({ plant, me }) {
   }, [filter]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const openCount = breakdowns.filter(b => b.status !== 'resolved' && b.status !== 'cancelled').length;
   const machinesDown = machines.filter(m => m.status === 'breakdown').length;
@@ -23439,6 +23505,7 @@ function Stocks({ plant, me }) {
   }, [plant.id]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   // Live updates on stock changes
   useEffect(() => {
@@ -24238,6 +24305,17 @@ function ActionHub({ plant, me, navAction }) {
   }, [statusFilter]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
+  // Live subscription so a task created in one tab shows up in another
+  // instantly. We refresh on any insert/update/delete -- the list is small
+  // enough that this is cheaper than diffing in the client.
+  useEffect(() => {
+    if (!plant?.id) return;
+    const ch = sb.channel('actions-' + plant.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'actions', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .subscribe();
+    return () => sb.removeChannel(ch);
+  }, [plant?.id, refresh]);
 
   // Live updates — subscribe to actions table
   useEffect(() => {
@@ -24969,6 +25047,7 @@ function Documents({ plant, me }) {
   }, []);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   // Live updates
   useEffect(() => {
@@ -25385,6 +25464,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
   }, [doc?.id, isNew]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   if (isNew && editing) {
     return html`<${DocumentEditModal} plant=${plant} me=${me} doc=${null} vendors=${vendors} onClose=${onClose} onSaved=${(d) => { setDoc(d); setEditing(false); }} />`;
@@ -25909,6 +25989,7 @@ function ProductionFlow({ plant, parts }) {
     setLoading(false);
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   useEffect(() => {
     if (!plant?.id) return;
@@ -26131,6 +26212,7 @@ function StageLog({ plant, me, parts, machines, dies, units, shifts, users }) {
   }, [filterDate, filterPart, filterStatus]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   // Live updates
   useEffect(() => {
@@ -31924,6 +32006,7 @@ function IatfDashboard({ plant, me, setTab }) {
   }, [plant.id]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   // Live updates: refresh when a version is added/edited
   useEffect(() => {
@@ -32096,6 +32179,7 @@ function IatfDocDetail({ plant, me, row, setTab, onClose }) {
   }, [plant.id, row.registry_id]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
 
   const canApprove = me.role === 'plant_head' || me.role === 'admin' || me.role === 'qa';
 
