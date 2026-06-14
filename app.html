@@ -16004,10 +16004,11 @@ function SalesDocMakerModule({ plant, me, navAction }) {
       <button class=${'auth-tab' + (tab==='new_packing'?' active':'')} onClick=${() => setTab('new_packing')}>+ Packing</button>
     </div>
 
-    ${activeDocType && html`<${DocFormatManager} plant=${plant} me=${me} docType=${activeDocType} />`}
+    ${/* Format upload UI lives in the standalone Doc Formats module
+        (More → Commercial → Doc Formats), not inside DC creation. */ ''}
 
     ${(tab === 'new_dc' || tab === 'new_rdc' || tab === 'new_invoice') && html`
-      <${SalesDocCreateForm} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber} customers=${customers}
+      <${SalesDocCreateForm} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber} customers=${customers} vendors=${vendors}
         onCounterChanged=${() => {
           // The "Set starting number" panel inside the form just bumped the
           // counter; refetch the peek so the displayed number reflects it.
@@ -16031,7 +16032,11 @@ function SalesDocMakerModule({ plant, me, navAction }) {
 // DC/Invoice form so the existing sales flow stays untouched.
 function PoPackingForm({ plant, me, kind, previewNumber, customers, vendors, onSaved, onCancel }) {
   const isPo = kind === 'po';
-  const parties = isPo ? vendors : customers;
+  // Locally-added parties merge on top so a freshly-created vendor / customer
+  // is immediately selectable.
+  const [addedParties, setAddedParties] = useState([]);
+  const [addPartyOpen, setAddPartyOpen] = useState(false);
+  const parties = [...addedParties, ...(isPo ? vendors : customers)];
   const [form, setForm] = useState({
     doc_date: new Date().toISOString().slice(0,10),
     party_id: '',
@@ -16119,10 +16124,14 @@ function PoPackingForm({ plant, me, kind, previewNumber, customers, vendors, onS
       <div class="field-row">
         <div class="field"><label>Date *</label><input type="date" required value=${form.doc_date} onChange=${e=>setForm({...form,doc_date:e.target.value})} /></div>
         <div class="field"><label>${isPo ? 'Vendor *' : 'Customer *'}</label>
-          <select required value=${form.party_id} onChange=${e=>setForm({...form,party_id:e.target.value})}>
-            <option value="">— Pick ${isPo?'vendor':'customer'} —</option>
-            ${parties.map(p => html`<option key=${p.id} value=${p.id}>${p.name}${p.gstin?' · '+p.gstin:''}</option>`)}
-          </select>
+          <div style="display:flex;gap:6px;align-items:stretch">
+            <select required value=${form.party_id} onChange=${e=>setForm({...form,party_id:e.target.value})} style="flex:1">
+              <option value="">— Pick ${isPo?'vendor':'customer'} —</option>
+              ${parties.map(p => html`<option key=${p.id} value=${p.id}>${p.name}${p.gstin?' · '+p.gstin:''}</option>`)}
+            </select>
+            <button type="button" onClick=${() => setAddPartyOpen(true)}
+              style="padding:8px 12px;border:1px dashed var(--teal-400);background:var(--teal-50);color:var(--teal-700);border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;font-family:inherit">+ New</button>
+          </div>
         </div>
       </div>
       <div class="field-row">
@@ -16172,6 +16181,13 @@ function PoPackingForm({ plant, me, kind, previewNumber, customers, vendors, onS
         <button class="btn" disabled=${busy} style="flex:1">${busy?'Saving…':(isPo?'🛒 Create PO':'📋 Create Packing List')}</button>
       </div>
     </form>
+    ${addPartyOpen && (isPo
+      ? html`<${VendorEditModal} plant=${plant} me=${me} vendor=${null}
+          onClose=${() => setAddPartyOpen(false)}
+          onSaved=${(row) => { if (row) { setAddedParties(p => [row, ...p]); setForm(f => ({ ...f, party_id: row.id })); } setAddPartyOpen(false); }} />`
+      : html`<${CustomerModal} plant=${plant} me=${me} editTarget=${null}
+          onClose=${() => setAddPartyOpen(false)}
+          onSaved=${(row) => { if (row) { setAddedParties(p => [row, ...p]); setForm(f => ({ ...f, party_id: row.id })); } setAddPartyOpen(false); }} />`)}
   `;
 }
 
@@ -16221,9 +16237,17 @@ function SetStartingNumberPanel({ plant, kind, onChanged }) {
     </div>`;
 }
 
-function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCounterChanged, onSaved, onCancel }) {
+function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors = [], onCounterChanged, onSaved, onCancel }) {
   const isInvoice = kind === 'invoice';
   const isReturnable = kind === 'rdc';
+  // DC / RDC can be issued to a vendor (sending material out) as well as a
+  // customer. Tax invoices are always to a customer.
+  const [partyType, setPartyType] = useState('customer'); // 'customer' | 'vendor'
+  const [addedParties, setAddedParties] = useState([]);   // from the + New popup
+  const [addPartyOpen, setAddPartyOpen] = useState(false);
+  const partyList = (partyType === 'vendor'
+    ? [...addedParties.filter(p => p._kind === 'vendor'), ...vendors]
+    : [...addedParties.filter(p => p._kind === 'customer'), ...customers]);
   const [form, setForm] = useState({
     doc_date: new Date().toISOString().slice(0,10),
     customer_id: '',
@@ -16267,9 +16291,10 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCount
   const submit = async (e) => {
     e.preventDefault(); setErr(''); setBusy(true);
     try {
-      if (!form.customer_id) throw new Error('Pick a customer');
+      const useVendor = !isInvoice && partyType === 'vendor';
+      if (!form.customer_id) throw new Error(useVendor ? 'Pick a vendor' : 'Pick a customer');
       if (validItems.length === 0) throw new Error('Add at least one item with qty');
-      const cust = customers.find(c => c.id === form.customer_id);
+      const party = partyList.find(c => c.id === form.customer_id);
       // Allocate the next number atomically (this commits it — even if save fails, the number is consumed)
       const { data: docNo, error: numErr } = await sb.rpc('get_next_logistics_doc_number', {
         p_plant_id: plant.id, p_doc_kind: kind, p_date: form.doc_date,
@@ -16292,18 +16317,19 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCount
         doc_type: isInvoice ? 'invoice_out' : (isReturnable ? 'dc_out_returnable' : 'dc_out'),
         doc_number: docNo,
         doc_date: form.doc_date,
-        // Customers live in mcp_sched_customers, but vendor_id FK'd to
-        // mcp_logistics_vendors. Snapshot name/GSTIN here; keep the lookup
-        // pointer in raw_extraction.customer_id.
-        vendor_id: null,
-        vendor_name_raw: cust?.name || null,
-        vendor_gstin_raw: cust?.gstin || null,
+        // vendor_id FK -> mcp_logistics_vendors. Only set when the party is
+        // really a vendor; for a customer keep it null and stash the lookup
+        // id in raw_extraction.customer_id.
+        vendor_id: useVendor ? form.customer_id : null,
+        vendor_name_raw: party?.name || null,
+        vendor_gstin_raw: party?.gstin || null,
         taxable_value: isInvoice ? taxableValue : null,
         tax_amount: isInvoice ? taxAmount : null,
         total_value: isInvoice ? total : null,
         items: items,
         raw_extraction: {
-          customer_id: form.customer_id,
+          party_type: useVendor ? 'vendor' : 'customer',
+          customer_id: useVendor ? null : form.customer_id,
           place_of_supply: form.place_of_supply || null,
           vehicle_no: form.vehicle_no || null,
           eway_bill: form.eway_bill || null,
@@ -16335,13 +16361,26 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCount
     ${err && html`<div class="alert error">${err}</div>`}
 
     <form onSubmit=${submit}>
+      ${!isInvoice && html`
+        <div class="field">
+          <label>Issue to</label>
+          <div style="display:inline-flex;border:1px solid var(--slate-200);border-radius:6px;overflow:hidden;background:white;font-size:12px;font-weight:600">
+            <button type="button" onClick=${() => { setPartyType('customer'); setForm(f => ({ ...f, customer_id: '' })); }} style=${'padding:7px 14px;border:none;cursor:pointer;background:'+(partyType==='customer'?'var(--teal-600)':'white')+';color:'+(partyType==='customer'?'white':'var(--slate-600)')}>🤝 Customer</button>
+            <button type="button" onClick=${() => { setPartyType('vendor'); setForm(f => ({ ...f, customer_id: '' })); }} style=${'padding:7px 14px;border:none;cursor:pointer;background:'+(partyType==='vendor'?'var(--teal-600)':'white')+';color:'+(partyType==='vendor'?'white':'var(--slate-600)')}>🏭 Vendor</button>
+          </div>
+        </div>
+      `}
       <div class="field-row">
         <div class="field"><label>Doc date *</label><input type="date" required value=${form.doc_date} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
-        <div class="field"><label>Customer *</label>
-          <select required value=${form.customer_id} onChange=${e => setForm({...form, customer_id: e.target.value})}>
-            <option value="">— Pick customer —</option>
-            ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.gstin?' · '+c.gstin:''}</option>`)}
-          </select>
+        <div class="field"><label>${partyType === 'vendor' ? 'Vendor *' : 'Customer *'}</label>
+          <div style="display:flex;gap:6px;align-items:stretch">
+            <select required value=${form.customer_id} onChange=${e => setForm({...form, customer_id: e.target.value})} style="flex:1">
+              <option value="">— Pick ${partyType === 'vendor' ? 'vendor' : 'customer'} —</option>
+              ${partyList.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.gstin?' · '+c.gstin:''}</option>`)}
+            </select>
+            <button type="button" onClick=${() => setAddPartyOpen(true)}
+              style="padding:8px 12px;border:1px dashed var(--teal-400);background:var(--teal-50);color:var(--teal-700);border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;font-family:inherit">+ New</button>
+          </div>
         </div>
       </div>
 
@@ -16420,6 +16459,13 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCount
         <button class="btn" disabled=${busy} style="flex:1">${busy ? 'Saving…' : (isInvoice ? '🧾 Create Invoice' : '📦 Create DC')}</button>
       </div>
     </form>
+    ${addPartyOpen && (partyType === 'vendor'
+      ? html`<${VendorEditModal} plant=${plant} me=${me} vendor=${null}
+          onClose=${() => setAddPartyOpen(false)}
+          onSaved=${(row) => { if (row) { setAddedParties(p => [{ ...row, _kind: 'vendor' }, ...p]); setForm(f => ({ ...f, customer_id: row.id })); } setAddPartyOpen(false); }} />`
+      : html`<${CustomerModal} plant=${plant} me=${me} editTarget=${null}
+          onClose=${() => setAddPartyOpen(false)}
+          onSaved=${(row) => { if (row) { setAddedParties(p => [{ ...row, _kind: 'customer' }, ...p]); setForm(f => ({ ...f, customer_id: row.id })); } setAddPartyOpen(false); }} />`)}
   `;
 }
 
@@ -16545,14 +16591,15 @@ function DocFormatBar({ plant, me, doc, party, isInvoice, onPrintDefault, defaul
 // delete actions plus an Upload button.
 // =================================================================
 function DocFormatsModule({ plant, me }) {
+  // Marvel: only DC + RDC are issued for his plant (no separate JW DCs).
+  // The DB CHECK constraint still permits the JW kinds for any plant that
+  // genuinely uses them; we just hide them from this picker.
   const SOURCES = [
     { key:'dc_out',            ico:'📦', label:'Delivery Challan' },
     { key:'dc_out_returnable', ico:'🔁', label:'Returnable DC' },
     { key:'invoice_out',       ico:'🧾', label:'Tax Invoice' },
     { key:'po',                ico:'🛒', label:'Purchase Order' },
     { key:'packing_list',      ico:'📋', label:'Packing List' },
-    { key:'job_work_dc_out',   ico:'🏭', label:'JW DC Out' },
-    { key:'job_work_dc_in',    ico:'🏭', label:'JW DC In' },
     { key:'quote',             ico:'💬', label:'Quotation' },
     { key:'petty_cash',        ico:'💵', label:'Petty Cash' },
   ];
