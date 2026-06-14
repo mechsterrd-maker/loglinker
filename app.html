@@ -15925,7 +15925,12 @@ function SalesDocMakerModule({ plant, me, navAction }) {
   useEffect(() => {
     if (navAction && navAction.tab === 'sales_docs' && navAction.sub) setTab(navAction.sub);
   }, [navAction?.ts]);
-  const [docKind, setDocKind] = useState('dc');
+  // docKind derived directly from tab (no separate state). Holding it as
+  // useState caused the form to render one cycle stale: tab updated to
+  // new_rdc but docKind was still 'dc' until the effect ran -> the form
+  // would mount with the previous kind and never re-mount on the second
+  // render because key=docKind hadn't changed yet. Marvel: 'when i switch
+  // dc to rdc its getting stuck'. Deriving fixes it for every kind switch.
   const [recent, setRecent] = useState([]);
   const [previewNumber, setPreviewNumber] = useState('—');
   const [customers, setCustomers] = useState([]);
@@ -15963,6 +15968,7 @@ function SalesDocMakerModule({ plant, me, navAction }) {
   }, [plant.id, refresh]);
 
   const TAB_KIND = { new_dc:'dc', new_rdc:'rdc', new_invoice:'invoice', new_po:'po', new_packing:'packing' };
+  const docKind = TAB_KIND[tab] || 'dc';
   // Fabrication plants typically don't issue tax invoices from this module
   // (they bill separately or use DCs only). Marvel asked for it explicitly.
   // Per session decision: hide the Tax Invoice option for all fab plants.
@@ -15971,7 +15977,6 @@ function SalesDocMakerModule({ plant, me, navAction }) {
   useEffect(() => {
     const kind = TAB_KIND[tab];
     if (kind) {
-      setDocKind(kind);
       sb.rpc('peek_next_logistics_doc_number', { p_plant_id: plant.id, p_doc_kind: kind }).then(({ data }) => setPreviewNumber(data || '—'));
     }
   }, [tab, plant.id]);
