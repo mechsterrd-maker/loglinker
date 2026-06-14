@@ -1547,89 +1547,9 @@ function isProjectRestricted(myPerms) {
   return true;
 }
 
-// My-profile editor. Opened by tapping the header avatar (which previously
-// logged you out instantly -- Marvel: "If I enter in this, my profile will
-// not come, it will be logged out directly"). Edit name / phone / email,
-// upload a photo, or sign out from here.
-function ProfileModal({ me, user, logout, onClose, onSaved }) {
-  const [fullName, setFullName] = useState(me.full_name || '');
-  const [phone, setPhone] = useState(me.phone || '');
-  const [email, setEmail] = useState(me.email || '');
-  const [avatarUrl, setAvatarUrl] = useState(me.avatar_url || '');
-  const [busy, setBusy] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [err, setErr] = useState('');
-
-  const pickPhoto = async (e) => {
-    const f = e.target.files?.[0];
-    if (!f) return;
-    if (!f.type.startsWith('image/')) { setErr('Pick an image file.'); return; }
-    if (f.size > 5 * 1024 * 1024) { setErr('Image over 5 MB — pick a smaller one.'); return; }
-    setErr(''); setUploading(true);
-    try {
-      const ext = (f.name.split('.').pop() || 'jpg').toLowerCase();
-      const path = 'avatars/' + me.id + '-' + Date.now() + '.' + ext;
-      const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, f, { upsert: true, contentType: f.type });
-      if (upErr) throw upErr;
-      const { data } = sb.storage.from('chat-attachments').getPublicUrl(path);
-      setAvatarUrl(data.publicUrl);
-    } catch (e2) { setErr('Upload failed: ' + (e2.message || e2)); }
-    finally { setUploading(false); }
-  };
-
-  const save = async () => {
-    if (!fullName.trim()) { setErr('Name is required.'); return; }
-    setBusy(true); setErr('');
-    try {
-      const { error } = await sb.from('users').update({
-        full_name: fullName.trim(),
-        phone: phone.trim() || null,
-        email: email.trim() || null,
-        avatar_url: avatarUrl || null,
-      }).eq('id', me.id);
-      if (error) throw error;
-      showToast('✓ Profile updated');
-      onSaved && onSaved();
-    } catch (e) { setErr(e.message || String(e)); }
-    finally { setBusy(false); }
-  };
-
-  const initials = (fullName || me.email || '?').split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
-
-  return html`
-    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div class="modal" style="max-width:440px">
-        <div class="modal-header">
-          <div class="modal-title">👤 My Profile</div>
-          <button class="close-btn" onClick=${onClose}>×</button>
-        </div>
-        ${err && html`<div class="alert error">${err}</div>`}
-        <div style="display:flex;flex-direction:column;align-items:center;gap:8px;margin-bottom:14px">
-          <div style="width:84px;height:84px;border-radius:50%;background:var(--teal-100);color:var(--teal-700);display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700;overflow:hidden">
-            ${avatarUrl ? html`<img src=${avatarUrl} style="width:100%;height:100%;object-fit:cover" />` : initials}
-          </div>
-          <label style="font-size:12px;color:var(--teal-700);font-weight:600;cursor:pointer">
-            ${uploading ? 'Uploading…' : (avatarUrl ? '📷 Change photo' : '📷 Upload photo')}
-            <input type="file" accept="image/*" onChange=${pickPhoto} style="display:none" />
-          </label>
-          ${avatarUrl && html`<button type="button" onClick=${() => setAvatarUrl('')} style="background:none;border:none;color:var(--rose-600);font-size:11px;cursor:pointer">Remove photo</button>`}
-        </div>
-        <div class="field"><label>Full name *</label><input type="text" value=${fullName} onInput=${e => setFullName(e.target.value)} /></div>
-        <div class="field-row" style="display:flex;gap:10px">
-          <div class="field" style="flex:1"><label>Phone</label><input type="tel" value=${phone} onInput=${e => setPhone(e.target.value)} placeholder="+91…" /></div>
-          <div class="field" style="flex:1"><label>Email</label><input type="email" value=${email} onInput=${e => setEmail(e.target.value)} /></div>
-        </div>
-        <button class="btn" onClick=${save} disabled=${busy || uploading} style="width:100%;margin-top:4px">${busy ? 'Saving…' : '✓ Save profile'}</button>
-        <button class="btn ghost" onClick=${logout} style="width:100%;margin-top:8px;color:var(--rose-600)">Log out</button>
-      </div>
-    </div>
-  `;
-}
-
 function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessibleUnits, activeUnit, switchUnit }) {
   const initials = (me.full_name || user.email).split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
   const [unreadCount, setUnreadCount] = useState(0);
-  const [profileOpen, setProfileOpen] = useState(false);
   // navAction: a one-shot deep-link signal so Home shortcuts can land a user on
   // a specific sub-screen (e.g. Make Documents → New PO), not just a tab. Pages
   // stay mounted (hidden via CSS), so target components react via useEffect on
@@ -1675,7 +1595,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
 
   return html`
     <div class="app">
-      <${TopNavDesktop} plant=${plant} me=${me} myPerms=${myPerms} initials=${initials} tab=${tab} setTab=${setTab} logout=${logout} onProfile=${() => setProfileOpen(true)} unreadCount=${unreadCount} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />
+      <${TopNavDesktop} plant=${plant} me=${me} myPerms=${myPerms} initials=${initials} tab=${tab} setTab=${setTab} logout=${logout} unreadCount=${unreadCount} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />
 
       <div class="topbar">
         <div class="topbar-left">
@@ -1696,12 +1616,9 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
           })() : html`
             <span style="font-size:10px;color:var(--rose-600);padding:4px 8px;background:var(--rose-50);border-radius:6px" title="No unit access — run fix-unit-access.sql">⚠ No units</span>
           `}
-          <div class="topbar-user" onClick=${() => setProfileOpen(true)} title="My profile" style="cursor:pointer;overflow:hidden">
-            ${me.avatar_url ? html`<img src=${me.avatar_url} style="width:100%;height:100%;object-fit:cover;border-radius:50%" />` : initials}
-          </div>
+          <div class="topbar-user" onClick=${logout} title="Log out">${initials}</div>
         </div>
       </div>
-      ${profileOpen && html`<${ProfileModal} me=${me} user=${user} logout=${logout} onClose=${() => setProfileOpen(false)} onSaved=${() => { setProfileOpen(false); reload && reload(); }} />`}
 
       <${Page} active=${tab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} /></${Page}>
       <${Page} active=${tab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -1767,7 +1684,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   `;
 }
 
-function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onProfile, unreadCount, accessibleUnits, activeUnit, switchUnit }) {
+function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, unreadCount, accessibleUnits, activeUnit, switchUnit }) {
   const [moreOpen, setMoreOpen] = useState(false);
   const [navOpenGroups, setNavOpenGroups] = useState({});
   const toggleNavGroup = (key) => setNavOpenGroups(prev => ({ ...prev, [key]: !prev[key] }));
@@ -1868,9 +1785,7 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
       })() : html`
         <span style="font-size:11px;color:var(--rose-600);padding:5px 10px;background:var(--rose-50);border-radius:6px;margin-right:10px;border:1px solid var(--rose-200)" title="No unit access — run recovery-multiunit.sql">⚠ No unit access</span>
       `}
-      <div class="user-avatar" onClick=${() => onProfile ? onProfile() : logout()} title=${'My profile (' + (me.full_name || me.email) + ')'} style="overflow:hidden">
-        ${me.avatar_url ? html`<img src=${me.avatar_url} style="width:100%;height:100%;object-fit:cover;border-radius:50%" />` : initials}
-      </div>
+      <div class="user-avatar" onClick=${logout} title=${'Log out (' + (me.full_name || me.email) + ')'}>${initials}</div>
     </div>
   `;
 }
@@ -2051,7 +1966,7 @@ function Home({ plant, me, setTab, go, reload }) {
           { tab:'sales_docs', sub:'new_dc', emoji:'📦', label:'DC' },
           { tab:'sales_docs', sub:'new_po', emoji:'🛒', label:'PO' },
           { tab:'chat',       sub:'upload_bill', emoji:'📄', label:'Upload Bill' },
-          { tab:'actions',    emoji:'✅', label:'Task' },
+          { tab:'expenses',   emoji:'💸', label:'Expense' },
           { tab:'chat',       emoji:'💬', label:'Chat' },
         ] : [
           { tab:'production',  emoji:'📋', label:'Log Shot' },
@@ -6599,17 +6514,7 @@ function RolesTab({ plant, me }) {
             <div class="list-item-title">${r.display_name} <span style="color:var(--slate-400);font-weight:400;font-size:12px">· ${r.slug}</span></div>
             <div class="list-item-sub">${r.description || ''} · ${r.member_count} user${r.member_count === 1 ? '' : 's'} · ${r.permissions.length} permission${r.permissions.length === 1 ? '' : 's'}</div>
           </div>
-          <div style="display:flex;gap:6px">
-            <button class="btn small" onClick=${() => setEditTarget(r)}>Edit</button>
-            <button class="btn small ghost" style="color:var(--rose-600)" onClick=${async () => {
-              if (r.member_count > 0) { alert('This role has ' + r.member_count + ' member(s). Reassign them to another role first, then delete.'); return; }
-              if (!confirm('Delete the "' + r.display_name + '" role permanently?')) return;
-              const { error } = await sb.rpc('delete_plant_role', { p_role_id: r.id });
-              if (error) { alert('Delete failed: ' + error.message); return; }
-              showToast('🗑 Role deleted');
-              await refresh();
-            }}>🗑</button>
-          </div>
+          <button class="btn small" onClick=${() => setEditTarget(r)}>Edit</button>
         </div>
       </div>
     `)}
@@ -11190,27 +11095,6 @@ function rtResolveValue(hint, ctx) {
   return '';
 }
 
-// Open a self-contained HTML document in a new tab for printing / Save-as-PDF.
-// IMPORTANT: Safari (which Marvel uses) prints a BLANK page when you do
-// window.open('') + document.write() -- the about:blank document never paints
-// for print. Serving the HTML via a Blob URL makes it a real navigable
-// document so Safari renders + prints it correctly. Returns false if the
-// pop-up was blocked.
-function openPrintableDoc(html) {
-  try {
-    const blob = new Blob([html], { type: 'text/html' });
-    const url = URL.createObjectURL(blob);
-    const w = window.open(url, '_blank');
-    if (!w) { alert('Pop-up blocked — allow pop-ups for loglinkr.com so the PDF can open.'); return false; }
-    // Revoke after the tab has had time to load; keeps memory tidy.
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
-    return true;
-  } catch (e) {
-    alert('Could not open the document: ' + (e.message || e));
-    return false;
-  }
-}
-
 function rtFormatValue(val, format) {
   if (val == null || val === '') return '';
   if (format === 'currency') return '₹' + fmtNum(Number(val).toFixed(0));
@@ -11614,7 +11498,10 @@ function RecordTemplateUploadModal({ plant, me, source, sourceLabel, onClose, on
                   doc: { doc_number: 'SAMPLE/0001', doc_date: new Date().toISOString().slice(0,10), customer_name: 'Sample Customer', customer_gstin: '33AAA0000A1Z5', customer_address: 'Sample Address, City', vendor_name: 'Sample Vendor', vehicle_no: 'TN-00-XX-0000', total_value: 1000, taxable_value: 1000, tax_amount: 0 },
                   rows: [sample, sample],
                 };
-                openPrintableDoc(rtRenderDocument(extracted, ctx));
+                const doc = rtRenderDocument(extracted, ctx);
+                const w = window.open('', '_blank');
+                if (!w) { alert('Pop-up blocked.'); return; }
+                w.document.write(doc); w.document.close();
               }} style="margin-top:8px;padding:6px 10px;background:white;border:1px solid var(--teal-400);color:var(--teal-700);font-size:11px;font-weight:600;border-radius:5px;cursor:pointer">👁 Preview with sample data</button>
             `}
             ${notes && html`<div style="margin-top:8px;font-size:10px;color:var(--slate-600);font-style:italic">${rtEsc(notes)}</div>`}
@@ -11815,7 +11702,11 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
             net, count: filtered.length,
           },
         };
-        openPrintableDoc(rtRenderDocument(tpl.config, ctx));
+        const doc = rtRenderDocument(tpl.config, ctx);
+        const w = window.open('', '_blank');
+        if (!w) { alert('Pop-up blocked — allow pop-ups so the report can open.'); return; }
+        w.document.write(doc);
+        w.document.close();
         return;
       }
     }
@@ -11899,7 +11790,10 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
           '</tbody></table>') +
       '<div class="meta"><span>' + esc(plant.name) + ' · Petty Cash Report</span><span>Loglinkr · ' + esc(new Date().toLocaleDateString()) + '</span></div>' +
       '</body></html>';
-    openPrintableDoc(docHtml);
+    const w = window.open('', '_blank');
+    if (!w) { alert('Pop-up blocked — allow pop-ups for this site so the report can open.'); return; }
+    w.document.write(docHtml);
+    w.document.close();
   };
 
   const ready = !fetching && filtered.length > 0 && range.from && range.to;
@@ -12582,9 +12476,6 @@ function ProjectModal({ plant, me, customers, users, editTarget, onClose, onSave
         actual_weight_kg: form.actual_weight_kg?parseFloat(form.actual_weight_kg):null,
         start_date: form.start_date||null, target_date: form.target_date||null,
         progress_pct: parseInt(form.progress_pct)||0, owner_user_id: form.owner_user_id||null, notes: form.notes||null,
-        po_number: form.po_number||null,
-        qty: form.qty!==''&&form.qty!=null ? parseFloat(form.qty) : null,
-        uom: form.uom||null,
       };
       if (form.status === 'completed' && !form.completed_date) payload.completed_date = new Date().toISOString().slice(0,10);
       if (editTarget) {
@@ -12633,12 +12524,7 @@ function ProjectModal({ plant, me, customers, users, editTarget, onClose, onSave
             <div class="field"><label>Site location</label><input type="text" value=${form.site_location} onChange=${e=>setForm({...form,site_location:e.target.value})} placeholder="Hosur" /></div>
           </div>
           <div class="field-row">
-            <div class="field"><label>Customer PO number</label><input type="text" value=${form.po_number||''} onChange=${e=>setForm({...form,po_number:e.target.value})} placeholder="PO-2026-0456" /></div>
             <div class="field"><label>Order value ₹</label><input type="number" step="any" value=${form.order_value} onChange=${e=>setForm({...form,order_value:e.target.value})} /></div>
-          </div>
-          <div class="field-row">
-            <div class="field"><label>Quantity</label><input type="number" step="any" value=${form.qty||''} onChange=${e=>setForm({...form,qty:e.target.value})} /></div>
-            <div class="field"><label>Unit</label><select value=${form.uom||'nos'} onChange=${e=>setForm({...form,uom:e.target.value})}>${PROJECT_UOMS.map(u=>html`<option key=${u} value=${u}>${u}</option>`)}</select></div>
             <div class="field"><label>Owner</label><select value=${form.owner_user_id} onChange=${e=>setForm({...form,owner_user_id:e.target.value})}><option value="">— none —</option>${users.map(u=>html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}</select></div>
           </div>
           <div class="field-row">
@@ -12785,7 +12671,6 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
       <div style="flex:1;min-width:0">
         <h1 style="font-size:17px;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${project.code?project.code+' · ':''}${project.name}</h1>
         <div class="sub">${project.customer?.name||project.customer_name||'—'}${project.site_location?' · '+project.site_location:''}${project.target_date?' · due '+project.target_date:''}</div>
-        ${(project.po_number || project.qty) && html`<div class="sub" style="margin-top:1px">${project.po_number ? 'PO ' + project.po_number : ''}${project.po_number && project.qty ? ' · ' : ''}${project.qty ? 'Qty ' + fmtNum(project.qty) + (project.uom ? ' ' + project.uom : '') : ''}</div>`}
       </div>
       ${!restricted && html`<button class="btn small ghost" onClick=${onEdit} title="Edit project details" style="padding:6px 10px">✏️ Edit</button>`}
     </div>
@@ -14363,6 +14248,17 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
       <div class="card" style="background:#fef2f2;border:1px solid var(--rose-300);padding:14px;color:var(--rose-700);margin-bottom:12px;font-size:13px">⚠ ${result.error}</div>
     `}
 
+    ${result?.ok && result.stats.sheetsUsed > 0 && html`
+      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:14px;padding:14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
+        <${CutStat} num=${result.stats.sheetsUsed} label="Sheets" tickKey=${statTick} />
+        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'} label="Waste" tickKey=${statTick} />
+        ${kgPerM2 != null
+          ? html`<${CutStat} num=${((result.stats.totalPiecesAreaMm2 / 1e6) * kgPerM2).toFixed(1) + ' kg'} label="Pieces" tickKey=${statTick} />`
+          : html`<${CutStat} num=${(result.stats.totalPiecesAreaMm2 / 1e6).toFixed(2) + ' m²'} label="Pieces" tickKey=${statTick} />`}
+        ${result.stats.totalCost > 0 && html`<${CutStat} num=${'₹' + fmtNum(result.stats.totalCost.toFixed(0))} label="Stock cost" tickKey=${statTick} />`}
+      </div>
+    `}
+
     <${CutAIAnalysis} draft=${draft} setDraft=${setDraft} result=${result} plant=${plant} />
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;margin-bottom:12px">
@@ -14499,18 +14395,6 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
         </div>
       </div>
     </div>
-
-    ${/* Output goes BELOW the inputs (Marvel: "input top, output bottom"). */ ''}
-    ${result?.ok && result.stats.sheetsUsed > 0 && html`
-      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:14px;padding:14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
-        <${CutStat} num=${result.stats.sheetsUsed} label="Sheets" tickKey=${statTick} />
-        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'} label="Waste" tickKey=${statTick} />
-        ${kgPerM2 != null
-          ? html`<${CutStat} num=${((result.stats.totalPiecesAreaMm2 / 1e6) * kgPerM2).toFixed(1) + ' kg'} label="Pieces" tickKey=${statTick} />`
-          : html`<${CutStat} num=${(result.stats.totalPiecesAreaMm2 / 1e6).toFixed(2) + ' m²'} label="Pieces" tickKey=${statTick} />`}
-        ${result.stats.totalCost > 0 && html`<${CutStat} num=${'₹' + fmtNum(result.stats.totalCost.toFixed(0))} label="Stock cost" tickKey=${statTick} />`}
-      </div>
-    `}
 
     ${result?.ok && result.sheets.length > 0 && html`
       <div class="card" style="padding:14px;margin-bottom:12px">
@@ -15004,9 +14888,6 @@ function CutStat({ num, label, tickKey }) {
 // on every piece + stock row that references this material.
 function CutMaterialList({ draft, setDraft }) {
   const materials = draft.materials || [];
-  // 2D plans cut flat stock only -- round bar / angle / pipe etc. make no
-  // sense on a plate nesting plan. Marvel: "In 2D, round bar should not come."
-  const is2D = draft.plan_kind === '2d';
 
   const update = (idx, patch) => {
     const next = materials.slice();
@@ -15028,8 +14909,7 @@ function CutMaterialList({ draft, setDraft }) {
   };
   const add = () => {
     const id = 'm' + Date.now();
-    const defType = is2D ? 'plate' : 'round_bar';
-    const newMat = { id, type: defType, spec: cutDefaultSpec(defType), density_kg_per_m3: 7850 };
+    const newMat = { id, type: 'round_bar', spec: cutDefaultSpec('round_bar'), density_kg_per_m3: 7850 };
     setDraft(Object.assign({}, draft, { materials: [...materials, newMat] }));
   };
 
@@ -15040,15 +14920,12 @@ function CutMaterialList({ draft, setDraft }) {
         <div style="font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500)">Material${multi ? 's · ' + materials.length : ''}</div>
         <button class="btn small ghost" onClick=${add} style="padding:2px 7px;font-size:10px">+ Add</button>
       </div>
-      ${materials.map((m, idx) => html`<${CutMaterialRow} key=${m.id} m=${m} idx=${idx} update=${update} remove=${remove} multi=${multi} is2D=${is2D} />`)}
+      ${materials.map((m, idx) => html`<${CutMaterialRow} key=${m.id} m=${m} idx=${idx} update=${update} remove=${remove} multi=${multi} />`)}
     </div>
   `;
 }
 
-function CutMaterialRow({ m, idx, update, remove, multi, is2D }) {
-  // In a 2D plan only flat-stock types are valid (plate / sheet). Filter the
-  // dropdown so round bar, angle, pipe, channel etc. never appear.
-  const typeOptions = is2D ? CUT_MATERIAL_TYPES.filter(t => t.is2D) : CUT_MATERIAL_TYPES.filter(t => !t.is2D);
+function CutMaterialRow({ m, idx, update, remove, multi }) {
   const meta = CUT_MATERIAL_TYPES.find(x => x.value === m.type) || CUT_MATERIAL_TYPES[0];
   const isPlate = meta.is2D === true;
   const kgPerM = isPlate ? cutComputePlateKgPerM2(m.spec, m.density_kg_per_m3) : cutComputeKgPerM(m.type, m.spec, m.density_kg_per_m3);
@@ -15077,7 +14954,7 @@ function CutMaterialRow({ m, idx, update, remove, multi, is2D }) {
           <span>Type</span>
           <select value=${m.type} onChange=${e => setType(e.target.value)}
             style="border:1px solid var(--slate-200);border-radius:5px;padding:5px 8px;font-size:12px;font-family:inherit;background:white">
-            ${typeOptions.map(t => html`<option key=${t.value} value=${t.value}>${t.label}</option>`)}
+            ${CUT_MATERIAL_TYPES.map(t => html`<option key=${t.value} value=${t.value}>${t.label}</option>`)}
           </select>
         </label>
         ${meta.fields.map(field => {
@@ -15570,7 +15447,7 @@ function SalesDocMakerModule({ plant, me, navAction }) {
     ${activeDocType && html`<${DocFormatManager} plant=${plant} me=${me} docType=${activeDocType} />`}
 
     ${(tab === 'new_dc' || tab === 'new_rdc' || tab === 'new_invoice') && html`
-      <${SalesDocCreateForm} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber} customers=${customers} vendors=${vendors}
+      <${SalesDocCreateForm} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber} customers=${customers}
         onCounterChanged=${() => {
           // The "Set starting number" panel inside the form just bumped the
           // counter; refetch the peek so the displayed number reflects it.
@@ -15594,12 +15471,7 @@ function SalesDocMakerModule({ plant, me, navAction }) {
 // DC/Invoice form so the existing sales flow stays untouched.
 function PoPackingForm({ plant, me, kind, previewNumber, customers, vendors, onSaved, onCancel }) {
   const isPo = kind === 'po';
-  // Locally-added parties (from the + New popup) are merged on top of the
-  // props so a freshly-created vendor/customer is immediately selectable
-  // without leaving the form.
-  const [addedParties, setAddedParties] = useState([]);
-  const [addPartyOpen, setAddPartyOpen] = useState(false);
-  const parties = [...addedParties, ...(isPo ? vendors : customers)];
+  const parties = isPo ? vendors : customers;
   const [form, setForm] = useState({
     doc_date: new Date().toISOString().slice(0,10),
     party_id: '',
@@ -15687,14 +15559,10 @@ function PoPackingForm({ plant, me, kind, previewNumber, customers, vendors, onS
       <div class="field-row">
         <div class="field"><label>Date *</label><input type="date" required value=${form.doc_date} onChange=${e=>setForm({...form,doc_date:e.target.value})} /></div>
         <div class="field"><label>${isPo ? 'Vendor *' : 'Customer *'}</label>
-          <div style="display:flex;gap:6px;align-items:stretch">
-            <select required value=${form.party_id} onChange=${e=>setForm({...form,party_id:e.target.value})} style="flex:1">
-              <option value="">— Pick ${isPo?'vendor':'customer'} —</option>
-              ${parties.map(p => html`<option key=${p.id} value=${p.id}>${p.name}${p.gstin?' · '+p.gstin:''}</option>`)}
-            </select>
-            <button type="button" onClick=${() => setAddPartyOpen(true)}
-              style="padding:8px 12px;border:1px dashed var(--teal-400);background:var(--teal-50);color:var(--teal-700);border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;font-family:inherit">+ New</button>
-          </div>
+          <select required value=${form.party_id} onChange=${e=>setForm({...form,party_id:e.target.value})}>
+            <option value="">— Pick ${isPo?'vendor':'customer'} —</option>
+            ${parties.map(p => html`<option key=${p.id} value=${p.id}>${p.name}${p.gstin?' · '+p.gstin:''}</option>`)}
+          </select>
         </div>
       </div>
       <div class="field-row">
@@ -15744,13 +15612,6 @@ function PoPackingForm({ plant, me, kind, previewNumber, customers, vendors, onS
         <button class="btn" disabled=${busy} style="flex:1">${busy?'Saving…':(isPo?'🛒 Create PO':'📋 Create Packing List')}</button>
       </div>
     </form>
-    ${addPartyOpen && (isPo
-      ? html`<${VendorEditModal} plant=${plant} me=${me} vendor=${null}
-          onClose=${() => setAddPartyOpen(false)}
-          onSaved=${(row) => { if (row) { setAddedParties(p => [row, ...p]); setForm(f => ({ ...f, party_id: row.id })); } setAddPartyOpen(false); }} />`
-      : html`<${CustomerModal} plant=${plant} me=${me} editTarget=${null}
-          onClose=${() => setAddPartyOpen(false)}
-          onSaved=${(row) => { if (row) { setAddedParties(p => [row, ...p]); setForm(f => ({ ...f, party_id: row.id })); } setAddPartyOpen(false); }} />`)}
   `;
 }
 
@@ -15800,18 +15661,9 @@ function SetStartingNumberPanel({ plant, kind, onChanged }) {
     </div>`;
 }
 
-function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors = [], onCounterChanged, onSaved, onCancel }) {
+function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, onCounterChanged, onSaved, onCancel }) {
   const isInvoice = kind === 'invoice';
   const isReturnable = kind === 'rdc';
-  // DC / RDC can be issued to a vendor (sending material out) as well as a
-  // customer. Tax invoices are always to a customer. Marvel: "You have to get
-  // a vendor for DC. Anyone can be a vendor."
-  const [partyType, setPartyType] = useState('customer'); // 'customer' | 'vendor'
-  const [addedParties, setAddedParties] = useState([]);   // from the + New popup
-  const [addPartyOpen, setAddPartyOpen] = useState(false);
-  const partyList = (partyType === 'vendor'
-    ? [...addedParties.filter(p => p._kind === 'vendor'), ...vendors]
-    : [...addedParties.filter(p => p._kind === 'customer'), ...customers]);
   const [form, setForm] = useState({
     doc_date: new Date().toISOString().slice(0,10),
     customer_id: '',
@@ -15855,10 +15707,9 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   const submit = async (e) => {
     e.preventDefault(); setErr(''); setBusy(true);
     try {
-      const useVendor = !isInvoice && partyType === 'vendor';
-      if (!form.customer_id) throw new Error(useVendor ? 'Pick a vendor' : 'Pick a customer');
+      if (!form.customer_id) throw new Error('Pick a customer');
       if (validItems.length === 0) throw new Error('Add at least one item with qty');
-      const party = partyList.find(c => c.id === form.customer_id);
+      const cust = customers.find(c => c.id === form.customer_id);
       // Allocate the next number atomically (this commits it — even if save fails, the number is consumed)
       const { data: docNo, error: numErr } = await sb.rpc('get_next_logistics_doc_number', {
         p_plant_id: plant.id, p_doc_kind: kind, p_date: form.doc_date,
@@ -15881,27 +15732,25 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
         doc_type: isInvoice ? 'invoice_out' : (isReturnable ? 'dc_out_returnable' : 'dc_out'),
         doc_number: docNo,
         doc_date: form.doc_date,
-        // vendor_id FK -> mcp_logistics_vendors. Only set it when the party
-        // really is a vendor; for a customer party keep it null and stash the
-        // lookup id in raw_extraction.customer_id (customers live in a
-        // different table).
-        vendor_id: useVendor ? form.customer_id : null,
-        vendor_name_raw: party?.name || null,
-        vendor_gstin_raw: party?.gstin || null,
+        // Customers live in mcp_sched_customers, but vendor_id FK'd to
+        // mcp_logistics_vendors. Snapshot name/GSTIN here; keep the lookup
+        // pointer in raw_extraction.customer_id.
+        vendor_id: null,
+        vendor_name_raw: cust?.name || null,
+        vendor_gstin_raw: cust?.gstin || null,
         taxable_value: isInvoice ? taxableValue : null,
         tax_amount: isInvoice ? taxAmount : null,
         total_value: isInvoice ? total : null,
         items: items,
         raw_extraction: {
-          party_type: useVendor ? 'vendor' : 'customer',
-          customer_id: useVendor ? null : form.customer_id,
+          customer_id: form.customer_id,
           place_of_supply: form.place_of_supply || null,
           vehicle_no: form.vehicle_no || null,
           eway_bill: form.eway_bill || null,
           po_reference: form.po_reference || null,
           igst: form.igst,
           cgst_pct: form.cgst_pct, sgst_pct: form.sgst_pct, igst_pct: form.igst_pct,
-          customer: party ? { name: party.name, gstin: party.gstin, address: party.address, city: party.city } : null,
+          customer: cust ? { name: cust.name, gstin: cust.gstin, address: cust.address, city: cust.city } : null,
         },
         status: 'approved',
         notes: form.notes || null,
@@ -15926,26 +15775,13 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
     ${err && html`<div class="alert error">${err}</div>`}
 
     <form onSubmit=${submit}>
-      ${!isInvoice && html`
-        <div class="field">
-          <label>Issue to</label>
-          <div style="display:inline-flex;border:1px solid var(--slate-200);border-radius:6px;overflow:hidden;background:white;font-size:12px;font-weight:600">
-            <button type="button" onClick=${() => { setPartyType('customer'); setForm(f => ({ ...f, customer_id: '' })); }} style=${'padding:7px 14px;border:none;cursor:pointer;background:'+(partyType==='customer'?'var(--teal-600)':'white')+';color:'+(partyType==='customer'?'white':'var(--slate-600)')}>🤝 Customer</button>
-            <button type="button" onClick=${() => { setPartyType('vendor'); setForm(f => ({ ...f, customer_id: '' })); }} style=${'padding:7px 14px;border:none;cursor:pointer;background:'+(partyType==='vendor'?'var(--teal-600)':'white')+';color:'+(partyType==='vendor'?'white':'var(--slate-600)')}>🏭 Vendor</button>
-          </div>
-        </div>
-      `}
       <div class="field-row">
         <div class="field"><label>Doc date *</label><input type="date" required value=${form.doc_date} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
-        <div class="field"><label>${partyType === 'vendor' ? 'Vendor *' : 'Customer *'}</label>
-          <div style="display:flex;gap:6px;align-items:stretch">
-            <select required value=${form.customer_id} onChange=${e => setForm({...form, customer_id: e.target.value})} style="flex:1">
-              <option value="">— Pick ${partyType === 'vendor' ? 'vendor' : 'customer'} —</option>
-              ${partyList.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.gstin?' · '+c.gstin:''}</option>`)}
-            </select>
-            <button type="button" onClick=${() => setAddPartyOpen(true)}
-              style="padding:8px 12px;border:1px dashed var(--teal-400);background:var(--teal-50);color:var(--teal-700);border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;font-family:inherit">+ New</button>
-          </div>
+        <div class="field"><label>Customer *</label>
+          <select required value=${form.customer_id} onChange=${e => setForm({...form, customer_id: e.target.value})}>
+            <option value="">— Pick customer —</option>
+            ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.gstin?' · '+c.gstin:''}</option>`)}
+          </select>
         </div>
       </div>
 
@@ -16024,13 +15860,6 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
         <button class="btn" disabled=${busy} style="flex:1">${busy ? 'Saving…' : (isInvoice ? '🧾 Create Invoice' : '📦 Create DC')}</button>
       </div>
     </form>
-    ${addPartyOpen && (partyType === 'vendor'
-      ? html`<${VendorEditModal} plant=${plant} me=${me} vendor=${null}
-          onClose=${() => setAddPartyOpen(false)}
-          onSaved=${(row) => { if (row) { setAddedParties(p => [{ ...row, _kind: 'vendor' }, ...p]); setForm(f => ({ ...f, customer_id: row.id })); } setAddPartyOpen(false); }} />`
-      : html`<${CustomerModal} plant=${plant} me=${me} editTarget=${null}
-          onClose=${() => setAddPartyOpen(false)}
-          onSaved=${(row) => { if (row) { setAddedParties(p => [{ ...row, _kind: 'customer' }, ...p]); setForm(f => ({ ...f, customer_id: row.id })); } setAddPartyOpen(false); }} />`)}
   `;
 }
 
@@ -16122,8 +15951,11 @@ function DocFormatBar({ plant, me, doc, party, isInvoice, onPrintDefault, defaul
       iframeRef.current.contentWindow.print();
       return;
     }
-    // Iframe not ready -- fall back to a Blob-URL tab.
-    openPrintableDoc(customSrcdoc);
+    // Iframe not ready -- fall back to popup.
+    const w = window.open('', '_blank');
+    if (!w) { alert('Pop-up blocked — allow pop-ups so the document can open.'); return; }
+    w.document.write(customSrcdoc);
+    w.document.close();
   };
 
   if (!source) return html`${defaultView}`;
@@ -16221,7 +16053,10 @@ function DocFormatsModule({ plant, me }) {
           doc: { doc_number: 'SAMPLE/0001', doc_date: new Date().toISOString().slice(0,10), customer_name: 'Sample Customer Pvt Ltd', customer_gstin: '33AAACS0000A1Z5', customer_address: 'No.12, Sample Street, Chennai-600001', vendor_name: 'Sample Vendor', vehicle_no: 'TN-00-XX-0000', total_value: 12000, taxable_value: 10169, tax_amount: 1831, cgst_amount: 916, sgst_amount: 915 },
           rows: [sample, { ...sample, name: 'SAMPLE PART NAME B', qty: 5, amount: 500 }],
         };
-    openPrintableDoc(rtRenderDocument(tpl.config, ctx));
+    const docHtml = rtRenderDocument(tpl.config, ctx);
+    const w = window.open('', '_blank');
+    if (!w) { alert('Pop-up blocked.'); return; }
+    w.document.write(docHtml); w.document.close();
   };
 
   const forTab = templates.filter(t => t.source === tab);
@@ -17911,7 +17746,10 @@ function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
       '</div>' +
       '<div class="meta"><span>' + esc(plant.name) + ' · MoM Report</span><span>Generated ' + esc(new Date().toLocaleString()) + '</span></div>' +
       '</body></html>';
-    openPrintableDoc(docHtml);
+    const w = window.open('', '_blank');
+    if (!w) { alert('Pop-up blocked — allow pop-ups so the PDF can open.'); return; }
+    w.document.write(docHtml);
+    w.document.close();
   };
 
   return html`
@@ -21902,17 +21740,10 @@ function HomeInstallBanner() {
 // modal is intentionally TIGHT — Name, Customer, Qty, Target Date, Leader, Manager,
 // Supervisor(s). Skip Drawing/Notes per "tight" decision; they're edit-after-create.
 // Writes via create_fab_project() RPC which is admin-gated server-side too.
-// Common units of measure on Indian factory POs. Marvel: qty must be a
-// number with a separate UoM since a PO can be in nos / kg / ton / set / etc.
-const PROJECT_UOMS = ['nos', 'set', 'kg', 'ton', 'mtr', 'sqm', 'litre', 'pairs', 'lot'];
-
 function NewProjectModal({ plant, me, onClose, onCreated }) {
   const [name, setName] = useState('');
   const [customerId, setCustomerId] = useState('');
-  const [poNumber, setPoNumber] = useState('');
   const [qty, setQty] = useState('');
-  const [uom, setUom] = useState('nos');
-  const [notes, setNotes] = useState('');
   const [targetDate, setTargetDate] = useState('');
   const [leaderId, setLeaderId] = useState('');
   const [managerId, setManagerId] = useState('');
@@ -21952,15 +21783,11 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
         p_name: name.trim(),
         p_customer_id: customerId || null,
         p_customer_name: cust?.name || null,
-        p_qty_note: null,
+        p_qty_note: qty.trim() || null,
         p_target_date: targetDate || null,
         p_leader_id: leaderId || null,
         p_manager_id: managerId || null,
         p_supervisor_ids: Array.from(supervisorIds),
-        p_po_number: poNumber.trim() || null,
-        p_qty: qty.trim() ? parseFloat(qty) : null,
-        p_uom: qty.trim() ? uom : null,
-        p_notes: notes.trim() || null,
       });
       if (error) throw error;
       onCreated && onCreated(newId);
@@ -22004,24 +21831,13 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
           </div>
           <div class="field-row" style="display:flex;gap:10px">
             <div class="field" style="flex:1">
-              <label>Customer PO number</label>
-              <input type="text" value=${poNumber} onInput=${e => setPoNumber(e.target.value)} placeholder="e.g. PO-2026-0456" />
+              <label>Quantity / weight</label>
+              <input type="text" value=${qty} onInput=${e => setQty(e.target.value)}
+                placeholder="e.g. 12 MT or 8 nos" />
             </div>
             <div class="field" style="flex:1">
               <label>Target completion</label>
               <input type="date" value=${targetDate} onInput=${e => setTargetDate(e.target.value)} />
-            </div>
-          </div>
-          <div class="field-row" style="display:flex;gap:10px">
-            <div class="field" style="flex:1">
-              <label>Quantity</label>
-              <input type="number" step="any" min=${0} value=${qty} onInput=${e => setQty(e.target.value)} placeholder="e.g. 12" />
-            </div>
-            <div class="field" style="flex:1">
-              <label>Unit</label>
-              <select value=${uom} onChange=${e => setUom(e.target.value)}>
-                ${PROJECT_UOMS.map(u => html`<option key=${u} value=${u}>${u}</option>`)}
-              </select>
             </div>
           </div>
           <div class="field">
@@ -22040,25 +21856,20 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
           </div>
           <div class="field">
             <label>Supervisor(s)</label>
-            <select value="" onChange=${e => { if (e.target.value) { toggleSupervisor(e.target.value); e.target.value = ''; } }}>
-              <option value="">+ Add a supervisor…</option>
-              ${users.filter(u => u.id !== leaderId && u.id !== managerId && !supervisorIds.has(u.id)).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} · ${u.role}</option>`)}
-            </select>
-            ${supervisorIds.size > 0 && html`
-              <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
-                ${Array.from(supervisorIds).map(id => {
-                  const u = users.find(x => x.id === id);
-                  return html`<span key=${id} style="display:inline-flex;align-items:center;gap:6px;background:var(--teal-50);border:1px solid var(--teal-200);color:var(--teal-800);padding:4px 8px;border-radius:999px;font-size:12px">
-                    ${u ? u.full_name : 'user'}
-                    <button type="button" onClick=${() => toggleSupervisor(id)} style="background:none;border:none;color:var(--teal-700);cursor:pointer;font-size:13px;line-height:1;padding:0">×</button>
-                  </span>`;
-                })}
-              </div>
-            `}
-          </div>
-          <div class="field">
-            <label>Notes</label>
-            <textarea rows=${2} value=${notes} onInput=${e => setNotes(e.target.value)} placeholder="Set value, repeat-order reference, special instructions…"></textarea>
+            <div style="border:1px solid var(--slate-200);border-radius:8px;padding:6px;max-height:140px;overflow-y:auto">
+              ${users.filter(u => u.id !== leaderId && u.id !== managerId).length === 0 && html`
+                <div style="padding:10px;color:var(--slate-500);font-size:12px">No other team members available. Invite supervisors first in People.</div>
+              `}
+              ${users.filter(u => u.id !== leaderId && u.id !== managerId).map(u => html`
+                <label key=${u.id} style="display:flex;align-items:center;gap:10px;padding:7px 8px;cursor:pointer;border-radius:6px"
+                  onMouseOver=${e => { e.currentTarget.style.background = 'var(--slate-50)'; }}
+                  onMouseOut=${e => { e.currentTarget.style.background = 'transparent'; }}>
+                  <input type="checkbox" checked=${supervisorIds.has(u.id)} onChange=${() => toggleSupervisor(u.id)} />
+                  <div style="flex:1;min-width:0;font-size:13px">${u.full_name} <span style="color:var(--slate-400);font-weight:400">· ${u.role}</span></div>
+                </label>
+              `)}
+            </div>
+            <p style="font-size:11px;color:var(--slate-500);margin-top:6px">Pick any number. Phase 3 will use this to scope what each supervisor sees of this project.</p>
           </div>
           <button class="btn" type="submit" disabled=${busy} style="width:100%;margin-top:6px">
             ${busy ? 'Creating…' : 'Create project'}
@@ -25301,23 +25112,15 @@ function DocumentEditModal({ plant, me, doc, vendors, onClose, onSaved }) {
     ...doc,
     doc_date: doc.doc_date || '',
     due_date: doc.due_date || '',
-    project_id: doc.project_id || '',
   } : {
     doc_type: 'invoice_in',
     doc_number: '', doc_date: new Date().toISOString().slice(0,10), due_date: '',
     vendor_id: '', vendor_name_raw: '', vendor_gstin_raw: '',
     taxable_value: '', tax_amount: '', total_value: '',
-    status: 'pending', notes: '', project_id: '',
+    status: 'pending', notes: '',
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  // Projects for the "tag to project" dropdown -- Marvel: lets you fix a
-  // wrongly-assigned project on a bill, or detach it entirely.
-  const [projects, setProjects] = useState([]);
-  useEffect(() => {
-    sb.from('mcp_projects').select('id, code, name').eq('plant_id', plant.id).order('created_at', { ascending: false })
-      .then(({ data }) => setProjects(data || []));
-  }, [plant.id]);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -25337,7 +25140,6 @@ function DocumentEditModal({ plant, me, doc, vendors, onClose, onSaved }) {
         total_value: form.total_value ? parseFloat(form.total_value) : null,
         status: form.status,
         notes: form.notes || null,
-        project_id: form.project_id || null,
       };
       let result;
       if (doc?.id) {
@@ -25399,13 +25201,6 @@ function DocumentEditModal({ plant, me, doc, vendors, onClose, onSaved }) {
               <option value="closed">Closed</option>
               <option value="cancelled">Cancelled</option>
             </select>
-          </div>
-          <div class="field"><label>Project ${form.project_id ? '' : '(optional)'}</label>
-            <select value=${form.project_id || ''} onChange=${e => setForm({...form, project_id: e.target.value})}>
-              <option value="">— Not linked to a project —</option>
-              ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
-            </select>
-            <div style="font-size:11px;color:var(--slate-500);margin-top:3px">Reassign here if this bill was tagged to the wrong project, or clear it to detach.</div>
           </div>
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes || ''} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
           <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (doc?.id ? 'Update' : 'Create')}</button>
@@ -32299,8 +32094,12 @@ function ReportConfig({ plant, me, report, onClose }) {
           }
           throw new Error('Unknown report');
       }
-      // Open in a Blob-URL tab so Safari prints it (about:blank prints blank).
-      openPrintableDoc(html_content);
+      // Open in new tab
+      const w = window.open('', '_blank');
+      if (!w) { alert('Please allow popups to open the report'); return; }
+      w.document.open();
+      w.document.write(html_content);
+      w.document.close();
     } catch (err) {
       alert('Failed to generate report: ' + (err.message || err));
       console.error(err);
