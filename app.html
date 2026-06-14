@@ -5602,7 +5602,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
       <div class="chat-thread">
         <div class="thread-header">
           <button class="thread-back" onClick=${() => setActiveGroup(null)}>←</button>
-          <div class="chat-avatar" onClick=${() => setGroupSettingsTarget(activeGroup)} style="cursor:pointer">${activeGroup.name[0] === '#' ? '#' : activeGroup.name[0]}</div>
+          <div class="chat-avatar" onClick=${() => setGroupSettingsTarget(activeGroup)} style="cursor:pointer;overflow:hidden">${activeGroup.icon_url ? html`<img src=${activeGroup.icon_url} style="width:100%;height:100%;object-fit:cover" />` : (activeGroup.name[0] === '#' ? '#' : activeGroup.name[0])}</div>
           <div style="flex:1;cursor:pointer" onClick=${() => setGroupSettingsTarget(activeGroup)}>
             <div style="font-weight:600;font-size:14px">${activeGroup.name}</div>
             <div style="font-size:11px;color:var(--slate-500)">${activeGroup.members.length} member${activeGroup.members.length > 1 ? 's' : ''} · tap for settings</div>
@@ -5774,7 +5774,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
           const preview = last ? (lastWho ? lastWho + ': ' + lastBody : lastBody) : g.members.length + ' member' + (g.members.length > 1 ? 's' : '');
           return html`
             <div class="chat-item" key=${g.id} onClick=${() => setActiveGroup(g)}>
-              <div class="chat-avatar">${g.name[0] === '#' ? '#' : g.name[0]}</div>
+              <div class="chat-avatar" style="overflow:hidden">${g.icon_url ? html`<img src=${g.icon_url} style="width:100%;height:100%;object-fit:cover" />` : (g.name[0] === '#' ? '#' : g.name[0])}</div>
               <div class="chat-info">
                 <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
                   <div class="chat-name" style=${g.unread > 0 ? 'font-weight:700' : ''}>${g.name}${g.ai_logistics_enabled ? html` <span style="font-size:10px;background:var(--teal-100);color:var(--teal-700);padding:1px 6px;border-radius:999px;font-weight:600;vertical-align:middle">🤖 AI</span>` : ''}</div>
@@ -27359,8 +27359,70 @@ function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
   const [adding, setAdding] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const groupAdmins = group.admins || [];
   const isOwner = group.created_by === me.id;
-  const canManage = isOwner || me.role === 'plant_head' || me.role === 'admin';
+  const canManage = isOwner || groupAdmins.includes(me.id) || me.role === 'plant_head' || me.role === 'admin';
+  // Edit name / description / icon (admins only)
+  const [editOpen, setEditOpen] = useState(false);
+  const [gName, setGName] = useState(group.name || '');
+  const [gDesc, setGDesc] = useState(group.description || '');
+  const [gIcon, setGIcon] = useState(group.icon_url || '');
+  const [iconUploading, setIconUploading] = useState(false);
+
+  const reloadGroup = async () => {
+    const { data: g } = await sb.from('chat_groups').select('*').eq('id', group.id).maybeSingle();
+    if (g) onChanged(g);
+    return g;
+  };
+
+  const pickIcon = async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (!f.type.startsWith('image/')) { setError('Pick an image.'); return; }
+    if (f.size > 5 * 1024 * 1024) { setError('Image over 5 MB.'); return; }
+    setError(''); setIconUploading(true);
+    try {
+      const ext = (f.name.split('.').pop() || 'jpg').toLowerCase();
+      const path = 'group-icons/' + group.id + '-' + Date.now() + '.' + ext;
+      const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, f, { upsert: true, contentType: f.type });
+      if (upErr) throw upErr;
+      const { data } = sb.storage.from('chat-attachments').getPublicUrl(path);
+      setGIcon(data.publicUrl);
+    } catch (e2) { setError('Upload failed: ' + (e2.message || e2)); }
+    finally { setIconUploading(false); }
+  };
+
+  const saveGroupInfo = async () => {
+    if (!gName.trim()) { setError('Group name is required.'); return; }
+    setBusy(true); setError('');
+    try {
+      const { data, error: err } = await sb.rpc('update_chat_group', { p_group_id: group.id, p_name: gName.trim(), p_description: gDesc.trim() || null, p_icon_url: gIcon || null });
+      if (err || !data?.success) throw new Error(err?.message || data?.error || 'Failed');
+      await reloadGroup();
+      showToast('✓ Group updated'); setEditOpen(false);
+    } catch (e) { setError(e.message); } finally { setBusy(false); }
+  };
+
+  const toggleAdmin = async (uid, makeAdmin) => {
+    setBusy(true); setError('');
+    try {
+      const { data, error: err } = await sb.rpc('set_group_admin', { p_group_id: group.id, p_user_id: uid, p_make_admin: makeAdmin });
+      if (err || !data?.success) throw new Error(err?.message || data?.error || 'Failed');
+      await reloadGroup();
+      showToast(makeAdmin ? '👑 Promoted to admin' : 'Admin removed');
+    } catch (e) { setError(e.message); } finally { setBusy(false); }
+  };
+
+  const deleteGroup = async () => {
+    if (!confirm('Delete "' + group.name + '" permanently? All its messages will be removed for everyone. This cannot be undone.')) return;
+    setBusy(true); setError('');
+    try {
+      const { data, error: err } = await sb.rpc('delete_chat_group', { p_group_id: group.id });
+      if (err || !data?.success) throw new Error(err?.message || data?.error || 'Failed');
+      showToast('🗑 Group deleted');
+      onChanged(null);
+    } catch (e) { setError(e.message); setBusy(false); }
+  };
 
   // Re-load whenever the group prop's members array length changes
   useEffect(() => { load(); }, [group.id, (group.members || []).length, (group.members || []).join(',')]);
@@ -27451,10 +27513,37 @@ function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal">
         <div class="modal-header">
-          <div class="modal-title">${group.name}</div>
+          <div class="modal-title" style="display:flex;align-items:center;gap:8px">
+            ${group.icon_url ? html`<img src=${group.icon_url} style="width:28px;height:28px;border-radius:50%;object-fit:cover" />` : ''}
+            ${group.name}
+          </div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
+
+        ${group.description && !editOpen && html`<div style="font-size:12px;color:var(--slate-600);margin-bottom:12px;white-space:pre-wrap">${group.description}</div>`}
+
+        ${canManage && html`
+          ${!editOpen
+            ? html`<button class="btn small ghost" onClick=${() => { setGName(group.name||''); setGDesc(group.description||''); setGIcon(group.icon_url||''); setEditOpen(true); }} style="margin-bottom:12px">✎ Edit group info</button>`
+            : html`
+              <div style="border:1px solid var(--slate-200);border-radius:10px;padding:12px;margin-bottom:14px">
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+                  <div style="width:52px;height:52px;border-radius:50%;background:var(--teal-100);color:var(--teal-700);display:flex;align-items:center;justify-content:center;font-weight:700;overflow:hidden;flex-shrink:0">
+                    ${gIcon ? html`<img src=${gIcon} style="width:100%;height:100%;object-fit:cover" />` : (gName[0] || '#')}
+                  </div>
+                  <label style="font-size:12px;color:var(--teal-700);font-weight:600;cursor:pointer">${iconUploading ? 'Uploading…' : '📷 ' + (gIcon ? 'Change' : 'Add') + ' icon'}<input type="file" accept="image/*" onChange=${pickIcon} style="display:none" /></label>
+                  ${gIcon && html`<button type="button" onClick=${() => setGIcon('')} style="background:none;border:none;color:var(--rose-600);font-size:11px;cursor:pointer">Remove</button>`}
+                </div>
+                <div class="field"><label>Group name</label><input type="text" value=${gName} onInput=${e => setGName(e.target.value)} /></div>
+                <div class="field"><label>Description</label><textarea rows=${2} value=${gDesc} onInput=${e => setGDesc(e.target.value)} placeholder="What's this group for?"></textarea></div>
+                <div style="display:flex;gap:6px">
+                  <button class="btn ghost" onClick=${() => setEditOpen(false)} style="flex:1">Cancel</button>
+                  <button class="btn" disabled=${busy || iconUploading} onClick=${saveGroupInfo} style="flex:2">${busy ? 'Saving…' : 'Save'}</button>
+                </div>
+              </div>
+            `}
+        `}
 
         ${isAdmin && html`
           <div style="border:1px solid ${aiEnabled ? 'var(--teal-200)' : 'var(--slate-200)'};background:${aiEnabled ? 'var(--teal-50)' : 'var(--slate-50)'};border-radius:10px;padding:12px 14px;margin-bottom:14px">
@@ -27497,22 +27586,35 @@ function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
         <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px">
           ${members.map(m => {
             const isCreator = m.id === group.created_by;
+            const isGroupAdmin = isCreator || groupAdmins.includes(m.id);
             const isMe = m.id === me.id;
             return html`
               <div key=${m.id} class="list-item">
                 <div class="list-item-row">
                   <div class="list-item-main">
-                    <div class="list-item-title">${m.full_name}${isMe ? ' (you)' : ''}${isCreator ? ' · 👑 creator' : ''}</div>
+                    <div class="list-item-title">${m.full_name}${isMe ? ' (you)' : ''}${isCreator ? ' · 👑 creator' : (isGroupAdmin ? ' · 🛡 admin' : '')}</div>
                     <div class="list-item-sub">${roleLabel(m.role)}</div>
                   </div>
-                  ${(canManage || isMe) && !isCreator && html`<button class="btn small danger" disabled=${busy} onClick=${() => removeMember(m.id)}>${isMe ? 'Leave' : 'Remove'}</button>`}
+                  <div style="display:flex;gap:6px;align-items:center">
+                    ${canManage && !isCreator && !isMe && html`
+                      <button class="btn small ghost" disabled=${busy} onClick=${() => toggleAdmin(m.id, !isGroupAdmin)} title=${isGroupAdmin ? 'Remove admin' : 'Make admin'}>${isGroupAdmin ? '🛡 Remove admin' : '🛡 Make admin'}</button>
+                    `}
+                    ${(canManage || isMe) && !isCreator && html`<button class="btn small danger" disabled=${busy} onClick=${() => removeMember(m.id)}>${isMe ? 'Leave' : 'Remove'}</button>`}
+                  </div>
                 </div>
               </div>
             `;
           })}
         </div>
 
-        ${!canManage && html`<div style="font-size:11px;color:var(--slate-500);text-align:center;margin-top:6px">Only group creator and plant head can add or remove members.</div>`}
+        ${!canManage && html`<div style="font-size:11px;color:var(--slate-500);text-align:center;margin-top:6px">Only group admins can add, remove or promote members.</div>`}
+
+        ${canManage && html`
+          <div style="border-top:1px solid var(--slate-200);margin-top:14px;padding-top:14px">
+            <button class="btn danger" disabled=${busy} onClick=${deleteGroup} style="width:100%">🗑 Delete group for everyone</button>
+            <div style="font-size:11px;color:var(--slate-500);text-align:center;margin-top:6px">Deletes the group and all its messages. Cannot be undone.</div>
+          </div>
+        `}
       </div>
     </div>
   `;
