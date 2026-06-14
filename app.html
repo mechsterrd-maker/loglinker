@@ -12487,6 +12487,9 @@ function ProjectModal({ plant, me, customers, users, editTarget, onClose, onSave
         actual_weight_kg: form.actual_weight_kg?parseFloat(form.actual_weight_kg):null,
         start_date: form.start_date||null, target_date: form.target_date||null,
         progress_pct: parseInt(form.progress_pct)||0, owner_user_id: form.owner_user_id||null, notes: form.notes||null,
+        po_number: form.po_number||null,
+        qty: form.qty!==''&&form.qty!=null ? parseFloat(form.qty) : null,
+        uom: form.uom||null,
       };
       if (form.status === 'completed' && !form.completed_date) payload.completed_date = new Date().toISOString().slice(0,10);
       if (editTarget) {
@@ -12535,7 +12538,12 @@ function ProjectModal({ plant, me, customers, users, editTarget, onClose, onSave
             <div class="field"><label>Site location</label><input type="text" value=${form.site_location} onChange=${e=>setForm({...form,site_location:e.target.value})} placeholder="Hosur" /></div>
           </div>
           <div class="field-row">
+            <div class="field"><label>Customer PO number</label><input type="text" value=${form.po_number||''} onChange=${e=>setForm({...form,po_number:e.target.value})} placeholder="PO-2026-0456" /></div>
             <div class="field"><label>Order value ₹</label><input type="number" step="any" value=${form.order_value} onChange=${e=>setForm({...form,order_value:e.target.value})} /></div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>Quantity</label><input type="number" step="any" value=${form.qty||''} onChange=${e=>setForm({...form,qty:e.target.value})} /></div>
+            <div class="field"><label>Unit</label><select value=${form.uom||'nos'} onChange=${e=>setForm({...form,uom:e.target.value})}>${PROJECT_UOMS.map(u=>html`<option key=${u} value=${u}>${u}</option>`)}</select></div>
             <div class="field"><label>Owner</label><select value=${form.owner_user_id} onChange=${e=>setForm({...form,owner_user_id:e.target.value})}><option value="">— none —</option>${users.map(u=>html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}</select></div>
           </div>
           <div class="field-row">
@@ -12682,6 +12690,7 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
       <div style="flex:1;min-width:0">
         <h1 style="font-size:17px;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${project.code?project.code+' · ':''}${project.name}</h1>
         <div class="sub">${project.customer?.name||project.customer_name||'—'}${project.site_location?' · '+project.site_location:''}${project.target_date?' · due '+project.target_date:''}</div>
+        ${(project.po_number || project.qty) && html`<div class="sub" style="margin-top:1px">${project.po_number ? 'PO ' + project.po_number : ''}${project.po_number && project.qty ? ' · ' : ''}${project.qty ? 'Qty ' + fmtNum(project.qty) + (project.uom ? ' ' + project.uom : '') : ''}</div>`}
       </div>
       ${!restricted && html`<button class="btn small ghost" onClick=${onEdit} title="Edit project details" style="padding:6px 10px">✏️ Edit</button>`}
     </div>
@@ -21742,10 +21751,17 @@ function HomeInstallBanner() {
 // modal is intentionally TIGHT — Name, Customer, Qty, Target Date, Leader, Manager,
 // Supervisor(s). Skip Drawing/Notes per "tight" decision; they're edit-after-create.
 // Writes via create_fab_project() RPC which is admin-gated server-side too.
+// Common units of measure on Indian factory POs. Marvel: qty must be a
+// number with a separate UoM since a PO can be in nos / kg / ton / set / etc.
+const PROJECT_UOMS = ['nos', 'set', 'kg', 'ton', 'mtr', 'sqm', 'litre', 'pairs', 'lot'];
+
 function NewProjectModal({ plant, me, onClose, onCreated }) {
   const [name, setName] = useState('');
   const [customerId, setCustomerId] = useState('');
+  const [poNumber, setPoNumber] = useState('');
   const [qty, setQty] = useState('');
+  const [uom, setUom] = useState('nos');
+  const [notes, setNotes] = useState('');
   const [targetDate, setTargetDate] = useState('');
   const [leaderId, setLeaderId] = useState('');
   const [managerId, setManagerId] = useState('');
@@ -21785,11 +21801,15 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
         p_name: name.trim(),
         p_customer_id: customerId || null,
         p_customer_name: cust?.name || null,
-        p_qty_note: qty.trim() || null,
+        p_qty_note: null,
         p_target_date: targetDate || null,
         p_leader_id: leaderId || null,
         p_manager_id: managerId || null,
         p_supervisor_ids: Array.from(supervisorIds),
+        p_po_number: poNumber.trim() || null,
+        p_qty: qty.trim() ? parseFloat(qty) : null,
+        p_uom: qty.trim() ? uom : null,
+        p_notes: notes.trim() || null,
       });
       if (error) throw error;
       onCreated && onCreated(newId);
@@ -21833,13 +21853,24 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
           </div>
           <div class="field-row" style="display:flex;gap:10px">
             <div class="field" style="flex:1">
-              <label>Quantity / weight</label>
-              <input type="text" value=${qty} onInput=${e => setQty(e.target.value)}
-                placeholder="e.g. 12 MT or 8 nos" />
+              <label>Customer PO number</label>
+              <input type="text" value=${poNumber} onInput=${e => setPoNumber(e.target.value)} placeholder="e.g. PO-2026-0456" />
             </div>
             <div class="field" style="flex:1">
               <label>Target completion</label>
               <input type="date" value=${targetDate} onInput=${e => setTargetDate(e.target.value)} />
+            </div>
+          </div>
+          <div class="field-row" style="display:flex;gap:10px">
+            <div class="field" style="flex:1">
+              <label>Quantity</label>
+              <input type="number" step="any" min=${0} value=${qty} onInput=${e => setQty(e.target.value)} placeholder="e.g. 12" />
+            </div>
+            <div class="field" style="flex:1">
+              <label>Unit</label>
+              <select value=${uom} onChange=${e => setUom(e.target.value)}>
+                ${PROJECT_UOMS.map(u => html`<option key=${u} value=${u}>${u}</option>`)}
+              </select>
             </div>
           </div>
           <div class="field">
@@ -21858,20 +21889,25 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
           </div>
           <div class="field">
             <label>Supervisor(s)</label>
-            <div style="border:1px solid var(--slate-200);border-radius:8px;padding:6px;max-height:140px;overflow-y:auto">
-              ${users.filter(u => u.id !== leaderId && u.id !== managerId).length === 0 && html`
-                <div style="padding:10px;color:var(--slate-500);font-size:12px">No other team members available. Invite supervisors first in People.</div>
-              `}
-              ${users.filter(u => u.id !== leaderId && u.id !== managerId).map(u => html`
-                <label key=${u.id} style="display:flex;align-items:center;gap:10px;padding:7px 8px;cursor:pointer;border-radius:6px"
-                  onMouseOver=${e => { e.currentTarget.style.background = 'var(--slate-50)'; }}
-                  onMouseOut=${e => { e.currentTarget.style.background = 'transparent'; }}>
-                  <input type="checkbox" checked=${supervisorIds.has(u.id)} onChange=${() => toggleSupervisor(u.id)} />
-                  <div style="flex:1;min-width:0;font-size:13px">${u.full_name} <span style="color:var(--slate-400);font-weight:400">· ${u.role}</span></div>
-                </label>
-              `)}
-            </div>
-            <p style="font-size:11px;color:var(--slate-500);margin-top:6px">Pick any number. Phase 3 will use this to scope what each supervisor sees of this project.</p>
+            <select value="" onChange=${e => { if (e.target.value) { toggleSupervisor(e.target.value); e.target.value = ''; } }}>
+              <option value="">+ Add a supervisor…</option>
+              ${users.filter(u => u.id !== leaderId && u.id !== managerId && !supervisorIds.has(u.id)).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} · ${u.role}</option>`)}
+            </select>
+            ${supervisorIds.size > 0 && html`
+              <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+                ${Array.from(supervisorIds).map(id => {
+                  const u = users.find(x => x.id === id);
+                  return html`<span key=${id} style="display:inline-flex;align-items:center;gap:6px;background:var(--teal-50);border:1px solid var(--teal-200);color:var(--teal-800);padding:4px 8px;border-radius:999px;font-size:12px">
+                    ${u ? u.full_name : 'user'}
+                    <button type="button" onClick=${() => toggleSupervisor(id)} style="background:none;border:none;color:var(--teal-700);cursor:pointer;font-size:13px;line-height:1;padding:0">×</button>
+                  </span>`;
+                })}
+              </div>
+            `}
+          </div>
+          <div class="field">
+            <label>Notes</label>
+            <textarea rows=${2} value=${notes} onInput=${e => setNotes(e.target.value)} placeholder="Set value, repeat-order reference, special instructions…"></textarea>
           </div>
           <button class="btn" type="submit" disabled=${busy} style="width:100%;margin-top:6px">
             ${busy ? 'Creating…' : 'Create project'}
