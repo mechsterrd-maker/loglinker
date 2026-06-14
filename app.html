@@ -11095,6 +11095,27 @@ function rtResolveValue(hint, ctx) {
   return '';
 }
 
+// Open a self-contained HTML document in a new tab for printing / Save-as-PDF.
+// IMPORTANT: Safari (which Marvel uses) prints a BLANK page when you do
+// window.open('') + document.write() -- the about:blank document never paints
+// for print. Serving the HTML via a Blob URL makes it a real navigable
+// document so Safari renders + prints it correctly. Returns false if the
+// pop-up was blocked.
+function openPrintableDoc(html) {
+  try {
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const w = window.open(url, '_blank');
+    if (!w) { alert('Pop-up blocked — allow pop-ups for loglinkr.com so the PDF can open.'); return false; }
+    // Revoke after the tab has had time to load; keeps memory tidy.
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    return true;
+  } catch (e) {
+    alert('Could not open the document: ' + (e.message || e));
+    return false;
+  }
+}
+
 function rtFormatValue(val, format) {
   if (val == null || val === '') return '';
   if (format === 'currency') return '₹' + fmtNum(Number(val).toFixed(0));
@@ -11498,10 +11519,7 @@ function RecordTemplateUploadModal({ plant, me, source, sourceLabel, onClose, on
                   doc: { doc_number: 'SAMPLE/0001', doc_date: new Date().toISOString().slice(0,10), customer_name: 'Sample Customer', customer_gstin: '33AAA0000A1Z5', customer_address: 'Sample Address, City', vendor_name: 'Sample Vendor', vehicle_no: 'TN-00-XX-0000', total_value: 1000, taxable_value: 1000, tax_amount: 0 },
                   rows: [sample, sample],
                 };
-                const doc = rtRenderDocument(extracted, ctx);
-                const w = window.open('', '_blank');
-                if (!w) { alert('Pop-up blocked.'); return; }
-                w.document.write(doc); w.document.close();
+                openPrintableDoc(rtRenderDocument(extracted, ctx));
               }} style="margin-top:8px;padding:6px 10px;background:white;border:1px solid var(--teal-400);color:var(--teal-700);font-size:11px;font-weight:600;border-radius:5px;cursor:pointer">👁 Preview with sample data</button>
             `}
             ${notes && html`<div style="margin-top:8px;font-size:10px;color:var(--slate-600);font-style:italic">${rtEsc(notes)}</div>`}
@@ -11702,11 +11720,7 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
             net, count: filtered.length,
           },
         };
-        const doc = rtRenderDocument(tpl.config, ctx);
-        const w = window.open('', '_blank');
-        if (!w) { alert('Pop-up blocked — allow pop-ups so the report can open.'); return; }
-        w.document.write(doc);
-        w.document.close();
+        openPrintableDoc(rtRenderDocument(tpl.config, ctx));
         return;
       }
     }
@@ -11790,10 +11804,7 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
           '</tbody></table>') +
       '<div class="meta"><span>' + esc(plant.name) + ' · Petty Cash Report</span><span>Loglinkr · ' + esc(new Date().toLocaleDateString()) + '</span></div>' +
       '</body></html>';
-    const w = window.open('', '_blank');
-    if (!w) { alert('Pop-up blocked — allow pop-ups for this site so the report can open.'); return; }
-    w.document.write(docHtml);
-    w.document.close();
+    openPrintableDoc(docHtml);
   };
 
   const ready = !fetching && filtered.length > 0 && range.from && range.to;
@@ -15951,11 +15962,8 @@ function DocFormatBar({ plant, me, doc, party, isInvoice, onPrintDefault, defaul
       iframeRef.current.contentWindow.print();
       return;
     }
-    // Iframe not ready -- fall back to popup.
-    const w = window.open('', '_blank');
-    if (!w) { alert('Pop-up blocked — allow pop-ups so the document can open.'); return; }
-    w.document.write(customSrcdoc);
-    w.document.close();
+    // Iframe not ready -- fall back to a Blob-URL tab.
+    openPrintableDoc(customSrcdoc);
   };
 
   if (!source) return html`${defaultView}`;
@@ -16053,10 +16061,7 @@ function DocFormatsModule({ plant, me }) {
           doc: { doc_number: 'SAMPLE/0001', doc_date: new Date().toISOString().slice(0,10), customer_name: 'Sample Customer Pvt Ltd', customer_gstin: '33AAACS0000A1Z5', customer_address: 'No.12, Sample Street, Chennai-600001', vendor_name: 'Sample Vendor', vehicle_no: 'TN-00-XX-0000', total_value: 12000, taxable_value: 10169, tax_amount: 1831, cgst_amount: 916, sgst_amount: 915 },
           rows: [sample, { ...sample, name: 'SAMPLE PART NAME B', qty: 5, amount: 500 }],
         };
-    const docHtml = rtRenderDocument(tpl.config, ctx);
-    const w = window.open('', '_blank');
-    if (!w) { alert('Pop-up blocked.'); return; }
-    w.document.write(docHtml); w.document.close();
+    openPrintableDoc(rtRenderDocument(tpl.config, ctx));
   };
 
   const forTab = templates.filter(t => t.source === tab);
@@ -17746,10 +17751,7 @@ function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
       '</div>' +
       '<div class="meta"><span>' + esc(plant.name) + ' · MoM Report</span><span>Generated ' + esc(new Date().toLocaleString()) + '</span></div>' +
       '</body></html>';
-    const w = window.open('', '_blank');
-    if (!w) { alert('Pop-up blocked — allow pop-ups so the PDF can open.'); return; }
-    w.document.write(docHtml);
-    w.document.close();
+    openPrintableDoc(docHtml);
   };
 
   return html`
@@ -32094,12 +32096,8 @@ function ReportConfig({ plant, me, report, onClose }) {
           }
           throw new Error('Unknown report');
       }
-      // Open in new tab
-      const w = window.open('', '_blank');
-      if (!w) { alert('Please allow popups to open the report'); return; }
-      w.document.open();
-      w.document.write(html_content);
-      w.document.close();
+      // Open in a Blob-URL tab so Safari prints it (about:blank prints blank).
+      openPrintableDoc(html_content);
     } catch (err) {
       alert('Failed to generate report: ' + (err.message || err));
       console.error(err);
