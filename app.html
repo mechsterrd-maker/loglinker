@@ -1436,6 +1436,7 @@ const MORE_GROUPS = [
       { key:'npd',                 icon:'🧪', label:'NPD Projects (APQP)', iatf:true, sub:'RFQ → SOP lifecycle, PPAP auto-feed, commercials' },
       { key:'ppap',                icon:'📑', label:'PPAP Submissions',   iatf:true, sub:'Part approval status (IATF 8.3.4.4)' },
       { key:'mom',                 icon:'📝', label:'MOM (Minutes of Meeting)',  sub:'Internal / customer / supplier · action items auto-task' },
+      { key:'voice_notes',         icon:'🎙', label:'Voice Notes (Tamil → English)', sub:'Upload meeting recording · AI translates + extracts action items · creates MoM + tasks' },
       { key:'iap',                 icon:'🗓', label:'Internal Audit Plan', iatf:true, sub:'Annual schedule + auditor assignments (IATF 9.2.2)' },
     ],
   },
@@ -1653,6 +1654,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${tab === 'cad3d'}><${CadNexaEmbed} plant=${plant} me=${me} user=${user} /></${Page}>
       <${Page} active=${tab === 'iatf_docs'}><${IatfDocsLibrary} /></${Page}>
       <${Page} active=${tab === 'mom'}><${MomModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${tab === 'voice_notes'}><${VoiceNotesModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} /></${Page}>
@@ -6433,6 +6435,7 @@ const RBAC_MODULES = [
   { key:'cad3d', label:'3D Models · CadNexa', group:'projects' },
   { key:'npd', label:'NPD Projects', group:'projects' },
   { key:'mom', label:'Minutes of Meeting', group:'projects' },
+  { key:'voice_notes', label:'Voice Notes (meeting recordings)', group:'projects' },
   { key:'documents', label:'Documents · Bills', group:'commercial' },
   { key:'sales_docs', label:'Make Documents (DC/Invoice/PO)', group:'commercial' },
   { key:'doc_formats', label:'Doc Formats', group:'commercial' },
@@ -16776,6 +16779,293 @@ function JobworkReceiveModal({ plant, me, line, onClose, onSaved }) {
 // =================================================================
 // MOM MODULE (Minutes of Meeting · internal / customer / supplier)
 // =================================================================
+// =================================================================
+// VoiceNotesModule -- upload a meeting recording (Tamil / Hindi / mixed),
+// Whisper translates to English, Claude pulls out summary + decisions +
+// action items. User reviews and saves; the save writes a MoM meeting
+// row plus mcp_mom_action_items rows (which auto-create tasks via
+// existing triggers).
+// =================================================================
+function VoiceNotesModule({ plant, me }) {
+  const [file, setFile] = useState(null);
+  const [hintSubject, setHintSubject] = useState('');
+  const [meetingType, setMeetingType] = useState('internal');
+  const [meetingDate, setMeetingDate] = useState(new Date().toISOString().slice(0, 10));
+  const [externalOrgName, setExternalOrgName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [phase, setPhase] = useState('idle'); // idle | uploading | extracting | done
+  const [error, setError] = useState('');
+  const [extraction, setExtraction] = useState(null);
+  const [transcript, setTranscript] = useState('');
+  const [showTranscript, setShowTranscript] = useState(false);
+  const [actionItems, setActionItems] = useState([]);
+  const [subject, setSubject] = useState('');
+  const [summary, setSummary] = useState('');
+  const [decisions, setDecisions] = useState('');
+  const [users, setUsers] = useState([]);
+  const [savedMeetingId, setSavedMeetingId] = useState(null);
+  const [savingMeeting, setSavingMeeting] = useState(false);
+  const fileRef = useRef(null);
+
+  useEffect(() => {
+    sb.from('users').select('id, full_name, role').eq('plant_id', plant.id).eq('status', 'active').order('full_name')
+      .then(({ data }) => setUsers(data || []));
+  }, [plant.id]);
+
+  const pickFile = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (!f.type.startsWith('audio/') && !/\.(mp3|m4a|wav|ogg|webm|mp4|aac|flac)$/i.test(f.name)) {
+      setError('Pick an audio file (mp3 / m4a / wav / aac).');
+      return;
+    }
+    if (f.size > 25 * 1024 * 1024) {
+      setError('Audio is over 25 MB. Compress to ~64 kbps mp3 or split the recording.');
+      return;
+    }
+    setError('');
+    setFile(f);
+    setExtraction(null);
+    setTranscript('');
+    setActionItems([]);
+    setSubject('');
+    setSummary('');
+    setDecisions('');
+    setSavedMeetingId(null);
+  };
+
+  const extract = async () => {
+    if (!file) return;
+    setBusy(true); setError(''); setPhase('uploading');
+    try {
+      const fd = new FormData();
+      fd.set('audio', file, file.name);
+      fd.set('plant_id', plant.id);
+      if (hintSubject.trim()) fd.set('hint_subject', hintSubject.trim());
+      setPhase('extracting');
+      const { data, error: err } = await sb.functions.invoke('extract-meeting-actions', { body: fd });
+      if (err) throw err;
+      if (data?.error) throw new Error(data.error);
+      const ext = data.extraction || {};
+      setExtraction(ext);
+      setTranscript(data.transcript || '');
+      setSubject(ext.subject || hintSubject || 'Meeting · ' + meetingDate);
+      setSummary(ext.summary || '');
+      setDecisions(Array.isArray(ext.decisions) ? ext.decisions.map((d, i) => (i + 1) + '. ' + d).join('\n') : '');
+      setMeetingType(ext.meeting_type === 'customer' || ext.meeting_type === 'supplier' ? ext.meeting_type : meetingType);
+      setActionItems((ext.action_items || []).map((it, i) => ({
+        id: 'ai-' + i,
+        title: it.title || '',
+        description: it.description || '',
+        owner_external_name: it.assignee_hint || '',
+        owner_user_id: '',
+        due_date_hint: it.due_date_hint || '',
+        due_date: /^\d{4}-\d{2}-\d{2}$/.test(it.due_date_hint || '') ? it.due_date_hint : '',
+        priority: it.priority || 'medium',
+      })));
+      setPhase('done');
+    } catch (e) {
+      setError(e.message || String(e));
+      setPhase('idle');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const updateAi = (i, patch) => setActionItems(prev => prev.map((it, idx) => idx === i ? { ...it, ...patch } : it));
+  const removeAi = (i) => setActionItems(prev => prev.filter((_, idx) => idx !== i));
+  const addAi = () => setActionItems(prev => [...prev, { id: 'manual-' + Date.now(), title: '', description: '', owner_external_name: '', owner_user_id: '', due_date: '', priority: 'medium' }]);
+
+  const saveMeeting = async () => {
+    if (!subject.trim()) { setError('Give the meeting a subject.'); return; }
+    setSavingMeeting(true); setError('');
+    try {
+      const validItems = actionItems.filter(it => it.title.trim());
+      const minutesBody = (summary || '').trim() + (transcript ? '\n\n--- Transcript (English) ---\n' + transcript : '');
+      const { data: meeting, error: mErr } = await sb.from('mcp_mom_meetings').insert({
+        plant_id: plant.id,
+        meeting_type: meetingType,
+        subject: subject.trim(),
+        meeting_date: meetingDate,
+        external_org_name: externalOrgName.trim() || null,
+        minutes: minutesBody || null,
+        decisions: decisions.trim() || null,
+        status: 'draft',
+        created_by: me.id,
+      }).select('id').single();
+      if (mErr) throw mErr;
+
+      if (validItems.length > 0) {
+        const rows = validItems.map((it, idx) => ({
+          plant_id: plant.id,
+          meeting_id: meeting.id,
+          ord: idx + 1,
+          description: it.title.trim() + (it.description ? '\n' + it.description : ''),
+          owner_user_id: it.owner_user_id || null,
+          owner_external_name: !it.owner_user_id && it.owner_external_name ? it.owner_external_name.trim() : null,
+          due_date: it.due_date || null,
+          status: 'open',
+        }));
+        const { error: aErr } = await sb.from('mcp_mom_action_items').insert(rows);
+        if (aErr) throw aErr;
+      }
+      setSavedMeetingId(meeting.id);
+      showToast('✓ MoM created · ' + validItems.length + ' action item' + (validItems.length === 1 ? '' : 's'));
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setSavingMeeting(false);
+    }
+  };
+
+  const reset = () => {
+    setFile(null); setExtraction(null); setTranscript(''); setActionItems([]);
+    setSubject(''); setSummary(''); setDecisions(''); setSavedMeetingId(null);
+    setHintSubject(''); setExternalOrgName(''); setPhase('idle');
+    if (fileRef.current) fileRef.current.value = '';
+  };
+
+  return html`
+    <div class="page-header">
+      <h1>🎙 Voice Notes</h1>
+      <div class="sub">Upload a meeting recording (Tamil / Hindi / English / mixed). AI translates to English and pulls out the action items. Saves as a MoM with auto-tasks.</div>
+    </div>
+
+    ${savedMeetingId ? html`
+      <div class="card" style="padding:18px;text-align:center">
+        <div style="font-size:32px;margin-bottom:6px">✓</div>
+        <div style="font-size:15px;font-weight:700;margin-bottom:4px">MoM saved · ${subject}</div>
+        <div style="font-size:12px;color:var(--slate-500);margin-bottom:14px">${actionItems.filter(i => i.title.trim()).length} action items created as tasks.</div>
+        <button class="btn small" onClick=${reset}>+ Upload another recording</button>
+      </div>
+    ` : html`
+      ${phase === 'idle' && !file && html`
+        <div class="card" style="padding:18px">
+          <div class="field">
+            <label>Meeting recording (mp3 / m4a / wav · max 25 MB ≈ 25 min)</label>
+            <input ref=${fileRef} type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg,.webm" onChange=${pickFile} style="font-size:13px" />
+            <div style="font-size:11px;color:var(--slate-500);margin-top:6px">Bigger than 25 MB? Compress to 64 kbps mono mp3 with any audio tool (covers ~50 min in 25 MB).</div>
+          </div>
+        </div>
+      `}
+
+      ${file && phase === 'idle' && html`
+        <div class="card" style="padding:14px;margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <div>
+              <div style="font-size:14px;font-weight:600">🎵 ${file.name}</div>
+              <div style="font-size:11px;color:var(--slate-500)">${(file.size/1024/1024).toFixed(1)} MB · ${file.type || 'audio'}</div>
+            </div>
+            <button type="button" class="btn ghost small" onClick=${reset} style="padding:4px 10px;font-size:11px">✕ Change</button>
+          </div>
+          <div class="field">
+            <label>Subject hint (optional)</label>
+            <input type="text" value=${hintSubject} onInput=${e => setHintSubject(e.target.value)} placeholder="e.g. Weekly review with Marvel · production update" style="font-size:13px" />
+            <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Helps Whisper transcribe technical words (PDC, NCR, customer names) more accurately.</div>
+          </div>
+          <button class="btn" disabled=${busy} onClick=${extract} style="width:100%;margin-top:8px">${busy ? '…' : '🤖 Translate & extract action items'}</button>
+        </div>
+      `}
+
+      ${phase === 'uploading' && html`
+        <div class="card" style="padding:24px;text-align:center">
+          <div class="spinner" style="margin:0 auto 12px"></div>
+          <div style="font-size:13px;font-weight:600">Uploading & transcribing…</div>
+          <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Whisper translating ${file ? '(' + (file.size/1024/1024).toFixed(1) + ' MB) ' : ''}to English. ~10-30 seconds.</div>
+        </div>
+      `}
+
+      ${phase === 'extracting' && html`
+        <div class="card" style="padding:24px;text-align:center">
+          <div class="spinner" style="margin:0 auto 12px"></div>
+          <div style="font-size:13px;font-weight:600">Pulling out the action items…</div>
+          <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Whisper translating then Claude extracting structure. ~30-60 seconds total.</div>
+        </div>
+      `}
+
+      ${error && html`<div style="background:#fef2f2;border:1px solid var(--rose-300);padding:10px;border-radius:6px;color:var(--rose-700);font-size:12px;margin-bottom:12px">⚠ ${error}</div>`}
+
+      ${extraction && phase === 'done' && html`
+        <div class="card" style="padding:14px;margin-bottom:12px;background:var(--teal-50);border:1px solid var(--teal-200)">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <div style="font-weight:700;font-size:13px;color:var(--teal-800)">✓ AI extracted ${actionItems.length} action item${actionItems.length===1?'':'s'}</div>
+            <span style=${'font-size:10px;padding:2px 8px;border-radius:999px;background:'+(extraction.confidence==='high'?'#bbf7d0':extraction.confidence==='low'?'#fecaca':'#fde68a')+';font-weight:700;text-transform:uppercase'}>${extraction.confidence || 'medium'} confidence</span>
+          </div>
+          ${extraction.notes && html`<div style="font-size:11px;color:var(--slate-600);font-style:italic">${extraction.notes}</div>`}
+          ${Array.isArray(extraction.attendees_mentioned) && extraction.attendees_mentioned.length > 0 && html`
+            <div style="font-size:11px;color:var(--slate-700);margin-top:6px"><b>Attendees mentioned:</b> ${extraction.attendees_mentioned.join(', ')}</div>
+          `}
+          ${Array.isArray(extraction.open_questions) && extraction.open_questions.length > 0 && html`
+            <div style="font-size:11px;color:var(--slate-700);margin-top:6px"><b>Open questions:</b><ul style="margin:4px 0 0 18px;padding:0">${extraction.open_questions.map((q, i) => html`<li key=${i}>${q}</li>`)}</ul></div>
+          `}
+        </div>
+
+        <div class="card" style="padding:14px;margin-bottom:12px">
+          <div class="field-row" style="display:flex;gap:10px">
+            <div class="field" style="flex:2"><label>Subject *</label><input type="text" required value=${subject} onInput=${e => setSubject(e.target.value)} /></div>
+            <div class="field" style="flex:1"><label>Date</label><input type="date" value=${meetingDate} onInput=${e => setMeetingDate(e.target.value)} /></div>
+          </div>
+          <div class="field-row" style="display:flex;gap:10px">
+            <div class="field" style="flex:1">
+              <label>Type</label>
+              <select value=${meetingType} onChange=${e => setMeetingType(e.target.value)}>
+                <option value="internal">🏛 Internal</option>
+                <option value="customer">🤝 Customer</option>
+                <option value="supplier">🛒 Supplier</option>
+              </select>
+            </div>
+            ${meetingType !== 'internal' && html`
+              <div class="field" style="flex:2"><label>${meetingType === 'customer' ? 'Customer' : 'Supplier'} name</label><input type="text" value=${externalOrgName} onInput=${e => setExternalOrgName(e.target.value)} placeholder="Org name" /></div>
+            `}
+          </div>
+          <div class="field"><label>Summary</label><textarea rows=${4} value=${summary} onInput=${e => setSummary(e.target.value)}></textarea></div>
+          <div class="field"><label>Decisions (one per line)</label><textarea rows=${3} value=${decisions} onInput=${e => setDecisions(e.target.value)}></textarea></div>
+          <div>
+            <button type="button" onClick=${() => setShowTranscript(s => !s)} style="background:none;border:none;color:var(--teal-700);cursor:pointer;font-size:12px;font-weight:600;padding:0">${showTranscript ? '▼' : '▶'} ${showTranscript ? 'Hide' : 'Show'} full English transcript (${transcript.length} chars)</button>
+            ${showTranscript && html`<textarea readonly rows=${10} value=${transcript} style="width:100%;margin-top:6px;padding:8px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;font-family:ui-monospace,Menlo,monospace;background:var(--slate-50)"></textarea>`}
+          </div>
+        </div>
+
+        <div class="card" style="padding:14px;margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <div style="font-weight:700;font-size:13px">📋 Action items · ${actionItems.length}</div>
+            <button type="button" class="btn ghost small" onClick=${addAi} style="padding:4px 10px;font-size:11px">+ Add manually</button>
+          </div>
+          ${actionItems.length === 0 && html`<div style="font-size:12px;color:var(--slate-500);font-style:italic">No action items extracted. Add one manually if needed.</div>`}
+          ${actionItems.map((it, idx) => html`
+            <div key=${it.id} style="border:1px solid var(--slate-200);border-radius:6px;padding:10px;margin-bottom:8px;background:var(--slate-50)">
+              <div style="display:flex;gap:6px;margin-bottom:6px">
+                <span style="font-size:11px;font-weight:600;color:var(--teal-700);min-width:18px;padding-top:6px">${idx+1}.</span>
+                <input type="text" value=${it.title} onInput=${e => updateAi(idx, { title: e.target.value })} placeholder="What needs to be done" style="flex:1;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                <button type="button" class="btn small danger" onClick=${() => removeAi(idx)} style="padding:2px 8px;font-size:11px">×</button>
+              </div>
+              ${it.description && html`<textarea value=${it.description} onInput=${e => updateAi(idx, { description: e.target.value })} rows=${2} placeholder="Context" style="width:100%;margin-bottom:6px;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;font-family:inherit;box-sizing:border-box"></textarea>`}
+              <div style="display:grid;grid-template-columns:1.4fr 1fr 0.8fr;gap:6px">
+                <select value=${it.owner_user_id} onChange=${e => updateAi(idx, { owner_user_id: e.target.value, owner_external_name: e.target.value ? '' : it.owner_external_name })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px">
+                  <option value="">${it.owner_external_name ? '🙋 ' + it.owner_external_name + ' (external)' : '— Owner —'}</option>
+                  ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+                </select>
+                <input type="date" value=${it.due_date} onChange=${e => updateAi(idx, { due_date: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                <select value=${it.priority} onChange=${e => updateAi(idx, { priority: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px">
+                  <option value="high">🔴 High</option>
+                  <option value="medium">🟡 Medium</option>
+                  <option value="low">⚪ Low</option>
+                </select>
+              </div>
+              ${(it.due_date_hint && !it.due_date) && html`<div style="font-size:10px;color:var(--slate-500);margin-top:4px">AI said: "${it.due_date_hint}" — pick a date if you want this scheduled.</div>`}
+            </div>
+          `)}
+        </div>
+
+        <div style="display:flex;gap:8px">
+          <button type="button" class="btn ghost" onClick=${reset} style="flex:1">Discard</button>
+          <button class="btn" disabled=${savingMeeting || !subject.trim()} onClick=${saveMeeting} style="flex:2">${savingMeeting ? 'Saving…' : '✓ Create MoM + ' + actionItems.filter(i => i.title.trim()).length + ' task' + (actionItems.filter(i => i.title.trim()).length === 1 ? '' : 's')}</button>
+        </div>
+      `}
+    `}
+  `;
+}
+
 function MomModule({ plant, me }) {
   const [view, setView] = useState('list');
   const [meetings, setMeetings] = useState([]);
