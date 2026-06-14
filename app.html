@@ -15932,7 +15932,13 @@ function SalesDocMakerModule({ plant, me, navAction }) {
   // render because key=docKind hadn't changed yet. Marvel: 'when i switch
   // dc to rdc its getting stuck'. Deriving fixes it for every kind switch.
   const [recent, setRecent] = useState([]);
-  const [previewNumber, setPreviewNumber] = useState('—');
+  // Cache the next-number-peek per kind so switching tabs never shows the
+  // previous kind's number. Marvel hit this repeatedly: + RDC tab showing
+  // a WEW/PO/.. number because the parent's previewNumber state was the
+  // last peek's answer. Keying by kind means the very first render after
+  // the tab change reads from the cache (placeholder until the RPC fills
+  // it) instead of the previous tab's value.
+  const [previewByKind, setPreviewByKind] = useState({});
   const [customers, setCustomers] = useState([]);
   const [vendors, setVendors] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -15969,6 +15975,9 @@ function SalesDocMakerModule({ plant, me, navAction }) {
 
   const TAB_KIND = { new_dc:'dc', new_rdc:'rdc', new_invoice:'invoice', new_po:'po', new_packing:'packing' };
   const docKind = TAB_KIND[tab] || 'dc';
+  // Read from the per-kind cache. Falls through to '…' until the RPC for
+  // this kind has filled the cache; never shows another kind's number.
+  const previewNumber = previewByKind[docKind] || '…';
   // Fabrication plants typically don't issue tax invoices from this module
   // (they bill separately or use DCs only). Marvel asked for it explicitly.
   // Per session decision: hide the Tax Invoice option for all fab plants.
@@ -15977,12 +15986,9 @@ function SalesDocMakerModule({ plant, me, navAction }) {
   useEffect(() => {
     const kind = TAB_KIND[tab];
     if (!kind) return;
-    // Reset to a placeholder immediately so the user never sees a stale
-    // number from the previous tab (PO peek answering on the RDC tab etc.).
-    setPreviewNumber('…');
     let cancelled = false;
     sb.rpc('peek_next_logistics_doc_number', { p_plant_id: plant.id, p_doc_kind: kind })
-      .then(({ data }) => { if (!cancelled) setPreviewNumber(data || '—'); });
+      .then(({ data }) => { if (!cancelled) setPreviewByKind(prev => ({ ...prev, [kind]: data || '—' })); });
     return () => { cancelled = true; };
   }, [tab, plant.id]);
 
@@ -16025,17 +16031,17 @@ function SalesDocMakerModule({ plant, me, navAction }) {
       <${SalesDocCreateForm} key=${docKind} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber} customers=${customers} vendors=${vendors}
         onCounterChanged=${() => {
           // The "Set starting number" panel inside the form just bumped the
-          // counter; refetch the peek so the displayed number reflects it.
+          // counter; re-peek so the cached value reflects the new starting #.
           sb.rpc('peek_next_logistics_doc_number', { p_plant_id: plant.id, p_doc_kind: docKind })
-            .then(({ data }) => setPreviewNumber(data || '—'));
+            .then(({ data }) => setPreviewByKind(prev => ({ ...prev, [docKind]: data || '—' })));
         }}
-        onSaved=${(doc) => { setTab('list'); refresh(); setView(doc); }} onCancel=${() => setTab('list')} />
+        onSaved=${(doc) => { setPreviewByKind(prev => { const next = { ...prev }; delete next[docKind]; return next; }); setTab('list'); refresh(); setView(doc); }} onCancel=${() => setTab('list')} />
     `}
 
     ${(tab === 'new_po' || tab === 'new_packing') && html`
       <${PoPackingForm} key=${docKind} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber}
         customers=${customers} vendors=${vendors}
-        onSaved=${(doc) => { setTab('list'); refresh(); setView(doc); }} onCancel=${() => setTab('list')} />
+        onSaved=${(doc) => { setPreviewByKind(prev => { const next = { ...prev }; delete next[docKind]; return next; }); setTab('list'); refresh(); setView(doc); }} onCancel=${() => setTab('list')} />
     `}
 
     ${tab === 'list' && html`<${SalesDocFilteredList} recent=${recent} loading=${loading} META=${META} onView=${setView} />`}
