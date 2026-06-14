@@ -16803,43 +16803,16 @@ async function decodeToMono16k(file) {
   return monoBuffer.getChannelData(0); // Float32Array
 }
 
-// In-browser compressor + concatenator. Takes one or many audio files (parts
-// of a split recording), decodes each, splices the samples end-to-end in
-// the order given, and encodes the combined stream to a single mp3 at
-// 32 kbps mono 16 kHz. Typical 60-min total goes to ~14 MB, comfortably
-// under Whisper's 25 MB hard cap.
-async function compressAudioForWhisper(filesIn, onProgress) {
-  const files = Array.isArray(filesIn) ? filesIn : [filesIn];
-  const targetSampleRate = 16000;
-  const targetBitrate = 32;
-  const parts = [];
-  let total = 0;
-  for (let i = 0; i < files.length; i++) {
-    onProgress && onProgress('decoding', { current: i + 1, total: files.length });
-    const samples = await decodeToMono16k(files[i]);
-    parts.push(samples);
-    total += samples.length;
-  }
-  // Splice parts together; insert 0.5 s silence between each so the AI can
-  // tell parts apart in the transcript.
-  const gap = Math.round(targetSampleRate * 0.5);
-  const totalWithGaps = total + Math.max(0, parts.length - 1) * gap;
-  onProgress && onProgress('resampling');
-  const combined = new Float32Array(totalWithGaps);
-  let off = 0;
-  for (let i = 0; i < parts.length; i++) {
-    combined.set(parts[i], off);
-    off += parts[i].length;
-    if (i < parts.length - 1) off += gap;
-  }
-  const int16 = new Int16Array(combined.length);
-  for (let i = 0; i < combined.length; i++) {
-    const s = Math.max(-1, Math.min(1, combined[i]));
+// Encode mono 16 kHz Float32 samples to a 32 kbps mp3 Blob. Used both for
+// the final upload and for splitting the meeting into transcription chunks.
+async function encodeMonoToMp3(samples, sampleRate = 16000, bitrate = 32) {
+  const int16 = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
     int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
-  onProgress && onProgress('encoding');
   const lamejs = await import('https://esm.sh/@breezystack/lamejs@1.2.7');
-  const encoder = new lamejs.Mp3Encoder(1, targetSampleRate, targetBitrate);
+  const encoder = new lamejs.Mp3Encoder(1, sampleRate, bitrate);
   const blockSize = 1152;
   const chunks = [];
   for (let i = 0; i < int16.length; i += blockSize) {
@@ -16850,6 +16823,49 @@ async function compressAudioForWhisper(filesIn, onProgress) {
   const tail = encoder.flush();
   if (tail.length > 0) chunks.push(tail);
   return new Blob(chunks, { type: 'audio/mpeg' });
+}
+
+// Decode every input file, splice samples end-to-end (0.5 s silence between
+// parts so chunk boundaries are obvious), and split the combined stream
+// into ~chunkSeconds segments. Each segment is encoded as its own mp3 so
+// the client can transcribe them in parallel and stay under Supabase's
+// 150 s edge function wall clock.
+async function prepareAudioChunks(filesIn, onProgress, chunkSeconds = 300) {
+  const files = Array.isArray(filesIn) ? filesIn : [filesIn];
+  const sampleRate = 16000;
+  const parts = [];
+  let total = 0;
+  for (let i = 0; i < files.length; i++) {
+    onProgress && onProgress('decoding', { current: i + 1, total: files.length });
+    const samples = await decodeToMono16k(files[i]);
+    parts.push(samples);
+    total += samples.length;
+  }
+  const gap = Math.round(sampleRate * 0.5);
+  const totalWithGaps = total + Math.max(0, parts.length - 1) * gap;
+  const combined = new Float32Array(totalWithGaps);
+  let off = 0;
+  for (let i = 0; i < parts.length; i++) {
+    combined.set(parts[i], off);
+    off += parts[i].length;
+    if (i < parts.length - 1) off += gap;
+  }
+  // Split into chunks. We slice the Float32Array; lamejs encodes each
+  // independently so concatenating the resulting mp3s isn't required.
+  const chunkSamples = sampleRate * chunkSeconds;
+  const chunkCount = Math.max(1, Math.ceil(combined.length / chunkSamples));
+  const blobs = [];
+  for (let i = 0; i < chunkCount; i++) {
+    onProgress && onProgress('encoding', { current: i + 1, total: chunkCount });
+    const start = i * chunkSamples;
+    const slice = combined.subarray(start, Math.min(start + chunkSamples, combined.length));
+    blobs.push(await encodeMonoToMp3(slice, sampleRate, 32));
+  }
+  return {
+    chunks: blobs,
+    totalDurationSec: combined.length / sampleRate,
+    sampleRate,
+  };
 }
 
 // =================================================================
@@ -16879,11 +16895,13 @@ function VoiceNotesModule({ plant, me }) {
   const [savedMeetingId, setSavedMeetingId] = useState(null);
   const [savingMeeting, setSavingMeeting] = useState(false);
   // originalFiles is an ordered list of the raw recordings the user picked
-  // (one or many parts of a split recording). They get decoded and spliced
-  // into a single mp3 before upload.
+  // (one or many parts of a split recording). They get decoded, spliced
+  // and split into ~5-min chunks before per-chunk transcription.
   const [originalFiles, setOriginalFiles] = useState([]);
   const [compressing, setCompressing] = useState(false);
   const [compressStage, setCompressStage] = useState('');
+  const [preppedChunks, setPreppedChunks] = useState(null); // { chunks: Blob[], totalDurationSec, sampleRate }
+  const [chunksDone, setChunksDone] = useState(0);
   const fileRef = useRef(null);
 
   useEffect(() => {
@@ -16900,31 +16918,48 @@ function VoiceNotesModule({ plant, me }) {
     setSummary('');
     setDecisions('');
     setSavedMeetingId(null);
+    setPreppedChunks(null);
     setOriginalFiles(files);
     if (files.length === 0) { setFile(null); return; }
 
     setCompressing(true);
     setCompressStage('decoding');
     try {
-      const compressed = await compressAudioForWhisper(files, (stage, info) => {
+      const prepped = await prepareAudioChunks(files, (stage, info) => {
         setCompressStage(stage + (info ? ' (' + info.current + '/' + info.total + ')' : ''));
       });
+      setPreppedChunks(prepped);
+      const totalCompressed = prepped.chunks.reduce((s, b) => s + b.size, 0);
       const baseName = (files[0].name || 'meeting').replace(/\.[^.]+$/, '');
-      const outName = files.length > 1 ? baseName + '-and-' + (files.length - 1) + '-more.mp3' : baseName + '.mp3';
-      const out = new File([compressed], outName, { type: 'audio/mpeg' });
-      if (out.size > 25 * 1024 * 1024) {
-        setError('Combined file is ' + (out.size/1024/1024).toFixed(1) + ' MB after compression -- Whisper hard-caps at 25 MB (~100 min mono mp3). Try fewer parts or compress source files further.');
-        setFile(null);
-      } else {
-        setFile(out);
-      }
+      const outName = (files.length > 1 ? baseName + '-and-' + (files.length - 1) + '-more' : baseName) + '.mp3';
+      // We expose a synthetic "file" object only so the UI can show the
+      // combined size and the user knows what's about to be transmitted.
+      setFile({ name: outName, size: totalCompressed, type: 'audio/mpeg' });
     } catch (err) {
       setError('Could not compress this audio (' + (err.message || err) + '). Try re-exporting each part as mp3 / m4a first.');
       setFile(null);
+      setPreppedChunks(null);
     } finally {
       setCompressing(false);
       setCompressStage('');
     }
+  };
+
+  // Read the actual error body from the edge function -- supabase.functions
+  // .invoke only exposes 'Edge Function returned a non-2xx status code' on
+  // failure, which is useless. We hit the function directly so we can read
+  // and surface the real error string.
+  const invokeFn = async (path, init) => {
+    const session = (await sb.auth.getSession()).data.session;
+    const headers = Object.assign({}, init.headers || {});
+    if (session?.access_token) headers.Authorization = 'Bearer ' + session.access_token;
+    headers.apikey = SUPABASE_ANON_KEY;
+    const res = await fetch(SUPABASE_URL + '/functions/v1/' + path, Object.assign({}, init, { headers }));
+    const text = await res.text();
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch { /* not json */ }
+    if (!res.ok) throw new Error(parsed?.error || text || ('HTTP ' + res.status));
+    return parsed ?? text;
   };
 
   const pickFile = async (e) => {
@@ -16963,21 +16998,52 @@ function VoiceNotesModule({ plant, me }) {
     await runCompression([...originalFiles, ...list]);
   };
 
+  // Transcribe one mp3 chunk via the edge function (mode=transcribe).
+  const transcribeChunk = async (blob, idx) => {
+    const fd = new FormData();
+    fd.set('audio', blob, 'chunk-' + (idx + 1) + '.mp3');
+    fd.set('plant_id', plant.id);
+    fd.set('mode', 'transcribe');
+    if (hintSubject.trim()) fd.set('hint_subject', hintSubject.trim());
+    const data = await invokeFn('extract-meeting-actions', { method: 'POST', body: fd });
+    return data.transcript || '';
+  };
+
   const extract = async () => {
-    if (!file) return;
-    setBusy(true); setError(''); setPhase('uploading');
+    if (!preppedChunks) return;
+    const chunks = preppedChunks.chunks;
+    setBusy(true); setError(''); setPhase('uploading'); setChunksDone(0);
     try {
-      const fd = new FormData();
-      fd.set('audio', file, file.name);
-      fd.set('plant_id', plant.id);
-      if (hintSubject.trim()) fd.set('hint_subject', hintSubject.trim());
+      // Run up to 3 chunks at once -- balances throughput vs OpenAI rate
+      // limits, and stays well under any individual edge function's 150s
+      // wall clock since each call is one Whisper translation only.
+      const limit = 3;
+      const transcripts = new Array(chunks.length).fill('');
+      let next = 0;
+      const workers = Array.from({ length: Math.min(limit, chunks.length) }, async () => {
+        while (true) {
+          const myIdx = next++;
+          if (myIdx >= chunks.length) return;
+          transcripts[myIdx] = await transcribeChunk(chunks[myIdx], myIdx);
+          setChunksDone(d => d + 1);
+        }
+      });
+      await Promise.all(workers);
+
+      // Join chunk transcripts with explicit markers so the AI can tell
+      // chunk boundaries apart from real silences.
+      const joined = transcripts.map((t, i) => chunks.length > 1 ? `[Part ${i + 1}]\n${t}` : t).join('\n\n').trim();
+      if (!joined) throw new Error('Whisper returned empty text. The recording may be silent.');
+
       setPhase('extracting');
-      const { data, error: err } = await sb.functions.invoke('extract-meeting-actions', { body: fd });
-      if (err) throw err;
-      if (data?.error) throw new Error(data.error);
+      const data = await invokeFn('extract-meeting-actions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transcript: joined, plant_id: plant.id }),
+      });
       const ext = data.extraction || {};
       setExtraction(ext);
-      setTranscript(data.transcript || '');
+      setTranscript(joined);
       setSubject(ext.subject || hintSubject || 'Meeting · ' + meetingDate);
       setSummary(ext.summary || '');
       setDecisions(Array.isArray(ext.decisions) ? ext.decisions.map((d, i) => (i + 1) + '. ' + d).join('\n') : '');
@@ -17052,6 +17118,7 @@ function VoiceNotesModule({ plant, me }) {
     setSubject(''); setSummary(''); setDecisions(''); setSavedMeetingId(null);
     setHintSubject(''); setExternalOrgName(''); setPhase('idle');
     setCompressing(false); setCompressStage('');
+    setPreppedChunks(null); setChunksDone(0);
     if (fileRef.current) fileRef.current.value = '';
   };
 
@@ -17114,7 +17181,7 @@ function VoiceNotesModule({ plant, me }) {
 
           ${file && !compressing && html`
             <div style="background:var(--teal-50);border:1px solid var(--teal-200);padding:10px 12px;border-radius:6px;margin-bottom:10px;font-size:12px">
-              ✓ Ready to upload · <b>${(file.size/1024/1024).toFixed(1)} MB</b> stitched mp3 · was <b>${(originalFiles.reduce((s, f) => s + f.size, 0)/1024/1024).toFixed(1)} MB</b> across ${originalFiles.length} part${originalFiles.length===1?'':'s'} · <b style="color:var(--teal-700)">${Math.round((1 - file.size / Math.max(1, originalFiles.reduce((s, f) => s + f.size, 0))) * 100)}% smaller</b>
+              ✓ Ready to translate · <b>${(file.size/1024/1024).toFixed(1)} MB</b> in <b>${preppedChunks ? preppedChunks.chunks.length : 1} chunk${preppedChunks && preppedChunks.chunks.length === 1 ? '' : 's'}</b> · ${preppedChunks ? Math.round(preppedChunks.totalDurationSec / 60) : '?'} min of audio · was <b>${(originalFiles.reduce((s, f) => s + f.size, 0)/1024/1024).toFixed(1)} MB</b> raw · <b style="color:var(--teal-700)">${Math.round((1 - file.size / Math.max(1, originalFiles.reduce((s, f) => s + f.size, 0))) * 100)}% smaller</b>
             </div>
           `}
 
@@ -17129,19 +17196,22 @@ function VoiceNotesModule({ plant, me }) {
         </div>
       `}
 
-      ${phase === 'uploading' && html`
+      ${phase === 'uploading' && preppedChunks && html`
         <div class="card" style="padding:24px;text-align:center">
           <div class="spinner" style="margin:0 auto 12px"></div>
-          <div style="font-size:13px;font-weight:600">Uploading & transcribing…</div>
-          <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Whisper translating ${file ? '(' + (file.size/1024/1024).toFixed(1) + ' MB) ' : ''}to English. ~10-30 seconds.</div>
+          <div style="font-size:13px;font-weight:600">Translating chunk ${Math.min(chunksDone + 1, preppedChunks.chunks.length)} of ${preppedChunks.chunks.length}…</div>
+          <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Up to 3 chunks run in parallel · ~${Math.max(20, Math.ceil(preppedChunks.totalDurationSec / 60 * 3))} sec total.</div>
+          <div style="margin-top:10px;background:var(--slate-100);height:6px;border-radius:3px;overflow:hidden">
+            <div style=${'background:var(--teal-500);height:100%;width:' + Math.round((chunksDone / preppedChunks.chunks.length) * 100) + '%;transition:width 200ms'}></div>
+          </div>
         </div>
       `}
 
       ${phase === 'extracting' && html`
         <div class="card" style="padding:24px;text-align:center">
           <div class="spinner" style="margin:0 auto 12px"></div>
-          <div style="font-size:13px;font-weight:600">Pulling out the action items…</div>
-          <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Whisper translating then Claude extracting structure. ~30-60 seconds total.</div>
+          <div style="font-size:13px;font-weight:600">Claude is pulling out the action items…</div>
+          <div style="font-size:11px;color:var(--slate-500);margin-top:4px">~5-15 seconds.</div>
         </div>
       `}
 
