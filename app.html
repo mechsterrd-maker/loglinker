@@ -14268,17 +14268,6 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
       <div class="card" style="background:#fef2f2;border:1px solid var(--rose-300);padding:14px;color:var(--rose-700);margin-bottom:12px;font-size:13px">⚠ ${result.error}</div>
     `}
 
-    ${result?.ok && result.stats.sheetsUsed > 0 && html`
-      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:14px;padding:14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
-        <${CutStat} num=${result.stats.sheetsUsed} label="Sheets" tickKey=${statTick} />
-        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'} label="Waste" tickKey=${statTick} />
-        ${kgPerM2 != null
-          ? html`<${CutStat} num=${((result.stats.totalPiecesAreaMm2 / 1e6) * kgPerM2).toFixed(1) + ' kg'} label="Pieces" tickKey=${statTick} />`
-          : html`<${CutStat} num=${(result.stats.totalPiecesAreaMm2 / 1e6).toFixed(2) + ' m²'} label="Pieces" tickKey=${statTick} />`}
-        ${result.stats.totalCost > 0 && html`<${CutStat} num=${'₹' + fmtNum(result.stats.totalCost.toFixed(0))} label="Stock cost" tickKey=${statTick} />`}
-      </div>
-    `}
-
     <${CutAIAnalysis} draft=${draft} setDraft=${setDraft} result=${result} plant=${plant} />
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;margin-bottom:12px">
@@ -14415,6 +14404,18 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
         </div>
       </div>
     </div>
+
+    ${/* Output goes BELOW the inputs (Marvel: "input top, output bottom"). */ ''}
+    ${result?.ok && result.stats.sheetsUsed > 0 && html`
+      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:14px;padding:14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
+        <${CutStat} num=${result.stats.sheetsUsed} label="Sheets" tickKey=${statTick} />
+        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'} label="Waste" tickKey=${statTick} />
+        ${kgPerM2 != null
+          ? html`<${CutStat} num=${((result.stats.totalPiecesAreaMm2 / 1e6) * kgPerM2).toFixed(1) + ' kg'} label="Pieces" tickKey=${statTick} />`
+          : html`<${CutStat} num=${(result.stats.totalPiecesAreaMm2 / 1e6).toFixed(2) + ' m²'} label="Pieces" tickKey=${statTick} />`}
+        ${result.stats.totalCost > 0 && html`<${CutStat} num=${'₹' + fmtNum(result.stats.totalCost.toFixed(0))} label="Stock cost" tickKey=${statTick} />`}
+      </div>
+    `}
 
     ${result?.ok && result.sheets.length > 0 && html`
       <div class="card" style="padding:14px;margin-bottom:12px">
@@ -14908,6 +14909,9 @@ function CutStat({ num, label, tickKey }) {
 // on every piece + stock row that references this material.
 function CutMaterialList({ draft, setDraft }) {
   const materials = draft.materials || [];
+  // 2D plans cut flat stock only -- round bar / angle / pipe etc. make no
+  // sense on a plate nesting plan. Marvel: "In 2D, round bar should not come."
+  const is2D = draft.plan_kind === '2d';
 
   const update = (idx, patch) => {
     const next = materials.slice();
@@ -14929,7 +14933,8 @@ function CutMaterialList({ draft, setDraft }) {
   };
   const add = () => {
     const id = 'm' + Date.now();
-    const newMat = { id, type: 'round_bar', spec: cutDefaultSpec('round_bar'), density_kg_per_m3: 7850 };
+    const defType = is2D ? 'plate' : 'round_bar';
+    const newMat = { id, type: defType, spec: cutDefaultSpec(defType), density_kg_per_m3: 7850 };
     setDraft(Object.assign({}, draft, { materials: [...materials, newMat] }));
   };
 
@@ -14940,12 +14945,15 @@ function CutMaterialList({ draft, setDraft }) {
         <div style="font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500)">Material${multi ? 's · ' + materials.length : ''}</div>
         <button class="btn small ghost" onClick=${add} style="padding:2px 7px;font-size:10px">+ Add</button>
       </div>
-      ${materials.map((m, idx) => html`<${CutMaterialRow} key=${m.id} m=${m} idx=${idx} update=${update} remove=${remove} multi=${multi} />`)}
+      ${materials.map((m, idx) => html`<${CutMaterialRow} key=${m.id} m=${m} idx=${idx} update=${update} remove=${remove} multi=${multi} is2D=${is2D} />`)}
     </div>
   `;
 }
 
-function CutMaterialRow({ m, idx, update, remove, multi }) {
+function CutMaterialRow({ m, idx, update, remove, multi, is2D }) {
+  // In a 2D plan only flat-stock types are valid (plate / sheet). Filter the
+  // dropdown so round bar, angle, pipe, channel etc. never appear.
+  const typeOptions = is2D ? CUT_MATERIAL_TYPES.filter(t => t.is2D) : CUT_MATERIAL_TYPES.filter(t => !t.is2D);
   const meta = CUT_MATERIAL_TYPES.find(x => x.value === m.type) || CUT_MATERIAL_TYPES[0];
   const isPlate = meta.is2D === true;
   const kgPerM = isPlate ? cutComputePlateKgPerM2(m.spec, m.density_kg_per_m3) : cutComputeKgPerM(m.type, m.spec, m.density_kg_per_m3);
@@ -14974,7 +14982,7 @@ function CutMaterialRow({ m, idx, update, remove, multi }) {
           <span>Type</span>
           <select value=${m.type} onChange=${e => setType(e.target.value)}
             style="border:1px solid var(--slate-200);border-radius:5px;padding:5px 8px;font-size:12px;font-family:inherit;background:white">
-            ${CUT_MATERIAL_TYPES.map(t => html`<option key=${t.value} value=${t.value}>${t.label}</option>`)}
+            ${typeOptions.map(t => html`<option key=${t.value} value=${t.value}>${t.label}</option>`)}
           </select>
         </label>
         ${meta.fields.map(field => {
