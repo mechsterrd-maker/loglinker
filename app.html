@@ -26034,19 +26034,24 @@ function VendorDetail({ plant, me, vendor: initialVendor, jobworkStock: jobworkS
   // anywhere VendorDetail is mounted.
   const [docsLocal, setDocsLocal] = useState(docsProp || null);
   const [jobworkLocal, setJobworkLocal] = useState(jobworkStockProp || null);
+  const [projectsList, setProjectsList] = useState([]);
+  const [grnList, setGrnList] = useState([]);
   const [lazyLoading, setLazyLoading] = useState(false);
   useEffect(() => {
     if (!vendor?.id || isNew) return;
-    if (docsProp && jobworkStockProp) return; // parent already supplied
     setLazyLoading(true);
     Promise.all([
       docsProp ? Promise.resolve({ data: docsProp }) :
         sb.from('mcp_logistics_documents').select('*').eq('plant_id', plant.id).eq('vendor_id', vendor.id).order('doc_date', { ascending: false }).limit(500),
       jobworkStockProp ? Promise.resolve({ data: jobworkStockProp }) :
         sb.from('v_vendor_jobwork_stock').select('*').eq('plant_id', plant.id).eq('vendor_id', vendor.id),
-    ]).then(([d, jw]) => {
+      sb.from('mcp_projects').select('id, code, name, status').eq('plant_id', plant.id),
+      sb.from('mcp_logistics_grn_receptions').select('document_id, reception_date, status').eq('plant_id', plant.id).eq('vendor_id', vendor.id),
+    ]).then(([d, jw, pr, grn]) => {
       setDocsLocal(d.data || []);
       setJobworkLocal(jw.data || []);
+      setProjectsList(pr.data || []);
+      setGrnList(grn.data || []);
     }).finally(() => setLazyLoading(false));
   }, [vendor?.id, plant.id, isNew]);
 
@@ -26109,6 +26114,74 @@ function VendorDetail({ plant, me, vendor: initialVendor, jobworkStock: jobworkS
 
   const statusBadge = (s) => s === 'paid' ? 'emerald' : (s === 'partial' || s === 'approved') ? 'amber' : (s === 'rejected' || s === 'cancelled') ? 'rose' : '';
 
+  // ── Projects this vendor has supplied to ───────────────────────────────
+  const projectIdsForVendor = new Set(docs.map(d => d.project_id).filter(Boolean));
+  const vendorProjects = projectsList.filter(p => projectIdsForVendor.has(p.id));
+
+  // ── On-time delivery from PO due_date vs GRN reception_date ────────────
+  // A PO is "delivered on time" if the linked GRN (document_id = PO id) was
+  // received on or before the PO's due_date. We only count POs that have BOTH
+  // a due_date and an arrived GRN — POs without a due date or without a GRN
+  // yet are excluded from the percentage so it isn't artificially inflated.
+  const posWithDue = docs.filter(d => d.doc_type === 'po' && d.due_date);
+  const grnByDoc = new Map(grnList.map(g => [g.document_id, g]));
+  let onTimeCount = 0, lateCount = 0, leadDaysSum = 0, leadDaysN = 0;
+  for (const po of posWithDue) {
+    const grn = grnByDoc.get(po.id);
+    if (!grn || !grn.reception_date) continue;
+    if (grn.reception_date <= po.due_date) onTimeCount++; else lateCount++;
+    if (po.doc_date) {
+      const ld = (new Date(grn.reception_date) - new Date(po.doc_date)) / 86400000;
+      if (ld >= 0 && ld < 365) { leadDaysSum += ld; leadDaysN++; }
+    }
+  }
+  const otpDenom = onTimeCount + lateCount;
+  const onTimePct = otpDenom > 0 ? Math.round((onTimeCount / otpDenom) * 100) : null;
+  const avgLeadDays = leadDaysN > 0 ? Math.round(leadDaysSum / leadDaysN) : null;
+
+  // ── Derived supplier rating (1-5 stars). Honest about why: drives off OTP
+  // only because NCRs don't link to vendors in this schema yet. When NCR
+  // vendor-linkage lands, fold quality into the score here.
+  let rating = null;
+  if (onTimePct != null) {
+    if (onTimePct >= 95) rating = 5;
+    else if (onTimePct >= 85) rating = 4;
+    else if (onTimePct >= 70) rating = 3;
+    else if (onTimePct >= 50) rating = 2;
+    else rating = 1;
+  }
+  const stars = (n) => n == null ? '—' : '★★★★★'.slice(0, n) + '☆☆☆☆☆'.slice(0, 5 - n);
+
+  // ── Pricing book: aggregate items across THIS vendor's POs / invoices.
+  // For each distinct item name: latest unit price, lowest seen, # times,
+  // most recent doc. Lets Marvel sanity-check quoted prices against history.
+  const PRICE_DOC_TYPES = new Set(['po', 'invoice_in', 'bill']);
+  const priceMap = new Map();
+  for (const d of docs) {
+    if (!PRICE_DOC_TYPES.has(d.doc_type) || !Array.isArray(d.items)) continue;
+    for (const it of d.items) {
+      const name = (it.name || it.description || '').toString().trim();
+      const rate = parseFloat(it.rate ?? it.unit_price ?? 0);
+      if (!name || !rate) continue;
+      const cur = priceMap.get(name) || { name, last_rate: null, last_date: '', min: rate, max: rate, sum: 0, n: 0, uom: it.uom || '', last_doc: '' };
+      cur.n += 1;
+      cur.sum += rate;
+      if (rate < cur.min) cur.min = rate;
+      if (rate > cur.max) cur.max = rate;
+      const dt = d.doc_date || '';
+      if (dt > cur.last_date) {
+        cur.last_date = dt;
+        cur.last_rate = rate;
+        cur.last_doc = d.doc_number || '';
+        cur.uom = it.uom || cur.uom;
+      }
+      priceMap.set(name, cur);
+    }
+  }
+  const priceBook = Array.from(priceMap.values())
+    .map(p => ({ ...p, avg: p.sum / p.n }))
+    .sort((a, b) => b.n - a.n || String(b.last_date).localeCompare(String(a.last_date)));
+
   return html`
     <div class="page-header" style="display:flex;align-items:center;gap:10px">
       <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
@@ -26145,10 +26218,53 @@ function VendorDetail({ plant, me, vendor: initialVendor, jobworkStock: jobworkS
     <div class="auth-tabs" style="margin-bottom:10px">
       <button class=${'auth-tab'+(tab==='overview'?' active':'')} onClick=${() => setTab('overview')}>Overview</button>
       <button class=${'auth-tab'+(tab==='ledger'?' active':'')} onClick=${() => setTab('ledger')}>Ledger · ${docs.length}</button>
+      ${priceBook.length > 0 && html`<button class=${'auth-tab'+(tab==='pricing'?' active':'')} onClick=${() => setTab('pricing')}>Pricing · ${priceBook.length}</button>`}
       ${jobworkStock.length > 0 && html`<button class=${'auth-tab'+(tab==='jobwork'?' active':'')} onClick=${() => setTab('jobwork')}>Job-work · ${jobworkStock.length}</button>`}
     </div>
 
     ${tab === 'overview' && html`
+      <div class="card" style="padding:12px;margin-bottom:10px">
+        <div style="font-size:11px;font-weight:700;color:var(--slate-600);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:10px">Performance</div>
+        <div style="display:grid;grid-template-columns:repeat(4, 1fr);gap:10px;font-size:12px">
+          <div>
+            <div style="color:var(--slate-500);font-size:11px">Supplier rating</div>
+            <div style="font-size:16px;font-weight:700;color:${rating==null?'var(--slate-400)':(rating>=4?'var(--emerald-600)':rating>=3?'var(--amber-600)':'var(--rose-600)')}">${stars(rating)}</div>
+            <div style="font-size:10px;color:var(--slate-500)">${rating==null ? 'no completed POs' : 'from on-time only'}</div>
+          </div>
+          <div>
+            <div style="color:var(--slate-500);font-size:11px">On-time delivery</div>
+            <div style="font-size:16px;font-weight:700">${onTimePct==null ? '—' : onTimePct + '%'}</div>
+            <div style="font-size:10px;color:var(--slate-500)">${otpDenom > 0 ? onTimeCount + ' / ' + otpDenom + ' POs' : 'needs PO + GRN with dates'}</div>
+          </div>
+          <div>
+            <div style="color:var(--slate-500);font-size:11px">Avg lead time</div>
+            <div style="font-size:16px;font-weight:700">${avgLeadDays==null ? '—' : avgLeadDays + ' d'}</div>
+            <div style="font-size:10px;color:var(--slate-500)">PO to GRN</div>
+          </div>
+          <div>
+            <div style="color:var(--slate-500);font-size:11px">Material at vendor</div>
+            <div style="font-size:16px;font-weight:700">${jobworkStock.length}</div>
+            <div style="font-size:10px;color:var(--slate-500)">open job-work lines</div>
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--slate-500);margin-top:8px;border-top:1px dashed var(--slate-200);padding-top:6px">
+          ⓘ Quality NCRs aren't linked to vendors in this schema yet, so they're not folded into the rating. They will be once we add a vendor_id column to NCRs.
+        </div>
+      </div>
+
+      ${vendorProjects.length > 0 && html`
+        <div class="card" style="padding:12px;margin-bottom:10px">
+          <div style="font-size:11px;font-weight:700;color:var(--slate-600);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:8px">Projects supplied · ${vendorProjects.length}</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px">
+            ${vendorProjects.map(p => html`
+              <span key=${p.id} style="background:var(--slate-100);color:var(--slate-800);border:1px solid var(--slate-200);border-radius:999px;padding:4px 10px;font-size:12px">
+                ${p.code ? p.code + ' · ' : ''}${p.name}${p.status === 'completed' ? ' · ✓' : ''}
+              </span>
+            `)}
+          </div>
+        </div>
+      `}
+
       <div class="card" style="padding:12px;margin-bottom:10px">
         <div style="font-size:11px;font-weight:700;color:var(--slate-600);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:10px">Spend · last 6 months</div>
         <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:6px;height:90px">
@@ -26210,6 +26326,43 @@ function VendorDetail({ plant, me, vendor: initialVendor, jobworkStock: jobworkS
           </div>
         `)
       }
+    `}
+
+    ${tab === 'pricing' && html`
+      <div class="card" style="padding:10px 12px;margin-bottom:8px;font-size:12px;color:var(--slate-700)">
+        Every line item this vendor has billed us for. Use it to sanity-check a fresh quote against past pricing.
+      </div>
+      <div class="card" style="padding:0;overflow-x:auto">
+        <table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead>
+            <tr style="background:var(--slate-50);text-align:left">
+              <th style="padding:8px 10px;border-bottom:1px solid var(--slate-200);font-weight:700">Item</th>
+              <th style="padding:8px 10px;border-bottom:1px solid var(--slate-200);font-weight:700;text-align:right">Last price</th>
+              <th style="padding:8px 10px;border-bottom:1px solid var(--slate-200);font-weight:700;text-align:right">Avg</th>
+              <th style="padding:8px 10px;border-bottom:1px solid var(--slate-200);font-weight:700;text-align:right">Min</th>
+              <th style="padding:8px 10px;border-bottom:1px solid var(--slate-200);font-weight:700;text-align:right">Max</th>
+              <th style="padding:8px 10px;border-bottom:1px solid var(--slate-200);font-weight:700;text-align:right">Buys</th>
+              <th style="padding:8px 10px;border-bottom:1px solid var(--slate-200);font-weight:700">Last doc</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${priceBook.slice(0, 300).map(p => html`
+              <tr key=${p.name} style="border-bottom:1px solid var(--slate-100)">
+                <td style="padding:7px 10px">
+                  <div style="font-weight:600">${p.name}</div>
+                  ${p.uom && html`<div style="font-size:10px;color:var(--slate-500)">per ${p.uom}</div>`}
+                </td>
+                <td style="padding:7px 10px;text-align:right;font-weight:700">₹${fmtNum(p.last_rate)}</td>
+                <td style="padding:7px 10px;text-align:right;color:var(--slate-700)">₹${fmtNum(p.avg)}</td>
+                <td style="padding:7px 10px;text-align:right;color:var(--emerald-700)">₹${fmtNum(p.min)}</td>
+                <td style="padding:7px 10px;text-align:right;color:var(--rose-700)">₹${fmtNum(p.max)}</td>
+                <td style="padding:7px 10px;text-align:right">${p.n}</td>
+                <td style="padding:7px 10px;font-size:11px;color:var(--slate-600)">${p.last_date}${p.last_doc ? ' · ' + p.last_doc : ''}</td>
+              </tr>
+            `)}
+          </tbody>
+        </table>
+      </div>
     `}
 
     ${tab === 'jobwork' && html`
