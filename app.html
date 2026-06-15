@@ -12956,6 +12956,7 @@ function ProjectTracker({ plant, me, myPerms, go }) {
   const [filter, setFilter] = useState('active');
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
+  const [cloneTarget, setCloneTarget] = useState(null);
   const [activeProject, setActiveProject] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -13026,12 +13027,16 @@ function ProjectTracker({ plant, me, myPerms, go }) {
               <span class=${'badge '+st.c}>${st.l}</span>
               <div style="font-size:13px;font-weight:700;margin-top:4px">${p.progress_pct||0}%</div>
               ${p.order_value && html`<div style="font-size:10px;color:var(--slate-500)">₹${fmtNum(p.order_value)}</div>`}
+              <button class="btn small ghost" title="Duplicate as a new project (repeat order)"
+                onClick=${e => { e.stopPropagation(); setCloneTarget(p); }}
+                style="margin-top:6px;padding:2px 8px;font-size:11px">⧉ Duplicate</button>
             </div>
           </div>
         </div>
       `; })
     }
     ${modal==='project' && html`<${ProjectModal} plant=${plant} me=${me} customers=${customers} users=${users} editTarget=${editTarget} onClose=${()=>{setModal(null);setEditTarget(null);}} onSaved=${()=>{setModal(null);setEditTarget(null);refresh();}} />`}
+    ${cloneTarget && html`<${NewProjectModal} plant=${plant} me=${me} cloneFrom=${cloneTarget} onClose=${()=>setCloneTarget(null)} onCreated=${()=>{ setCloneTarget(null); showToast('Project duplicated'); refresh(); }} />`}
   `;
 }
 
@@ -22416,18 +22421,25 @@ function HomeInstallBanner() {
 // and the iframe contract (window.self !== window.top) suppresses its own
 // landing screen and analytics chrome.
 // ============= NEW PROJECT MODAL =============
-// Marvel's request: project creation is the origin of every fab workflow. This
-// modal is intentionally TIGHT — Name, Customer, Qty, Target Date, Leader, Manager,
-// Supervisor(s). Skip Drawing/Notes per "tight" decision; they're edit-after-create.
-// Writes via create_fab_project() RPC which is admin-gated server-side too.
-function NewProjectModal({ plant, me, onClose, onCreated }) {
-  const [name, setName] = useState('');
-  const [customerId, setCustomerId] = useState('');
-  const [qty, setQty] = useState('');
-  const [targetDate, setTargetDate] = useState('');
+// Marvel's request: project creation is the origin of every fab workflow. Per
+// the 14-Jun MoM it should read like a sales order (minus shipping/customer
+// address): Name, Customer, PO number, separate Quantity + UOM, Target date,
+// Leader, Manager, Supervisors (dropdown), Notes. Writes via create_fab_project()
+// RPC which is admin-gated server-side too. Accepts an optional `cloneFrom`
+// project to pre-fill every field for repeat orders.
+const PROJECT_UOMS = ['nos', 'pcs', 'set', 'kg', 'ton', 'MT', 'litre', 'metre', 'sq.ft', 'lot'];
+
+function NewProjectModal({ plant, me, onClose, onCreated, cloneFrom }) {
+  const [name, setName] = useState(cloneFrom ? (cloneFrom.name || '') + ' (copy)' : '');
+  const [customerId, setCustomerId] = useState(cloneFrom?.customer_id || '');
+  const [poNumber, setPoNumber] = useState(cloneFrom?.po_number || '');
+  const [qty, setQty] = useState(cloneFrom?.qty != null ? String(cloneFrom.qty) : '');
+  const [uom, setUom] = useState(cloneFrom?.uom || '');
+  const [targetDate, setTargetDate] = useState(''); // repeat order gets a fresh timeline
   const [leaderId, setLeaderId] = useState('');
   const [managerId, setManagerId] = useState('');
   const [supervisorIds, setSupervisorIds] = useState(new Set());
+  const [notes, setNotes] = useState(cloneFrom?.notes || '');
   const [customers, setCustomers] = useState([]);
   const [users, setUsers] = useState([]);
   const [busy, setBusy] = useState(false);
@@ -22442,13 +22454,30 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
       ]);
       setCustomers(c.data || []);
       setUsers(u.data || []);
+      // For a clone, pull the source project's team so leader/manager/supervisors
+      // carry over (repeat orders usually reuse the same crew).
+      if (cloneFrom?.id) {
+        const { data: members } = await sb.from('mcp_project_members')
+          .select('user_id, role_label').eq('project_id', cloneFrom.id);
+        if (members) {
+          const sup = new Set();
+          for (const m of members) {
+            if (m.role_label === 'leader') setLeaderId(m.user_id);
+            else if (m.role_label === 'manager') setManagerId(m.user_id);
+            else if (m.role_label === 'supervisor') sup.add(m.user_id);
+          }
+          if (sup.size) setSupervisorIds(sup);
+        }
+      }
     })();
   }, []);
 
-  const toggleSupervisor = (id) => {
-    const next = new Set(supervisorIds);
-    if (next.has(id)) next.delete(id); else next.add(id);
-    setSupervisorIds(next);
+  const addSupervisor = (id) => {
+    if (!id) return;
+    setSupervisorIds(prev => { const next = new Set(prev); next.add(id); return next; });
+  };
+  const removeSupervisor = (id) => {
+    setSupervisorIds(prev => { const next = new Set(prev); next.delete(id); return next; });
   };
 
   const submit = async (e) => {
@@ -22463,11 +22492,15 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
         p_name: name.trim(),
         p_customer_id: customerId || null,
         p_customer_name: cust?.name || null,
-        p_qty_note: qty.trim() || null,
+        p_qty_note: null,
         p_target_date: targetDate || null,
         p_leader_id: leaderId || null,
         p_manager_id: managerId || null,
         p_supervisor_ids: Array.from(supervisorIds),
+        p_po_number: poNumber.trim() || null,
+        p_qty: qty.trim() ? parseFloat(qty) : null,
+        p_uom: uom || null,
+        p_notes: notes.trim() || null,
       });
       if (error) throw error;
       onCreated && onCreated(newId);
@@ -22487,10 +22520,11 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal" style="max-width:520px">
         <div class="modal-header">
-          <div class="modal-title">📐 New project</div>
+          <div class="modal-title">📐 ${cloneFrom ? 'Duplicate project' : 'New project'}</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
         ${err && html`<div class="alert error">${err}</div>`}
+        ${cloneFrom && html`<div style="font-size:12px;color:var(--teal-800);background:var(--teal-50);border-radius:8px;padding:8px 10px;margin-bottom:12px">⧉ Cloned from <b>${esc(cloneFrom.name)}</b> — edit any field, then create. A fresh target date and project number are assigned.</div>`}
         <form onSubmit=${submit}>
           <div class="field">
             <label>Project name *</label>
@@ -22509,50 +22543,71 @@ function NewProjectModal({ plant, me, onClose, onCreated }) {
             </div>
             ${customers.length === 0 && html`<p style="font-size:11px;color:var(--slate-500);margin-top:4px">No customers yet. Tap <b>+ New</b> to add one without leaving this page.</p>`}
           </div>
+          <div class="field">
+            <label>PO number</label>
+            <input type="text" value=${poNumber} onInput=${e => setPoNumber(e.target.value)}
+              placeholder="Customer PO / order reference" />
+          </div>
           <div class="field-row" style="display:flex;gap:10px">
-            <div class="field" style="flex:1">
-              <label>Quantity / weight</label>
-              <input type="text" value=${qty} onInput=${e => setQty(e.target.value)}
-                placeholder="e.g. 12 MT or 8 nos" />
+            <div class="field" style="flex:1.2">
+              <label>Quantity</label>
+              <input type="number" step="any" min="0" value=${qty} onInput=${e => setQty(e.target.value)}
+                placeholder="e.g. 8" />
             </div>
             <div class="field" style="flex:1">
+              <label>Unit</label>
+              <select value=${uom} onChange=${e => setUom(e.target.value)}>
+                <option value="">— UOM —</option>
+                ${PROJECT_UOMS.map(u => html`<option key=${u} value=${u}>${u}</option>`)}
+              </select>
+            </div>
+            <div class="field" style="flex:1.3">
               <label>Target completion</label>
               <input type="date" value=${targetDate} onInput=${e => setTargetDate(e.target.value)} />
             </div>
           </div>
-          <div class="field">
-            <label>Leader</label>
-            <select value=${leaderId} onChange=${e => setLeaderId(e.target.value)}>
-              <option value="">— Select leader —</option>
-              ${candidatesFor(false, true).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${roleLabel(u.role)})</option>`)}
-            </select>
-          </div>
-          <div class="field">
-            <label>Manager</label>
-            <select value=${managerId} onChange=${e => setManagerId(e.target.value)}>
-              <option value="">— Select manager —</option>
-              ${candidatesFor(true, false).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${roleLabel(u.role)})</option>`)}
-            </select>
+          <div class="field-row" style="display:flex;gap:10px">
+            <div class="field" style="flex:1">
+              <label>Leader</label>
+              <select value=${leaderId} onChange=${e => setLeaderId(e.target.value)}>
+                <option value="">— Select leader —</option>
+                ${candidatesFor(false, true).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${roleLabel(u.role)})</option>`)}
+              </select>
+            </div>
+            <div class="field" style="flex:1">
+              <label>Manager</label>
+              <select value=${managerId} onChange=${e => setManagerId(e.target.value)}>
+                <option value="">— Select manager —</option>
+                ${candidatesFor(true, false).map(u => html`<option key=${u.id} value=${u.id}>${u.full_name} (${roleLabel(u.role)})</option>`)}
+              </select>
+            </div>
           </div>
           <div class="field">
             <label>Supervisor(s)</label>
-            <div style="border:1px solid var(--slate-200);border-radius:8px;padding:6px;max-height:140px;overflow-y:auto">
-              ${users.filter(u => u.id !== leaderId && u.id !== managerId).length === 0 && html`
-                <div style="padding:10px;color:var(--slate-500);font-size:12px">No other team members available. Invite supervisors first in People.</div>
-              `}
-              ${users.filter(u => u.id !== leaderId && u.id !== managerId).map(u => html`
-                <label key=${u.id} style="display:flex;align-items:center;gap:10px;padding:7px 8px;cursor:pointer;border-radius:6px"
-                  onMouseOver=${e => { e.currentTarget.style.background = 'var(--slate-50)'; }}
-                  onMouseOut=${e => { e.currentTarget.style.background = 'transparent'; }}>
-                  <input type="checkbox" checked=${supervisorIds.has(u.id)} onChange=${() => toggleSupervisor(u.id)} />
-                  <div style="flex:1;min-width:0;font-size:13px">${u.full_name} <span style="color:var(--slate-400);font-weight:400">· ${u.role}</span></div>
-                </label>
-              `)}
-            </div>
-            <p style="font-size:11px;color:var(--slate-500);margin-top:6px">Pick any number. Phase 3 will use this to scope what each supervisor sees of this project.</p>
+            <select value="" onChange=${e => { addSupervisor(e.target.value); e.target.value = ''; }}>
+              <option value="">+ Add supervisor…</option>
+              ${users.filter(u => u.id !== leaderId && u.id !== managerId && !supervisorIds.has(u.id)).map(u => html`
+                <option key=${u.id} value=${u.id}>${u.full_name} (${roleLabel(u.role)})</option>`)}
+            </select>
+            ${supervisorIds.size > 0 && html`
+              <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+                ${Array.from(supervisorIds).map(id => {
+                  const u = users.find(x => x.id === id);
+                  return html`<span key=${id} style="display:inline-flex;align-items:center;gap:6px;background:var(--teal-50);color:var(--teal-800);border:1px solid var(--teal-200);border-radius:999px;padding:4px 6px 4px 10px;font-size:12px">
+                    ${u ? u.full_name : '—'}
+                    <button type="button" onClick=${() => removeSupervisor(id)} style="background:none;border:0;color:var(--teal-600);cursor:pointer;font-size:14px;line-height:1;padding:0 2px">×</button>
+                  </span>`;
+                })}
+              </div>
+            `}
+          </div>
+          <div class="field">
+            <label>Notes</label>
+            <textarea rows=${2} value=${notes} onInput=${e => setNotes(e.target.value)}
+              placeholder="Repeat order ref, set breakdown, special instructions…"></textarea>
           </div>
           <button class="btn" type="submit" disabled=${busy} style="width:100%;margin-top:6px">
-            ${busy ? 'Creating…' : 'Create project'}
+            ${busy ? 'Creating…' : (cloneFrom ? 'Create duplicate' : 'Create project')}
           </button>
         </form>
       </div>
