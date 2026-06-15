@@ -15632,6 +15632,11 @@ function CutStat({ num, label, tickKey }) {
 // on every piece + stock row that references this material.
 function CutMaterialList({ draft, setDraft }) {
   const materials = draft.materials || [];
+  // Collapsed by default — Marvel wants a simpler form. The full type/
+  // thickness/density editor only shows when the user taps the summary
+  // chip. Once expanded, state survives drafts via the draft itself
+  // (no persistence — fresh expand on next plan).
+  const [expanded, setExpanded] = useState(false);
 
   const update = (idx, patch) => {
     const next = materials.slice();
@@ -15655,14 +15660,38 @@ function CutMaterialList({ draft, setDraft }) {
     const id = 'm' + Date.now();
     const newMat = { id, type: 'round_bar', spec: cutDefaultSpec('round_bar'), density_kg_per_m3: 7850 };
     setDraft(Object.assign({}, draft, { materials: [...materials, newMat] }));
+    setExpanded(true); // jump straight into editing the new material
   };
 
   const multi = materials.length > 1;
+
+  // COLLAPSED: a single-line chip row — Marvel's "simpler" ask.
+  if (!expanded) {
+    return html`
+      <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding-bottom:10px;margin-bottom:10px;border-bottom:1px solid var(--slate-100)">
+        <span style="font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500);margin-right:2px">Material${multi ? 's' : ''}</span>
+        ${materials.map(m => {
+          const color = cutMaterialColor(m.id);
+          const label = cutFormatMaterialLabel(m.type, m.spec);
+          return html`
+            <span key=${m.id} style=${'display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:999px;background:'+color+';color:white;font-size:11px;font-weight:700'}>${label}</span>
+          `;
+        })}
+        <button class="btn small ghost" onClick=${() => setExpanded(true)} style="padding:3px 8px;font-size:11px">✏️ Edit</button>
+        <button class="btn small ghost" onClick=${add} style="padding:3px 8px;font-size:11px">+ Material</button>
+      </div>
+    `;
+  }
+
+  // EXPANDED: the full editor (existing behaviour) plus a Done button.
   return html`
     <div style=${'padding-bottom:'+(multi?'10':'12')+'px;margin-bottom:'+(multi?'10':'10')+'px;border-bottom:1px solid var(--slate-100)'}>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:${multi?'6':'8'}px">
         <div style="font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:var(--slate-500)">Material${multi ? 's · ' + materials.length : ''}</div>
-        <button class="btn small ghost" onClick=${add} style="padding:2px 7px;font-size:10px">+ Add</button>
+        <div style="display:flex;gap:6px">
+          <button class="btn small ghost" onClick=${add} style="padding:2px 7px;font-size:10px">+ Add</button>
+          <button class="btn small" onClick=${() => setExpanded(false)} style="padding:2px 9px;font-size:10px">Done</button>
+        </div>
       </div>
       ${materials.map((m, idx) => html`<${CutMaterialRow} key=${m.id} m=${m} idx=${idx} update=${update} remove=${remove} multi=${multi} />`)}
     </div>
