@@ -13827,27 +13827,31 @@ function planSingleSheet({ pieces, stocks, kerfMm }) {
   // hole, so the recovered piece is "free": it stops occupying its previous
   // spot on the sheet. Empty sheets get dropped.
   const usableHole = (innerMm) => Math.max(0, Number(innerMm) - 2 * k);
-  // Whether `cand` would still fit if we add it as the (existing + 1)th
-  // piece nested inside a hole of Ø holeMm. We pack into a grid inside the
-  // inscribed square of the hole (side = holeØ / √2); cell size shrinks as
-  // we add more pieces, so this is honest: refusing a piece once cells
-  // would have to be smaller than its actual dimensions.
-  const fitsInHole = (cand, holeMm, alreadyNested) => {
+  // Whether `cand` would still fit if added to the existing nestedList.
+  // Two checks:
+  //   1. Individual dimension fit — the piece's bounding circle ≤ hole.
+  //   2. Cumulative area fit — total area of (existing + this) ≤ 80% of
+  //      hole area. 80% mimics hexagonal-packing density (~90.7%) with
+  //      headroom for kerfs between nested pieces.
+  // This is more honest than the strict grid approach: a single big piece
+  // can fill the whole hole, while many small pieces share the area budget.
+  const pieceArea = (shape, w, h) => {
+    if (shape === 'round') return Math.PI * (w / 2) * (w / 2);
+    if (shape === 'ring')  return Math.PI * (w / 2) * (w / 2); // outer disc area; the inner hole is its own thing
+    return w * h;
+  };
+  const fitsInHole = (cand, holeMm, existing) => {
     const D = usableHole(holeMm);
     if (D <= 0) return false;
-    const N = (alreadyNested || 0) + 1;
-    const cols = Math.ceil(Math.sqrt(N));
-    const rows = Math.ceil(N / cols);
-    const inscribedSide = D / Math.SQRT2;
-    const cellW = inscribedSide / cols;
-    const cellH = inscribedSide / rows;
     const w = cand.origW || cand.w || 0;
     const h = cand.origH || cand.h || 0;
-    if (cand.shape === 'round') return w <= Math.min(cellW, cellH);
-    // Allow ring-in-ring: outer Ø of inner ring must fit its cell.
-    if (cand.shape === 'ring') return w <= Math.min(cellW, cellH);
-    // Rect: try both orientations.
-    return (w <= cellW && h <= cellH) || (h <= cellW && w <= cellH);
+    if (w <= 0 || h <= 0) return false;
+    const isCircular = cand.shape === 'round' || cand.shape === 'ring';
+    const fits = isCircular ? (w <= D) : (Math.sqrt(w * w + h * h) <= D);
+    if (!fits) return false;
+    const holeArea = Math.PI * (D / 2) * (D / 2);
+    const existingArea = (existing || []).reduce((s, np) => s + pieceArea(np.shape, np.origW || 0, np.origH || 0), 0);
+    return (existingArea + pieceArea(cand.shape, w, h)) <= holeArea * 0.80;
   };
   // Snapshot ring placements BEFORE we start absorbing, because splicing
   // pieces out of sheets later would invalidate a lazy traversal.
@@ -13859,32 +13863,68 @@ function planSingleSheet({ pieces, stocks, kerfMm }) {
   }
   // Per ring: keep absorbing the largest fitting piece until nothing more
   // fits. Cap at 12 nested pieces per ring to bound the search.
-  for (const ringPl of ringRefs) {
-    for (let pass = 0; pass < 20; pass++) {
-      const nestedCount = (ringPl.nestedInside || []).length;
-      let best = null;
-      for (const sheet of sheets) {
-        for (let i = 0; i < sheet.placed.length; i++) {
-          const cand = sheet.placed[i];
-          if (cand === ringPl) continue;
-          // A piece that's hosting nested pieces of its own can still be
-          // nested into a larger ring (rings inside rings inside rings) —
-          // pessimistic test: it must fit cell at its outer dimensions.
-          if (!fitsInHole(cand, ringPl.innerMm, nestedCount)) continue;
-          const area = (cand.origW || cand.w) * (cand.origH || cand.h);
-          if (!best || area > best.area) best = { sheet, idx: i, cand, area };
-        }
+  // Process the queue iteratively. A ring that gets nested into another
+  // is removed from sheets.placed but is still a valid host candidate —
+  // its hole can absorb yet-smaller pieces. Keep absorbing until nothing
+  // moves on a full pass.
+  const tryAbsorb = (host) => {
+    let best = null;
+    for (const sheet of sheets) {
+      for (let i = 0; i < sheet.placed.length; i++) {
+        const cand = sheet.placed[i];
+        if (cand === host) continue;
+        if (!fitsInHole(cand, host.innerMm, host.nestedInside)) continue;
+        const area = (cand.origW || cand.w) * (cand.origH || cand.h);
+        if (!best || area > best.area) best = { sheet, idx: i, cand, area };
       }
-      if (!best) break;
-      if (!ringPl.nestedInside) ringPl.nestedInside = [];
-      ringPl.nestedInside.push({
-        pieceId: best.cand.pieceId, label: best.cand.label,
-        origW: best.cand.origW || best.cand.w, origH: best.cand.origH || best.cand.h,
-        shape: best.cand.shape,
-        innerMm: best.cand.innerMm || 0, // for ring-in-ring
-        nestedInside: best.cand.nestedInside || null, // carry recursive nest if any
-      });
-      best.sheet.placed.splice(best.idx, 1);
+    }
+    return best;
+  };
+  const absorbInto = (host, best) => {
+    if (!host.nestedInside) host.nestedInside = [];
+    host.nestedInside.push({
+      pieceId: best.cand.pieceId, label: best.cand.label,
+      origW: best.cand.origW || best.cand.w, origH: best.cand.origH || best.cand.h,
+      shape: best.cand.shape,
+      innerMm: best.cand.innerMm || 0,
+      nestedInside: best.cand.nestedInside || null,
+    });
+    best.sheet.placed.splice(best.idx, 1);
+  };
+  // Outer ring hosts (sheets-level): keep iterating until a full pass
+  // does no work.
+  let progress = true;
+  while (progress) {
+    progress = false;
+    for (const ringPl of ringRefs) {
+      for (let pass = 0; pass < 32; pass++) {
+        const best = tryAbsorb(ringPl);
+        if (!best) break;
+        absorbInto(ringPl, best);
+        progress = true;
+      }
+    }
+  }
+  // Recursive pass: any ring that's NOW nested inside something can also
+  // host its own pieces from the remaining sheet placements.
+  const collectNestedRings = (host, out) => {
+    for (const np of (host.nestedInside || [])) {
+      if (np.shape === 'ring' && Number(np.innerMm) > 0) out.push(np);
+      collectNestedRings(np, out);
+    }
+  };
+  progress = true;
+  while (progress) {
+    progress = false;
+    const recursiveHosts = [];
+    for (const r of ringRefs) collectNestedRings(r, recursiveHosts);
+    for (const rh of recursiveHosts) {
+      for (let pass = 0; pass < 32; pass++) {
+        const best = tryAbsorb(rh);
+        if (!best) break;
+        absorbInto(rh, best);
+        progress = true;
+      }
     }
   }
   // Drop sheets that no longer hold anything
