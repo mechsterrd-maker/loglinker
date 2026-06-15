@@ -5831,7 +5831,13 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
   // current browser supports for playback, so the user can play back their own
   // recording at minimum. Order: mp4 (Safari + new Chrome) → webm.
   const pickRecorderMime = () => {
-    const candidates = ['audio/mp4', 'audio/mp4;codecs=mp4a.40.2', 'audio/webm;codecs=opus', 'audio/webm'];
+    // Safari's only playback target is mp4/aac. BUT on Android Chrome,
+    // `audio/mp4` is supported only as opus-in-mp4, which Safari refuses
+    // silently. So we require an explicit AAC codec string before
+    // accepting mp4; otherwise fall through to webm (which is at least
+    // honest about being opus and renders the download fallback cleanly
+    // on Safari instead of a stuck 0:00 player).
+    const candidates = ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4;codecs=aac', 'audio/webm;codecs=opus', 'audio/webm'];
     for (const c of candidates) {
       try { if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(c)) return c; } catch (_) { /* ignore */ }
     }
@@ -24968,6 +24974,13 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
 // clear "Open / download" fallback so the user can still get the file.
 function VoiceNoteAtt({ url, type, duration }) {
   const [failed, setFailed] = useState(false);
+  // Safari refuses opus-in-mp4 silently — no `error` event, just a 0:00
+  // player that never plays. So we ALSO mark as failed when the metadata
+  // load reports a non-finite or zero duration.
+  const onMeta = (e) => {
+    const d = e.target?.duration;
+    if (!Number.isFinite(d) || d <= 0) setFailed(true);
+  };
   if (failed) {
     return html`
       <a href=${url} target="_blank" rel="noopener" download
@@ -24976,10 +24989,16 @@ function VoiceNoteAtt({ url, type, duration }) {
       </a>
     `;
   }
+  // Don't pass a `type` hint to Safari for opus-tagged mp4s — Safari believes
+  // the hint over file sniffing and bails out. Letting it sniff means it
+  // still rejects them, but the rejection path is the one that triggers
+  // onLoadedMetadata's duration check above.
   return html`
-    <audio controls preload="metadata" playsInline onError=${() => setFailed(true)}
+    <audio controls preload="metadata" playsInline
+           src=${url}
+           onError=${() => setFailed(true)}
+           onLoadedMetadata=${onMeta}
            style="max-width:240px;height:38px;margin-top:4px">
-      <source src=${url} type=${type || 'audio/mp4'} />
       <a href=${url} target="_blank" rel="noopener">Open voice note</a>
     </audio>
   `;
