@@ -1875,7 +1875,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${tab === 'performance'}><${PerformanceDashboards} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} myPerms=${myPerms} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} navAction=${navAction} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} myPerms=${myPerms} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
-      <${Page} active=${tab === 'masters'}><${MastersHub} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
+      <${Page} active=${tab === 'masters'}><${MastersHub} plant=${plant} me=${me} myPerms=${myPerms} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'calibration'}><${CalibrationModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'training'}><${TrainingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -6210,6 +6210,9 @@ const MASTERS_TREE = [
       { key: 'operators', icon: '👷', label: 'Operators' },
       { key: 'shifts',    icon: '⏰', label: 'Shifts' },
       { key: 'team',      icon: '🧑‍💼', label: 'Team (login users)' },
+      // Roles & matrix — gated to admins/plant-head with RBAC enforced;
+      // hidden for everyone else (the leaf is filtered out in treeCard).
+      { key: 'roles',     icon: '🗂', label: 'Roles & matrix', adminOnly: true, noCount: true },
     ],
   },
   {
@@ -6237,7 +6240,10 @@ const MASTERS_TREE = [
   },
 ];
 
-function MastersHub({ plant, me, setTab }) {
+function MastersHub({ plant, me, myPerms, setTab }) {
+  const isAdminLike = me?.role === 'admin' || me?.role === 'plant_head';
+  const canSeeRoles = isAdminLike && myPerms?.rbac_enforced;
+  const leafGate = (leaf) => leaf.adminOnly ? canSeeRoles : true;
   const [active, setActive] = useState('parts');
   const [openGroups, setOpenGroups] = useState({ people:true, production:true, inventory:true, logistics:true });
   const [search, setSearch] = useState('');
@@ -6378,6 +6384,13 @@ function MastersHub({ plant, me, setTab }) {
             list.map(s => Row({ title: s.name, sub: (s.start_time||'?') + ' → ' + (s.end_time||'?'), onClick: () => openEdit('shift', s) }))}
         `;
       }
+      case 'roles': {
+        if (!canSeeRoles) return html`<div class="card"><div class="empty"><div>Roles & matrix is for admins / plant-head when RBAC is enforced.</div></div></div>`;
+        return html`
+          <div class="section-h">🗂 Roles & matrix<a onClick=${() => setTab('people')} style="color:var(--teal-700);cursor:pointer;font-size:11px;font-weight:600">Open full People page →</a></div>
+          <${RolesTab} plant=${plant} me=${me} />
+        `;
+      }
       case 'team': {
         const list = filterRows(users, ['full_name','phone','email','role']);
         const openInvite = () => { console.log('[Masters] Open InviteModal'); setEditTarget(null); setModal('invite'); };
@@ -6472,7 +6485,9 @@ function MastersHub({ plant, me, setTab }) {
     <div class="card" style=${(fullWidth ? 'width:100%;' : 'flex:0 0 240px;max-height:80vh;overflow-y:auto;') + 'max-width:100%;padding:8px 6px;box-sizing:border-box'}>
       ${MASTERS_TREE.map(group => {
         const open = openGroups[group.key] !== false;
-        const hasActive = !isMobile && group.leaves.some(l => l.key === active);
+        const visibleLeaves = group.leaves.filter(leafGate);
+        if (visibleLeaves.length === 0) return null;
+        const hasActive = !isMobile && visibleLeaves.some(l => l.key === active);
         return html`
           <div key=${group.key} style=${'margin-bottom:'+(open?'6':'2')+'px'}>
             <div onClick=${() => setOpenGroups(prev => ({...prev, [group.key]: !open}))} style=${'padding:'+(fullWidth?'10':'6')+'px 10px;cursor:pointer;display:flex;align-items:center;gap:6px;font-size:'+(fullWidth?'14':'12')+'px;font-weight:700;color:'+(hasActive?'var(--teal-700)':'var(--slate-700)')+';border-radius:5px;background:'+(hasActive?'var(--teal-50)':'transparent')}>
@@ -6481,13 +6496,13 @@ function MastersHub({ plant, me, setTab }) {
               <span style="font-size:10px;color:var(--slate-400)">${open?'▾':'▸'}</span>
             </div>
             ${open && html`<div style="margin-left:8px">
-              ${group.leaves.map(leaf => {
+              ${visibleLeaves.map(leaf => {
                 const isActive = !isMobile && leaf.key === active;
                 return html`
                   <div key=${leaf.key} onClick=${() => { setActive(leaf.key); setMobileOpen(true); }} style=${'padding:'+(fullWidth?'11':'5')+'px 10px '+(fullWidth?'11':'5')+'px 16px;cursor:pointer;font-size:'+(fullWidth?'14':'12')+'px;display:flex;align-items:center;gap:8px;border-left:2px solid '+(isActive?'var(--teal-600)':'transparent')+';background:'+(isActive?'var(--teal-50)':'transparent')+';color:'+(isActive?'var(--teal-800)':'var(--slate-700)')+';font-weight:'+(isActive?'600':'400')}>
                     <span>${leaf.icon}</span>
                     <span style="flex:1">${leaf.label}</span>
-                    <span style=${'font-size:10px;color:var(--slate-500);background:'+(isActive?'white':'var(--slate-100)')+';padding:1px 6px;border-radius:999px;font-weight:600'}>${counts[leaf.key] ?? 0}</span>
+                    ${!leaf.noCount && html`<span style=${'font-size:10px;color:var(--slate-500);background:'+(isActive?'white':'var(--slate-100)')+';padding:1px 6px;border-radius:999px;font-weight:600'}>${counts[leaf.key] ?? 0}</span>`}
                     ${isMobile && html`<span style="color:var(--slate-300);font-size:16px">›</span>`}
                   </div>
                 `;
