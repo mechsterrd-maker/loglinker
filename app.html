@@ -15031,24 +15031,9 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
     </div>
     ${showPOModal && html`<${CutGeneratePOModal} draft=${draft} plant=${plant} me=${me} onClose=${() => setShowPOModal(false)} />`}
 
-    ${result?.ok && result.smartPick && html`<${CutSmartPickCaption} smartPick=${result.smartPick} dim="2d" procurement=${draft.procurement_mode === true} />`}
-
     ${result?.ok === false && html`
       <div class="card" style="background:#fef2f2;border:1px solid var(--rose-300);padding:14px;color:var(--rose-700);margin-bottom:12px;font-size:13px">⚠ ${result.error}</div>
     `}
-
-    ${result?.ok && result.stats.sheetsUsed > 0 && html`
-      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:14px;padding:14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
-        <${CutStat} num=${result.stats.sheetsUsed} label="Sheets" tickKey=${statTick} />
-        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'} label="Waste" tickKey=${statTick} />
-        ${kgPerM2 != null
-          ? html`<${CutStat} num=${((result.stats.totalPiecesAreaMm2 / 1e6) * kgPerM2).toFixed(1) + ' kg'} label="Pieces" tickKey=${statTick} />`
-          : html`<${CutStat} num=${(result.stats.totalPiecesAreaMm2 / 1e6).toFixed(2) + ' m²'} label="Pieces" tickKey=${statTick} />`}
-        ${result.stats.totalCost > 0 && html`<${CutStat} num=${'₹' + fmtNum(result.stats.totalCost.toFixed(0))} label="Stock cost" tickKey=${statTick} />`}
-      </div>
-    `}
-
-    <${CutAIAnalysis} draft=${draft} setDraft=${setDraft} result=${result} plant=${plant} />
 
     <div style="display:grid;grid-template-columns:1fr;gap:10px;margin-bottom:12px">
       <div class="card" style="padding:12px">
@@ -15061,8 +15046,8 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
             <th style="text-align:right;padding:4px 2px;width:62px" title="Plate thickness — type any value, a matching material is created or reused automatically">Thick (mm)</th>
             <th style="text-align:left;padding:4px 2px;width:78px" title="Rectangular plate, round disc, or ring (washer)">Shape</th>
             <th style="text-align:left;padding:4px 2px">Label</th>
-            <th style="text-align:right;padding:4px 2px;width:54px" title="Width (rect) or outer diameter (round/ring)">W / Ø</th>
-            <th style="text-align:right;padding:4px 2px;width:54px" title="Height (rect) or inner diameter (ring)">H / Ø in</th>
+            <th style="text-align:right;padding:4px 2px;width:62px" title="Rect: width · Round: diameter · Ring: outer diameter (OD)">W / Ø / OD</th>
+            <th style="text-align:right;padding:4px 2px;width:62px" title="Rect: height · Round: auto-mirrors OD · Ring: inner diameter (ID) — the hole">H / ID</th>
             <th style="text-align:right;padding:4px 2px;width:42px">Qty</th>
             <th style="text-align:left;padding:4px 2px;width:90px" title="Pin this piece to a specific sheet size, or leave Auto">Sheet</th>
             <th style="text-align:center;padding:4px 2px;width:32px" title="Allow rotation 90°">↻</th>
@@ -15083,11 +15068,27 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
                   <span style=${'width:10px;height:10px;border-radius:'+(p.shape==='round'||p.shape==='ring'?'50%':'3px')+';flex-shrink:0;background:' + colorFor(p.id) + (p.shape === 'ring' ? ';box-shadow:inset 0 0 0 2px white' : '')}></span>
                   <input type="text" value=${p.label} onChange=${e => updatePiece(idx, 'label', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px" />
                 </div></td>
-                <td data-label="W / Ø mm" style="padding:3px 2px"><input type="number" value=${p.widthMm} onChange=${e => updatePiece(idx, 'widthMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
-                <td data-label=${p.shape === 'ring' ? 'Inner Ø mm' : 'H mm'} style="padding:3px 2px">
-                  ${p.shape === 'ring'
-                    ? html`<input type="number" value=${p.innerMm ?? Math.max(0, (Number(p.widthMm) || 0) / 2)} onChange=${e => updatePiece(idx, 'innerMm', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" title="Inner diameter (the hole). Other small pieces could be nested inside this hole in a future planner update." />`
-                    : html`<input type="number" value=${p.heightMm} onChange=${e => updatePiece(idx, 'heightMm', e.target.value)} disabled=${p.shape === 'round'} style=${'width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right;background:' + (p.shape === 'round' ? 'var(--slate-100)' : 'white') + ';color:' + (p.shape === 'round' ? 'var(--slate-500)' : 'inherit')} title=${p.shape === 'round' ? 'For round pieces, H follows the diameter automatically' : 'Height (mm)'} />`}
+                <td data-label=${p.shape === 'ring' ? 'OD mm' : (p.shape === 'round' ? 'Ø mm' : 'W mm')} style="padding:3px 2px">
+                  <div style="position:relative">
+                    <input type="number" value=${p.widthMm} onChange=${e => updatePiece(idx, 'widthMm', e.target.value)}
+                      placeholder=${p.shape === 'ring' ? 'OD' : (p.shape === 'round' ? 'Ø' : 'W')}
+                      title=${p.shape === 'ring' ? 'Outer diameter (OD)' : (p.shape === 'round' ? 'Diameter (Ø)' : 'Width (mm)')}
+                      style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 22px 3px 6px;font-size:12px;text-align:right" />
+                    <span style="position:absolute;right:5px;top:50%;transform:translateY(-50%);font-size:9px;color:var(--slate-400);font-weight:700;pointer-events:none">${p.shape === 'ring' ? 'OD' : (p.shape === 'round' ? 'Ø' : 'W')}</span>
+                  </div>
+                </td>
+                <td data-label=${p.shape === 'ring' ? 'ID mm' : 'H mm'} style="padding:3px 2px">
+                  <div style="position:relative">
+                    ${p.shape === 'ring'
+                      ? html`<input type="number" value=${p.innerMm ?? Math.max(0, (Number(p.widthMm) || 0) / 2)} onChange=${e => updatePiece(idx, 'innerMm', e.target.value)}
+                          placeholder="ID" title="Inner diameter (ID) — the hole. Future planner update can nest smaller pieces inside this hole."
+                          style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 22px 3px 6px;font-size:12px;text-align:right" />`
+                      : html`<input type="number" value=${p.heightMm} onChange=${e => updatePiece(idx, 'heightMm', e.target.value)} disabled=${p.shape === 'round'}
+                          placeholder=${p.shape === 'round' ? '=Ø' : 'H'}
+                          style=${'width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 22px 3px 6px;font-size:12px;text-align:right;background:' + (p.shape === 'round' ? 'var(--slate-100)' : 'white') + ';color:' + (p.shape === 'round' ? 'var(--slate-500)' : 'inherit')}
+                          title=${p.shape === 'round' ? 'For round pieces, H mirrors the diameter automatically' : 'Height (mm)'} />`}
+                    <span style="position:absolute;right:5px;top:50%;transform:translateY(-50%);font-size:9px;color:var(--slate-400);font-weight:700;pointer-events:none">${p.shape === 'ring' ? 'ID' : 'H'}</span>
+                  </div>
                 </td>
                 <td data-label="Qty" style="padding:3px 2px"><input type="number" value=${p.qty} onChange=${e => updatePiece(idx, 'qty', e.target.value)} style="width:100%;border:1px solid var(--slate-200);border-radius:4px;padding:3px 6px;font-size:12px;text-align:right" /></td>
                 <td data-label="Sheet" style="padding:3px 2px">
@@ -15186,6 +15187,24 @@ function CutPlannerEditor2D({ draft, setDraft, plant, me, onSaved, onBack }) {
         </div>
       </div>
     </div>
+
+    <!-- ALL RESULT BLOCKS BELOW THE INPUTS — Marvel asked for results to
+         appear after the input forms, not above them. Smart pick, stats
+         ribbon (weight / waste), AI analysis, layout SVG, cutting list. -->
+    ${result?.ok && result.smartPick && html`<${CutSmartPickCaption} smartPick=${result.smartPick} dim="2d" procurement=${draft.procurement_mode === true} />`}
+
+    ${result?.ok && result.stats.sheetsUsed > 0 && html`
+      <div class="card cut-ribbon" style=${'display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:14px;padding:14px;margin-bottom:12px;background:'+ribbonGrad+';color:white;border:none'}>
+        <${CutStat} num=${result.stats.sheetsUsed} label="Sheets" tickKey=${statTick} />
+        <${CutStat} num=${result.stats.wastePct.toFixed(1) + '%'} label="Waste" tickKey=${statTick} />
+        ${kgPerM2 != null
+          ? html`<${CutStat} num=${((result.stats.totalPiecesAreaMm2 / 1e6) * kgPerM2).toFixed(1) + ' kg'} label="Pieces" tickKey=${statTick} />`
+          : html`<${CutStat} num=${(result.stats.totalPiecesAreaMm2 / 1e6).toFixed(2) + ' m²'} label="Pieces" tickKey=${statTick} />`}
+        ${result.stats.totalCost > 0 && html`<${CutStat} num=${'₹' + fmtNum(result.stats.totalCost.toFixed(0))} label="Stock cost" tickKey=${statTick} />`}
+      </div>
+    `}
+
+    <${CutAIAnalysis} draft=${draft} setDraft=${setDraft} result=${result} plant=${plant} />
 
     ${result?.ok && result.sheets.length > 0 && html`
       <div class="card" style="padding:14px;margin-bottom:12px">
