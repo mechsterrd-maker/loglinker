@@ -13820,9 +13820,61 @@ function planSingleSheet({ pieces, stocks, kerfMm }) {
     sheets.push(newSheet);
   }
 
+  // ── SMART NESTING ─────────────────────────────────────────────────────
+  // For each ring with a hole, find the largest non-ring placement
+  // anywhere that fits inscribed in the hole (diagonal ≤ hole Ø − 2 × kerf)
+  // and absorb it. The ring's bounding box on the sheet already covers the
+  // hole, so the recovered piece is "free": it stops occupying its previous
+  // spot on the sheet. Empty sheets get dropped.
+  const usableHole = (innerMm) => Math.max(0, Number(innerMm) - 2 * k);
+  const fitsInHole = (cand, holeMm) => {
+    const D = usableHole(holeMm);
+    if (D <= 0) return false;
+    const w = cand.origW || cand.w || 0;
+    const h = cand.origH || cand.h || 0;
+    if (cand.shape === 'round') return w <= D;
+    if (cand.shape === 'ring') return false; // skip ring-in-ring for now
+    return Math.sqrt(w * w + h * h) <= D; // rect inscribed in circle
+  };
+  for (const ring of sheets.flatMap(s => s.placed.filter(p => p.shape === 'ring' && Number(p.innerMm) > 0).map(p => ({ sheet: s, placement: p })))) {
+    let best = null;
+    for (const sheet of sheets) {
+      for (let i = 0; i < sheet.placed.length; i++) {
+        const cand = sheet.placed[i];
+        if (cand === ring.placement) continue;
+        if (cand.nestedInside?.length) continue;
+        if (!fitsInHole(cand, ring.placement.innerMm)) continue;
+        const area = (cand.origW || cand.w) * (cand.origH || cand.h);
+        if (!best || area > best.area) best = { sheet, idx: i, cand, area };
+      }
+    }
+    if (best) {
+      if (!ring.placement.nestedInside) ring.placement.nestedInside = [];
+      ring.placement.nestedInside.push({
+        pieceId: best.cand.pieceId, label: best.cand.label,
+        origW: best.cand.origW || best.cand.w, origH: best.cand.origH || best.cand.h,
+        shape: best.cand.shape,
+      });
+      best.sheet.placed.splice(best.idx, 1);
+    }
+  }
+  // Drop sheets that no longer hold anything
+  for (let i = sheets.length - 1; i >= 0; i--) {
+    if (sheets[i].placed.length === 0) sheets.splice(i, 1);
+  }
+
   let totalStockArea = 0, totalPiecesArea = 0, totalCost = 0;
   const enriched = sheets.map((s, idx) => {
-    const usedArea = s.placed.reduce((sum, p) => sum + p.w * p.h, 0);
+    const usedArea = s.placed.reduce((sum, p) => {
+      let area = p.w * p.h;
+      // Honest accounting: a nested piece's bounding box is recovered from
+      // the ring's hole — count it as 'used' too so removing it from the
+      // sheet doesn't dishonestly inflate the waste %.
+      if (p.nestedInside?.length) {
+        for (const np of p.nestedInside) area += (Number(np.origW) || 0) * (Number(np.origH) || 0);
+      }
+      return sum + area;
+    }, 0);
     const stockArea = s.stockW * s.stockH;
     totalStockArea += stockArea;
     totalPiecesArea += usedArea;
@@ -15334,7 +15386,23 @@ function CutSheetSvg({ sheet, colorFor }) {
                   stroke=${p.nestedInside?.length ? '#10b981' : '#f43f5e'}
                   stroke-dasharray="3 3" stroke-width="1">
                   <title>${p.nestedInside?.length ? 'Hole reused for ' + p.nestedInside.length + ' nested piece' + (p.nestedInside.length === 1 ? '' : 's') : 'Inner waste · Ø' + (p.innerMm || 0) + ' mm hole'}</title>
-                </circle>`}`
+                </circle>`}
+                ${(p.nestedInside || []).map((np, ni) => {
+                  const npColor = colorFor(np.pieceId);
+                  const cx = x + w/2;
+                  const cy = y + h/2;
+                  const npW = (np.origW || 0) * scale;
+                  const npH = (np.origH || 0) * scale;
+                  const npIsCircular = np.shape === 'round' || np.shape === 'ring';
+                  return html`
+                    <g key=${'nest-' + ni}>
+                      ${npIsCircular
+                        ? html`<circle cx=${cx} cy=${cy} r=${Math.min(npW, npH) / 2} fill=${npColor} opacity="0.9" stroke="white" stroke-width="1"><title>${np.label} · nested in ${p.label}</title></circle>`
+                        : html`<rect x=${cx - npW/2} y=${cy - npH/2} width=${npW} height=${npH} fill=${npColor} opacity="0.9" stroke="white" stroke-width="1"><title>${np.label} · nested in ${p.label}</title></rect>`}
+                      ${npW > 36 && html`<text x=${cx} y=${cy} font-size=${Math.max(8, Math.min(11, npW/8))} font-weight="700" fill="white" text-anchor="middle" dominant-baseline="middle" pointer-events="none">${np.label}</text>`}
+                    </g>
+                  `;
+                })}`
               : isRound
               ? html`<circle class="sheet-rect" style=${'animation-delay:' + (i * 0.05) + 's'}
                   cx=${x + w/2} cy=${y + h/2} r=${Math.min(w, h)/2} fill=${color} opacity="0.9" stroke="white" stroke-width="1">
