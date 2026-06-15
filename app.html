@@ -6264,6 +6264,8 @@ function MastersHub({ plant, me, setTab }) {
   // Generic row click → open edit modal
   const openEdit = (type, row) => { setEditTarget(row); setModal(type); };
   const openAdd  = (type)       => { setEditTarget(null); setModal(type); };
+  // For party masters we want a dashboard view on row tap, not the edit form.
+  const [detailVendor, setDetailVendor] = useState(null);
   const closeModal = () => { setModal(null); setEditTarget(null); };
   const saveModal  = () => { closeModal(); refresh(); };
 
@@ -6407,9 +6409,9 @@ function MastersHub({ plant, me, setTab }) {
         const list = filterRows(vendors, ['name','gstin','city']);
         return html`
           <${SectionHeader} icon="🏪" title="Vendors" n=${vendors.length} onAdd=${() => openAdd('vendor')} />
-          <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Add manually or let approved invoices auto-create them. Tap any row to edit (GSTIN, address, payment terms, job-work flag).</div>
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Add manually or let approved invoices auto-create them. Tap any row to open the vendor dashboard — ledger, spend trend, document mix and outstanding.</div>
           ${list.length === 0 ? Empty({ icon:'🏪', msg:'No vendors yet', addLabel:'+ Add vendor', onAdd:() => openAdd('vendor') }) :
-            list.map(v => Row({ title: v.name + (v.is_jobwork_vendor?' · JW':''), sub: (v.gstin||'no gstin') + (v.city?' · '+v.city:''), onClick: () => openEdit('vendor', v) }))}
+            list.map(v => Row({ title: v.name + (v.is_jobwork_vendor?' · JW':''), sub: (v.gstin||'no gstin') + (v.city?' · '+v.city:''), onClick: () => setDetailVendor(v) }))}
         `;
       }
       case 'customers': {
@@ -6461,6 +6463,10 @@ function MastersHub({ plant, me, setTab }) {
       <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search this master…" style="width:100%;padding:8px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
     </div>
   `;
+
+  if (detailVendor) {
+    return html`<${VendorDetail} plant=${plant} me=${me} vendor=${detailVendor} onClose=${() => { setDetailVendor(null); refresh && refresh(); }} />`;
+  }
 
   return html`
     <div class="page-header"><div><h1>🗂 Masters</h1><div class="sub">All master data · grouped tree · single source of truth</div></div></div>
@@ -26017,12 +26023,32 @@ function DocumentEditModal({ plant, me, doc, vendors, onClose, onSaved }) {
 }
 
 // ============= VENDOR DETAIL =============
-function VendorDetail({ plant, me, vendor: initialVendor, jobworkStock, docs, onClose }) {
+function VendorDetail({ plant, me, vendor: initialVendor, jobworkStock: jobworkStockProp, docs: docsProp, onClose }) {
   const isNew = initialVendor?._new;
   const [editing, setEditing] = useState(isNew);
   const [vendor, setVendor] = useState(isNew ? null : initialVendor);
   const [tab, setTab] = useState('overview'); // overview | ledger | jobwork
   const [ledgerFilter, setLedgerFilter] = useState('all');
+  // When opened from MastersHub the parent doesn't pre-load this vendor's
+  // documents or job-work stock — fetch lazily so the dashboard works
+  // anywhere VendorDetail is mounted.
+  const [docsLocal, setDocsLocal] = useState(docsProp || null);
+  const [jobworkLocal, setJobworkLocal] = useState(jobworkStockProp || null);
+  const [lazyLoading, setLazyLoading] = useState(false);
+  useEffect(() => {
+    if (!vendor?.id || isNew) return;
+    if (docsProp && jobworkStockProp) return; // parent already supplied
+    setLazyLoading(true);
+    Promise.all([
+      docsProp ? Promise.resolve({ data: docsProp }) :
+        sb.from('mcp_logistics_documents').select('*').eq('plant_id', plant.id).eq('vendor_id', vendor.id).order('doc_date', { ascending: false }).limit(500),
+      jobworkStockProp ? Promise.resolve({ data: jobworkStockProp }) :
+        sb.from('v_vendor_jobwork_stock').select('*').eq('plant_id', plant.id).eq('vendor_id', vendor.id),
+    ]).then(([d, jw]) => {
+      setDocsLocal(d.data || []);
+      setJobworkLocal(jw.data || []);
+    }).finally(() => setLazyLoading(false));
+  }, [vendor?.id, plant.id, isNew]);
 
   if (isNew && editing) {
     return html`<${VendorEditModal} plant=${plant} me=${me} vendor=${null} onClose=${onClose} onSaved=${(v) => { setVendor(v); setEditing(false); }} />`;
@@ -26032,6 +26058,10 @@ function VendorDetail({ plant, me, vendor: initialVendor, jobworkStock, docs, on
   if (editing) {
     return html`<${VendorEditModal} plant=${plant} me=${me} vendor=${vendor} onClose=${() => setEditing(false)} onSaved=${(v) => { setVendor(v); setEditing(false); }} />`;
   }
+
+  const docs = docsLocal || [];
+  const jobworkStock = jobworkLocal || [];
+  const dataLoaded = docsLocal !== null;
 
   // ── Roll-ups ────────────────────────────────────────────────────────────
   // Payables: invoices / bills that aren't fully settled.
