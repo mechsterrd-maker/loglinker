@@ -13827,33 +13827,62 @@ function planSingleSheet({ pieces, stocks, kerfMm }) {
   // hole, so the recovered piece is "free": it stops occupying its previous
   // spot on the sheet. Empty sheets get dropped.
   const usableHole = (innerMm) => Math.max(0, Number(innerMm) - 2 * k);
-  const fitsInHole = (cand, holeMm) => {
+  // Whether `cand` would still fit if we add it as the (existing + 1)th
+  // piece nested inside a hole of Ø holeMm. We pack into a grid inside the
+  // inscribed square of the hole (side = holeØ / √2); cell size shrinks as
+  // we add more pieces, so this is honest: refusing a piece once cells
+  // would have to be smaller than its actual dimensions.
+  const fitsInHole = (cand, holeMm, alreadyNested) => {
     const D = usableHole(holeMm);
     if (D <= 0) return false;
+    const N = (alreadyNested || 0) + 1;
+    const cols = Math.ceil(Math.sqrt(N));
+    const rows = Math.ceil(N / cols);
+    const inscribedSide = D / Math.SQRT2;
+    const cellW = inscribedSide / cols;
+    const cellH = inscribedSide / rows;
     const w = cand.origW || cand.w || 0;
     const h = cand.origH || cand.h || 0;
-    if (cand.shape === 'round') return w <= D;
-    if (cand.shape === 'ring') return false; // skip ring-in-ring for now
-    return Math.sqrt(w * w + h * h) <= D; // rect inscribed in circle
+    if (cand.shape === 'round') return w <= Math.min(cellW, cellH);
+    // Allow ring-in-ring: outer Ø of inner ring must fit its cell.
+    if (cand.shape === 'ring') return w <= Math.min(cellW, cellH);
+    // Rect: try both orientations.
+    return (w <= cellW && h <= cellH) || (h <= cellW && w <= cellH);
   };
-  for (const ring of sheets.flatMap(s => s.placed.filter(p => p.shape === 'ring' && Number(p.innerMm) > 0).map(p => ({ sheet: s, placement: p })))) {
-    let best = null;
-    for (const sheet of sheets) {
-      for (let i = 0; i < sheet.placed.length; i++) {
-        const cand = sheet.placed[i];
-        if (cand === ring.placement) continue;
-        if (cand.nestedInside?.length) continue;
-        if (!fitsInHole(cand, ring.placement.innerMm)) continue;
-        const area = (cand.origW || cand.w) * (cand.origH || cand.h);
-        if (!best || area > best.area) best = { sheet, idx: i, cand, area };
-      }
+  // Snapshot ring placements BEFORE we start absorbing, because splicing
+  // pieces out of sheets later would invalidate a lazy traversal.
+  const ringRefs = [];
+  for (const s of sheets) {
+    for (const pl of s.placed) {
+      if (pl.shape === 'ring' && Number(pl.innerMm) > 0) ringRefs.push(pl);
     }
-    if (best) {
-      if (!ring.placement.nestedInside) ring.placement.nestedInside = [];
-      ring.placement.nestedInside.push({
+  }
+  // Per ring: keep absorbing the largest fitting piece until nothing more
+  // fits. Cap at 12 nested pieces per ring to bound the search.
+  for (const ringPl of ringRefs) {
+    for (let pass = 0; pass < 20; pass++) {
+      const nestedCount = (ringPl.nestedInside || []).length;
+      let best = null;
+      for (const sheet of sheets) {
+        for (let i = 0; i < sheet.placed.length; i++) {
+          const cand = sheet.placed[i];
+          if (cand === ringPl) continue;
+          // A piece that's hosting nested pieces of its own can still be
+          // nested into a larger ring (rings inside rings inside rings) —
+          // pessimistic test: it must fit cell at its outer dimensions.
+          if (!fitsInHole(cand, ringPl.innerMm, nestedCount)) continue;
+          const area = (cand.origW || cand.w) * (cand.origH || cand.h);
+          if (!best || area > best.area) best = { sheet, idx: i, cand, area };
+        }
+      }
+      if (!best) break;
+      if (!ringPl.nestedInside) ringPl.nestedInside = [];
+      ringPl.nestedInside.push({
         pieceId: best.cand.pieceId, label: best.cand.label,
         origW: best.cand.origW || best.cand.w, origH: best.cand.origH || best.cand.h,
         shape: best.cand.shape,
+        innerMm: best.cand.innerMm || 0, // for ring-in-ring
+        nestedInside: best.cand.nestedInside || null, // carry recursive nest if any
       });
       best.sheet.placed.splice(best.idx, 1);
     }
@@ -15382,27 +15411,40 @@ function CutSheetSvg({ sheet, colorFor }) {
                   <title>${p.label} · ${dimsLabel}mm${p.rotated ? ' (rotated)' : ''}</title>
                 </path>
                 ${ringInnerR > 2 && html`<circle cx=${x + w/2} cy=${y + h/2} r=${ringInnerR}
-                  fill=${p.nestedInside?.length ? 'rgba(16,185,129,0.35)' : 'rgba(244,63,94,0.35)'}
-                  stroke=${p.nestedInside?.length ? '#10b981' : '#f43f5e'}
-                  stroke-dasharray="3 3" stroke-width="1">
+                  fill=${p.nestedInside?.length ? 'rgba(34,197,94,0.7)' : 'rgba(239,68,68,0.7)'}
+                  stroke=${p.nestedInside?.length ? '#15803d' : '#b91c1c'}
+                  stroke-dasharray="4 3" stroke-width="1.5">
                   <title>${p.nestedInside?.length ? 'Hole reused for ' + p.nestedInside.length + ' nested piece' + (p.nestedInside.length === 1 ? '' : 's') : 'Inner waste · Ø' + (p.innerMm || 0) + ' mm hole'}</title>
                 </circle>`}
-                ${(p.nestedInside || []).map((np, ni) => {
-                  const npColor = colorFor(np.pieceId);
-                  const cx = x + w/2;
-                  const cy = y + h/2;
-                  const npW = (np.origW || 0) * scale;
-                  const npH = (np.origH || 0) * scale;
-                  const npIsCircular = np.shape === 'round' || np.shape === 'ring';
-                  return html`
-                    <g key=${'nest-' + ni}>
-                      ${npIsCircular
-                        ? html`<circle cx=${cx} cy=${cy} r=${Math.min(npW, npH) / 2} fill=${npColor} opacity="0.9" stroke="white" stroke-width="1"><title>${np.label} · nested in ${p.label}</title></circle>`
-                        : html`<rect x=${cx - npW/2} y=${cy - npH/2} width=${npW} height=${npH} fill=${npColor} opacity="0.9" stroke="white" stroke-width="1"><title>${np.label} · nested in ${p.label}</title></rect>`}
-                      ${npW > 36 && html`<text x=${cx} y=${cy} font-size=${Math.max(8, Math.min(11, npW/8))} font-weight="700" fill="white" text-anchor="middle" dominant-baseline="middle" pointer-events="none">${np.label}</text>`}
-                    </g>
-                  `;
-                })}`
+                ${(() => {
+                  const list = p.nestedInside || [];
+                  if (list.length === 0) return null;
+                  // Lay nested pieces out in a small grid centred in the hole
+                  // — bounded by the inscribed square (hole Ø / √2).
+                  const innerHalf = ringInnerR / Math.SQRT2;
+                  const cols = Math.ceil(Math.sqrt(list.length));
+                  const rows = Math.ceil(list.length / cols);
+                  const cellW = (innerHalf * 2) / cols;
+                  const cellH = (innerHalf * 2) / rows;
+                  return list.map((np, ni) => {
+                    const npColor = colorFor(np.pieceId);
+                    const r = Math.floor(ni / cols);
+                    const c = ni % cols;
+                    const cx = x + w/2 - innerHalf + cellW * (c + 0.5);
+                    const cy = y + h/2 - innerHalf + cellH * (r + 0.5);
+                    const npW = Math.min((np.origW || 0) * scale, cellW * 0.92);
+                    const npH = Math.min((np.origH || 0) * scale, cellH * 0.92);
+                    const npIsCircular = np.shape === 'round' || np.shape === 'ring';
+                    return html`
+                      <g key=${'nest-' + ni}>
+                        ${npIsCircular
+                          ? html`<circle cx=${cx} cy=${cy} r=${Math.min(npW, npH) / 2} fill=${npColor} opacity="0.95" stroke="white" stroke-width="1"><title>${np.label} · nested in ${p.label}</title></circle>`
+                          : html`<rect x=${cx - npW/2} y=${cy - npH/2} width=${npW} height=${npH} fill=${npColor} opacity="0.95" stroke="white" stroke-width="1"><title>${np.label} · nested in ${p.label}</title></rect>`}
+                        ${npW > 28 && html`<text x=${cx} y=${cy} font-size=${Math.max(7, Math.min(10, npW/6))} font-weight="700" fill="white" text-anchor="middle" dominant-baseline="middle" pointer-events="none">${np.label}</text>`}
+                      </g>
+                    `;
+                  });
+                })()}`
               : isRound
               ? html`<circle class="sheet-rect" style=${'animation-delay:' + (i * 0.05) + 's'}
                   cx=${x + w/2} cy=${y + h/2} r=${Math.min(w, h)/2} fill=${color} opacity="0.9" stroke="white" stroke-width="1">
@@ -15412,10 +15454,12 @@ function CutSheetSvg({ sheet, colorFor }) {
                   x=${x} y=${y} width=${w} height=${h} fill=${color} opacity="0.9" stroke="white" stroke-width="1">
                   <title>${p.label} · ${dimsLabel}mm${p.rotated ? ' (rotated)' : ''}</title>
                 </rect>`}
-            ${w > 50 && h > 24 && html`<text class="sheet-text" style=${'animation-delay:'+(i*0.05+0.18)+'s'}
+            ${w > 50 && h > 24 && !(isRing && p.nestedInside?.length) && html`<text class="sheet-text" style=${'animation-delay:'+(i*0.05+0.18)+'s'}
               x=${x + w/2} y=${y + h/2 - 2} font-size=${fontSize} font-weight="700" fill="white" text-anchor="middle" dominant-baseline="middle" pointer-events="none">${p.label}</text>`}
-            ${w > 80 && h > 40 && html`<text class="sheet-text" style=${'animation-delay:'+(i*0.05+0.22)+'s'}
+            ${w > 80 && h > 40 && !(isRing && p.nestedInside?.length) && html`<text class="sheet-text" style=${'animation-delay:'+(i*0.05+0.22)+'s'}
               x=${x + w/2} y=${y + h/2 + fontSize*0.9} font-size=${fontSize*0.7} fill="rgba(255,255,255,0.85)" text-anchor="middle" dominant-baseline="middle" pointer-events="none">${dimsLabel}</text>`}
+            ${isRing && p.nestedInside?.length && Math.min(w, h) > 100 && html`<text class="sheet-text" style=${'animation-delay:'+(i*0.05+0.18)+'s'}
+              x=${x + w/2} y=${y + ringOuterR * 0.18} font-size=${Math.max(8, fontSize * 0.8)} font-weight="700" fill="white" text-anchor="middle" dominant-baseline="middle" pointer-events="none">${p.label}</text>`}
           </g>
         `;
       })}
