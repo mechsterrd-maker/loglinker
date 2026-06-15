@@ -473,6 +473,10 @@ const __loglinkrPulse = (() => {
 if (typeof window !== 'undefined') {
   window.addEventListener('focus', __loglinkrPulse);
   window.addEventListener('online', __loglinkrPulse);
+  // Safari/PWA back-forward cache: pageshow fires when the page resumes
+  // from bfcache; the focus event does NOT in that case, so without this
+  // listener the data could be minutes stale.
+  window.addEventListener('pageshow', (e) => { if (e.persisted) __loglinkrPulse(); });
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', () => { if (!document.hidden) __loglinkrPulse(); });
   }
@@ -5222,7 +5226,27 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
         const newMsg = payload.new;
         if (newMsg.sender_id === user.id) return;
 
-        // Refresh group list so badges + previews update — debounced so
+        // INSTANT: patch the sidebar in place so the new last-message preview
+        // and unread badge appear within a frame. Avoids the 1.5s debounce
+        // lag Marvel was complaining about. The debounced reload below still
+        // runs as a safety net to reconcile anything we missed.
+        setGroups(prev => prev.map(g => {
+          if (g.id !== newMsg.group_id) return g;
+          const isActive = activeGroup && activeGroup.id === g.id;
+          return {
+            ...g,
+            lastMsg: {
+              body: newMsg.body || null,
+              attachments: newMsg.attachments || [],
+              created_at: newMsg.created_at,
+              sender_id: newMsg.sender_id,
+              users: g.lastMsg?.sender_id === newMsg.sender_id ? g.lastMsg.users : null,
+            },
+            unread: isActive ? 0 : (g.unread || 0) + 1,
+          };
+        }));
+
+        // Still refresh group list as a reconciliation pass — debounced so
         // bursty inserts (system alerts) don't trigger an N+1 storm.
         loadGroupsDebounced();
 
@@ -5234,6 +5258,16 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
         if (!group || !group.members?.includes(user.id)) return;
 
         const { data: sender } = await sb.from('users').select('full_name').eq('id', newMsg.sender_id).maybeSingle();
+
+        // Backfill the sender name on the patched preview so the sidebar
+        // shows "Karthik: hello" instead of just "hello" once we know.
+        if (sender) {
+          setGroups(prev => prev.map(g =>
+            g.id === newMsg.group_id && g.lastMsg && !g.lastMsg.users
+              ? { ...g, lastMsg: { ...g.lastMsg, users: sender } }
+              : g
+          ));
+        }
 
         playNotificationSound();
         const preview = newMsg.body || (Array.isArray(newMsg.attachments) && newMsg.attachments.length ? '📎 ' + (newMsg.attachments[0].name || 'attachment') : '');
