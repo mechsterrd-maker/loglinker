@@ -13342,7 +13342,7 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
   const reload = useCallback(async () => {
     const [m, d] = await Promise.all([
       sb.from('mcp_project_milestones').select('*').eq('project_id', project.id).order('seq'),
-      sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, total_value, stage_id, created_at').eq('project_id', project.id).order('created_at',{ascending:false}).limit(40),
+      sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, total_value, stage_id, created_at').eq('project_id', project.id).eq('hide_from_project', false).order('created_at',{ascending:false}).limit(40),
     ]);
     const all = m.data || [];
     const tops = all.filter(x => !x.parent_id);
@@ -26445,9 +26445,42 @@ function DocumentEditModal({ plant, me, doc, vendors, onClose, onSaved }) {
     vendor_id: '', vendor_name_raw: '', vendor_gstin_raw: '',
     taxable_value: '', tax_amount: '', total_value: '',
     status: 'pending', notes: '',
+    project_id: '', hide_from_project: false,
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [projects, setProjects] = useState([]);
+  const [savingVendor, setSavingVendor] = useState(false);
+
+  // Marvel: editable project mapping after the fact. Load the plant's
+  // active projects so the user can re-tag (or detach) a wrongly-mapped doc.
+  useEffect(() => {
+    sb.from('mcp_projects').select('id, code, name, status')
+      .eq('plant_id', plant.id)
+      .neq('status', 'completed').neq('status', 'cancelled')
+      .order('name')
+      .then(({ data }) => setProjects(data || []));
+  }, [plant.id]);
+
+  // Marvel: quick '+ Save as new vendor' when a bill arrived with a
+  // vendor name the master doesn't have yet. Pre-fills GSTIN if extracted.
+  const saveAsNewVendor = async () => {
+    const name = (form.vendor_name_raw || '').trim();
+    if (!name) { setError('Need a vendor name to save.'); return; }
+    setSavingVendor(true);
+    try {
+      const { data, error: err } = await sb.from('mcp_logistics_vendors').insert({
+        plant_id: plant.id,
+        name,
+        gstin: form.vendor_gstin_raw || null,
+        is_vendor: true,
+      }).select().single();
+      if (err) throw err;
+      setForm({ ...form, vendor_id: data.id });
+      showToast('✓ Vendor "' + name + '" added to master');
+    } catch (e) { setError('Could not save vendor: ' + e.message); }
+    finally { setSavingVendor(false); }
+  };
 
   const submit = async (e) => {
     e.preventDefault();
@@ -26467,6 +26500,8 @@ function DocumentEditModal({ plant, me, doc, vendors, onClose, onSaved }) {
         total_value: form.total_value ? parseFloat(form.total_value) : null,
         status: form.status,
         notes: form.notes || null,
+        project_id: form.project_id || null,
+        hide_from_project: !!form.hide_from_project,
       };
       let result;
       if (doc?.id) {
@@ -26529,6 +26564,31 @@ function DocumentEditModal({ plant, me, doc, vendors, onClose, onSaved }) {
               <option value="cancelled">Cancelled</option>
             </select>
           </div>
+          <!-- Marvel 14-Jun MoM: project mapping is editable and can be
+               hidden without deleting the document. -->
+          <div class="field">
+            <label>Project</label>
+            <select value=${form.project_id || ''} onChange=${e => setForm({...form, project_id: e.target.value})}>
+              <option value="">— Not tied to a project —</option>
+              ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+            </select>
+          </div>
+          ${form.project_id && html`
+            <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--slate-700);margin-bottom:10px">
+              <input type="checkbox" checked=${!!form.hide_from_project} onChange=${e => setForm({...form, hide_from_project: e.target.checked})} />
+              Hide from project bills list <span style="color:var(--slate-500);font-size:11px">(keeps the document, removes it from the project's bill tab)</span>
+            </label>
+          `}
+          <!-- Marvel 14-Jun MoM: quick + Save new vendor when the bill
+               brought a name not yet in the master. -->
+          ${!form.vendor_id && (form.vendor_name_raw || '').trim() && html`
+            <div style="background:var(--teal-50);border:1px solid var(--teal-200);border-radius:8px;padding:10px 12px;margin-bottom:10px;font-size:12px">
+              <div style="color:var(--teal-800);margin-bottom:6px">
+                <b>${esc(form.vendor_name_raw)}</b> isn't in the vendor master yet${form.vendor_gstin_raw ? ' (GSTIN ' + form.vendor_gstin_raw + ')' : ''}.
+              </div>
+              <button type="button" class="btn small" disabled=${savingVendor} onClick=${saveAsNewVendor} style="padding:5px 12px">${savingVendor ? 'Saving…' : '+ Save as new vendor'}</button>
+            </div>
+          `}
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes || ''} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
           <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (doc?.id ? 'Update' : 'Create')}</button>
         </form>
