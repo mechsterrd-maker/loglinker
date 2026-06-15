@@ -24720,10 +24720,18 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  // Auto-fill department from owner's department if available
+  // Auto-derive department whenever the assignee changes. Prefers the user's
+  // stored department field (set in their profile); falls back to a sensible
+  // role-based guess; finally keeps whatever the user typed. Marvel: 'auto
+  // deduct if choose the person because we already have that person dept info.'
+  const deptFromRole = (role) => ({
+    qa: 'Quality', maintenance: 'Maintenance', production: 'Production',
+    toolroom: 'Tool Room', plant_head: 'Admin', admin: 'Admin'
+  })[role];
   const onPickOwner = (id) => {
     const u = users.find(x => x.id === id);
-    setForm({...form, owner_id: id, department: form.department || (u?.role === 'qa' ? 'Quality' : u?.role === 'maintenance' ? 'Maintenance' : u?.role === 'production' ? 'Production' : form.department)});
+    const auto = u?.department || deptFromRole(u?.role);
+    setForm({...form, owner_id: id, department: auto || form.department || ''});
   };
 
   const submit = async (e) => {
@@ -24767,13 +24775,13 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
           <div class="field"><label>Title *</label><input type="text" required value=${form.title} onChange=${e => setForm({...form, title: e.target.value})} placeholder="Order new corepins" /></div>
           <div class="field"><label>Description</label><textarea rows=${2} value=${form.description || ''} onChange=${e => setForm({...form, description: e.target.value})}></textarea></div>
           <div class="field-row">
-            <div class="field"><label>Owner</label>
+            <div class="field"><label>Assigned to</label>
               <select value=${form.owner_id || ''} onChange=${e => onPickOwner(e.target.value)}>
                 <option value="">— Unassigned —</option>
-                ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+                ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.department ? ' · ' + u.department : (u.role ? ' · ' + roleLabel(u.role) : '')}</option>`)}
               </select>
             </div>
-            <div class="field"><label>Department</label>
+            <div class="field"><label>Department <span style="color:var(--slate-400);font-weight:400;font-size:11px">${form.owner_id ? '(auto)' : ''}</span></label>
               <select value=${form.department || ''} onChange=${e => setForm({...form, department: e.target.value})}>
                 <option value="">— None —</option>
                 ${deptOptions.map(d => html`<option key=${d} value=${d}>${d}</option>`)}
@@ -32537,25 +32545,33 @@ function PerformanceDashboards({ plant, me }) {
   const [users, setUsers] = useState([]);
   const [projects, setProjects] = useState([]);
   const [milestones, setMilestones] = useState([]);
+  const [departments, setDepartments] = useState([]);
   const [loading, setLoading] = useState(true);
+  // Drill-downs: tap a row -> open detail. Editing a task -> ActionModal.
+  const [userDrill, setUserDrill] = useState(null);     // { user }
+  const [projectDrill, setProjectDrill] = useState(null); // { project, stats }
+  const [taskEdit, setTaskEdit] = useState(null);       // action row being edited
 
   const refresh = useCallback(async () => {
     setLoading(true);
     const since = new Date(Date.now() - parseInt(period, 10) * 86400000).toISOString();
-    const [a, u, p, m] = await Promise.all([
-      sb.from('actions').select('id, owner_id, status, due_at, completed_at, created_at')
+    const [a, u, p, m, d] = await Promise.all([
+      // Pull the full action row so the edit modal can reuse it directly.
+      sb.from('actions').select('*')
         .eq('plant_id', plant.id).gte('created_at', since).limit(2000),
-      sb.from('users').select('id, full_name, role, avatar_url')
+      sb.from('users').select('id, full_name, role, avatar_url, department')
         .eq('plant_id', plant.id).eq('status','active').order('full_name'),
-      sb.from('mcp_projects').select('id, name, code, customer_name, status, start_date, target_date, completed_date, progress_pct, qty, uom')
+      sb.from('mcp_projects').select('id, name, code, customer_name, status, start_date, target_date, completed_date, progress_pct, qty, uom, po_number, notes, owner_user_id')
         .eq('plant_id', plant.id).order('target_date', { ascending: true }),
-      sb.from('mcp_project_milestones').select('id, project_id, status, target_date, done_date')
-        .eq('plant_id', plant.id).limit(2000),
+      sb.from('mcp_project_milestones').select('id, project_id, name, status, target_date, done_date, seq')
+        .eq('plant_id', plant.id).order('seq'),
+      sb.from('departments').select('*').order('name'),
     ]);
     setActions(a.data || []);
     setUsers(u.data || []);
     setProjects(p.data || []);
     setMilestones(m.data || []);
+    setDepartments(d.data || []);
     setLoading(false);
   }, [plant.id, period]);
   useEffect(() => { refresh(); }, [refresh]);
@@ -32677,7 +32693,7 @@ function PerformanceDashboards({ plant, me }) {
         ${userStats.length === 0 ? html`<div class="empty"><div style="padding:24px;font-size:13px">No users in this plant yet.</div></div>` :
           html`<div style="display:flex;flex-direction:column">
             ${userStats.map((s, i) => html`
-              <div key=${s.user.id} style="display:grid;grid-template-columns:36px minmax(140px,1.4fr) 60px minmax(180px,1fr) 90px 90px 80px;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--slate-100);font-size:13px">
+              <div key=${s.user.id} onClick=${() => setUserDrill({ user: s.user })} style="display:grid;grid-template-columns:36px minmax(140px,1.4fr) 60px minmax(180px,1fr) 90px 90px 80px;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--slate-100);font-size:13px;cursor:pointer;transition:background 0.1s" onMouseOver=${e => e.currentTarget.style.background='var(--slate-50)'} onMouseOut=${e => e.currentTarget.style.background=''}>
                 <div style="font-size:11px;color:var(--slate-400);font-weight:700">#${i+1}</div>
                 <div style="display:flex;align-items:center;gap:8px;min-width:0">
                   ${s.user.avatar_url ? html`<img src=${s.user.avatar_url} style="width:30px;height:30px;border-radius:50%;object-fit:cover" />`
@@ -32714,7 +32730,7 @@ function PerformanceDashboards({ plant, me }) {
         <div style="padding:10px 14px;background:var(--slate-50);border-bottom:1px solid var(--slate-200);font-weight:700;font-size:13px">Project schedule variance</div>
         ${projectStats.length === 0 ? html`<div class="empty"><div style="padding:24px;font-size:13px">No projects yet. Create one in Projects to see it here.</div></div>` :
           projectStats.map(s => html`
-            <div key=${s.p.id} style="display:grid;grid-template-columns:minmax(180px,1.6fr) minmax(200px,1.8fr) 110px 110px 110px;gap:12px;align-items:center;padding:12px 14px;border-bottom:1px solid var(--slate-100);font-size:13px;border-left:4px solid ${s.tone === 'emerald' ? 'var(--emerald-500)' : s.tone === 'rose' ? 'var(--rose-500)' : s.tone === 'amber' ? 'var(--amber-500)' : 'var(--teal-500)'}">
+            <div key=${s.p.id} onClick=${() => setProjectDrill({ project: s.p, stats: s })} style="display:grid;grid-template-columns:minmax(180px,1.6fr) minmax(200px,1.8fr) 110px 110px 110px;gap:12px;align-items:center;padding:12px 14px;border-bottom:1px solid var(--slate-100);font-size:13px;border-left:4px solid ${s.tone === 'emerald' ? 'var(--emerald-500)' : s.tone === 'rose' ? 'var(--rose-500)' : s.tone === 'amber' ? 'var(--amber-500)' : 'var(--teal-500)'};cursor:pointer;transition:background 0.1s" onMouseOver=${e => e.currentTarget.style.background='var(--slate-50)'} onMouseOut=${e => e.currentTarget.style.background=''}>
               <div style="min-width:0">
                 <div style="font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.p.code ? s.p.code + ' · ' : ''}${s.p.name}</div>
                 <div style="font-size:11px;color:var(--slate-500)">${s.p.customer_name || '—'}${s.p.qty ? ' · ' + fmtNum(s.p.qty) + ' ' + (s.p.uom || '') : ''}</div>
@@ -32744,6 +32760,128 @@ function PerformanceDashboards({ plant, me }) {
 
       <div style="font-size:11px;color:var(--slate-500);margin-top:10px;padding:0 4px">"vs plan" = actual % minus what should be done by today based on start/target dates. The black tick on each bar marks the planned %; the coloured bar marks the actual.</div>
     `}
+
+    ${userDrill && html`<${PerfUserDrillModal} plant=${plant} me=${me} user=${userDrill.user} actions=${actions} users=${users}
+      onClose=${() => setUserDrill(null)}
+      onEditTask=${(a) => setTaskEdit(a)} />`}
+    ${projectDrill && html`<${PerfProjectDrillModal} plant=${plant} me=${me} project=${projectDrill.project} stats=${projectDrill.stats}
+      milestones=${milestones.filter(m => m.project_id === projectDrill.project.id)}
+      actions=${actions.filter(a => a.source_type === 'project' && a.source_id === projectDrill.project.id)}
+      users=${users}
+      onClose=${() => setProjectDrill(null)}
+      onEditTask=${(a) => setTaskEdit(a)} />`}
+    ${taskEdit && html`<${ActionModal} plant=${plant} me=${me} users=${users} departments=${departments} editTarget=${taskEdit}
+      onClose=${() => setTaskEdit(null)} onSaved=${() => { setTaskEdit(null); refresh(); }} />`}
+  `;
+}
+
+// Drill-down: a user's tasks. Tap any row to open ActionModal so the
+// assignee can be switched on the fly.
+function PerfUserDrillModal({ plant, me, user, actions, users, onClose, onEditTask }) {
+  const mine = actions.filter(a => a.owner_id === user.id);
+  const groups = [
+    { key: 'overdue',    label: '🔴 Overdue',     items: mine.filter(a => (a.status === 'open' || a.status === 'in_progress') && a.due_at && new Date(a.due_at) < new Date()) },
+    { key: 'open',       label: '🟡 Open',         items: mine.filter(a => (a.status === 'open' || a.status === 'in_progress') && !(a.due_at && new Date(a.due_at) < new Date())) },
+    { key: 'completed',  label: '🟢 Completed',    items: mine.filter(a => a.status === 'completed') },
+    { key: 'cancelled',  label: '⚪ Cancelled',    items: mine.filter(a => a.status === 'cancelled') },
+  ].filter(g => g.items.length > 0);
+  const initials = (user.full_name || '?').split(' ').map(x => x[0]).join('').slice(0,2).toUpperCase();
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:680px;max-height:92vh;overflow-y:auto">
+        <div class="modal-header">
+          <div class="modal-title" style="display:flex;align-items:center;gap:10px">
+            ${user.avatar_url ? html`<img src=${user.avatar_url} style="width:34px;height:34px;border-radius:50%;object-fit:cover" />`
+              : html`<div style="width:34px;height:34px;border-radius:50%;background:var(--teal-100);color:var(--teal-700);display:flex;align-items:center;justify-content:center;font-weight:700">${initials}</div>`}
+            <div><div>${user.full_name}</div><div style="font-size:11px;color:var(--slate-500);font-weight:400">${roleLabel(user.role)}${user.department ? ' · ' + user.department : ''} · ${mine.length} task${mine.length===1?'':'s'} in period</div></div>
+          </div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${mine.length === 0 ? html`<div class="empty"><div class="icon">✓</div>No tasks for this person in the selected period.</div>` :
+          groups.map(g => html`
+            <div key=${g.key} style="margin-bottom:14px">
+              <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">${g.label} · ${g.items.length}</div>
+              ${g.items.map(a => html`
+                <div key=${a.id} onClick=${() => onEditTask(a)} style="border:1px solid var(--slate-200);border-radius:8px;padding:10px 12px;margin-bottom:6px;cursor:pointer;background:white;transition:background 0.1s" onMouseOver=${e => e.currentTarget.style.background='var(--slate-50)'} onMouseOut=${e => e.currentTarget.style.background='white'}>
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                    <div style="flex:1;min-width:0">
+                      <div style="font-weight:600;font-size:13px">${a.title}</div>
+                      <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${a.department ? a.department + ' · ' : ''}${a.due_at ? 'Due ' + new Date(a.due_at).toLocaleDateString() : 'No due date'}${a.completed_at ? ' · closed ' + new Date(a.completed_at).toLocaleDateString() : ''}</div>
+                    </div>
+                    <span class=${'badge ' + (a.status === 'completed' ? 'emerald' : (a.status === 'open' || a.status === 'in_progress') && a.due_at && new Date(a.due_at) < new Date() ? 'rose' : 'amber')} style="font-size:10px">${a.status.replace('_', ' ')}</span>
+                  </div>
+                  <div style="font-size:11px;color:var(--teal-700);margin-top:6px;font-weight:600">↗ Tap to view / reassign</div>
+                </div>
+              `)}
+            </div>
+          `)}
+      </div>
+    </div>
+  `;
+}
+
+// Drill-down: a project's snapshot — schedule chip, milestones, linked tasks
+function PerfProjectDrillModal({ plant, me, project, stats, milestones, actions, users, onClose, onEditTask }) {
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:680px;max-height:92vh;overflow-y:auto">
+        <div class="modal-header">
+          <div class="modal-title">${project.code ? project.code + ' · ' : ''}${project.name}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div style="background:var(--slate-50);border-radius:8px;padding:10px 12px;display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;font-size:12px;margin-bottom:12px">
+          <div><span style="color:var(--slate-500)">Customer</span><br/><b>${project.customer_name || '—'}</b></div>
+          <div><span style="color:var(--slate-500)">Quantity</span><br/><b>${project.qty ? fmtNum(project.qty) + ' ' + (project.uom || '') : '—'}</b></div>
+          <div><span style="color:var(--slate-500)">PO No</span><br/><b>${project.po_number || '—'}</b></div>
+          <div><span style="color:var(--slate-500)">Status</span><br/><b>${(project.status || 'planning').replace('_', ' ')}</b></div>
+          <div><span style="color:var(--slate-500)">Start</span><br/><b>${project.start_date || '—'}</b></div>
+          <div><span style="color:var(--slate-500)">Target</span><br/><b>${project.target_date || '—'}</b></div>
+        </div>
+
+        <div style="margin-bottom:14px">
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--slate-500);margin-bottom:4px">
+            <span>Actual ${stats.pct}%${stats.plannedPct != null ? ' · planned ' + stats.plannedPct + '%' : ''}</span>
+            <span style=${'font-weight:700;color:'+(stats.variance == null ? 'var(--slate-400)' : stats.variance >= -5 ? 'var(--emerald-700)' : stats.variance >= -15 ? 'var(--amber-700)' : 'var(--rose-700)')}>${stats.variance == null ? '' : (stats.variance > 0 ? '+' : '') + stats.variance + 'pp vs plan'}</span>
+          </div>
+          <div style="position:relative;height:10px;background:var(--slate-100);border-radius:5px;overflow:hidden">
+            <div style=${'height:100%;background:'+(stats.tone === 'rose' ? 'var(--rose-500)' : stats.tone === 'amber' ? 'var(--amber-500)' : 'var(--emerald-500)')+';width:'+Math.min(100, stats.pct)+'%'}></div>
+            ${stats.plannedPct != null && html`<div style=${'position:absolute;top:-3px;left:'+stats.plannedPct+'%;width:2px;height:16px;background:var(--slate-700)'}></div>`}
+          </div>
+        </div>
+
+        <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Milestones · ${milestones.length}</div>
+        ${milestones.length === 0 ? html`<div style="font-size:12px;color:var(--slate-500);padding:6px 0">No milestones yet.</div>` :
+          milestones.map(m => html`
+            <div key=${m.id} style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--slate-100);font-size:12px">
+              <span style="width:22px;height:22px;border-radius:50%;background:${m.status === 'done' ? 'var(--emerald-100)' : m.status === 'in_progress' ? 'var(--amber-100)' : 'var(--slate-100)'};color:${m.status === 'done' ? 'var(--emerald-700)' : m.status === 'in_progress' ? 'var(--amber-700)' : 'var(--slate-500)'};display:inline-flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0">${m.status === 'done' ? '✓' : m.seq}</span>
+              <div style="flex:1;min-width:0">
+                <div style="font-weight:600">${m.name}</div>
+                <div style="font-size:11px;color:var(--slate-500)">${m.target_date ? 'Target ' + m.target_date : 'No target'}${m.done_date ? ' · done ' + m.done_date : ''}</div>
+              </div>
+              <span class=${'badge ' + (m.status === 'done' ? 'emerald' : m.status === 'in_progress' ? 'amber' : '')} style="font-size:10px">${m.status}</span>
+            </div>
+          `)}
+
+        ${actions.length > 0 && html`
+          <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.04em;margin:14px 0 6px">Tasks · ${actions.length}</div>
+          ${actions.map(a => {
+            const u = users.find(x => x.id === a.owner_id);
+            return html`
+              <div key=${a.id} onClick=${() => onEditTask(a)} style="border:1px solid var(--slate-200);border-radius:8px;padding:8px 12px;margin-bottom:6px;cursor:pointer" onMouseOver=${e => e.currentTarget.style.background='var(--slate-50)'} onMouseOut=${e => e.currentTarget.style.background='white'}>
+                <div style="display:flex;justify-content:space-between;gap:8px">
+                  <div style="flex:1;min-width:0">
+                    <div style="font-weight:600;font-size:13px">${a.title}</div>
+                    <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${u ? u.full_name : '— Unassigned —'}${a.due_at ? ' · due ' + new Date(a.due_at).toLocaleDateString() : ''}</div>
+                  </div>
+                  <span class=${'badge ' + (a.status === 'completed' ? 'emerald' : (a.status === 'open' || a.status === 'in_progress') && a.due_at && new Date(a.due_at) < new Date() ? 'rose' : 'amber')} style="font-size:10px">${a.status.replace('_', ' ')}</span>
+                </div>
+                <div style="font-size:11px;color:var(--teal-700);margin-top:4px;font-weight:600">↗ Tap to reassign</div>
+              </div>
+            `;
+          })}
+        `}
+      </div>
+    </div>
   `;
 }
 
