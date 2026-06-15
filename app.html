@@ -22452,28 +22452,40 @@ function NewProjectModal({ plant, me, onClose, onCreated, cloneFrom }) {
   useEffect(() => {
     (async () => {
       const [c, u] = await Promise.all([
-        sb.from('mcp_sched_customers').select('id, name, code').order('name'),
+        sb.from('mcp_sched_customers').select('id, name, short_code').eq('plant_id', plant.id).order('name'),
         // All active team members — NOT just login-enabled ones. Operators /
         // supervisors are often added without app login but still get assigned
         // as leader/manager/supervisor (their work is tracked by others).
         sb.from('users').select('id, full_name, role').eq('status','active').order('full_name'),
       ]);
-      setCustomers(c.data || []);
+      const custList = c.data || [];
+      setCustomers(custList);
       setUsers(u.data || []);
       // For a clone, pull the source project's team so leader/manager/supervisors
       // carry over (repeat orders usually reuse the same crew).
       if (cloneFrom?.id) {
+        // Customer: prefer the FK; if it points at a deleted/seed customer,
+        // fall back to matching the snapshot name so the dropdown still lands.
+        if (cloneFrom.customer_id && custList.some(c => c.id === cloneFrom.customer_id)) {
+          setCustomerId(cloneFrom.customer_id);
+        } else if (cloneFrom.customer_name) {
+          const byName = custList.find(c => c.name === cloneFrom.customer_name);
+          if (byName) setCustomerId(byName.id);
+        }
         const { data: members } = await sb.from('mcp_project_members')
           .select('user_id, role_label').eq('project_id', cloneFrom.id);
+        let gotLeader = false;
         if (members) {
           const sup = new Set();
           for (const m of members) {
-            if (m.role_label === 'leader') setLeaderId(m.user_id);
+            if (m.role_label === 'leader') { setLeaderId(m.user_id); gotLeader = true; }
             else if (m.role_label === 'manager') setManagerId(m.user_id);
             else if (m.role_label === 'supervisor') sup.add(m.user_id);
           }
           if (sup.size) setSupervisorIds(sup);
         }
+        // Older projects stored the lead only as owner_user_id (no member row).
+        if (!gotLeader && cloneFrom.owner_user_id) setLeaderId(cloneFrom.owner_user_id);
       }
     })();
   }, []);
@@ -22542,7 +22554,7 @@ function NewProjectModal({ plant, me, onClose, onCreated, cloneFrom }) {
             <div style="display:flex;gap:6px;align-items:stretch">
               <select value=${customerId} onChange=${e => setCustomerId(e.target.value)} style="flex:1">
                 <option value="">— Select customer —</option>
-                ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.code ? ' (' + c.code + ')' : ''}${c.short_code ? ' (' + c.short_code + ')' : ''}</option>`)}
+                ${customers.map(c => html`<option key=${c.id} value=${c.id}>${c.name}${c.short_code ? ' (' + c.short_code + ')' : ''}</option>`)}
               </select>
               <button type="button" onClick=${() => setAddCustomerOpen(true)}
                 style="padding:8px 12px;border:1px dashed var(--teal-400);background:var(--teal-50);color:var(--teal-700);border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;font-family:inherit">+ New</button>
