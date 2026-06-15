@@ -13740,6 +13740,7 @@ function cutPlatePlaceRect(sheet, rect, rectIdx, item, pw, ph, rotated, kerf) {
     x: rect.x, y: rect.y, w: pw, h: ph,
     rotated, origW: item.w, origH: item.h,
     shape: item.shape || 'rect',
+    innerMm: item.innerMm || 0,
   });
   sheet.freeRects.splice(rectIdx, 1);
   // Guillotine "long right" split — right rect spans the parent's full height,
@@ -13758,7 +13759,7 @@ function planSingleSheet({ pieces, stocks, kerfMm }) {
     const qty = Math.max(0, Math.floor(Number(p.qty) || 0));
     if (w <= 0 || h <= 0 || qty <= 0) continue;
     for (let i = 0; i < qty; i++) {
-      items.push({ id: p.id + ':' + i, pieceId: p.id, label: p.label || 'piece', w, h, allowRotation: p.allow_rotation !== false, shape: p.shape || 'rect' });
+      items.push({ id: p.id + ':' + i, pieceId: p.id, label: p.label || 'piece', w, h, allowRotation: p.allow_rotation !== false, shape: p.shape || 'rect', innerMm: Number(p.innerMm) || 0 });
     }
   }
   items.sort((a, b) => (b.w * b.h) - (a.w * a.h));
@@ -15322,11 +15323,18 @@ function CutSheetSvg({ sheet, colorFor }) {
         return html`
           <g key=${i}>
             ${isRing
-              ? html`<path class="sheet-rect" style=${'animation-delay:' + (i * 0.05) + 's'}
+              ? html`
+                <path class="sheet-rect" style=${'animation-delay:' + (i * 0.05) + 's'}
                   d=${'M ' + (x + w/2 - ringOuterR) + ' ' + (y + h/2) + ' a ' + ringOuterR + ' ' + ringOuterR + ' 0 1 0 ' + (ringOuterR * 2) + ' 0 a ' + ringOuterR + ' ' + ringOuterR + ' 0 1 0 ' + (-ringOuterR * 2) + ' 0 Z M ' + (x + w/2 - ringInnerR) + ' ' + (y + h/2) + ' a ' + ringInnerR + ' ' + ringInnerR + ' 0 1 1 ' + (ringInnerR * 2) + ' 0 a ' + ringInnerR + ' ' + ringInnerR + ' 0 1 1 ' + (-ringInnerR * 2) + ' 0 Z'}
                   fill=${color} fill-rule="evenodd" opacity="0.9" stroke="white" stroke-width="1">
                   <title>${p.label} · ${dimsLabel}mm${p.rotated ? ' (rotated)' : ''}</title>
-                </path>`
+                </path>
+                ${ringInnerR > 2 && html`<circle cx=${x + w/2} cy=${y + h/2} r=${ringInnerR}
+                  fill=${p.nestedInside?.length ? 'rgba(16,185,129,0.35)' : 'rgba(244,63,94,0.35)'}
+                  stroke=${p.nestedInside?.length ? '#10b981' : '#f43f5e'}
+                  stroke-dasharray="3 3" stroke-width="1">
+                  <title>${p.nestedInside?.length ? 'Hole reused for ' + p.nestedInside.length + ' nested piece' + (p.nestedInside.length === 1 ? '' : 's') : 'Inner waste · Ø' + (p.innerMm || 0) + ' mm hole'}</title>
+                </circle>`}`
               : isRound
               ? html`<circle class="sheet-rect" style=${'animation-delay:' + (i * 0.05) + 's'}
                   cx=${x + w/2} cy=${y + h/2} r=${Math.min(w, h)/2} fill=${color} opacity="0.9" stroke="white" stroke-width="1">
