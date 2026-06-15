@@ -24032,13 +24032,20 @@ function ReceiveFromDocPicker({ plant, me, pendingReceptions, onClose, onSaved }
 
   const openRec = async (rec) => {
     setActiveRec(rec); setErr(''); setLoading(true);
-    const [lines, items] = await Promise.all([
-      sb.from('mcp_logistics_grn_lines').select('*, mcp_stocks_items(id, code, name, uom, current_qty, opening_recorded_at)').eq('grn_id', rec.id),
-      sb.from('mcp_stocks_items').select('id, code, name, uom, current_qty, opening_recorded_at').eq('plant_id', plant.id).order('name'),
-    ]);
-    setGrnLines((lines.data || []).map(l => ({ ...l, _post_qty: l.doc_qty || 0, _stock_item_id: l.item_id || '' })));
-    setAllItems(items.data || []);
-    setLoading(false);
+    try {
+      const [lines, items] = await Promise.all([
+        sb.from('mcp_logistics_grn_lines').select('*, mcp_stocks_items(id, code, name, uom, current_qty, opening_recorded_at)').eq('grn_id', rec.id),
+        sb.from('mcp_stocks_items').select('id, code, name, uom, current_qty, opening_recorded_at').eq('plant_id', plant.id).order('name'),
+      ]);
+      if (lines.error) throw lines.error;
+      if (items.error) throw items.error;
+      setGrnLines((lines.data || []).map(l => ({ ...l, _post_qty: l.doc_qty || 0, _stock_item_id: l.item_id || '' })));
+      setAllItems(items.data || []);
+    } catch (e) {
+      setErr('Could not load receipt: ' + (e.message || e));
+    } finally {
+      setLoading(false);
+    }
   };
 
   const setLine = (i, patch) => setGrnLines(arr => arr.map((l, idx) => idx === i ? { ...l, ...patch } : l));
@@ -28759,19 +28766,30 @@ function GrnVerifyModal({ plant, me, grn, onClose, onSaved }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
-      const [linesRes, itemsRes] = await Promise.all([
-        sb.from('mcp_logistics_grn_lines').select('*, mcp_stocks_items(name, uom)').eq('grn_id', grn.id),
-        sb.from('mcp_stocks_items').select('id, name, uom').eq('plant_id', plant.id).order('name'),
-      ]);
-      setLines((linesRes.data || []).map(l => ({
-        ...l,
-        received_qty_input: l.doc_qty != null ? String(l.doc_qty) : '',
-        item_id_input: l.item_id || '',
-      })));
-      setItems(itemsRes.data || []);
-      setLoading(false);
+      try {
+        const [linesRes, itemsRes] = await Promise.all([
+          sb.from('mcp_logistics_grn_lines').select('*, mcp_stocks_items(name, uom)').eq('grn_id', grn.id),
+          sb.from('mcp_stocks_items').select('id, name, uom').eq('plant_id', plant.id).order('name'),
+        ]);
+        if (cancelled) return;
+        if (linesRes.error) throw linesRes.error;
+        if (itemsRes.error) throw itemsRes.error;
+        setLines((linesRes.data || []).map(l => ({
+          ...l,
+          received_qty_input: l.doc_qty != null ? String(l.doc_qty) : '',
+          item_id_input: l.item_id || '',
+        })));
+        setItems(itemsRes.data || []);
+      } catch (e) {
+        if (cancelled) return;
+        setError('Could not load GRN lines: ' + (e.message || e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
     })();
+    return () => { cancelled = true; };
   }, [grn.id]);
 
   const updateLine = (idx, patch) => {
