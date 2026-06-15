@@ -24827,25 +24827,25 @@ function TaskDetail({ plant, me, task: initialTask, users, onClose }) {
 }
 
 function ActionModal({ plant, me, users, departments, editTarget, onClose, onSaved }) {
+  // Marvel 15-Jun: task assignment must be simple — what, project, assigned
+  // to, deadline. No department, no description field. The department column
+  // is still on the row for legacy task sources (NCR / MoM cron) so we just
+  // leave it null from this form.
   const [form, setForm] = useState(editTarget ? {...editTarget, due_at: editTarget.due_at ? editTarget.due_at.slice(0,16) : ''} : {
-    title:'', description:'', owner_id:'', department:'', due_at:'', source_type:'manual'
+    title:'', owner_id:'', project_id:'', due_at:'', source_type:'manual'
   });
+  const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  // Auto-derive department whenever the assignee changes. Prefers the user's
-  // stored department field (set in their profile); falls back to a sensible
-  // role-based guess; finally keeps whatever the user typed. Marvel: 'auto
-  // deduct if choose the person because we already have that person dept info.'
-  const deptFromRole = (role) => ({
-    qa: 'Quality', maintenance: 'Maintenance', production: 'Production',
-    toolroom: 'Tool Room', plant_head: 'Admin', admin: 'Admin'
-  })[role];
-  const onPickOwner = (id) => {
-    const u = users.find(x => x.id === id);
-    const auto = u?.department || deptFromRole(u?.role);
-    setForm({...form, owner_id: id, department: auto || form.department || ''});
-  };
+  useEffect(() => {
+    sb.from('mcp_projects')
+      .select('id, code, name')
+      .eq('plant_id', plant.id)
+      .neq('status', 'completed').neq('status', 'cancelled')
+      .order('name')
+      .then(({ data }) => setProjects(data || []));
+  }, [plant.id]);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -24853,11 +24853,10 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
     try {
       const payload = {
         plant_id: plant.id,
-        source_type: form.source_type,
+        source_type: form.source_type || 'manual',
         title: form.title,
-        description: form.description || null,
         owner_id: form.owner_id || null,
-        department: form.department || null,
+        project_id: form.project_id || null,
         assigned_by: me.id,
         due_at: form.due_at ? new Date(form.due_at).toISOString() : null,
         status: form.status || 'open',
@@ -24874,34 +24873,39 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
 
-  const deptOptions = ['Production', 'Quality', 'Maintenance', 'Stores', 'Tool Room', 'Logistics', 'Records', 'Admin', 'Finance'];
-
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal">
         <div class="modal-header">
-          <div class="modal-title">${editTarget ? 'Edit Task' : 'New Task'}</div>
+          <div class="modal-title">${editTarget ? 'Edit task' : 'New task'}</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
         <form onSubmit=${submit}>
-          <div class="field"><label>Title *</label><input type="text" required value=${form.title} onChange=${e => setForm({...form, title: e.target.value})} placeholder="Order new corepins" /></div>
-          <div class="field"><label>Description</label><textarea rows=${2} value=${form.description || ''} onChange=${e => setForm({...form, description: e.target.value})}></textarea></div>
-          <div class="field-row">
-            <div class="field"><label>Assigned to</label>
-              <select value=${form.owner_id || ''} onChange=${e => onPickOwner(e.target.value)}>
-                <option value="">— Unassigned —</option>
-                ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.department ? ' · ' + u.department : (u.role ? ' · ' + roleLabel(u.role) : '')}</option>`)}
-              </select>
-            </div>
-            <div class="field"><label>Department <span style="color:var(--slate-400);font-weight:400;font-size:11px">${form.owner_id ? '(auto)' : ''}</span></label>
-              <select value=${form.department || ''} onChange=${e => setForm({...form, department: e.target.value})}>
-                <option value="">— None —</option>
-                ${deptOptions.map(d => html`<option key=${d} value=${d}>${d}</option>`)}
-              </select>
-            </div>
+          <div class="field">
+            <label>What is the task? *</label>
+            <input type="text" required autoFocus value=${form.title}
+              onChange=${e => setForm({...form, title: e.target.value})}
+              placeholder="e.g. Order new corepins" />
           </div>
-          <div class="field"><label>Due Date</label><input type="datetime-local" value=${form.due_at} onChange=${e => setForm({...form, due_at: e.target.value})} /></div>
+          <div class="field">
+            <label>Project</label>
+            <select value=${form.project_id || ''} onChange=${e => setForm({...form, project_id: e.target.value})}>
+              <option value="">— Not tied to a project —</option>
+              ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+            </select>
+          </div>
+          <div class="field">
+            <label>Assigned to</label>
+            <select value=${form.owner_id || ''} onChange=${e => setForm({...form, owner_id: e.target.value})}>
+              <option value="">— Unassigned —</option>
+              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + roleLabel(u.role) : ''}</option>`)}
+            </select>
+          </div>
+          <div class="field">
+            <label>Deadline</label>
+            <input type="datetime-local" value=${form.due_at} onChange=${e => setForm({...form, due_at: e.target.value})} />
+          </div>
           ${editTarget && html`
             <div class="field"><label>Status</label>
               <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
