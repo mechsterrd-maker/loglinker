@@ -7079,6 +7079,7 @@ function RolesTab({ plant, me }) {
   const [editTarget, setEditTarget] = useState(null);
   const [creating, setCreating] = useState(false);
   const [err, setErr] = useState('');
+  const [mode, setMode] = useState('list'); // 'list' | 'matrix'
 
   const refresh = useCallback(async () => {
     setErr('');
@@ -7125,39 +7126,116 @@ function RolesTab({ plant, me }) {
     await refresh();
   };
 
+  // Build a (role.slug → Map(module_key → Set(actions))) lookup once so the
+  // matrix is cheap to render even with 30+ modules × 6 actions × N roles.
+  const permIndex = new Map();
+  for (const r of ordered) {
+    const byMod = new Map();
+    for (const p of (r.permissions || [])) {
+      if (!byMod.has(p.module_key)) byMod.set(p.module_key, new Set());
+      byMod.get(p.module_key).add(p.action);
+    }
+    permIndex.set(r.id, byMod);
+  }
+  const ACTION_COUNT = RBAC_ACTIONS.length;
+  // Plant Head + Admin always read as full access (intentional fail-safe).
+  const isAlwaysFull = (slug) => slug === 'plant_head' || slug === 'admin';
+  const cellState = (role, modKey) => {
+    if (isAlwaysFull(role.slug)) return ACTION_COUNT;
+    const acts = permIndex.get(role.id)?.get(modKey);
+    return acts ? acts.size : 0;
+  };
+
   return html`
     <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);padding:10px 14px;margin-bottom:12px">
       <div style="font-size:12px;color:var(--teal-800);line-height:1.55">
-        <strong>🏛 Role hierarchy.</strong> Top = most oversight (e.g. MD / CEO / Management), bottom = Operator.
-        Use ↑ ↓ to set the chain of command, <b>Rename</b> any role's label, and grant each one its module access via <b>Edit</b>.
-        A monitoring role (MD/CEO) is simply a top role with <b>View</b> ticked across the modules it should watch.
+        <strong>🏛 Roles & access matrix.</strong> Top = most oversight (MD / CEO / Management), bottom = Operator.
+        <b>List</b> view: rename, reorder, delete, and edit a role's full permission grid via Edit.
+        <b>Matrix</b> view: see every role × every module at a glance — tap a cell to jump to that role's editor.
       </div>
+    </div>
+    <div class="auth-tabs" style="margin-bottom:12px">
+      <button class=${'auth-tab' + (mode === 'list' ? ' active' : '')} onClick=${() => setMode('list')}>📋 Role list</button>
+      <button class=${'auth-tab' + (mode === 'matrix' ? ' active' : '')} onClick=${() => setMode('matrix')}>🧩 Access matrix</button>
     </div>
     ${err && html`<div class="alert error">${err}</div>`}
 
-    <div class="section-h">Roles · ${ordered.length}<button class="btn small" onClick=${() => setCreating(true)}>+ New role</button></div>
-    ${ordered.map((r, idx) => html`
-      <div class="list-item" key=${r.id}>
-        <div class="list-item-row" style="gap:8px">
-          <div style="display:flex;flex-direction:column;gap:2px">
-            <button class="btn small ghost" style="padding:0 7px;line-height:1.4;font-size:12px" disabled=${idx === 0} onClick=${() => move(idx, -1)} title="Move up">↑</button>
-            <button class="btn small ghost" style="padding:0 7px;line-height:1.4;font-size:12px" disabled=${idx === ordered.length - 1} onClick=${() => move(idx, 1)} title="Move down">↓</button>
-          </div>
-          <div style="font-size:11px;font-weight:700;color:var(--slate-400);min-width:18px;text-align:center">${idx + 1}</div>
-          <div class="list-item-main" style="flex:1">
-            <div class="list-item-title">
-              ${r.display_name}
-              <span class=${'badge ' + (r.is_builtin ? '' : 'teal')} style="font-size:9px;margin-left:4px">${r.is_builtin ? 'built-in' : 'custom'}</span>
+    ${mode === 'matrix' && html`
+      <div class="card" style="padding:0;overflow:auto;max-height:75vh">
+        <table style="width:100%;border-collapse:collapse;font-size:11px">
+          <thead>
+            <tr>
+              <th style="position:sticky;top:0;left:0;z-index:3;background:var(--slate-50);padding:8px 10px;text-align:left;border-right:1px solid var(--slate-200);min-width:170px">Module</th>
+              ${ordered.map(r => html`
+                <th key=${r.id} style="position:sticky;top:0;z-index:2;background:var(--slate-50);padding:8px 6px;font-weight:600;color:var(--slate-700);text-align:center;min-width:78px;border-right:1px solid var(--slate-100)">
+                  <div style="display:flex;flex-direction:column;align-items:center;gap:2px">
+                    <span>${r.display_name}</span>
+                    ${isAlwaysFull(r.slug) && html`<span style="font-size:9px;color:var(--slate-400)">always full</span>`}
+                  </div>
+                </th>
+              `)}
+            </tr>
+          </thead>
+          <tbody>
+            ${Object.keys(RBAC_MODULE_GROUPS).map(gk => html`
+              <tr key=${'g-'+gk}>
+                <td colSpan=${ordered.length + 1} style="background:var(--slate-50);padding:6px 10px;font-weight:700;font-size:10px;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.05em;position:sticky;left:0;z-index:1">
+                  ${RBAC_MODULE_GROUPS[gk]}
+                </td>
+              </tr>
+              ${RBAC_MODULES.filter(m => m.group === gk).map(m => html`
+                <tr key=${m.key} style="border-top:1px solid var(--slate-100)">
+                  <td style="position:sticky;left:0;background:white;padding:7px 10px;border-right:1px solid var(--slate-200);font-weight:500">${m.label}</td>
+                  ${ordered.map(r => {
+                    const n = cellState(r, m.key);
+                    const full = n === ACTION_COUNT;
+                    const none = n === 0;
+                    const bg = full ? 'var(--emerald-500)' : none ? 'transparent' : 'var(--amber-400)';
+                    const label = full ? '●' : none ? '·' : n + '/' + ACTION_COUNT;
+                    const color = full || none ? 'white' : '#7c2d12';
+                    return html`
+                      <td key=${r.id} onClick=${() => !isAlwaysFull(r.slug) && setEditTarget(r)} title=${r.display_name + ' · ' + m.label + ' (' + n + '/' + ACTION_COUNT + ')'}
+                          style=${'padding:6px;text-align:center;cursor:'+(isAlwaysFull(r.slug)?'default':'pointer')+';border-right:1px solid var(--slate-100)'}>
+                        <span style=${'display:inline-flex;align-items:center;justify-content:center;min-width:32px;height:22px;border-radius:4px;font-size:11px;font-weight:700;background:'+bg+';color:'+(none?'var(--slate-300)':color)}>${label}</span>
+                      </td>
+                    `;
+                  })}
+                </tr>
+              `)}
+            `)}
+          </tbody>
+        </table>
+      </div>
+      <div style="font-size:11px;color:var(--slate-500);margin-top:8px">
+        ● = full access · <span style="color:#b45309;font-weight:600">3/6</span> = partial · · = none. Tap a cell to open that role's editor with the module pre-scrolled.
+      </div>
+    `}
+
+    ${mode === 'list' && html`
+      <div class="section-h">Roles · ${ordered.length}<button class="btn small" onClick=${() => setCreating(true)}>+ New role</button></div>
+      ${ordered.map((r, idx) => html`
+        <div class="list-item" key=${r.id}>
+          <div class="list-item-row" style="gap:8px">
+            <div style="display:flex;flex-direction:column;gap:2px">
+              <button class="btn small ghost" style="padding:0 7px;line-height:1.4;font-size:12px" disabled=${idx === 0} onClick=${() => move(idx, -1)} title="Move up">↑</button>
+              <button class="btn small ghost" style="padding:0 7px;line-height:1.4;font-size:12px" disabled=${idx === ordered.length - 1} onClick=${() => move(idx, 1)} title="Move down">↓</button>
             </div>
-            <div class="list-item-sub">${r.member_count} user${r.member_count === 1 ? '' : 's'} · ${r.permissions.length} permission${r.permissions.length === 1 ? '' : 's'}${r.description ? ' · ' + r.description : ''}</div>
-          </div>
-          <div style="display:flex;gap:6px">
-            <button class="btn small" onClick=${() => setEditTarget(r)}>${r.is_builtin && (r.slug === 'plant_head' || r.slug === 'admin') ? 'View' : 'Edit'}</button>
-            ${!r.is_builtin && html`<button class="btn small ghost" style="color:var(--rose-600)" onClick=${() => del(r)} title="Delete role">🗑</button>`}
+            <div style="font-size:11px;font-weight:700;color:var(--slate-400);min-width:18px;text-align:center">${idx + 1}</div>
+            <div class="list-item-main" style="flex:1">
+              <div class="list-item-title">
+                ${r.display_name}
+                <span class=${'badge ' + (r.is_builtin ? '' : 'teal')} style="font-size:9px;margin-left:4px">${r.is_builtin ? 'built-in' : 'custom'}</span>
+              </div>
+              <div class="list-item-sub">${r.member_count} user${r.member_count === 1 ? '' : 's'} · ${r.permissions.length} permission${r.permissions.length === 1 ? '' : 's'}${r.description ? ' · ' + r.description : ''}</div>
+            </div>
+            <div style="display:flex;gap:6px">
+              <button class="btn small" onClick=${() => setEditTarget(r)}>${r.is_builtin && (r.slug === 'plant_head' || r.slug === 'admin') ? 'View' : 'Edit'}</button>
+              ${!r.is_builtin && html`<button class="btn small ghost" style="color:var(--rose-600)" onClick=${() => del(r)} title="Delete role">🗑</button>`}
+            </div>
           </div>
         </div>
-      </div>
-    `)}
+      `)}
+    `}
 
     ${creating && html`<${RoleCreateModal} plant=${plant} onClose=${() => setCreating(false)} onSaved=${async () => { setCreating(false); await refresh(); }} />`}
     ${editTarget && html`<${RoleEditModal} plant=${plant} role=${editTarget} onClose=${() => setEditTarget(null)} onSaved=${async () => { setEditTarget(null); await refresh(); }} />`}
