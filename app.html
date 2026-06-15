@@ -24032,6 +24032,11 @@ function ReceiveFromDocPicker({ plant, me, pendingReceptions, onClose, onSaved }
 
   const openRec = async (rec) => {
     setActiveRec(rec); setErr(''); setLoading(true);
+    const timeoutId = setTimeout(() => {
+      console.error('ReceiveFromDocPicker.openRec: timed out after 15s', { rec_id: rec.id, plant_id: plant.id });
+      setErr('Loading timed out. Check your connection or close and retry.');
+      setLoading(false);
+    }, 15000);
     try {
       const [lines, items] = await Promise.all([
         sb.from('mcp_logistics_grn_lines').select('*, mcp_stocks_items(id, code, name, uom, current_qty, opening_recorded_at)').eq('grn_id', rec.id),
@@ -24042,8 +24047,10 @@ function ReceiveFromDocPicker({ plant, me, pendingReceptions, onClose, onSaved }
       setGrnLines((lines.data || []).map(l => ({ ...l, _post_qty: l.doc_qty || 0, _stock_item_id: l.item_id || '' })));
       setAllItems(items.data || []);
     } catch (e) {
-      setErr('Could not load receipt: ' + (e.message || e));
+      console.error('ReceiveFromDocPicker.openRec failed:', e);
+      setErr('Could not load receipt: ' + (e?.message || e));
     } finally {
+      clearTimeout(timeoutId);
       setLoading(false);
     }
   };
@@ -28767,7 +28774,14 @@ function GrnVerifyModal({ plant, me, grn, onClose, onSaved }) {
 
   useEffect(() => {
     let cancelled = false;
+    let timeoutId = null;
     (async () => {
+      timeoutId = setTimeout(() => {
+        if (cancelled) return;
+        console.error('GrnVerifyModal: load timed out after 15s', { grn_id: grn.id, plant_id: plant.id });
+        setError('Loading timed out. Check your connection or close and retry.');
+        setLoading(false);
+      }, 15000);
       try {
         const [linesRes, itemsRes] = await Promise.all([
           sb.from('mcp_logistics_grn_lines').select('*, mcp_stocks_items(name, uom)').eq('grn_id', grn.id),
@@ -28784,12 +28798,14 @@ function GrnVerifyModal({ plant, me, grn, onClose, onSaved }) {
         setItems(itemsRes.data || []);
       } catch (e) {
         if (cancelled) return;
-        setError('Could not load GRN lines: ' + (e.message || e));
+        console.error('GrnVerifyModal load failed:', e);
+        setError('Could not load GRN lines: ' + (e?.message || e));
       } finally {
+        if (timeoutId) clearTimeout(timeoutId);
         if (!cancelled) setLoading(false);
       }
     })();
-    return () => { cancelled = true; };
+    return () => { cancelled = true; if (timeoutId) clearTimeout(timeoutId); };
   }, [grn.id]);
 
   const updateLine = (idx, patch) => {
@@ -28843,7 +28859,15 @@ function GrnVerifyModal({ plant, me, grn, onClose, onSaved }) {
     } finally { setBusy(false); }
   };
 
-  if (loading) return html`<div class="modal-backdrop active"><div class="modal"><div class="loader"><div class="spinner"></div></div></div></div>`;
+  if (loading) return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:380px;padding:24px;text-align:center">
+        <div class="loader" style="margin:0 auto 14px"><div class="spinner"></div></div>
+        <div style="font-size:13px;color:var(--slate-600);margin-bottom:14px">Loading GRN lines…</div>
+        <button class="btn small ghost" onClick=${onClose}>Cancel</button>
+      </div>
+    </div>
+  `;
 
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
