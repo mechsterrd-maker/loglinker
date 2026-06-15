@@ -13776,7 +13776,62 @@ function planSingleSheet({ pieces, stocks, kerfMm }) {
   const k = Number(kerfMm) || 0;
   const sheets = [];
 
+  // Helpers used by both the main pack and any later cleanup pass.
+  // 'usable hole' shrinks the inner Ø by 2× kerf for cutting clearance.
+  const usableHole = (innerMm) => Math.max(0, Number(innerMm) - 2 * k);
+  const pieceArea = (shape, w, h) => {
+    if (shape === 'round') return Math.PI * (w / 2) * (w / 2);
+    if (shape === 'ring')  return Math.PI * (w / 2) * (w / 2);
+    return w * h;
+  };
+  const fitsInHole = (cand, holeMm, existing) => {
+    const D = usableHole(holeMm);
+    if (D <= 0) return false;
+    const w = cand.origW || cand.w || 0;
+    const h = cand.origH || cand.h || 0;
+    if (w <= 0 || h <= 0) return false;
+    const isCircular = cand.shape === 'round' || cand.shape === 'ring';
+    const dimOK = isCircular ? (w <= D) : (Math.sqrt(w * w + h * h) <= D);
+    if (!dimOK) return false;
+    const holeArea = Math.PI * (D / 2) * (D / 2);
+    const existingArea = (existing || []).reduce((s, np) => s + pieceArea(np.shape, np.origW || 0, np.origH || 0), 0);
+    return (existingArea + pieceArea(cand.shape, w, h)) <= holeArea * 0.80;
+  };
+  const collectRingHosts = (placement, out) => {
+    if (placement.shape === 'ring' && Number(placement.innerMm) > 0) out.push(placement);
+    for (const np of (placement.nestedInside || [])) collectRingHosts(np, out);
+  };
+
   for (const item of items) {
+    // STEP 1 — Marvel's rule: 'try to cover all the available gaps in the
+    // wastage area first.' Ring holes are pure waste until they host
+    // something, so they're free real estate. Try them BEFORE any
+    // freeRect, and prefer the smallest hole that still fits (less
+    // leftover area inside the hole = tighter pack).
+    let nestHost = null;
+    let nestHostScore = Infinity;
+    for (const sheet of sheets) {
+      const hosts = [];
+      for (const pl of sheet.placed) collectRingHosts(pl, hosts);
+      for (const host of hosts) {
+        const cand = { shape: item.shape, origW: item.w, origH: item.h };
+        if (!fitsInHole(cand, host.innerMm, host.nestedInside)) continue;
+        const score = usableHole(host.innerMm); // smaller hole = preferred fit
+        if (score < nestHostScore) { nestHost = host; nestHostScore = score; }
+      }
+    }
+    if (nestHost) {
+      if (!nestHost.nestedInside) nestHost.nestedInside = [];
+      nestHost.nestedInside.push({
+        pieceId: item.pieceId, label: item.label,
+        origW: item.w, origH: item.h, shape: item.shape,
+        innerMm: item.innerMm || 0,
+        nestedInside: null,
+      });
+      continue;
+    }
+
+    // STEP 2 — existing freeRect search: smallest waste wins.
     let best = null;
     for (const sheet of sheets) {
       for (let i = 0; i < sheet.freeRects.length; i++) {
@@ -13796,7 +13851,8 @@ function planSingleSheet({ pieces, stocks, kerfMm }) {
       cutPlatePlaceRect(best.sheet, best.rect, best.rectIdx, item, pw, ph, best.rotated, k);
       continue;
     }
-    // Open a new sheet: smallest stock that holds the item in either orientation
+    // STEP 3 — only now extend: open a new sheet on the smallest stock
+    // that holds the item.
     const fit = stockPool
       .filter(s => s.remaining > 0 && (
         (item.w <= s.widthMm && item.h <= s.heightMm) ||
@@ -13820,39 +13876,11 @@ function planSingleSheet({ pieces, stocks, kerfMm }) {
     sheets.push(newSheet);
   }
 
-  // ── SMART NESTING ─────────────────────────────────────────────────────
-  // For each ring with a hole, find the largest non-ring placement
-  // anywhere that fits inscribed in the hole (diagonal ≤ hole Ø − 2 × kerf)
-  // and absorb it. The ring's bounding box on the sheet already covers the
-  // hole, so the recovered piece is "free": it stops occupying its previous
-  // spot on the sheet. Empty sheets get dropped.
-  const usableHole = (innerMm) => Math.max(0, Number(innerMm) - 2 * k);
-  // Whether `cand` would still fit if added to the existing nestedList.
-  // Two checks:
-  //   1. Individual dimension fit — the piece's bounding circle ≤ hole.
-  //   2. Cumulative area fit — total area of (existing + this) ≤ 80% of
-  //      hole area. 80% mimics hexagonal-packing density (~90.7%) with
-  //      headroom for kerfs between nested pieces.
-  // This is more honest than the strict grid approach: a single big piece
-  // can fill the whole hole, while many small pieces share the area budget.
-  const pieceArea = (shape, w, h) => {
-    if (shape === 'round') return Math.PI * (w / 2) * (w / 2);
-    if (shape === 'ring')  return Math.PI * (w / 2) * (w / 2); // outer disc area; the inner hole is its own thing
-    return w * h;
-  };
-  const fitsInHole = (cand, holeMm, existing) => {
-    const D = usableHole(holeMm);
-    if (D <= 0) return false;
-    const w = cand.origW || cand.w || 0;
-    const h = cand.origH || cand.h || 0;
-    if (w <= 0 || h <= 0) return false;
-    const isCircular = cand.shape === 'round' || cand.shape === 'ring';
-    const fits = isCircular ? (w <= D) : (Math.sqrt(w * w + h * h) <= D);
-    if (!fits) return false;
-    const holeArea = Math.PI * (D / 2) * (D / 2);
-    const existingArea = (existing || []).reduce((s, np) => s + pieceArea(np.shape, np.origW || 0, np.origH || 0), 0);
-    return (existingArea + pieceArea(cand.shape, w, h)) <= holeArea * 0.80;
-  };
+  // ── CLEANUP / RECOVERY PASS ───────────────────────────────────────────
+  // The main pack already tries ring holes first, so most pieces should
+  // already be nested. This pass catches any leftovers: a small piece
+  // that was placed on a sheet earlier (before its potential host ring
+  // was created) can now be moved into an empty hole.
   // Snapshot ring placements BEFORE we start absorbing, because splicing
   // pieces out of sheets later would invalidate a lazy traversal.
   const ringRefs = [];
