@@ -1784,18 +1784,26 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
 
   const recalcUnread = useCallback(async () => {
     if (!plant?.id) return;
-    const { data: groups } = await sb.from('chat_groups').select('id, members').contains('members', [user.id]);
-    if (!groups) return;
-    let total = 0;
+    const { data: groups } = await sb.from('chat_groups').select('id').contains('members', [user.id]);
+    if (!groups || groups.length === 0) { setUnreadCount(0); return; }
+    // Single aggregated fetch instead of N count-queries per group. Use the
+    // oldest lastRead across all groups as a server-side lower bound, then
+    // tally per-group in JS using per-group lastRead from localStorage.
+    const lastReads = {};
+    let oldest = Date.now();
     for (const g of groups) {
-      const lastRead = parseInt(localStorage.getItem('loglinkr_lastread_' + user.id + '_' + g.id) || '0');
-      const lastReadIso = new Date(lastRead || 0).toISOString();
-      const { count } = await sb.from('chat_messages')
-        .select('id', { count:'exact', head:true })
-        .eq('group_id', g.id)
-        .gt('created_at', lastReadIso)
-        .neq('sender_id', user.id);
-      total += count || 0;
+      const v = parseInt(localStorage.getItem('loglinkr_lastread_' + user.id + '_' + g.id) || '0');
+      lastReads[g.id] = v;
+      if (v < oldest) oldest = v;
+    }
+    const { data: msgs } = await sb.from('chat_messages')
+      .select('group_id, created_at')
+      .in('group_id', groups.map(g => g.id))
+      .neq('sender_id', user.id)
+      .gt('created_at', new Date(oldest || 0).toISOString());
+    let total = 0;
+    if (msgs) for (const m of msgs) {
+      if (new Date(m.created_at).getTime() > (lastReads[m.group_id] || 0)) total++;
     }
     setUnreadCount(total);
   }, [plant?.id, user.id]);
@@ -1808,8 +1816,9 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
         recalcUnread();
       })
       .subscribe();
-    // Recalc when localStorage changes (mark-read in chat)
-    const interval = setInterval(recalcUnread, 5000);
+    // Realtime sub is the primary signal; this poll is a 60s safety net,
+    // not the main mechanism, so it can't drown PostgREST in N+1 queries.
+    const interval = setInterval(recalcUnread, 60000);
     return () => { sb.removeChannel(channel); clearInterval(interval); };
   }, [plant?.id, recalcUnread]);
 
@@ -5148,6 +5157,15 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
   const recChunksRef = useRef([]);
   const recStartRef = useRef(0);
 
+  // Debounce loadGroups so a burst of realtime INSERTs (system alerts, chatty
+  // groups) doesn't trigger N reloads each doing per-group count+lastMsg
+  // queries — that was saturating PostgREST and starving other tabs.
+  const loadGroupsTimerRef = useRef(null);
+  const loadGroupsDebounced = useCallback(() => {
+    if (loadGroupsTimerRef.current) clearTimeout(loadGroupsTimerRef.current);
+    loadGroupsTimerRef.current = setTimeout(() => { loadGroups(); }, 1500);
+  }, []);
+
   useEffect(() => { loadGroups(); }, []);
 
   // RBAC: load the plant's active projects for the attachment "Tag to project"
@@ -5196,8 +5214,9 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
         const newMsg = payload.new;
         if (newMsg.sender_id === user.id) return;
 
-        // Refresh group list so badges + previews update
-        loadGroups();
+        // Refresh group list so badges + previews update — debounced so
+        // bursty inserts (system alerts) don't trigger an N+1 storm.
+        loadGroupsDebounced();
 
         // If we're in the active group already, per-group handler shows the message
         if (activeGroup && newMsg.group_id === activeGroup.id) return;
@@ -24038,7 +24057,7 @@ function ReceiveFromDocPicker({ plant, me, pendingReceptions, onClose, onSaved }
     }, 15000);
     try {
       const [lines, items] = await Promise.all([
-        sb.from('mcp_logistics_grn_lines').select('*, mcp_stocks_items(id, code, name, uom, current_qty, opening_recorded_at)').eq('grn_id', rec.id),
+        sb.from('mcp_logistics_grn_lines').select('*').eq('grn_id', rec.id),
         sb.from('mcp_stocks_items').select('id, code, name, uom, current_qty, opening_recorded_at').eq('plant_id', plant.id).order('name'),
       ]);
       if (lines.error) throw lines.error;
@@ -28783,7 +28802,7 @@ function GrnVerifyModal({ plant, me, grn, onClose, onSaved }) {
       }, 15000);
       try {
         const [linesRes, itemsRes] = await Promise.all([
-          sb.from('mcp_logistics_grn_lines').select('*, mcp_stocks_items(name, uom)').eq('grn_id', grn.id),
+          sb.from('mcp_logistics_grn_lines').select('*').eq('grn_id', grn.id),
           sb.from('mcp_stocks_items').select('id, name, uom').eq('plant_id', plant.id).order('name'),
         ]);
         if (cancelled) return;
@@ -28792,7 +28811,7 @@ function GrnVerifyModal({ plant, me, grn, onClose, onSaved }) {
         setLines((linesRes.data || []).map(l => ({
           ...l,
           received_qty_input: l.doc_qty != null ? String(l.doc_qty) : '',
-          item_id_input: l.item_id || '',
+          item_id_input: l.stock_item_id || l.item_id || '',
         })));
         setItems(itemsRes.data || []);
       } catch (e) {
@@ -28858,16 +28877,6 @@ function GrnVerifyModal({ plant, me, grn, onClose, onSaved }) {
     } finally { setBusy(false); }
   };
 
-  if (loading) return html`
-    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div class="modal" style="max-width:380px;padding:24px;text-align:center">
-        <div class="loader" style="margin:0 auto 14px"><div class="spinner"></div></div>
-        <div style="font-size:13px;color:var(--slate-600);margin-bottom:14px">Loading GRN lines…</div>
-        <button class="btn small ghost" onClick=${onClose}>Cancel</button>
-      </div>
-    </div>
-  `;
-
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal" style="max-width:760px">
@@ -28885,7 +28894,16 @@ function GrnVerifyModal({ plant, me, grn, onClose, onSaved }) {
         </div>
 
         <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">
-          ${lines.length === 0 && html`
+          ${loading && html`
+            ${[0,1].map(i => html`
+              <div key=${'skel'+i} style="border:1px solid var(--slate-200);border-radius:8px;padding:10px 12px;background:white;opacity:0.6">
+                <div style="display:grid;grid-template-columns:1.6fr 1fr 0.7fr 0.7fr;gap:8px">
+                  ${[0,1,2,3].map(j => html`<div key=${j} style="height:34px;background:var(--slate-100);border-radius:4px"></div>`)}
+                </div>
+              </div>
+            `)}
+          `}
+          ${!loading && lines.length === 0 && html`
             <div style="border:1px dashed var(--slate-300);border-radius:8px;padding:18px;text-align:center;color:var(--slate-600);font-size:13px;background:var(--slate-50)">
               No item lines on this GRN. The reception header was saved but no items were captured —<br/>
               either reject it, or close this and edit the source document to add line items first.
@@ -28923,10 +28941,10 @@ function GrnVerifyModal({ plant, me, grn, onClose, onSaved }) {
         </div>
 
         <div style="display:flex;gap:8px;justify-content:space-between">
-          <button class="btn small ghost" onClick=${reject} disabled=${busy} style="color:var(--rose-600)">✕ Reject GRN</button>
+          <button class="btn small ghost" onClick=${reject} disabled=${busy || loading} style="color:var(--rose-600)">✕ Reject GRN</button>
           <div style="display:flex;gap:8px">
             <button class="btn small ghost" onClick=${onClose} disabled=${busy}>Cancel</button>
-            <button class="btn small" onClick=${verify} disabled=${busy} style="background:var(--emerald-600)">${busy ? 'Saving...' : '✓ Verify & receive'}</button>
+            <button class="btn small" onClick=${verify} disabled=${busy || loading || lines.length === 0} style="background:var(--emerald-600)">${busy ? 'Saving...' : '✓ Verify & receive'}</button>
           </div>
         </div>
       </div>
