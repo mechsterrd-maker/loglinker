@@ -26021,6 +26021,8 @@ function VendorDetail({ plant, me, vendor: initialVendor, jobworkStock, docs, on
   const isNew = initialVendor?._new;
   const [editing, setEditing] = useState(isNew);
   const [vendor, setVendor] = useState(isNew ? null : initialVendor);
+  const [tab, setTab] = useState('overview'); // overview | ledger | jobwork
+  const [ledgerFilter, setLedgerFilter] = useState('all');
 
   if (isNew && editing) {
     return html`<${VendorEditModal} plant=${plant} me=${me} vendor=${null} onClose=${onClose} onSaved=${(v) => { setVendor(v); setEditing(false); }} />`;
@@ -26031,28 +26033,159 @@ function VendorDetail({ plant, me, vendor: initialVendor, jobworkStock, docs, on
     return html`<${VendorEditModal} plant=${plant} me=${me} vendor=${vendor} onClose=${() => setEditing(false)} onSaved=${(v) => { setVendor(v); setEditing(false); }} />`;
   }
 
-  const totalPayable = docs.filter(d => ['invoice_in','bill'].includes(d.doc_type) && ['pending','approved','partial'].includes(d.status))
-    .reduce((sum, d) => sum + (parseFloat(d.total_value || 0) - parseFloat(d.paid_amount || 0)), 0);
+  // ── Roll-ups ────────────────────────────────────────────────────────────
+  // Payables: invoices / bills that aren't fully settled.
+  const PAYABLE_TYPES = new Set(['invoice_in', 'bill', 'vendor_invoice']);
+  const PAY_OPEN = new Set(['pending', 'approved', 'partial', 'open']);
+  const outstanding = docs
+    .filter(d => PAYABLE_TYPES.has(d.doc_type) && PAY_OPEN.has(d.status))
+    .reduce((s, d) => s + (parseFloat(d.total_value || 0) - parseFloat(d.paid_amount || 0)), 0);
+  const lifetimeSpend = docs
+    .filter(d => PAYABLE_TYPES.has(d.doc_type))
+    .reduce((s, d) => s + parseFloat(d.total_value || 0), 0);
+  const overdue = docs
+    .filter(d => PAYABLE_TYPES.has(d.doc_type) && PAY_OPEN.has(d.status) && d.due_date && d.due_date < new Date().toISOString().slice(0,10))
+    .reduce((s, d) => s + (parseFloat(d.total_value || 0) - parseFloat(d.paid_amount || 0)), 0);
+
+  // Doc mix: count per type.
+  const mix = {};
+  for (const d of docs) mix[d.doc_type] = (mix[d.doc_type] || 0) + 1;
+  const mixEntries = Object.entries(mix).sort((a,b) => b[1]-a[1]);
+  const docLabel = (t) => ({
+    invoice_in:'Vendor invoice', bill:'Bill', vendor_invoice:'Vendor invoice',
+    po:'PO', dc_in:'DC in', dc_out:'DC out', dc_out_returnable:'Returnable DC',
+    grn:'GRN', quote:'Quote', packing_list:'Packing list',
+    job_work_dc_out:'JW DC out', job_work_dc_in:'JW DC in',
+  })[t] || (t || '').replace(/_/g,' ');
+
+  // Last 6 months trend
+  const monthly = {};
+  for (let i=5; i>=0; i--) {
+    const d = new Date(); d.setDate(1); d.setMonth(d.getMonth()-i);
+    const key = d.toISOString().slice(0,7);
+    monthly[key] = 0;
+  }
+  for (const d of docs) {
+    if (!PAYABLE_TYPES.has(d.doc_type) || !d.doc_date) continue;
+    const k = String(d.doc_date).slice(0,7);
+    if (k in monthly) monthly[k] += parseFloat(d.total_value || 0);
+  }
+  const monthMax = Math.max(1, ...Object.values(monthly));
+  const lastDocDate = docs[0]?.doc_date || null;
+
+  // Ledger view: sort by date desc, optionally filter by type
+  const ledger = (ledgerFilter === 'all' ? docs : docs.filter(d => d.doc_type === ledgerFilter))
+    .slice().sort((a,b) => String(b.doc_date||'').localeCompare(String(a.doc_date||'')));
+
+  const statusBadge = (s) => s === 'paid' ? 'emerald' : (s === 'partial' || s === 'approved') ? 'amber' : (s === 'rejected' || s === 'cancelled') ? 'rose' : '';
 
   return html`
     <div class="page-header" style="display:flex;align-items:center;gap:10px">
       <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
-      <div style="flex:1"><h1 style="font-size:18px">${vendor.name}</h1>
-        <div class="sub">${vendor.is_jobwork_vendor ? '🔧 Job-work vendor' : 'Vendor'}</div>
+      <div style="flex:1;min-width:0">
+        <h1 style="font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${vendor.name}</h1>
+        <div class="sub" style="font-size:11px">
+          ${vendor.is_jobwork_vendor ? '🔧 Job-work vendor · ' : ''}${vendor.city ? vendor.city + ' · ' : ''}${vendor.gstin ? 'GSTIN ' + vendor.gstin : (vendor.phone || '')}
+        </div>
       </div>
-      <button class="btn small ghost" onClick=${() => setEditing(true)}>Edit</button>
+      <button class="btn small ghost" onClick=${() => setEditing(true)}>✏️ Edit</button>
     </div>
 
-    <div class="card">
-      ${vendor.gstin && html`<div class="card-row"><span class="label">GSTIN</span><span class="value mono">${vendor.gstin}</span></div>`}
-      ${vendor.phone && html`<div class="card-row"><span class="label">Phone</span><span class="value mono">${vendor.phone}</span></div>`}
-      ${vendor.city && html`<div class="card-row"><span class="label">Location</span><span class="value">${vendor.city}${vendor.state ? ', ' + vendor.state : ''}</span></div>`}
-      <div class="card-row"><span class="label">Payment terms</span><span class="value">${vendor.payment_terms_days || 30} days</span></div>
-      <div class="card-row"><span class="label">Outstanding</span><span class="value" style="color:${totalPayable > 0 ? 'var(--rose-500)' : 'var(--emerald-600)'};font-weight:700">₹${fmtNum(totalPayable)}</span></div>
+    <!-- KPI ROW -->
+    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px">
+      <div class="stat ${outstanding > 0 ? 'rose' : 'teal'}">
+        <div class="stat-num" style="font-size:17px">₹${fmtNum(outstanding)}</div>
+        <div class="stat-label">Outstanding</div>
+      </div>
+      <div class="stat ${overdue > 0 ? 'amber' : ''}">
+        <div class="stat-num" style="font-size:17px">₹${fmtNum(overdue)}</div>
+        <div class="stat-label">Overdue</div>
+      </div>
+      <div class="stat">
+        <div class="stat-num" style="font-size:17px">₹${fmtNum(lifetimeSpend)}</div>
+        <div class="stat-label">Lifetime spend</div>
+      </div>
+      <div class="stat">
+        <div class="stat-num" style="font-size:17px">${docs.length}</div>
+        <div class="stat-label">Docs · ${lastDocDate ? 'last ' + lastDocDate : 'no activity'}</div>
+      </div>
     </div>
 
-    ${jobworkStock.length > 0 && html`
-      <div class="section-h">Stock at this vendor (job-work)</div>
+    <!-- TABS -->
+    <div class="auth-tabs" style="margin-bottom:10px">
+      <button class=${'auth-tab'+(tab==='overview'?' active':'')} onClick=${() => setTab('overview')}>Overview</button>
+      <button class=${'auth-tab'+(tab==='ledger'?' active':'')} onClick=${() => setTab('ledger')}>Ledger · ${docs.length}</button>
+      ${jobworkStock.length > 0 && html`<button class=${'auth-tab'+(tab==='jobwork'?' active':'')} onClick=${() => setTab('jobwork')}>Job-work · ${jobworkStock.length}</button>`}
+    </div>
+
+    ${tab === 'overview' && html`
+      <div class="card" style="padding:12px;margin-bottom:10px">
+        <div style="font-size:11px;font-weight:700;color:var(--slate-600);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:10px">Spend · last 6 months</div>
+        <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:6px;height:90px">
+          ${Object.entries(monthly).map(([k, v]) => html`
+            <div key=${k} style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">
+              <div style="font-size:9px;color:var(--slate-500);font-weight:600">${v ? '₹' + fmtNum(v) : ''}</div>
+              <div style="width:100%;background:var(--teal-100);border-radius:3px;height:${Math.max(2, Math.round((v/monthMax)*60))}px"></div>
+              <div style="font-size:10px;color:var(--slate-500)">${k.slice(5)}/${k.slice(2,4)}</div>
+            </div>
+          `)}
+        </div>
+      </div>
+
+      <div class="card" style="padding:12px;margin-bottom:10px">
+        <div style="font-size:11px;font-weight:700;color:var(--slate-600);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:8px">Document mix</div>
+        ${mixEntries.length === 0 ? html`<div style="font-size:12px;color:var(--slate-500)">No documents yet for this vendor</div>` :
+          html`<div style="display:flex;flex-wrap:wrap;gap:6px">
+            ${mixEntries.map(([t, n]) => html`
+              <button key=${t} onClick=${() => { setLedgerFilter(t); setTab('ledger'); }}
+                style="background:var(--teal-50);color:var(--teal-800);border:1px solid var(--teal-200);border-radius:999px;padding:4px 10px;font-size:12px;cursor:pointer">
+                ${docLabel(t)} · <b>${n}</b>
+              </button>
+            `)}
+          </div>`}
+      </div>
+
+      <div class="card" style="padding:12px;margin-bottom:10px">
+        <div style="font-size:11px;font-weight:700;color:var(--slate-600);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:8px">Contact & terms</div>
+        ${vendor.gstin && html`<div class="card-row"><span class="label">GSTIN</span><span class="value mono">${vendor.gstin}</span></div>`}
+        ${vendor.pan && html`<div class="card-row"><span class="label">PAN</span><span class="value mono">${vendor.pan}</span></div>`}
+        ${vendor.phone && html`<div class="card-row"><span class="label">Phone</span><span class="value mono">${vendor.phone}</span></div>`}
+        ${vendor.email && html`<div class="card-row"><span class="label">Email</span><span class="value">${vendor.email}</span></div>`}
+        ${(vendor.city || vendor.state) && html`<div class="card-row"><span class="label">Location</span><span class="value">${[vendor.city, vendor.state].filter(Boolean).join(', ')}</span></div>`}
+        <div class="card-row"><span class="label">Payment terms</span><span class="value">${vendor.payment_terms_days || 30} days</span></div>
+        ${vendor.notes && html`<div class="card-row"><span class="label">Notes</span><span class="value">${vendor.notes}</span></div>`}
+      </div>
+    `}
+
+    ${tab === 'ledger' && html`
+      <div class="card" style="padding:10px 12px;margin-bottom:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span style="font-size:11px;font-weight:700;color:var(--slate-600);text-transform:uppercase;letter-spacing:0.4px">Filter</span>
+        <select value=${ledgerFilter} onChange=${e => setLedgerFilter(e.target.value)} style="font-size:12px;padding:4px 8px">
+          <option value="all">All types · ${docs.length}</option>
+          ${mixEntries.map(([t, n]) => html`<option key=${t} value=${t}>${docLabel(t)} · ${n}</option>`)}
+        </select>
+        <span style="flex:1"></span>
+        <span style="font-size:11px;color:var(--slate-500)">Showing ${ledger.length} of ${docs.length}</span>
+      </div>
+      ${ledger.length === 0 ? html`<div class="empty"><div style="font-size:13px">No documents in this filter</div></div>` :
+        ledger.slice(0, 200).map(d => html`
+          <div class="list-item" key=${d.id}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${d.doc_number || '(no number)'} · ${docLabel(d.doc_type)}</div>
+                <div class="list-item-sub">${d.doc_date || '?'}${d.due_date ? ' · due ' + d.due_date : ''}${PAYABLE_TYPES.has(d.doc_type) ? ' · ₹' + fmtNum(d.total_value || 0) : ''}</div>
+              </div>
+              ${d.status && html`<span class=${'badge ' + statusBadge(d.status)}>${d.status}</span>`}
+            </div>
+          </div>
+        `)
+      }
+    `}
+
+    ${tab === 'jobwork' && html`
+      <div class="card" style="padding:10px 12px;margin-bottom:8px;font-size:12px;color:var(--slate-600)">
+        Material we've sent to this vendor and haven't received back yet.
+      </div>
       ${jobworkStock.map(s => html`
         <div class="list-item" key=${s.item_name}>
           <div class="list-item-row">
@@ -26065,21 +26198,6 @@ function VendorDetail({ plant, me, vendor: initialVendor, jobworkStock, docs, on
         </div>
       `)}
     `}
-
-    <div class="section-h">Documents · ${docs.length}</div>
-    ${docs.length === 0 ? html`<div class="empty"><div style="font-size:13px">No documents yet for this vendor</div></div>` :
-      docs.slice(0, 50).map(d => html`
-        <div class="list-item" key=${d.id}>
-          <div class="list-item-row">
-            <div class="list-item-main">
-              <div class="list-item-title">${d.doc_number || '?'} · ${d.doc_type?.replace('_',' ')}</div>
-              <div class="list-item-sub">${d.doc_date || '?'} · ₹${fmtNum(d.total_value || 0)}</div>
-            </div>
-            <span class=${'badge ' + (d.status === 'paid' ? 'emerald' : d.status === 'partial' ? 'amber' : '')}>${d.status}</span>
-          </div>
-        </div>
-      `)
-    }
   `;
 }
 
