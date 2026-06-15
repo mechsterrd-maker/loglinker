@@ -25835,10 +25835,10 @@ function Documents({ plant, me }) {
   return html`
     <div class="page-header"><div><h1>Documents</h1><div class="sub">Bills, DCs, payments · auto-extracted from chat</div></div></div>
 
-    ${ocrUsage && ocrUsage.cap != null && html`
+    ${ocrUsage && ocrUsage.cap != null && me?.role === 'admin' && html`
       <div style=${'display:flex;align-items:center;gap:12px;border-radius:10px;padding:10px 12px;margin-bottom:12px;border:1px solid ' + (ocrUsage.used >= ocrUsage.cap ? 'var(--rose-200);background:var(--rose-50)' : 'var(--slate-200);background:var(--slate-50)')}>
         <div style="flex:1;min-width:0">
-          <div style="font-size:12px;font-weight:600;color:var(--slate-700)">📄 OCR bills this month · ${ocrUsage.used} / ${ocrUsage.cap}</div>
+          <div style="font-size:12px;font-weight:600;color:var(--slate-700)">📄 OCR bills this month · ${ocrUsage.used} / ${ocrUsage.cap} <span style="font-size:10px;color:var(--slate-500);font-weight:500">· admin only</span></div>
           <div style="height:6px;background:var(--slate-200);border-radius:3px;margin-top:6px;overflow:hidden">
             <div style=${'height:100%;border-radius:3px;width:' + Math.min(100, Math.round(ocrUsage.used / ocrUsage.cap * 100)) + '%;background:' + (ocrUsage.used >= ocrUsage.cap ? 'var(--rose-500)' : ocrUsage.used / ocrUsage.cap >= 0.85 ? 'var(--amber-500)' : 'var(--teal-500)')}></div>
           </div>
@@ -26225,7 +26225,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       </div>
       ${doc.source_image_url && html`
         <button class="btn small ghost" title="Re-run extraction at full resolution with the latest plant context" onClick=${async () => {
-          if (!confirm('Re-extract this document at FULL resolution?\n\n• Uses the original (un-compressed) photo for max accuracy.\n• A NEW document row will be created — the current row is untouched.\n• Costs slightly more API budget than the default cheap path.\n• Best move when classification or item details came out wrong.')) return;
+          if (!confirm('Re-extract this document at FULL resolution?\n\n• Uses the original (un-compressed) photo for max accuracy.\n• A NEW document row will be created — the current row is untouched.\n• Best move when classification or item details came out wrong.')) return;
           showToast('Re-extracting (hi-res)…');
           try {
             const { data: { session } } = await sb.auth.getSession();
@@ -29033,7 +29033,7 @@ function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
                 </div>
                 <div style="font-size:11px;color:var(--slate-600);line-height:1.5">
                   ${aiEnabled
-                    ? 'Images posted in this group are auto-extracted into Logistics → Documents. AI cost applies per image.'
+                    ? 'Images posted in this group are auto-extracted into Logistics → Documents.'
                     : 'Enable to auto-extract DCs, invoices, and bills posted as images into Logistics. Only one group per unit can have AI enabled.'}
                 </div>
               </div>
@@ -32459,7 +32459,7 @@ function AIAuditor({ plant, me }) {
 
   if (activeRun) {
     const run = audits.find(a => a.id === activeRun);
-    if (run) return html`<${AuditDetailView} run=${run} onBack=${() => setActiveRun(null)} />`;
+    if (run) return html`<${AuditDetailView} run=${run} me=${me} onBack=${() => setActiveRun(null)} />`;
   }
 
   return html`
@@ -32537,8 +32537,7 @@ function AIAuditor({ plant, me }) {
                       ${critical > 0 && html`<span style="color:var(--rose-600);font-weight:600">${critical} critical</span>`}
                       ${warnings > 0 && html`<span style="color:var(--amber-700);font-weight:600">${warnings} warning${warnings>1?'s':''}</span>`}
                       <span>${findings.length} total findings</span>
-                      <span>·</span>
-                      <span>₹${a.estimated_cost_inr || '—'}</span>
+                      ${me?.role === 'admin' && html`<span>·</span><span title="admin only">₹${a.estimated_cost_inr || '—'}</span>`}
                     </div>
                   `}
                   ${a.status === 'failed' && html`<div style="font-size:11px;color:var(--rose-600);margin-top:4px">${a.error_message || 'Unknown error'}</div>`}
@@ -32592,7 +32591,7 @@ function AuditConfirmModal({ type, running, onConfirm, onClose }) {
 // =================================================================
 // AUDIT DETAIL VIEW — full findings of one audit
 // =================================================================
-function AuditDetailView({ run, onBack }) {
+function AuditDetailView({ run, me, onBack }) {
   const findings = run.findings || [];
   const verdict = VERDICT_STYLES[run.verdict] || VERDICT_STYLES.yellow;
 
@@ -32619,9 +32618,13 @@ function AuditDetailView({ run, onBack }) {
           ${run.summary && html`<div style="font-size:13px;color:var(--slate-800);margin-top:8px;line-height:1.5">${run.summary}</div>`}
         </div>
         <div style="text-align:right;flex-shrink:0">
-          <div style="font-size:11px;color:var(--slate-600)">Cost</div>
-          <div style="font-size:18px;font-weight:700;color:var(--slate-900)">₹${run.estimated_cost_inr || '—'}</div>
-          <div style="font-size:10px;color:var(--slate-500)">${run.input_tokens || 0} in · ${run.output_tokens || 0} out</div>
+          ${me?.role === 'admin' ? html`
+            <div style="font-size:11px;color:var(--slate-600)">Cost <span style="font-size:9px;color:var(--slate-400);font-weight:500">· admin only</span></div>
+            <div style="font-size:18px;font-weight:700;color:var(--slate-900)">₹${run.estimated_cost_inr || '—'}</div>
+            <div style="font-size:10px;color:var(--slate-500)">${run.input_tokens || 0} in · ${run.output_tokens || 0} out</div>
+          ` : html`
+            <span style="display:inline-flex;align-items:center;gap:6px;background:var(--teal-50);color:var(--teal-800);border:1px solid var(--teal-100);border-radius:999px;padding:5px 12px;font-size:12px;font-weight:600">✨ AI processed</span>
+          `}
         </div>
       </div>
     </div>
