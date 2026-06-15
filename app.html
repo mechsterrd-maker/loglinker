@@ -1487,6 +1487,7 @@ const MORE_GROUPS = [
     sub: 'Manager / auditor views',
     items: [
       { key:'iatf',                icon:'🛡', label:'IATF 16949 Readiness', iatf:true, sub:'Doc inventory, status, owners, cadences' },
+      { key:'performance',         icon:'📈', label:'Performance Dashboards',   sub:'User task completion · project schedule variance · live KPIs' },
       { key:'reports',             icon:'📑', label:'Reports & Documents',       sub:'Generate audit-ready reports from live data' },
       { key:'iatf_docs',           icon:'📚', label:'IATF Doc Library',    iatf:true, sub:'Glossary · what every IATF document does, who owns it, when reviewed' },
       { key:'trace',               icon:'🔍', label:'Trace · Audit Investigation', sub:'Linked timeline by date / part / machine' },
@@ -1858,6 +1859,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${tab === 'movements'}><${MovementsPage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'trace'}><${TracePage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} /></${Page}>
+      <${Page} active=${tab === 'performance'}><${PerformanceDashboards} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} myPerms=${myPerms} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} navAction=${navAction} setTab=${setTab} /></${Page}>
       <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} myPerms=${myPerms} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
       <${Page} active=${tab === 'masters'}><${MastersHub} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
@@ -6968,6 +6970,7 @@ const RBAC_MODULES = [
   { key:'supplier_chase', label:'Supplier Chase', group:'commercial' },
   { key:'customer_complaints', label:'Customer Complaints', group:'quality' },
   { key:'reports', label:'Reports', group:'audit' },
+  { key:'performance', label:'Performance Dashboards', group:'audit' },
   { key:'trace', label:'Trace / Audit Investigation', group:'audit' },
 ];
 const RBAC_MODULE_GROUPS = {
@@ -32502,6 +32505,245 @@ function IatfAuditFindingsLive({ plant }) {
         `)
       }
     </div>
+  `;
+}
+
+// =================================================================
+// PERFORMANCE DASHBOARDS -- two views Marvel asked for:
+//   1. Users -- task throughput, completion %, on-time %, overdue
+//   2. Projects -- schedule variance vs target, % progress, milestones
+// Both run client-side from already-loaded tables; no new RPCs needed.
+// =================================================================
+const PERF_FMT_DAYS = (n) => n == null ? '—' : (n > 0 ? '+' + n + 'd' : n + 'd');
+function PerfKpi({ num, label, sub, tone, big }) {
+  const toneColor = { teal:'var(--teal-600)', rose:'var(--rose-600)', amber:'var(--amber-600)', emerald:'var(--emerald-600)', slate:'var(--slate-700)' }[tone || 'slate'];
+  return html`<div class="card" style="padding:14px 16px;border-left:4px solid ${toneColor}">
+    <div style="font-size:${big?'30px':'22px'};font-weight:800;color:${toneColor};line-height:1.05">${num}</div>
+    <div style="font-size:11px;color:var(--slate-500);font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-top:4px">${label}</div>
+    ${sub && html`<div style="font-size:11px;color:var(--slate-500);margin-top:2px">${sub}</div>`}
+  </div>`;
+}
+function PerfBar({ pct, tone }) {
+  const c = tone === 'rose' ? 'var(--rose-500)' : tone === 'amber' ? 'var(--amber-500)' : tone === 'emerald' ? 'var(--emerald-500)' : 'var(--teal-500)';
+  return html`<div style="height:6px;background:var(--slate-100);border-radius:3px;overflow:hidden">
+    <div style=${'height:100%;background:'+c+';width:'+Math.max(0, Math.min(100, pct))+'%;transition:width 0.3s'}></div>
+  </div>`;
+}
+
+function PerformanceDashboards({ plant, me }) {
+  const [view, setView] = useState('users');
+  const [period, setPeriod] = useState('30');
+  const [actions, setActions] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [projects, setProjects] = useState([]);
+  const [milestones, setMilestones] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const since = new Date(Date.now() - parseInt(period, 10) * 86400000).toISOString();
+    const [a, u, p, m] = await Promise.all([
+      sb.from('actions').select('id, owner_id, status, due_at, completed_at, created_at')
+        .eq('plant_id', plant.id).gte('created_at', since).limit(2000),
+      sb.from('users').select('id, full_name, role, avatar_url')
+        .eq('plant_id', plant.id).eq('status','active').order('full_name'),
+      sb.from('mcp_projects').select('id, name, code, customer_name, status, start_date, target_date, completed_date, progress_pct, qty, uom')
+        .eq('plant_id', plant.id).order('target_date', { ascending: true }),
+      sb.from('mcp_project_milestones').select('id, project_id, status, target_date, done_date')
+        .eq('plant_id', plant.id).limit(2000),
+    ]);
+    setActions(a.data || []);
+    setUsers(u.data || []);
+    setProjects(p.data || []);
+    setMilestones(m.data || []);
+    setLoading(false);
+  }, [plant.id, period]);
+  useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
+
+  // ---- USER PERFORMANCE ----------------------------------------------------
+  const userStats = useMemo(() => {
+    const now = new Date();
+    const out = users.map(u => {
+      const mine = actions.filter(a => a.owner_id === u.id);
+      const completed = mine.filter(a => a.status === 'completed');
+      const open = mine.filter(a => a.status === 'open' || a.status === 'in_progress');
+      const overdue = open.filter(a => a.due_at && new Date(a.due_at) < now);
+      // On-time = completed before due_at
+      const withDue = completed.filter(a => a.due_at && a.completed_at);
+      const onTime = withDue.filter(a => new Date(a.completed_at) <= new Date(a.due_at));
+      // Median completion time (created -> completed) in hours
+      const durations = completed
+        .filter(a => a.completed_at && a.created_at)
+        .map(a => (new Date(a.completed_at) - new Date(a.created_at)) / 3600000)
+        .sort((x, y) => x - y);
+      const median = durations.length ? durations[Math.floor(durations.length / 2)] : null;
+      return {
+        user: u,
+        total: mine.length,
+        completed: completed.length,
+        open: open.length,
+        overdue: overdue.length,
+        completionRate: mine.length ? Math.round((completed.length / mine.length) * 100) : 0,
+        onTimeRate: withDue.length ? Math.round((onTime.length / withDue.length) * 100) : null,
+        medianHours: median,
+      };
+    });
+    // Sort by total tasks first then by completion rate so active users surface
+    out.sort((a, b) => (b.total - a.total) || (b.completionRate - a.completionRate));
+    return out;
+  }, [users, actions]);
+
+  const userKpis = useMemo(() => {
+    const totalTasks = actions.length;
+    const totalDone = actions.filter(a => a.status === 'completed').length;
+    const totalOverdue = actions.filter(a => (a.status === 'open' || a.status === 'in_progress') && a.due_at && new Date(a.due_at) < new Date()).length;
+    const closedWithDue = actions.filter(a => a.status === 'completed' && a.due_at && a.completed_at);
+    const onTime = closedWithDue.filter(a => new Date(a.completed_at) <= new Date(a.due_at)).length;
+    const onTimePct = closedWithDue.length ? Math.round((onTime / closedWithDue.length) * 100) : null;
+    const best = userStats.filter(s => s.total >= 3 && s.onTimeRate != null).sort((a, b) => (b.onTimeRate - a.onTimeRate) || (b.completed - a.completed))[0];
+    return { totalTasks, totalDone, totalOverdue, onTimePct, best };
+  }, [actions, userStats]);
+
+  // ---- PROJECT PERFORMANCE -------------------------------------------------
+  const projectStats = useMemo(() => {
+    const now = new Date();
+    return projects.map(p => {
+      const ms = milestones.filter(m => m.project_id === p.id);
+      const msDone = ms.filter(m => m.status === 'done').length;
+      const pct = p.progress_pct ?? (ms.length ? Math.round((msDone / ms.length) * 100) : 0);
+      // Schedule variance = (planned % expected) - (actual %).
+      // Planned% derived from days elapsed vs span (start -> target).
+      let plannedPct = null;
+      if (p.start_date && p.target_date) {
+        const start = new Date(p.start_date), target = new Date(p.target_date);
+        const span = (target - start) / 86400000;
+        const elapsed = (now - start) / 86400000;
+        plannedPct = span > 0 ? Math.max(0, Math.min(100, Math.round((elapsed / span) * 100))) : null;
+      }
+      const variance = plannedPct != null ? pct - plannedPct : null;
+      const daysToTarget = p.target_date ? Math.round((new Date(p.target_date) - now) / 86400000) : null;
+      const overdueDays = (p.status !== 'completed' && p.target_date && new Date(p.target_date) < now)
+        ? Math.round((now - new Date(p.target_date)) / 86400000) : 0;
+      const tone = p.status === 'completed' ? 'emerald'
+        : overdueDays > 0 ? 'rose'
+        : variance != null && variance < -10 ? 'amber'
+        : 'teal';
+      return { p, pct, plannedPct, variance, daysToTarget, overdueDays, milestonesTotal: ms.length, milestonesDone: msDone, tone };
+    });
+  }, [projects, milestones]);
+
+  const projectKpis = useMemo(() => {
+    const active = projectStats.filter(x => x.p.status !== 'completed' && x.p.status !== 'cancelled');
+    const onTrack = active.filter(x => x.variance == null || x.variance >= -5).length;
+    const behind = active.filter(x => x.variance != null && x.variance < -5).length;
+    const overdue = active.filter(x => x.overdueDays > 0).length;
+    const avgProgress = active.length ? Math.round(active.reduce((s, x) => s + (x.pct || 0), 0) / active.length) : 0;
+    const completedThisPeriod = projectStats.filter(x => x.p.completed_date && (new Date() - new Date(x.p.completed_date)) / 86400000 <= parseInt(period, 10)).length;
+    return { total: active.length, onTrack, behind, overdue, avgProgress, completedThisPeriod };
+  }, [projectStats, period]);
+
+  const periodPills = [
+    { v: '7', l: 'Week' },
+    { v: '30', l: '30 days' },
+    { v: '90', l: 'Quarter' },
+    { v: '365', l: 'Year' },
+  ];
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
+      <div><h1>📈 Performance Dashboards</h1><div class="sub">Live, plant-scoped. Switch tabs to see who's shipping and which projects are on schedule.</div></div>
+      <div style="display:flex;gap:6px">
+        ${periodPills.map(p => html`<button key=${p.v} class=${'auth-tab' + (period===p.v?' active':'')} onClick=${() => setPeriod(p.v)} style="padding:6px 12px;font-size:11px">${p.l}</button>`)}
+      </div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (view==='users'?' active':'')} onClick=${() => setView('users')}>👥 User performance</button>
+      <button class=${'auth-tab' + (view==='projects'?' active':'')} onClick=${() => setView('projects')}>📐 Project performance</button>
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` : view === 'users' ? html`
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:14px">
+        <${PerfKpi} num=${userKpis.totalTasks} label="Tasks in period" tone="slate" big=${true} />
+        <${PerfKpi} num=${userKpis.totalDone} label="Completed" tone="emerald" big=${true} sub=${userKpis.totalTasks ? Math.round(userKpis.totalDone / userKpis.totalTasks * 100) + '% closure' : ''} />
+        <${PerfKpi} num=${userKpis.onTimePct == null ? '—' : userKpis.onTimePct + '%'} label="On-time closure" tone=${userKpis.onTimePct == null ? 'slate' : userKpis.onTimePct >= 80 ? 'emerald' : userKpis.onTimePct >= 60 ? 'amber' : 'rose'} big=${true} />
+        <${PerfKpi} num=${userKpis.totalOverdue} label="Overdue (open)" tone=${userKpis.totalOverdue > 0 ? 'rose' : 'emerald'} big=${true} />
+        <${PerfKpi} num=${userKpis.best ? userKpis.best.user.full_name.split(' ')[0] : '—'} label="Top on-time" tone="teal" sub=${userKpis.best ? userKpis.best.onTimeRate + '% · ' + userKpis.best.completed + ' done' : 'Need ≥3 closed tasks'} />
+      </div>
+
+      <div class="card" style="padding:0;overflow:hidden">
+        <div style="padding:10px 14px;background:var(--slate-50);border-bottom:1px solid var(--slate-200);font-weight:700;font-size:13px">User leaderboard</div>
+        ${userStats.length === 0 ? html`<div class="empty"><div style="padding:24px;font-size:13px">No users in this plant yet.</div></div>` :
+          html`<div style="display:flex;flex-direction:column">
+            ${userStats.map((s, i) => html`
+              <div key=${s.user.id} style="display:grid;grid-template-columns:36px minmax(140px,1.4fr) 60px minmax(180px,1fr) 90px 90px 80px;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--slate-100);font-size:13px">
+                <div style="font-size:11px;color:var(--slate-400);font-weight:700">#${i+1}</div>
+                <div style="display:flex;align-items:center;gap:8px;min-width:0">
+                  ${s.user.avatar_url ? html`<img src=${s.user.avatar_url} style="width:30px;height:30px;border-radius:50%;object-fit:cover" />`
+                    : html`<div style="width:30px;height:30px;border-radius:50%;background:var(--teal-100);color:var(--teal-700);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:11px">${(s.user.full_name||'?').split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase()}</div>`}
+                  <div style="min-width:0">
+                    <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.user.full_name}</div>
+                    <div style="font-size:11px;color:var(--slate-500)">${roleLabel(s.user.role)}</div>
+                  </div>
+                </div>
+                <div style="text-align:right;font-weight:700;color:var(--slate-700)">${s.total}</div>
+                <div>
+                  <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--slate-500);margin-bottom:3px"><span>Completion</span><span>${s.completionRate}%</span></div>
+                  <${PerfBar} pct=${s.completionRate} tone=${s.completionRate >= 80 ? 'emerald' : s.completionRate >= 50 ? 'teal' : 'amber'} />
+                </div>
+                <div style="text-align:center;font-size:12px"><span style=${'color:'+(s.onTimeRate == null ? 'var(--slate-400)' : s.onTimeRate >= 80 ? 'var(--emerald-700)' : s.onTimeRate >= 60 ? 'var(--amber-700)' : 'var(--rose-700)')+';font-weight:700'}>${s.onTimeRate == null ? '—' : s.onTimeRate + '%'}</span><div style="font-size:10px;color:var(--slate-500)">on-time</div></div>
+                <div style="text-align:center;font-size:12px"><span style=${'font-weight:700;color:'+(s.overdue > 0 ? 'var(--rose-600)' : 'var(--slate-500)')}>${s.overdue}</span><div style="font-size:10px;color:var(--slate-500)">overdue</div></div>
+                <div style="text-align:center;font-size:12px">${s.medianHours == null ? '—' : (s.medianHours < 24 ? Math.round(s.medianHours) + 'h' : Math.round(s.medianHours / 24) + 'd')}<div style="font-size:10px;color:var(--slate-500)">median</div></div>
+              </div>
+            `)}
+          </div>`}
+      </div>
+
+      <div style="font-size:11px;color:var(--slate-500);margin-top:10px;padding:0 4px">Median = time from task creation to completion. On-time = closed on or before due. Overdue = open tasks past their due date.</div>
+    ` : html`
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:14px">
+        <${PerfKpi} num=${projectKpis.total} label="Active projects" tone="slate" big=${true} />
+        <${PerfKpi} num=${projectKpis.onTrack} label="On track" tone="emerald" big=${true} sub=${projectKpis.total ? Math.round(projectKpis.onTrack / projectKpis.total * 100) + '%' : ''} />
+        <${PerfKpi} num=${projectKpis.behind} label="Behind schedule" tone=${projectKpis.behind > 0 ? 'amber' : 'emerald'} big=${true} />
+        <${PerfKpi} num=${projectKpis.overdue} label="Past target" tone=${projectKpis.overdue > 0 ? 'rose' : 'emerald'} big=${true} />
+        <${PerfKpi} num=${projectKpis.avgProgress + '%'} label="Avg progress" tone="teal" big=${true} sub="${projectKpis.completedThisPeriod} closed in period" />
+      </div>
+
+      <div class="card" style="padding:0;overflow:hidden">
+        <div style="padding:10px 14px;background:var(--slate-50);border-bottom:1px solid var(--slate-200);font-weight:700;font-size:13px">Project schedule variance</div>
+        ${projectStats.length === 0 ? html`<div class="empty"><div style="padding:24px;font-size:13px">No projects yet. Create one in Projects to see it here.</div></div>` :
+          projectStats.map(s => html`
+            <div key=${s.p.id} style="display:grid;grid-template-columns:minmax(180px,1.6fr) minmax(200px,1.8fr) 110px 110px 110px;gap:12px;align-items:center;padding:12px 14px;border-bottom:1px solid var(--slate-100);font-size:13px;border-left:4px solid ${s.tone === 'emerald' ? 'var(--emerald-500)' : s.tone === 'rose' ? 'var(--rose-500)' : s.tone === 'amber' ? 'var(--amber-500)' : 'var(--teal-500)'}">
+              <div style="min-width:0">
+                <div style="font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.p.code ? s.p.code + ' · ' : ''}${s.p.name}</div>
+                <div style="font-size:11px;color:var(--slate-500)">${s.p.customer_name || '—'}${s.p.qty ? ' · ' + fmtNum(s.p.qty) + ' ' + (s.p.uom || '') : ''}</div>
+              </div>
+              <div>
+                <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--slate-500);margin-bottom:3px"><span>Actual ${s.pct}%${s.plannedPct != null ? ' · planned ' + s.plannedPct + '%' : ''}</span>${s.milestonesTotal > 0 ? html`<span>${s.milestonesDone}/${s.milestonesTotal} stages</span>` : ''}</div>
+                <div style="position:relative;height:8px">
+                  <${PerfBar} pct=${s.pct} tone=${s.tone === 'rose' ? 'rose' : s.tone === 'amber' ? 'amber' : 'emerald'} />
+                  ${s.plannedPct != null && html`<div style=${'position:absolute;top:-3px;left:'+s.plannedPct+'%;width:2px;height:14px;background:var(--slate-700)'}></div>`}
+                </div>
+              </div>
+              <div style="text-align:center">
+                <div style=${'font-size:15px;font-weight:800;color:'+(s.variance == null ? 'var(--slate-400)' : s.variance >= -5 ? 'var(--emerald-700)' : s.variance >= -15 ? 'var(--amber-700)' : 'var(--rose-700)')}>${s.variance == null ? '—' : (s.variance > 0 ? '+' : '') + s.variance + 'pp'}</div>
+                <div style="font-size:10px;color:var(--slate-500)">vs plan</div>
+              </div>
+              <div style="text-align:center">
+                <div style=${'font-size:14px;font-weight:700;color:'+(s.overdueDays > 0 ? 'var(--rose-600)' : s.daysToTarget != null && s.daysToTarget < 7 ? 'var(--amber-700)' : 'var(--slate-700)')}>${s.p.target_date ? (s.overdueDays > 0 ? '+' + s.overdueDays : PERF_FMT_DAYS(s.daysToTarget)) : '—'}</div>
+                <div style="font-size:10px;color:var(--slate-500)">${s.overdueDays > 0 ? 'past target' : 'to target'}</div>
+              </div>
+              <div style="text-align:center">
+                <span class=${'badge ' + (s.p.status === 'completed' ? 'emerald' : s.tone === 'rose' ? 'rose' : s.tone === 'amber' ? 'amber' : '')} style="font-size:10px">${(s.p.status||'planning').replace('_',' ')}</span>
+              </div>
+            </div>
+          `)
+        }
+      </div>
+
+      <div style="font-size:11px;color:var(--slate-500);margin-top:10px;padding:0 4px">"vs plan" = actual % minus what should be done by today based on start/target dates. The black tick on each bar marks the planned %; the coloured bar marks the actual.</div>
+    `}
   `;
 }
 
