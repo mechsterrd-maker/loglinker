@@ -949,6 +949,106 @@ function AuthScreen({ onAuth, pendingInviteCode }) {
   `;
 }
 
+// ============= FOUNDER ADMIN PANEL =============
+// Reachable only when isFounder(me) AND the URL has ?admin=1. Lists
+// plants by approval status and lets the founder approve / reject.
+// Decision goes through the founder_set_plant_approval RPC, which
+// re-verifies the caller's email server-side.
+function FounderAdminPanel({ me, onClose, logout }) {
+  const [tab, setTab] = useState('pending'); // pending | approved | rejected
+  const [plants, setPlants] = useState(null);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(null); // id being acted on
+
+  const refresh = useCallback(async () => {
+    setErr('');
+    const { data, error } = await sb
+      .from('plants')
+      .select('id, name, legal_name, gstin, city, state, business_type, plan_code, created_at, approval_status, approval_note, approval_decided_at, primary_contact_user_id')
+      .order('created_at', { ascending: false })
+      .limit(200);
+    if (error) { setErr(error.message); setPlants([]); return; }
+    setPlants(data || []);
+  }, []);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const decide = async (plantId, status) => {
+    const note = status === 'rejected'
+      ? (prompt('Why is this plant being rejected? (visible to the customer)') || '').trim() || null
+      : null;
+    if (status === 'rejected' && !confirm('Reject this plant?')) return;
+    if (status === 'approved' && !confirm('Approve this plant and let them in?')) return;
+    setBusy(plantId);
+    const { data, error } = await sb.rpc('founder_set_plant_approval', {
+      p_plant_id: plantId, p_status: status, p_note: note,
+    });
+    setBusy(null);
+    if (error || !data?.success) { alert((data && data.error) || error?.message || 'Failed'); return; }
+    showToast(status === 'approved' ? '✓ Plant approved' : '🚫 Plant rejected');
+    refresh();
+  };
+
+  const list = (plants || []).filter(p => (p.approval_status || 'approved') === tab);
+  const counts = (plants || []).reduce((acc, p) => {
+    const s = p.approval_status || 'approved';
+    acc[s] = (acc[s] || 0) + 1;
+    return acc;
+  }, {});
+
+  return html`
+    <div style="min-height:100vh;background:#0f172a;color:white;padding:24px">
+      <div style="max-width:1100px;margin:0 auto">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:24px">
+          <div style="width:40px;height:40px;border-radius:9px;background:#0d9488;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:20px">L</div>
+          <div style="flex:1">
+            <div style="font-size:20px;font-weight:800;letter-spacing:-0.01em">Loglinkr · Founder admin</div>
+            <div style="font-size:12px;color:rgba(255,255,255,0.6)">${me?.email} · platform owner view</div>
+          </div>
+          <button class="btn small ghost" onClick=${onClose} style="background:rgba(255,255,255,0.1);color:white;border:1px solid rgba(255,255,255,0.2)">← Back to my plant</button>
+          <button class="btn small ghost" onClick=${logout} style="background:rgba(255,255,255,0.1);color:white;border:1px solid rgba(255,255,255,0.2)">Sign out</button>
+        </div>
+
+        <div class="auth-tabs" style="margin-bottom:18px;background:rgba(255,255,255,0.06);border-radius:9px;padding:3px;display:inline-flex">
+          ${['pending','approved','rejected'].map(t => html`
+            <button key=${t} onClick=${() => setTab(t)}
+              style=${'padding:8px 16px;border:0;border-radius:7px;font-size:13px;font-weight:600;cursor:pointer;background:' + (tab === t ? 'white' : 'transparent') + ';color:' + (tab === t ? '#0f172a' : 'rgba(255,255,255,0.75)')}>
+              ${t === 'pending' ? '⏳' : t === 'approved' ? '✓' : '🚫'} ${t.charAt(0).toUpperCase() + t.slice(1)} · ${counts[t] || 0}
+            </button>
+          `)}
+        </div>
+
+        ${err && html`<div class="alert error" style="margin-bottom:12px">${err}</div>`}
+        ${plants === null ? html`<div style="padding:40px;text-align:center;color:rgba(255,255,255,0.6)">Loading…</div>` :
+          list.length === 0 ? html`<div style="padding:40px;text-align:center;color:rgba(255,255,255,0.6);background:rgba(255,255,255,0.04);border-radius:12px">Nothing ${tab}.</div>` :
+          list.map(p => html`
+            <div key=${p.id} style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.10);border-radius:12px;padding:16px 18px;margin-bottom:10px">
+              <div style="display:flex;align-items:flex-start;gap:12px">
+                <div style="flex:1;min-width:0">
+                  <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+                    <span style="font-size:16px;font-weight:800">${esc(p.name) || '(unnamed)'}</span>
+                    ${p.gstin && html`<span style="font-size:11px;color:rgba(255,255,255,0.6);font-family:ui-monospace,monospace">${esc(p.gstin)}</span>`}
+                  </div>
+                  <div style="font-size:12px;color:rgba(255,255,255,0.7)">
+                    ${p.legal_name ? esc(p.legal_name) + ' · ' : ''}${p.city ? esc(p.city) : ''}${p.state ? ', ' + esc(p.state) : ''}
+                  </div>
+                  <div style="font-size:11px;color:rgba(255,255,255,0.5);margin-top:6px">
+                    ${p.business_type || '—'} · plan ${p.plan_code || '—'} · registered ${new Date(p.created_at).toLocaleString('en-IN', { day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' })}
+                    ${p.approval_decided_at ? ' · decided ' + new Date(p.approval_decided_at).toLocaleString('en-IN', { day:'2-digit', month:'short' }) : ''}
+                  </div>
+                  ${p.approval_note && html`<div style="margin-top:8px;font-size:12px;background:rgba(0,0,0,0.25);padding:6px 10px;border-radius:6px;color:rgba(255,255,255,0.85)">Note: ${esc(p.approval_note)}</div>`}
+                </div>
+                <div style="display:flex;gap:6px;flex-shrink:0">
+                  ${tab !== 'approved' && html`<button class="btn small" disabled=${busy === p.id} onClick=${() => decide(p.id, 'approved')} style="background:#10b981;color:white">${busy === p.id ? '…' : '✓ Approve'}</button>`}
+                  ${tab !== 'rejected' && html`<button class="btn small ghost" disabled=${busy === p.id} onClick=${() => decide(p.id, 'rejected')} style="background:rgba(244,63,94,0.15);color:#fca5a5;border:1px solid rgba(244,63,94,0.4)">${busy === p.id ? '…' : '🚫 Reject'}</button>`}
+                </div>
+              </div>
+            </div>
+          `)}
+      </div>
+    </div>
+  `;
+}
+
 // ============= WIZARD =============
 function Wizard({ user, pendingInvite, onDone }) {
   // If invite detected, jump straight to join path with code prefilled
@@ -1393,6 +1493,13 @@ function App() {
   if (resetToken) return html`<${ResetPasswordScreen} token=${resetToken} />`;
   if (!user) return html`<${AuthScreen} onAuth=${handleAuth} pendingInviteCode=${urlCode} />`;
   if (!plant) return html`<${Wizard} user=${user} pendingInvite=${pendingInvite} onDone=${(p) => loadProfile(user)} />`;
+  // Founder admin panel — only the platform owner sees it. Toggled via the
+  // ?admin=1 URL param so it's never reachable for a customer even by
+  // accident. Mounted BEFORE the approval gate so the founder can review
+  // and approve pending plants without being kicked out by the gate.
+  if (isFounder(me) && new URLSearchParams(window.location.search).get('admin') === '1') {
+    return html`<${FounderAdminPanel} me=${me} onClose=${() => { window.location.search = ''; }} logout=${logout} />`;
+  }
   if (plant.suspended) return html`
     <div class="wizard">
       <div class="auth-logo" style="margin-bottom:24px"><div class="logo-mark">L</div><div class="display" style="font-size:22px;font-weight:700">Loglinkr</div></div>
@@ -1402,6 +1509,23 @@ function App() {
         <p class="sub"><strong>${plant.name}</strong> is temporarily suspended.${plant.suspended_reason ? ' ' + plant.suspended_reason : ''}</p>
         <p class="sub" style="margin-top:8px">Please contact Loglinkr to reactivate your account.</p>
         <button class="btn ghost" style="margin-top:20px;width:100%" onClick=${logout}>Sign out</button>
+      </div>
+    </div>`;
+  // Approval gate. Newly registered plants land as 'pending' until the
+  // founder approves them in the admin panel.
+  if (plant.approval_status && plant.approval_status !== 'approved' && !isFounder(me)) return html`
+    <div class="wizard">
+      <div class="auth-logo" style="margin-bottom:24px"><div class="logo-mark">L</div><div class="display" style="font-size:22px;font-weight:700">Loglinkr</div></div>
+      <div class="wizard-step" style="text-align:center">
+        <div style="font-size:40px;margin-bottom:8px">${plant.approval_status === 'rejected' ? '🚫' : '⏳'}</div>
+        <h2>${plant.approval_status === 'rejected' ? 'Registration not approved' : 'Waiting for approval'}</h2>
+        ${plant.approval_status === 'rejected'
+          ? html`<p class="sub"><strong>${plant.name}</strong>'s registration was not approved.${plant.approval_note ? ' ' + plant.approval_note : ''}</p>
+                  <p class="sub" style="margin-top:8px">Please reach out at <a href="mailto:team@loglinkr.com" style="color:var(--teal-700);font-weight:600">team@loglinkr.com</a> if you think this is a mistake.</p>`
+          : html`<p class="sub"><strong>${plant.name}</strong> is registered and waiting for the Loglinkr team to approve. We usually review within a few hours during business time.</p>
+                  <p class="sub" style="margin-top:8px">We'll send a WhatsApp message to the contact number on file as soon as you're live.</p>`}
+        <button class="btn small ghost" style="margin-top:20px;width:100%" onClick=${() => loadProfile(user)}>↻ Check again</button>
+        <button class="btn ghost" style="margin-top:8px;width:100%" onClick=${logout}>Sign out</button>
       </div>
     </div>`;
 
