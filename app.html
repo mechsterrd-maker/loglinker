@@ -23177,7 +23177,6 @@ function StageLogBatchVoiceModal({ plant, me, parts, machines, units, shifts, us
       });
       const ext = data.extraction || {};
       const aiSegs = Array.isArray(ext.segments) ? ext.segments : [];
-      if (aiSegs.length === 0) throw new Error('No production data found in the recording. Re-record more clearly or check the transcript below.');
 
       // Resolve AI's part_number / machine_code / op_seq strings into local ids
       const rows = aiSegs.map((s, i) => {
@@ -23203,6 +23202,10 @@ function StageLogBatchVoiceModal({ plant, me, parts, machines, units, shifts, us
         };
       });
       setSegs(rows);
+      // Always go to review — even if AI couldn't extract anything, the
+      // operator should see the transcript and add rows manually instead
+      // of being bounced back with a vague error.
+      if (rows.length === 0) setShowTranscript(true);
       setPhase('review');
     } catch (e) {
       setError(e.message || String(e));
@@ -23391,8 +23394,14 @@ function StageLogBatchVoiceModal({ plant, me, parts, machines, units, shifts, us
         ${phase === 'extracting' && html`<div class="card" style="padding:20px;text-align:center"><div class="spinner" style="margin:0 auto 10px"></div><div style="font-size:13px;font-weight:600">AI is extracting & matching parts + operations…</div></div>`}
 
         ${phase === 'review' && html`
+          ${segs.length === 0 && html`
+            <div style="background:var(--amber-50);border:1px solid var(--amber-300);padding:10px 12px;border-radius:8px;margin-bottom:10px;font-size:12px;color:var(--amber-800);line-height:1.5">
+              <b>🤔 AI couldn't pull any production data from this recording.</b><br/>
+              Likely causes: the audio was unclear, key words weren't said (machine/part/numbers), or the operator named something not in the parts master. Check the transcript below — if it looks wrong, re-record. If it looks right, tap <b>+ Add row manually</b> to log entries yourself.
+            </div>
+          `}
           <div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
-            <div style="font-size:12px;color:var(--slate-600)">${segs.length} segment${segs.length===1?'':'s'} extracted · amber rows need a manual pick</div>
+            <div style="font-size:12px;color:var(--slate-600)">${segs.length} segment${segs.length===1?'':'s'} extracted${segs.length > 0 ? ' · amber rows need a manual pick' : ''}</div>
             <button type="button" class="btn small ghost" onClick=${() => setShowTranscript(v => !v)} style="font-size:11px;padding:3px 8px">${showTranscript ? 'Hide' : 'Show'} transcript</button>
           </div>
           ${showTranscript && html`<div style="background:var(--slate-50);border:1px solid var(--slate-200);padding:8px 10px;border-radius:6px;font-size:11px;font-family:monospace;white-space:pre-wrap;max-height:120px;overflow-y:auto;margin-bottom:10px">${transcript}</div>`}
