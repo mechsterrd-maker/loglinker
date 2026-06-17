@@ -476,6 +476,12 @@ const __loglinkrPulse = (() => {
     const now = Date.now();
     if (now - last < 1500) return; // dedupe rapid focus/visibility bursts
     last = now;
+    // Skip refresh while a modal is open — the parent module's refresh()
+    // sets loading=true, which unmounts the modal subtree (including any
+    // hidden file input) before the OS camera can deliver its photo. This
+    // is why "upload pic" in petty cash etc. was being silently swallowed
+    // after returning from the camera app.
+    if (typeof document !== 'undefined' && document.querySelector('.modal-backdrop.active')) return;
     try { window.dispatchEvent(new CustomEvent('loglinkr-pulse')); } catch (_) {}
   };
 })();
@@ -2524,6 +2530,7 @@ function Production({ plant, me }) {
   const [activeMachine, setActiveMachine] = useState(null);
   const [loading, setLoading] = useState(true);
   const [voiceOpen, setVoiceOpen] = useState(false);
+  const [voiceBatchOpen, setVoiceBatchOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -2806,8 +2813,9 @@ function Production({ plant, me }) {
     ${view === 'forecast' && html`<${ToolForecastView} plant=${plant} setModal=${setModal} setEditTarget=${setEditTarget} />`}
 
     ${view === 'shots' && html`
-      <div class="section-h">Shots · ${shots.length}<span style="display:flex;gap:6px">
-        <button class="btn small" style="background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white" onClick=${() => setVoiceOpen(true)} title="Voice entry — Tamil / Hindi / English">🎙️ Voice</button>
+      <div class="section-h">Shots · ${shots.length}<span style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn small" style="background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white" onClick=${() => setVoiceOpen(true)} title="Voice entry — one machine at a time, conversational">🎙️ Voice</button>
+        <button class="btn small" style="background:linear-gradient(135deg,var(--indigo-600,#4f46e5),var(--indigo-500,#6366f1));color:white" onClick=${() => setVoiceBatchOpen(true)} title="Voice batch — record once at shift-end, multiple machines">🎙️ Batch</button>
         <button class="btn small ghost" onClick=${() => setModal('shot')}>+ Log</button>
       </span></div>
       ${shots.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📊</div>No shots logged yet</div></div>` :
@@ -2833,6 +2841,7 @@ function Production({ plant, me }) {
     ${modal === 'tool_assign' && html`<${ToolAssignmentModal} plant=${plant} tool=${editTarget} parts=${parts} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'shot' && html`<${ShotModal} plant=${plant} me=${me} units=${units} shifts=${shifts} machines=${machines} dies=${dies} parts=${parts} users=${users} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="shot_log" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
+    ${voiceBatchOpen && html`<${ShotBatchVoiceModal} plant=${plant} me=${me} units=${units} shifts=${shifts} machines=${machines} dies=${dies} onClose=${() => setVoiceBatchOpen(false)} onSaved=${() => { setVoiceBatchOpen(false); refresh(); }} />`}
   `;
 }
 
@@ -22555,6 +22564,434 @@ if (typeof document !== 'undefined' && !document.getElementById('voice-pulse-css
   s.id = 'voice-pulse-css';
   s.textContent = '@keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.06); } }';
   document.head.appendChild(s);
+}
+
+// =================================================================
+// SHOT BATCH VOICE — end-of-shift dictation → N shots in one go
+// =================================================================
+// Same architecture as VoiceNotesModule (MoM): browser compresses +
+// chunks audio, ships chunks to Whisper for English translation, joins
+// the transcript, hits Claude Haiku for structured extraction, then
+// shows an editable review grid before bulk-inserting into mcp_pdc_shots.
+function ShotBatchVoiceModal({ plant, me, units, shifts, machines, dies, onClose, onSaved }) {
+  const [originalFiles, setOriginalFiles] = useState([]);
+  const [preppedChunks, setPreppedChunks] = useState(null);
+  const [file, setFile] = useState(null);
+  const [compressing, setCompressing] = useState(false);
+  const [compressStage, setCompressStage] = useState('');
+  const [phase, setPhase] = useState('idle'); // idle | uploading | extracting | review
+  const [chunksDone, setChunksDone] = useState(0);
+  const [hintSubject, setHintSubject] = useState('');
+  const [transcript, setTranscript] = useState('');
+  const [showTranscript, setShowTranscript] = useState(false);
+  const [shotRows, setShotRows] = useState([]);
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [savedCount, setSavedCount] = useState(0);
+  const [recording, setRecording] = useState(false);
+  const [recElapsed, setRecElapsed] = useState(0);
+  const fileRef = useRef(null);
+  const mediaRecRef = useRef(null);
+  const recChunksRef = useRef([]);
+  const recStreamRef = useRef(null);
+  const recStartRef = useRef(0);
+  const recTimerRef = useRef(null);
+
+  const pdcMachines = useMemo(() => machines.filter(m => m.category === 'pdc'), [machines]);
+
+  const invokeFn = async (path, init) => {
+    const session = (await sb.auth.getSession()).data.session;
+    const headers = Object.assign({}, init.headers || {});
+    if (session?.access_token) headers.Authorization = 'Bearer ' + session.access_token;
+    headers.apikey = SUPABASE_ANON_KEY;
+    const res = await fetch(SUPABASE_URL + '/functions/v1/' + path, Object.assign({}, init, { headers }));
+    const text = await res.text();
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch {}
+    if (!res.ok) throw new Error(parsed?.error || text || ('HTTP ' + res.status));
+    return parsed ?? text;
+  };
+
+  const runCompression = async (files) => {
+    setError(''); setShotRows([]); setTranscript(''); setPreppedChunks(null); setOriginalFiles(files);
+    if (files.length === 0) { setFile(null); return; }
+    setCompressing(true); setCompressStage('decoding');
+    try {
+      const prepped = await prepareAudioChunks(files, (stage, info) => {
+        setCompressStage(stage + (info ? ' (' + info.current + '/' + info.total + ')' : ''));
+      });
+      setPreppedChunks(prepped);
+      const totalCompressed = prepped.chunks.reduce((s, b) => s + b.size, 0);
+      const baseName = (files[0].name || 'shift').replace(/\.[^.]+$/, '');
+      const outName = (files.length > 1 ? baseName + '-and-' + (files.length - 1) + '-more' : baseName) + '.mp3';
+      setFile({ name: outName, size: totalCompressed, type: 'audio/mpeg' });
+    } catch (e) {
+      setError('Could not prep audio: ' + (e.message || e));
+      setFile(null); setPreppedChunks(null);
+    } finally {
+      setCompressing(false); setCompressStage('');
+    }
+  };
+
+  const pickFile = async (e) => {
+    const list = Array.from(e.target.files || []);
+    if (list.length === 0) return;
+    for (const f of list) {
+      if (!f.type.startsWith('audio/') && !/\.(mp3|m4a|wav|ogg|webm|mp4|aac|flac)$/i.test(f.name)) {
+        setError('"' + f.name + '" isn\'t an audio file.'); return;
+      }
+      if (f.size > 200 * 1024 * 1024) { setError('"' + f.name + '" is over 200 MB.'); return; }
+    }
+    await runCompression(list);
+  };
+
+  // Record straight in the modal (mic → MediaRecorder → File). The recorded
+  // webm blob flows through the same prepareAudioChunks pipeline as an
+  // uploaded mp3, so the rest of the flow stays identical.
+  const startRec = async () => {
+    setError('');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recStreamRef.current = stream;
+      const mr = new MediaRecorder(stream);
+      recChunksRef.current = [];
+      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) recChunksRef.current.push(e.data); };
+      mr.onstop = async () => {
+        const blob = new Blob(recChunksRef.current, { type: 'audio/webm' });
+        const f = new File([blob], 'shift-dictation-' + Date.now() + '.webm', { type: 'audio/webm' });
+        try { recStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
+        recStreamRef.current = null;
+        await runCompression([f]);
+      };
+      mr.start();
+      mediaRecRef.current = mr;
+      recStartRef.current = Date.now();
+      setRecElapsed(0);
+      setRecording(true);
+      recTimerRef.current = setInterval(() => setRecElapsed(Math.floor((Date.now() - recStartRef.current) / 1000)), 500);
+    } catch (e) {
+      setError('Mic access denied: ' + (e.message || e));
+    }
+  };
+
+  const stopRec = () => {
+    try {
+      if (mediaRecRef.current && mediaRecRef.current.state !== 'inactive') mediaRecRef.current.stop();
+    } catch {}
+    if (recTimerRef.current) { clearInterval(recTimerRef.current); recTimerRef.current = null; }
+    setRecording(false);
+  };
+
+  // Tidy up an in-progress recording if the modal is closed mid-record.
+  // Clear onstop first so we don't trip setState on an unmounted component.
+  useEffect(() => () => {
+    try {
+      const mr = mediaRecRef.current;
+      if (mr) { mr.onstop = null; if (mr.state !== 'inactive') mr.stop(); }
+    } catch {}
+    try { recStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
+    if (recTimerRef.current) clearInterval(recTimerRef.current);
+  }, []);
+
+  const fmtSec = (s) => {
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return m + ':' + String(r).padStart(2, '0');
+  };
+
+  const transcribeChunk = async (blob, idx) => {
+    const fd = new FormData();
+    fd.set('audio', blob, 'chunk-' + (idx + 1) + '.mp3');
+    fd.set('plant_id', plant.id);
+    fd.set('mode', 'transcribe');
+    if (hintSubject.trim()) fd.set('hint_subject', hintSubject.trim());
+    const data = await invokeFn('extract-production-shots', { method: 'POST', body: fd });
+    return data.transcript || '';
+  };
+
+  // Pick an active shift based on the model's shift_name hint (or current IST
+  // time bucket A/B/C as a fallback — same heuristic as the conversational
+  // voice flow uses).
+  const resolveShiftId = (name) => {
+    if (name) {
+      const exact = shifts.find(s => s.name.toLowerCase() === String(name).toLowerCase());
+      if (exact) return exact.id;
+      const contains = shifts.find(s => String(name).toLowerCase().includes(s.name.toLowerCase()));
+      if (contains) return contains.id;
+    }
+    const now = new Date();
+    const istHour = (now.getUTCHours() + 5 + Math.floor((now.getUTCMinutes() + 30) / 60)) % 24;
+    const target = istHour >= 6 && istHour < 14 ? 'A' : istHour >= 14 && istHour < 22 ? 'B' : 'C';
+    const byBucket = shifts.find(s => s.name.toUpperCase().startsWith(target));
+    return byBucket?.id || shifts[0]?.id || '';
+  };
+
+  const extract = async () => {
+    if (!preppedChunks) return;
+    const chunks = preppedChunks.chunks;
+    setError(''); setPhase('uploading'); setChunksDone(0);
+    try {
+      const limit = 3;
+      const transcripts = new Array(chunks.length).fill('');
+      let next = 0;
+      const workers = Array.from({ length: Math.min(limit, chunks.length) }, async () => {
+        while (true) {
+          const myIdx = next++;
+          if (myIdx >= chunks.length) return;
+          transcripts[myIdx] = await transcribeChunk(chunks[myIdx], myIdx);
+          setChunksDone(d => d + 1);
+        }
+      });
+      await Promise.all(workers);
+      const joined = transcripts.map((t, i) => chunks.length > 1 ? `[Part ${i + 1}]\n${t}` : t).join('\n\n').trim();
+      if (!joined) throw new Error('Transcription was empty — recording may be silent.');
+      setTranscript(joined);
+
+      setPhase('extracting');
+      const data = await invokeFn('extract-production-shots', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transcript: joined, plant_id: plant.id }),
+      });
+      const ext = data.extraction || {};
+      const aiShots = Array.isArray(ext.shots) ? ext.shots : [];
+      if (aiShots.length === 0) throw new Error('No shots found in the recording. Re-record more clearly, or review the transcript below.');
+
+      // Resolve codes/names → ids using the local plant data. Anything the AI
+      // couldn't match shows up as blank, with the raw_quote in the row so
+      // the operator can correct it before saving.
+      const rows = aiShots.map((s, i) => {
+        const m = s.machine_code ? pdcMachines.find(x => x.code === s.machine_code) : null;
+        const d = s.die_code ? dies.find(x => x.code === s.die_code) : null;
+        const good = parseInt(s.shots_good ?? 0) || 0;
+        const reject = parseInt(s.shots_rejected ?? 0) || 0;
+        return {
+          id: 'ai-' + i,
+          machine_id: m?.id || '',
+          die_id: d?.id || '',
+          shift_id: resolveShiftId(s.shift_name),
+          shots_good: good,
+          shots_rejected: reject,
+          reject_reason: reject > 0 ? (s.reject_reason || '') : '',
+          metal_consumed_kg: s.metal_consumed_kg != null ? String(s.metal_consumed_kg) : '',
+          raw_quote: s.raw_quote || '',
+        };
+      });
+      setShotRows(rows);
+      setPhase('review');
+    } catch (e) {
+      setError(e.message || String(e));
+      setPhase('idle');
+    }
+  };
+
+  const updateRow = (idx, patch) => setShotRows(prev => prev.map((r, i) => i === idx ? { ...r, ...patch } : r));
+  const removeRow = (idx) => setShotRows(prev => prev.filter((_, i) => i !== idx));
+  const addRow = () => setShotRows(prev => [...prev, {
+    id: 'manual-' + Date.now(),
+    machine_id: '', die_id: '', shift_id: resolveShiftId(null),
+    shots_good: 0, shots_rejected: 0, reject_reason: '', metal_consumed_kg: '', raw_quote: '',
+  }]);
+
+  const saveAll = async () => {
+    setError(''); setSaving(true);
+    try {
+      const valid = shotRows.filter(r => r.machine_id && r.die_id && r.shift_id && (parseInt(r.shots_good) >= 0));
+      if (valid.length === 0) throw new Error('At least one row needs machine + die + shift filled in.');
+      if (valid.length !== shotRows.length) {
+        if (!confirm((shotRows.length - valid.length) + ' row(s) are missing machine/die/shift and will be skipped. Save the ' + valid.length + ' complete row(s)?')) {
+          setSaving(false); return;
+        }
+      }
+      const die = (id) => dies.find(d => d.id === id);
+      const mach = (id) => pdcMachines.find(m => m.id === id);
+      const rows = valid.map(r => {
+        const m = mach(r.machine_id);
+        const d = die(r.die_id);
+        const good = parseInt(r.shots_good) || 0;
+        const reject = parseInt(r.shots_rejected) || 0;
+        return {
+          plant_id: plant.id,
+          unit_id: m?.unit_id || units[0]?.id || null,
+          shift_id: r.shift_id,
+          machine_id: r.machine_id,
+          die_id: r.die_id,
+          part_id: d?.default_part_id || null,
+          operator_user_id: me.id,
+          recorded_by_user_id: me.id,
+          shots_good: good,
+          shots_rejected: reject,
+          reject_reason: reject > 0 ? (r.reject_reason || 'unspecified') : null,
+          metal_consumed_kg: r.metal_consumed_kg ? parseFloat(r.metal_consumed_kg) : null,
+          notes: 'Logged via batch voice entry',
+        };
+      });
+      const { error: err } = await sb.from('mcp_pdc_shots').insert(rows);
+      if (err) throw err;
+      setSavedCount(rows.length);
+      showToast('✓ ' + rows.length + ' shot' + (rows.length === 1 ? '' : 's') + ' logged by voice');
+      setTimeout(() => onSaved(), 1200);
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const isWorking = compressing || phase === 'uploading' || phase === 'extracting' || saving;
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget && !isWorking) onClose(); }}>
+      <div class="modal" style="max-width:760px">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">🎙️ Voice batch — multi-shot entry</div>
+            <div style="font-size:11px;color:var(--slate-500);font-weight:400">Record once at shift-end. Tamil / Hindi / English / mixed → English → review → save all.</div>
+          </div>
+          <button class="close-btn" onClick=${onClose} disabled=${isWorking}>×</button>
+        </div>
+
+        ${error && html`<div class="alert error" style="font-size:12px">${error}</div>`}
+        ${savedCount > 0 && html`<div class="alert" style="background:var(--emerald-50);border-color:var(--emerald-300);color:var(--emerald-700);font-size:12px">✓ ${savedCount} shot${savedCount===1?'':'s'} saved · BOM + die strokes updated.</div>`}
+
+        ${phase === 'idle' && originalFiles.length === 0 && html`
+          <div class="card" style="padding:14px">
+            <div class="field">
+              <label>Record straight from the mic</label>
+              ${!recording ? html`
+                <button type="button" class="btn" onClick=${startRec} style="width:100%;background:linear-gradient(135deg,var(--rose-600,#e11d48),var(--rose-500,#f43f5e));color:white">🎙️ Start recording</button>
+              ` : html`
+                <button type="button" class="btn" onClick=${stopRec} style="width:100%;background:var(--slate-800);color:white;display:flex;align-items:center;justify-content:center;gap:10px">
+                  <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--rose-500,#f43f5e);animation:pulse 1.2s infinite"></span>
+                  ⏹ Stop · ${fmtSec(recElapsed)}
+                </button>
+              `}
+              <div style="font-size:11px;color:var(--slate-500);margin-top:6px">Or upload an audio file below if you recorded outside the app.</div>
+            </div>
+            <div class="field">
+              <label style="font-size:11px;color:var(--slate-500)">Or pick a file (mp3 / m4a / wav / aac)</label>
+              <input ref=${fileRef} type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg,.webm" multiple onChange=${pickFile} style="font-size:13px" disabled=${recording} />
+            </div>
+            <div style="background:var(--slate-50);border:1px solid var(--slate-200);padding:8px 10px;border-radius:6px;font-size:11px;color:var(--slate-600);margin:8px 0">
+              💡 Say each machine in turn: <i>"Machine M1 die 654 shift A two-forty good eight reject flash. M2 die 712 shift A one-eighty good zero reject…"</i>
+            </div>
+            <div class="field">
+              <label>Subject hint (optional)</label>
+              <input type="text" value=${hintSubject} onInput=${e => setHintSubject(e.target.value)} placeholder="Helps AI transcribe technical words (die codes, customers)" style="font-size:13px" />
+            </div>
+          </div>
+        `}
+
+        ${originalFiles.length > 0 && phase === 'idle' && html`
+          <div class="card" style="padding:14px;margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <div style="font-size:13px;font-weight:700">🎵 ${originalFiles.length} part${originalFiles.length===1?'':'s'}</div>
+              <button type="button" class="btn ghost small" onClick=${() => runCompression([])} disabled=${isWorking} style="padding:4px 10px;font-size:11px">✕ Start over</button>
+            </div>
+            ${compressing && html`
+              <div style="padding:12px;text-align:center;background:var(--slate-50);border-radius:6px;margin-bottom:8px">
+                <div class="spinner" style="margin:0 auto 6px"></div>
+                <div style="font-size:12px">${compressStage}</div>
+              </div>
+            `}
+            ${file && !compressing && preppedChunks && html`
+              <div style="background:var(--teal-50);border:1px solid var(--teal-200);padding:8px 10px;border-radius:6px;margin-bottom:8px;font-size:12px">
+                ✓ Ready · <b>${(file.size/1024/1024).toFixed(1)} MB</b> in <b>${preppedChunks.chunks.length} chunk${preppedChunks.chunks.length===1?'':'s'}</b> · ${Math.round(preppedChunks.trimmedDurationSec / 60)} min of speech
+              </div>
+            `}
+            ${file && !compressing && html`
+              <button class="btn" onClick=${extract} style="width:100%">🤖 Translate & extract shots</button>
+            `}
+          </div>
+        `}
+
+        ${phase === 'uploading' && preppedChunks && html`
+          <div class="card" style="padding:20px;text-align:center">
+            <div class="spinner" style="margin:0 auto 10px"></div>
+            <div style="font-size:13px;font-weight:600">Translating chunk ${Math.min(chunksDone + 1, preppedChunks.chunks.length)} of ${preppedChunks.chunks.length}…</div>
+            <div style="margin-top:8px;background:var(--slate-100);height:6px;border-radius:3px;overflow:hidden">
+              <div style=${'background:var(--teal-500);height:100%;width:' + Math.round((chunksDone / preppedChunks.chunks.length) * 100) + '%;transition:width 200ms'}></div>
+            </div>
+          </div>
+        `}
+
+        ${phase === 'extracting' && html`
+          <div class="card" style="padding:20px;text-align:center">
+            <div class="spinner" style="margin:0 auto 10px"></div>
+            <div style="font-size:13px;font-weight:600">AI is extracting the shots…</div>
+          </div>
+        `}
+
+        ${phase === 'review' && html`
+          <div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
+            <div style="font-size:12px;color:var(--slate-600)">${shotRows.length} shot${shotRows.length===1?'':'s'} extracted · review and edit before saving</div>
+            <button type="button" class="btn small ghost" onClick=${() => setShowTranscript(v => !v)} style="font-size:11px;padding:3px 8px">${showTranscript ? 'Hide' : 'Show'} transcript</button>
+          </div>
+          ${showTranscript && html`
+            <div style="background:var(--slate-50);border:1px solid var(--slate-200);padding:8px 10px;border-radius:6px;font-size:11px;font-family:monospace;white-space:pre-wrap;max-height:120px;overflow-y:auto;margin-bottom:10px">${transcript}</div>
+          `}
+          <div style="display:flex;flex-direction:column;gap:8px">
+            ${shotRows.map((r, idx) => {
+              const missingCore = !r.machine_id || !r.die_id || !r.shift_id;
+              return html`
+                <div key=${r.id} style="border:1px solid ${missingCore ? 'var(--amber-300)' : 'var(--slate-200)'};border-radius:8px;padding:10px;background:${missingCore ? 'var(--amber-50)' : 'white'}">
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:6px;margin-bottom:6px">
+                    <div style="flex:1;font-size:11px;color:var(--slate-500);font-style:italic">${r.raw_quote ? '"' + r.raw_quote + '"' : 'manual row'}</div>
+                    <button type="button" onClick=${() => removeRow(idx)} title="Remove" style="background:none;border:1px solid var(--rose-200);color:var(--rose-600);padding:2px 8px;font-size:11px;border-radius:4px;cursor:pointer">✕</button>
+                  </div>
+                  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:6px">
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Machine</label>
+                      <select value=${r.machine_id} onChange=${e => updateRow(idx, { machine_id: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px">
+                        <option value="">— pick —</option>
+                        ${pdcMachines.map(m => html`<option key=${m.id} value=${m.id}>${m.code}</option>`)}
+                      </select>
+                    </div>
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Die</label>
+                      <select value=${r.die_id} onChange=${e => updateRow(idx, { die_id: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px">
+                        <option value="">— pick —</option>
+                        ${dies.map(d => html`<option key=${d.id} value=${d.id}>${d.code} · ${d.part_number}</option>`)}
+                      </select>
+                    </div>
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Shift</label>
+                      <select value=${r.shift_id} onChange=${e => updateRow(idx, { shift_id: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px">
+                        ${shifts.map(s => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
+                      </select>
+                    </div>
+                  </div>
+                  <div style="display:grid;grid-template-columns:1fr 1fr 2fr 1fr;gap:6px">
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Good</label>
+                      <input type="number" min="0" value=${r.shots_good} onChange=${e => updateRow(idx, { shots_good: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px" />
+                    </div>
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Reject</label>
+                      <input type="number" min="0" value=${r.shots_rejected} onChange=${e => updateRow(idx, { shots_rejected: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px" />
+                    </div>
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Reject reason</label>
+                      <input type="text" value=${r.reject_reason} onChange=${e => updateRow(idx, { reject_reason: e.target.value })} placeholder=${(parseInt(r.shots_rejected)||0) > 0 ? 'flash / porosity / …' : '—'} disabled=${(parseInt(r.shots_rejected)||0) === 0} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px" />
+                    </div>
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Metal kg</label>
+                      <input type="number" step="0.01" value=${r.metal_consumed_kg} onChange=${e => updateRow(idx, { metal_consumed_kg: e.target.value })} placeholder="—" style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px" />
+                    </div>
+                  </div>
+                </div>
+              `;
+            })}
+            <button type="button" class="btn ghost small" onClick=${addRow} style="font-size:11px">+ Add row manually</button>
+          </div>
+          <div style="display:flex;gap:6px;margin-top:12px">
+            <button type="button" class="btn ghost" onClick=${onClose} disabled=${saving} style="flex:1">Cancel</button>
+            <button class="btn" onClick=${saveAll} disabled=${saving || shotRows.length === 0} style="flex:2">${saving ? 'Saving…' : '✓ Save ' + shotRows.length + ' shot' + (shotRows.length === 1 ? '' : 's')}</button>
+          </div>
+        `}
+      </div>
+    </div>
+  `;
 }
 
 // =================================================================

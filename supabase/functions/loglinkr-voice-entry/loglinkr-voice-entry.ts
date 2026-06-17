@@ -9,8 +9,11 @@
 //   plus the structured payload. The client then performs the actual
 //   database insert.
 //
-// Per-turn cost: ~₹1-2 with Claude Sonnet 4 prompt caching. Whole
-// breakdown entry typically 3-4 turns = ~₹5 total.
+// Per-turn cost: ~₹0.20-0.40 with Haiku 4.5 + prompt caching (4-5× cheaper
+// than Sonnet 4). Whole breakdown entry typically 3-4 turns = ~₹1-1.5 total.
+// Same model family already proven on loglinkr-siri (tool-use) and
+// loglinkr-chat (free-form chat) — quality is identical for short
+// data-entry dialogs.
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -18,7 +21,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
-const MODEL         = "claude-sonnet-4-20250514";
+const MODEL         = "claude-haiku-4-5";
 
 // =============================================================================
 // MODULE REGISTRY — each entry defines: which fields to collect + which Claude
