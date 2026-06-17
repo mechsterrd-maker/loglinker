@@ -22995,6 +22995,481 @@ function ShotBatchVoiceModal({ plant, me, units, shifts, machines, dies, onClose
 }
 
 // =================================================================
+// STAGE-LOG BATCH VOICE — CNC / VMC / lathe / etc. (non-PDC categories)
+// =================================================================
+// Same shape as ShotBatchVoiceModal but the extracted rows go through the
+// submit_shift_segments RPC instead of a direct table insert. Operators
+// can be loose with part names / operations — the edge function passes
+// every part's aliases + route steps to Claude so loose terms ("Bosch
+// part", "facing op", "first op") resolve correctly.
+function StageLogBatchVoiceModal({ plant, me, parts, machines, units, shifts, users, defaultDate, defaultCategory, onClose, onSaved }) {
+  const [logDate, setLogDate] = useState(defaultDate || new Date().toISOString().slice(0,10));
+  const [shiftId, setShiftId] = useState(shifts[0]?.id || '');
+  const [unitId, setUnitId] = useState(units[0]?.id || '');
+  const [category, setCategory] = useState(defaultCategory || '');
+  const [originalFiles, setOriginalFiles] = useState([]);
+  const [preppedChunks, setPreppedChunks] = useState(null);
+  const [file, setFile] = useState(null);
+  const [compressing, setCompressing] = useState(false);
+  const [compressStage, setCompressStage] = useState('');
+  const [phase, setPhase] = useState('idle'); // idle | uploading | extracting | review
+  const [chunksDone, setChunksDone] = useState(0);
+  const [hintSubject, setHintSubject] = useState('');
+  const [transcript, setTranscript] = useState('');
+  const [showTranscript, setShowTranscript] = useState(false);
+  const [segs, setSegs] = useState([]);
+  const [routeSteps, setRouteSteps] = useState([]);
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [results, setResults] = useState(null);
+  const [recording, setRecording] = useState(false);
+  const [recElapsed, setRecElapsed] = useState(0);
+  const fileRef = useRef(null);
+  const mediaRecRef = useRef(null);
+  const recChunksRef = useRef([]);
+  const recStreamRef = useRef(null);
+  const recStartRef = useRef(0);
+  const recTimerRef = useRef(null);
+
+  const categories = useMemo(() => [...new Set(machines.map(m => m.category || 'pdc'))].filter(c => c !== 'pdc').sort(), [machines]);
+  const catMachines = useMemo(() => machines.filter(m => (m.category || 'pdc') === category), [machines, category]);
+  const partsById = useMemo(() => Object.fromEntries(parts.map(p => [p.id, p])), [parts]);
+  const partsByNumber = useMemo(() => Object.fromEntries(parts.map(p => [p.part_number, p])), [parts]);
+
+  // Load route steps once — we need them to resolve op_seq/op_name to a
+  // specific route_step_id for the RPC payload.
+  useEffect(() => {
+    sb.from('v_part_route_steps').select('*').order('part_id').order('op_seq').then(({ data }) => setRouteSteps(data || []));
+  }, []);
+
+  const invokeFn = async (path, init) => {
+    const session = (await sb.auth.getSession()).data.session;
+    const headers = Object.assign({}, init.headers || {});
+    if (session?.access_token) headers.Authorization = 'Bearer ' + session.access_token;
+    headers.apikey = SUPABASE_ANON_KEY;
+    const res = await fetch(SUPABASE_URL + '/functions/v1/' + path, Object.assign({}, init, { headers }));
+    const text = await res.text();
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch {}
+    if (!res.ok) throw new Error(parsed?.error || text || ('HTTP ' + res.status));
+    return parsed ?? text;
+  };
+
+  const runCompression = async (files) => {
+    setError(''); setSegs([]); setTranscript(''); setPreppedChunks(null); setOriginalFiles(files);
+    if (files.length === 0) { setFile(null); return; }
+    setCompressing(true); setCompressStage('decoding');
+    try {
+      const prepped = await prepareAudioChunks(files, (stage, info) => {
+        setCompressStage(stage + (info ? ' (' + info.current + '/' + info.total + ')' : ''));
+      });
+      setPreppedChunks(prepped);
+      const totalCompressed = prepped.chunks.reduce((s, b) => s + b.size, 0);
+      const baseName = (files[0].name || 'shift').replace(/\.[^.]+$/, '');
+      const outName = (files.length > 1 ? baseName + '-and-' + (files.length - 1) + '-more' : baseName) + '.mp3';
+      setFile({ name: outName, size: totalCompressed, type: 'audio/mpeg' });
+    } catch (e) {
+      setError('Could not prep audio: ' + (e.message || e));
+      setFile(null); setPreppedChunks(null);
+    } finally {
+      setCompressing(false); setCompressStage('');
+    }
+  };
+
+  const pickFile = async (e) => {
+    const list = Array.from(e.target.files || []);
+    if (list.length === 0) return;
+    for (const f of list) {
+      if (!f.type.startsWith('audio/') && !/\.(mp3|m4a|wav|ogg|webm|mp4|aac|flac)$/i.test(f.name)) {
+        setError('"' + f.name + '" isn\'t an audio file.'); return;
+      }
+      if (f.size > 200 * 1024 * 1024) { setError('"' + f.name + '" is over 200 MB.'); return; }
+    }
+    await runCompression(list);
+  };
+
+  const startRec = async () => {
+    setError('');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recStreamRef.current = stream;
+      const mr = new MediaRecorder(stream);
+      recChunksRef.current = [];
+      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) recChunksRef.current.push(e.data); };
+      mr.onstop = async () => {
+        const blob = new Blob(recChunksRef.current, { type: 'audio/webm' });
+        const f = new File([blob], 'shift-dictation-' + Date.now() + '.webm', { type: 'audio/webm' });
+        try { recStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
+        recStreamRef.current = null;
+        await runCompression([f]);
+      };
+      mr.start();
+      mediaRecRef.current = mr;
+      recStartRef.current = Date.now();
+      setRecElapsed(0);
+      setRecording(true);
+      recTimerRef.current = setInterval(() => setRecElapsed(Math.floor((Date.now() - recStartRef.current) / 1000)), 500);
+    } catch (e) {
+      setError('Mic access denied: ' + (e.message || e));
+    }
+  };
+  const stopRec = () => {
+    try { if (mediaRecRef.current && mediaRecRef.current.state !== 'inactive') mediaRecRef.current.stop(); } catch {}
+    if (recTimerRef.current) { clearInterval(recTimerRef.current); recTimerRef.current = null; }
+    setRecording(false);
+  };
+  useEffect(() => () => {
+    try {
+      const mr = mediaRecRef.current;
+      if (mr) { mr.onstop = null; if (mr.state !== 'inactive') mr.stop(); }
+    } catch {}
+    try { recStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
+    if (recTimerRef.current) clearInterval(recTimerRef.current);
+  }, []);
+  const fmtSec = (s) => Math.floor(s/60) + ':' + String(s%60).padStart(2, '0');
+
+  const transcribeChunk = async (blob, idx) => {
+    const fd = new FormData();
+    fd.set('audio', blob, 'chunk-' + (idx + 1) + '.mp3');
+    fd.set('plant_id', plant.id);
+    fd.set('mode', 'transcribe');
+    if (hintSubject.trim()) fd.set('hint_subject', hintSubject.trim());
+    const data = await invokeFn('extract-production-shots', { method: 'POST', body: fd });
+    return data.transcript || '';
+  };
+
+  // Resolve a part+op_seq pair to a specific route_step_id (which the
+  // submit_shift_segments RPC needs).
+  const findRouteStepId = (partId, opSeq) => {
+    if (!partId || opSeq == null) return '';
+    const step = routeSteps.find(s => s.part_id === partId && s.op_seq === opSeq);
+    return step?.id || step?.route_step_id || '';
+  };
+  const stepsForPart = (partId) => routeSteps.filter(s => s.part_id === partId).sort((a,b) => a.op_seq - b.op_seq);
+
+  const extract = async () => {
+    if (!preppedChunks) return;
+    if (!category) { setError('Pick a category first.'); return; }
+    const chunks = preppedChunks.chunks;
+    setError(''); setPhase('uploading'); setChunksDone(0);
+    try {
+      const limit = 3;
+      const transcripts = new Array(chunks.length).fill('');
+      let next = 0;
+      const workers = Array.from({ length: Math.min(limit, chunks.length) }, async () => {
+        while (true) {
+          const myIdx = next++;
+          if (myIdx >= chunks.length) return;
+          transcripts[myIdx] = await transcribeChunk(chunks[myIdx], myIdx);
+          setChunksDone(d => d + 1);
+        }
+      });
+      await Promise.all(workers);
+      const joined = transcripts.map((t, i) => chunks.length > 1 ? `[Part ${i + 1}]\n${t}` : t).join('\n\n').trim();
+      if (!joined) throw new Error('Transcription was empty — recording may be silent.');
+      setTranscript(joined);
+
+      setPhase('extracting');
+      const data = await invokeFn('extract-production-shots', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transcript: joined, plant_id: plant.id, category }),
+      });
+      const ext = data.extraction || {};
+      const aiSegs = Array.isArray(ext.segments) ? ext.segments : [];
+      if (aiSegs.length === 0) throw new Error('No production data found in the recording. Re-record more clearly or check the transcript below.');
+
+      // Resolve AI's part_number / machine_code / op_seq strings into local ids
+      const rows = aiSegs.map((s, i) => {
+        const m = s.machine_code ? catMachines.find(x => x.code === s.machine_code) : null;
+        const p = s.part_number ? partsByNumber[s.part_number] : null;
+        const rsId = p && s.op_seq != null ? findRouteStepId(p.id, s.op_seq) : '';
+        const good = parseInt(s.qty_good ?? 0) || 0;
+        const reject = parseInt(s.qty_rejected ?? 0) || 0;
+        return {
+          id: 'ai-' + i,
+          machine_id: m?.id || '',
+          part_id: p?.id || '',
+          route_step_id: rsId,
+          op_seq_hint: s.op_seq ?? null,  // for showing AI's pick even when we couldn't resolve
+          op_name_hint: s.op_name || '',
+          qty_good: good,
+          qty_rejected: reject,
+          reject_reason: reject > 0 ? (s.reject_reason || '') : '',
+          setup_change: !!s.setup_change,
+          operator_user_id: me.id,
+          raw_quote: s.raw_quote || '',
+        };
+      });
+      setSegs(rows);
+      setPhase('review');
+    } catch (e) {
+      setError(e.message || String(e));
+      setPhase('idle');
+    }
+  };
+
+  const updateRow = (idx, patch) => setSegs(prev => prev.map((r, i) => {
+    if (i !== idx) return r;
+    const merged = { ...r, ...patch };
+    // If part changed, reset route_step_id; if it didn't have a hint, also try
+    // to reapply the hint against the new part's route.
+    if (patch.part_id !== undefined && patch.part_id !== r.part_id) {
+      merged.route_step_id = r.op_seq_hint != null ? findRouteStepId(patch.part_id, r.op_seq_hint) : '';
+    }
+    return merged;
+  }));
+  const removeRow = (idx) => setSegs(prev => prev.filter((_, i) => i !== idx));
+  const addRow = () => setSegs(prev => [...prev, {
+    id: 'manual-' + Date.now(),
+    machine_id: '', part_id: '', route_step_id: '',
+    op_seq_hint: null, op_name_hint: '',
+    qty_good: 0, qty_rejected: 0, reject_reason: '', setup_change: false,
+    operator_user_id: me.id, raw_quote: '',
+  }]);
+
+  const saveAll = async () => {
+    setError(''); setSaving(true); setResults(null);
+    try {
+      const valid = segs.filter(r => r.machine_id && r.part_id && r.route_step_id && r.operator_user_id);
+      if (valid.length === 0) throw new Error('At least one row needs machine + part + operation + operator filled in.');
+      if (valid.length !== segs.length) {
+        if (!confirm((segs.length - valid.length) + ' row(s) are missing machine/part/operation/operator and will be skipped. Save the ' + valid.length + ' complete row(s)?')) {
+          setSaving(false); return;
+        }
+      }
+      const payload = valid.map(r => ({
+        machine_id: r.machine_id,
+        part_id: r.part_id,
+        route_step_id: r.route_step_id,
+        op_number: null,
+        op_name: null,
+        qty_good: parseFloat(r.qty_good || 0),
+        qty_rejected: parseFloat(r.qty_rejected || 0),
+        reject_reason: r.reject_reason || null,
+        setup_change: !!r.setup_change,
+        setup_time_min: null,
+        previous_part_id: null,
+        operator_user_id: r.operator_user_id,
+        operator_2_user_id: null,
+        category_attrs: {},
+        notes: 'Logged via batch voice entry',
+        tool_changes: [],
+      }));
+      const { data, error: err } = await sb.rpc('submit_shift_segments', {
+        p_log_date: logDate,
+        p_shift_id: shiftId,
+        p_unit_id: unitId,
+        p_category: category,
+        p_segments: payload,
+      });
+      if (err) throw err;
+      if (!data?.success) throw new Error(data?.error || 'Submit failed');
+      const success = (data.results || []).filter(r => r.status === 'success').length;
+      const failed = (data.results || []).filter(r => r.status === 'failed').length;
+      const skipped = (data.results || []).filter(r => r.status === 'skipped').length;
+      setResults({ success, failed, skipped, details: data.results || [] });
+      showToast('✓ ' + success + ' segment' + (success === 1 ? '' : 's') + ' logged by voice' + (failed > 0 ? ' · ' + failed + ' failed' : ''));
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const isWorking = compressing || phase === 'uploading' || phase === 'extracting' || saving;
+
+  if (results) {
+    return html`
+      <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onSaved(); }}>
+        <div class="modal" style="max-width:520px">
+          <div class="modal-header">
+            <div class="modal-title">📋 Batch voice results</div>
+            <button class="close-btn" onClick=${onSaved}>×</button>
+          </div>
+          <div class="card-row" style="background:var(--emerald-50);padding:8px 12px;border-radius:6px;margin-bottom:6px"><span class="label">✓ Logged</span><span class="value" style="font-weight:700;color:var(--emerald-700)">${results.success}</span></div>
+          ${results.failed > 0 && html`<div class="card-row" style="background:var(--rose-50);padding:8px 12px;border-radius:6px;margin-bottom:6px"><span class="label">✗ Failed</span><span class="value" style="font-weight:700;color:var(--rose-700)">${results.failed}</span></div>`}
+          ${results.failed > 0 && html`
+            <div style="margin-top:14px">
+              <div style="font-size:11px;font-weight:700;color:var(--rose-700);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Failures</div>
+              ${results.details.filter(d => d.status === 'failed').map(d => {
+                const m = machines.find(mm => mm.id === d.machine_id);
+                return html`<div key=${d.idx} style="font-size:12px;color:var(--slate-700);padding:6px 10px;background:var(--rose-50);border-radius:4px;margin-bottom:4px"><b>${m?.code || '?'}</b>: ${d.error}</div>`;
+              })}
+            </div>
+          `}
+          <button class="btn" onClick=${onSaved} style="margin-top:14px">Done</button>
+        </div>
+      </div>
+    `;
+  }
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget && !isWorking) onClose(); }}>
+      <div class="modal" style="max-width:880px">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">🎙️ Batch voice — stage log</div>
+            <div style="font-size:11px;color:var(--slate-500);font-weight:400">Record once at shift-end. AI matches loose terms ("Bosch part", "facing op") to the right part + route step.</div>
+          </div>
+          <button class="close-btn" onClick=${onClose} disabled=${isWorking}>×</button>
+        </div>
+
+        ${error && html`<div class="alert error" style="font-size:12px">${error}</div>`}
+
+        <div class="field-row">
+          <div class="field"><label>Date *</label><input type="date" required value=${logDate} onChange=${e => setLogDate(e.target.value)} disabled=${phase !== 'idle'} /></div>
+          <div class="field"><label>Shift *</label>
+            <select required value=${shiftId} onChange=${e => setShiftId(e.target.value)} disabled=${phase !== 'idle'}>
+              ${shifts.map(s => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
+            </select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Unit *</label>
+            <select required value=${unitId} onChange=${e => setUnitId(e.target.value)} disabled=${phase !== 'idle'}>
+              ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Category *</label>
+            <select required value=${category} onChange=${e => setCategory(e.target.value)} disabled=${phase !== 'idle'}>
+              <option value="">— Pick —</option>
+              ${categories.map(c => html`<option key=${c} value=${c}>${c.toUpperCase()} (${machines.filter(m => (m.category || 'pdc') === c).length})</option>`)}
+            </select>
+          </div>
+        </div>
+
+        ${phase === 'idle' && originalFiles.length === 0 && html`
+          <div class="card" style="padding:14px">
+            <div class="field">
+              <label>Record straight from the mic</label>
+              ${!recording ? html`
+                <button type="button" class="btn" onClick=${startRec} disabled=${!category} style="width:100%;background:linear-gradient(135deg,var(--rose-600,#e11d48),var(--rose-500,#f43f5e));color:white">🎙️ Start recording</button>
+              ` : html`
+                <button type="button" class="btn" onClick=${stopRec} style="width:100%;background:var(--slate-800);color:white;display:flex;align-items:center;justify-content:center;gap:10px">
+                  <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--rose-500,#f43f5e);animation:pulse 1.2s infinite"></span>
+                  ⏹ Stop · ${fmtSec(recElapsed)}
+                </button>
+              `}
+              ${!category && html`<div style="font-size:11px;color:var(--amber-700);margin-top:4px">Pick a category first.</div>`}
+            </div>
+            <div class="field">
+              <label style="font-size:11px;color:var(--slate-500)">Or pick a file (mp3 / m4a / wav / aac)</label>
+              <input ref=${fileRef} type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg,.webm" multiple onChange=${pickFile} style="font-size:13px" disabled=${recording} />
+            </div>
+            <div style="background:var(--slate-50);border:1px solid var(--slate-200);padding:8px 10px;border-radius:6px;font-size:11px;color:var(--slate-600);margin:8px 0">
+              💡 You can speak loosely: <i>"On CNC-01 ran the Bosch bracket facing op, 200 good 5 reject chatter. Then VMC-2, big housing first op, 80 good zero reject…"</i>
+            </div>
+            <div class="field">
+              <label>Subject hint (optional)</label>
+              <input type="text" value=${hintSubject} onInput=${e => setHintSubject(e.target.value)} placeholder="Helps AI hear technical terms (part nicknames, customers)" style="font-size:13px" />
+            </div>
+          </div>
+        `}
+
+        ${originalFiles.length > 0 && phase === 'idle' && html`
+          <div class="card" style="padding:14px;margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <div style="font-size:13px;font-weight:700">🎵 ${originalFiles.length} part${originalFiles.length===1?'':'s'}</div>
+              <button type="button" class="btn ghost small" onClick=${() => runCompression([])} disabled=${isWorking} style="padding:4px 10px;font-size:11px">✕ Start over</button>
+            </div>
+            ${compressing && html`<div style="padding:12px;text-align:center;background:var(--slate-50);border-radius:6px;margin-bottom:8px"><div class="spinner" style="margin:0 auto 6px"></div><div style="font-size:12px">${compressStage}</div></div>`}
+            ${file && !compressing && preppedChunks && html`<div style="background:var(--teal-50);border:1px solid var(--teal-200);padding:8px 10px;border-radius:6px;margin-bottom:8px;font-size:12px">✓ Ready · <b>${(file.size/1024/1024).toFixed(1)} MB</b> in <b>${preppedChunks.chunks.length} chunk${preppedChunks.chunks.length===1?'':'s'}</b> · ${Math.round(preppedChunks.trimmedDurationSec / 60)} min of speech</div>`}
+            ${file && !compressing && html`<button class="btn" onClick=${extract} style="width:100%">🤖 Translate & extract</button>`}
+          </div>
+        `}
+
+        ${phase === 'uploading' && preppedChunks && html`
+          <div class="card" style="padding:20px;text-align:center">
+            <div class="spinner" style="margin:0 auto 10px"></div>
+            <div style="font-size:13px;font-weight:600">Translating chunk ${Math.min(chunksDone + 1, preppedChunks.chunks.length)} of ${preppedChunks.chunks.length}…</div>
+            <div style="margin-top:8px;background:var(--slate-100);height:6px;border-radius:3px;overflow:hidden"><div style=${'background:var(--teal-500);height:100%;width:' + Math.round((chunksDone / preppedChunks.chunks.length) * 100) + '%;transition:width 200ms'}></div></div>
+          </div>
+        `}
+
+        ${phase === 'extracting' && html`<div class="card" style="padding:20px;text-align:center"><div class="spinner" style="margin:0 auto 10px"></div><div style="font-size:13px;font-weight:600">AI is extracting & matching parts + operations…</div></div>`}
+
+        ${phase === 'review' && html`
+          <div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
+            <div style="font-size:12px;color:var(--slate-600)">${segs.length} segment${segs.length===1?'':'s'} extracted · amber rows need a manual pick</div>
+            <button type="button" class="btn small ghost" onClick=${() => setShowTranscript(v => !v)} style="font-size:11px;padding:3px 8px">${showTranscript ? 'Hide' : 'Show'} transcript</button>
+          </div>
+          ${showTranscript && html`<div style="background:var(--slate-50);border:1px solid var(--slate-200);padding:8px 10px;border-radius:6px;font-size:11px;font-family:monospace;white-space:pre-wrap;max-height:120px;overflow-y:auto;margin-bottom:10px">${transcript}</div>`}
+          <div style="display:flex;flex-direction:column;gap:8px;max-height:55vh;overflow-y:auto;padding-right:4px">
+            ${segs.map((r, idx) => {
+              const missing = !r.machine_id || !r.part_id || !r.route_step_id;
+              const partSteps = r.part_id ? stepsForPart(r.part_id) : [];
+              return html`
+                <div key=${r.id} style="border:1px solid ${missing ? 'var(--amber-300)' : 'var(--slate-200)'};border-radius:8px;padding:10px;background:${missing ? 'var(--amber-50)' : 'white'}">
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:6px;margin-bottom:6px">
+                    <div style="flex:1;font-size:11px;color:var(--slate-500);font-style:italic">${r.raw_quote ? '"' + r.raw_quote + '"' : 'manual row'}${r.op_name_hint && !r.route_step_id ? html` · <span style="color:var(--amber-700)">AI heard "${r.op_name_hint}" — pick the matching op</span>` : ''}</div>
+                    <button type="button" onClick=${() => removeRow(idx)} title="Remove" style="background:none;border:1px solid var(--rose-200);color:var(--rose-600);padding:2px 8px;font-size:11px;border-radius:4px;cursor:pointer">✕</button>
+                  </div>
+                  <div style="display:grid;grid-template-columns:1fr 2fr 1.5fr;gap:6px;margin-bottom:6px">
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Machine</label>
+                      <select value=${r.machine_id} onChange=${e => updateRow(idx, { machine_id: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px">
+                        <option value="">— pick —</option>
+                        ${catMachines.map(m => html`<option key=${m.id} value=${m.id}>${m.code}</option>`)}
+                      </select>
+                    </div>
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Part</label>
+                      <select value=${r.part_id} onChange=${e => updateRow(idx, { part_id: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px">
+                        <option value="">— pick —</option>
+                        ${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number} · ${p.name}</option>`)}
+                      </select>
+                    </div>
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Operation</label>
+                      <select value=${r.route_step_id} onChange=${e => updateRow(idx, { route_step_id: e.target.value })} disabled=${!r.part_id} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px">
+                        <option value="">${r.part_id ? '— pick —' : '— pick part first —'}</option>
+                        ${partSteps.map(s => html`<option key=${s.id || s.route_step_id} value=${s.id || s.route_step_id}>Op ${s.op_seq} · ${s.op_name || s.op_type || '?'}</option>`)}
+                      </select>
+                    </div>
+                  </div>
+                  <div style="display:grid;grid-template-columns:1fr 1fr 2fr;gap:6px;margin-bottom:6px">
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Good</label>
+                      <input type="number" min="0" value=${r.qty_good} onChange=${e => updateRow(idx, { qty_good: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px" />
+                    </div>
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Reject</label>
+                      <input type="number" min="0" value=${r.qty_rejected} onChange=${e => updateRow(idx, { qty_rejected: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px" />
+                    </div>
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Reject reason</label>
+                      <input type="text" value=${r.reject_reason} onChange=${e => updateRow(idx, { reject_reason: e.target.value })} placeholder=${(parseInt(r.qty_rejected)||0) > 0 ? 'chatter / dimensional / …' : '—'} disabled=${(parseInt(r.qty_rejected)||0) === 0} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px" />
+                    </div>
+                  </div>
+                  <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;align-items:end">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--slate-700);padding:6px">
+                      <input type="checkbox" checked=${r.setup_change} onChange=${e => updateRow(idx, { setup_change: e.target.checked })} />
+                      ⚙️ Setup change
+                    </label>
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Operator</label>
+                      <select value=${r.operator_user_id} onChange=${e => updateRow(idx, { operator_user_id: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px">
+                        ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              `;
+            })}
+            <button type="button" class="btn ghost small" onClick=${addRow} style="font-size:11px">+ Add row manually</button>
+          </div>
+          <div style="display:flex;gap:6px;margin-top:12px">
+            <button type="button" class="btn ghost" onClick=${onClose} disabled=${saving} style="flex:1">Cancel</button>
+            <button class="btn" onClick=${saveAll} disabled=${saving || segs.length === 0} style="flex:2">${saving ? 'Saving…' : '✓ Save ' + segs.length + ' segment' + (segs.length === 1 ? '' : 's')}</button>
+          </div>
+        `}
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
 // SIRI MODE — voice-first manager assistant (read + locate + navigate)
 // =================================================================
 // Manager-only (plant_head | admin). Full-screen orb with continuous
@@ -27906,6 +28381,7 @@ function StageLog({ plant, me, parts, machines, dies, units, shifts, users }) {
   const [logTarget, setLogTarget] = useState(null);
   const [overrideTarget, setOverrideTarget] = useState(null);
   const [bulkOpen, setBulkOpen] = useState(false);
+  const [voiceBatchOpen, setVoiceBatchOpen] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
@@ -27983,7 +28459,8 @@ function StageLog({ plant, me, parts, machines, dies, units, shifts, users }) {
     </div>
 
     <div class="section-h">Stage Log · ${filterDate}
-      <span style="margin-left:auto;display:flex;gap:6px">
+      <span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn small" style="background:linear-gradient(135deg,var(--indigo-600,#4f46e5),var(--indigo-500,#6366f1));color:white" onClick=${() => setVoiceBatchOpen(true)} title="Voice batch — record once at shift-end, AI extracts segments">🎙️ Batch</button>
         <button class="btn small ghost" onClick=${() => setBulkOpen(true)}>📋 Bulk Log</button>
         <button class="btn small" onClick=${() => setLogTarget({})}>+ Log entry</button>
       </span>
@@ -28036,6 +28513,7 @@ function StageLog({ plant, me, parts, machines, dies, units, shifts, users }) {
 
     ${logTarget && html`<${StageLogModal} plant=${plant} me=${me} pendingEntry=${logTarget.id ? logTarget : null} parts=${parts} machines=${machines} dies=${dies} units=${units} shifts=${shifts} users=${users} defaultDate=${filterDate} onClose=${() => setLogTarget(null)} onSaved=${() => { setLogTarget(null); refresh(); }} />`}
     ${bulkOpen && html`<${BulkLogModal} plant=${plant} me=${me} parts=${parts} machines=${machines} units=${units} shifts=${shifts} users=${users} defaultDate=${filterDate} onClose=${() => setBulkOpen(false)} onSaved=${() => { setBulkOpen(false); refresh(); }} />`}
+    ${voiceBatchOpen && html`<${StageLogBatchVoiceModal} plant=${plant} me=${me} parts=${parts} machines=${machines} units=${units} shifts=${shifts} users=${users} defaultDate=${filterDate} onClose=${() => setVoiceBatchOpen(false)} onSaved=${() => { setVoiceBatchOpen(false); refresh(); }} />`}
     ${overrideTarget && html`<${StageOverrideModal} plant=${plant} me=${me} entry=${overrideTarget} onClose=${() => setOverrideTarget(null)} onSaved=${() => { setOverrideTarget(null); refresh(); }} />`}
   `;
 }
