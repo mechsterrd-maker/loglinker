@@ -22588,7 +22588,14 @@ function ShotBatchVoiceModal({ plant, me, units, shifts, machines, dies, onClose
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
   const [savedCount, setSavedCount] = useState(0);
+  const [recording, setRecording] = useState(false);
+  const [recElapsed, setRecElapsed] = useState(0);
   const fileRef = useRef(null);
+  const mediaRecRef = useRef(null);
+  const recChunksRef = useRef([]);
+  const recStreamRef = useRef(null);
+  const recStartRef = useRef(0);
+  const recTimerRef = useRef(null);
 
   const pdcMachines = useMemo(() => machines.filter(m => m.category === 'pdc'), [machines]);
 
@@ -22636,6 +22643,60 @@ function ShotBatchVoiceModal({ plant, me, units, shifts, machines, dies, onClose
       if (f.size > 200 * 1024 * 1024) { setError('"' + f.name + '" is over 200 MB.'); return; }
     }
     await runCompression(list);
+  };
+
+  // Record straight in the modal (mic → MediaRecorder → File). The recorded
+  // webm blob flows through the same prepareAudioChunks pipeline as an
+  // uploaded mp3, so the rest of the flow stays identical.
+  const startRec = async () => {
+    setError('');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recStreamRef.current = stream;
+      const mr = new MediaRecorder(stream);
+      recChunksRef.current = [];
+      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) recChunksRef.current.push(e.data); };
+      mr.onstop = async () => {
+        const blob = new Blob(recChunksRef.current, { type: 'audio/webm' });
+        const f = new File([blob], 'shift-dictation-' + Date.now() + '.webm', { type: 'audio/webm' });
+        try { recStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
+        recStreamRef.current = null;
+        await runCompression([f]);
+      };
+      mr.start();
+      mediaRecRef.current = mr;
+      recStartRef.current = Date.now();
+      setRecElapsed(0);
+      setRecording(true);
+      recTimerRef.current = setInterval(() => setRecElapsed(Math.floor((Date.now() - recStartRef.current) / 1000)), 500);
+    } catch (e) {
+      setError('Mic access denied: ' + (e.message || e));
+    }
+  };
+
+  const stopRec = () => {
+    try {
+      if (mediaRecRef.current && mediaRecRef.current.state !== 'inactive') mediaRecRef.current.stop();
+    } catch {}
+    if (recTimerRef.current) { clearInterval(recTimerRef.current); recTimerRef.current = null; }
+    setRecording(false);
+  };
+
+  // Tidy up an in-progress recording if the modal is closed mid-record.
+  // Clear onstop first so we don't trip setState on an unmounted component.
+  useEffect(() => () => {
+    try {
+      const mr = mediaRecRef.current;
+      if (mr) { mr.onstop = null; if (mr.state !== 'inactive') mr.stop(); }
+    } catch {}
+    try { recStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
+    if (recTimerRef.current) clearInterval(recTimerRef.current);
+  }, []);
+
+  const fmtSec = (s) => {
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return m + ':' + String(r).padStart(2, '0');
   };
 
   const transcribeChunk = async (blob, idx) => {
@@ -22796,9 +22857,23 @@ function ShotBatchVoiceModal({ plant, me, units, shifts, machines, dies, onClose
         ${phase === 'idle' && originalFiles.length === 0 && html`
           <div class="card" style="padding:14px">
             <div class="field">
-              <label>Recording (mp3 / m4a / wav / aac)</label>
-              <input ref=${fileRef} type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg,.webm" multiple onChange=${pickFile} style="font-size:13px" />
-              <div style="font-size:11px;color:var(--slate-500);margin-top:6px">Dictate each machine: <i>"Machine M1 die 654 shift A two-forty good eight reject flash. M2 die 712 shift A one-eighty good zero reject…"</i></div>
+              <label>Record straight from the mic</label>
+              ${!recording ? html`
+                <button type="button" class="btn" onClick=${startRec} style="width:100%;background:linear-gradient(135deg,var(--rose-600,#e11d48),var(--rose-500,#f43f5e));color:white">🎙️ Start recording</button>
+              ` : html`
+                <button type="button" class="btn" onClick=${stopRec} style="width:100%;background:var(--slate-800);color:white;display:flex;align-items:center;justify-content:center;gap:10px">
+                  <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--rose-500,#f43f5e);animation:pulse 1.2s infinite"></span>
+                  ⏹ Stop · ${fmtSec(recElapsed)}
+                </button>
+              `}
+              <div style="font-size:11px;color:var(--slate-500);margin-top:6px">Or upload an audio file below if you recorded outside the app.</div>
+            </div>
+            <div class="field">
+              <label style="font-size:11px;color:var(--slate-500)">Or pick a file (mp3 / m4a / wav / aac)</label>
+              <input ref=${fileRef} type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg,.webm" multiple onChange=${pickFile} style="font-size:13px" disabled=${recording} />
+            </div>
+            <div style="background:var(--slate-50);border:1px solid var(--slate-200);padding:8px 10px;border-radius:6px;font-size:11px;color:var(--slate-600);margin:8px 0">
+              💡 Say each machine in turn: <i>"Machine M1 die 654 shift A two-forty good eight reject flash. M2 die 712 shift A one-eighty good zero reject…"</i>
             </div>
             <div class="field">
               <label>Subject hint (optional)</label>
