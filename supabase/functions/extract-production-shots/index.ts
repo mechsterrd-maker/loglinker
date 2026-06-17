@@ -75,39 +75,52 @@ const STAGE_PROMPT = `You are an extraction engine for an Indian SME manufacturi
 
 INPUT: an English transcript translated from a shift-end voice dictation. The original audio was in Tamil / Hindi / Tanglish / Hinglish / English / mixed. The supervisor lists production for one or more machines.
 
-CRUCIAL: operators are NOT precise. They use general terms. You MUST match loosely:
-- Part may be said by part_number ("XYZ-123"), by name ("the big bracket", "support arm"), by customer alias ("Bosch part", "the Marvel one"), or by description. Try ALL of these.
-- Operation may be said as op number ("op 10", "first operation"), op name ("facing op", "drilling"), or generic ("first stage", "next op"). Match against the part's route steps.
-- Machine code is often loose: "CNC one", "CNC zero one", "machine number 3".
-- When you're uncertain between two candidates, set the field to null AND add a note in raw_quote — a human will pick from a dropdown.
+YOUR JOB: be a decisive matcher. Operators speak loosely — your task is to figure out what they meant from the PARTS list. Do NOT throw your hands up. When there's a single plausible candidate, PICK IT.
+
+LOOSE MATCHING (apply aggressively):
+- Substring match wins: operator says "filter" → match "Filter Head", "Filter Body", whichever part_number contains or starts with "filter". Same for "adapter" → "Adapter Plate", "Cover" → "Top Cover Assembly", etc.
+- Token overlap: any meaningful word the operator says should match a part whose name or aliases contain that word (skip stopwords like "the", "an", "for").
+- Customer aliases are first-class: "Bosch part" → any part whose aliases mention Bosch.
+- Common abbreviations: "FH" → "Filter Head", "BP" → "Bottom Plate", etc.
+- If two parts plausibly match, prefer the one whose route includes the operation the operator named.
+
+OPERATION MAPPING (always apply):
+- "first operation" / "1st op" / "Op 1" / "first stage" → the route step with the SMALLEST op_seq for that part.
+- "second operation" / "2nd op" / "Op 2" / "next stage" → the route step with the 2nd-smallest op_seq.
+- "third operation" / "3rd op" → 3rd-smallest op_seq. And so on.
+- "Op 10" / "Op 20" / "Op 30" with the explicit number → match the route step whose op_seq equals that number.
+- Named ops ("facing op", "drilling", "milling", "boring", "tapping") → match against op_name (substring OK).
+- If part is set but the operation phrase is vague AND the part has only one route step, USE that one step.
+
+DECISIVENESS:
+- "Single plausible candidate" = PICK IT (don't second-guess).
+- Only return part_number=null when there are TWO OR MORE equally plausible candidates with no disambiguator, OR when the operator named no part at all.
+- Same for op_seq: only null when the part has multiple steps and the operator gave zero hint.
 
 OUTPUT: strict JSON, NO markdown fences, NO commentary:
 {
   "segments": [
     {
       "machine_code":  "exact code from MACHINES list, or null if unmatchable",
-      "part_number":   "exact part_number from PARTS list, or null",
-      "op_seq":        <integer — route step op_seq, or null if no clear match>,
+      "part_number":   "exact part_number from PARTS list — be decisive — null only if truly ambiguous",
+      "op_seq":        <integer — route step op_seq, or null only if truly ambiguous>,
       "op_name":       "exact op_name from the part's ROUTE STEPS, or null",
       "qty_good":      <integer>,
       "qty_rejected":  <integer>,
       "reject_reason": "short defect name, or null if zero rejects",
-      "setup_change":  <boolean — true only if operator explicitly mentioned setup change / part changeover>,
-      "raw_quote":     "the phrase from the transcript this row came from — for human review"
+      "setup_change":  <boolean — true if operator mentioned setup change / part changeover>,
+      "confidence":    "high | medium | low — high when match is unambiguous, medium when you used loose matching, low when guessing",
+      "raw_quote":     "the phrase from the transcript this row came from"
     }
   ]
 }
 
-MATCHING RULES:
-- Try part_number → name → aliases (in that order). Pick the part that best fits the operator's words.
-- If two parts are plausibly the same description, choose the one whose route includes the operation the operator mentioned.
-- op_seq + op_name must both come from the SAME route step of the resolved part. If you set part_number, set BOTH op_seq and op_name (or both null).
-- If operator says only "made 200 good on CNC-1" without naming a part, return part_number=null, op_seq=null, op_name=null — human will fill in.
+OTHER RULES:
 - If qty_good and qty_rejected can't both be extracted (or inferred zero), SKIP that segment — don't half-fill.
 - "no rejects" / "zero" / "all good" / "vendraavadhu illa" → qty_rejected=0, reject_reason=null.
-- "setup change" / "part change" / "changeover" / "new part started" → setup_change=true.
+- "setup change" / "setting change" / "part change" / "changeover" / "new part started" → setup_change=true.
 - Ignore greetings, chatter, non-production sentences.
-- Number words → integers ("two hundred forty" → 240).
+- Number words → integers ("two hundred forty" → 240, "two thousand" → 2000, "fifteen hundred" → 1500).
 
 If the transcript has no usable production data, return {"segments": []}.`;
 
@@ -219,19 +232,12 @@ async function extractStage(
     aliasesByPart[pn].push(tag);
   }
 
-  // Limit context size — pick the parts that have at least one route step in this
-  // category (so we don't send irrelevant noise) plus everything has aliases as
-  // they help disambiguation.
-  const partsInCategory = new Set<string>();
-  for (const s of routeSteps) {
-    if (s.op_type && s.op_type.toLowerCase() === category.toLowerCase()) {
-      partsInCategory.add(s.part_number);
-    }
-  }
-  // If filtering yields nothing (route steps don't have category info), keep all parts.
-  const relevantParts = partsInCategory.size > 0
-    ? parts.filter(p => partsInCategory.has(p.part_number))
-    : parts;
+  // Send ALL active parts — don't filter by category. Route step op_type is
+  // often unset or named differently than the machine category, so filtering
+  // here silently drops parts the operator would legitimately mention.
+  // Haiku handles a few hundred parts fine; truncate only if extremely large.
+  const MAX_PARTS = 250;
+  const relevantParts = parts.slice(0, MAX_PARTS);
 
   const partsBlock = relevantParts.map(p => {
     const steps = stepsByPart[p.part_number] || [];
@@ -256,8 +262,103 @@ ${transcript.trim()}
 """`;
 
   const a = await callClaude(STAGE_PROMPT, dynamic);
-  const segments = Array.isArray((a as any)?.segments) ? (a as any).segments : [];
+  const rawSegments = Array.isArray((a as any)?.segments) ? (a as any).segments : [];
+
+  // SERVER-SIDE FUZZY FALLBACK
+  // When the AI returns part_number=null but the operator clearly named
+  // something, try a token-overlap match against the raw_quote. Same for
+  // op_seq once we have a part — "1st"/"first"/"Op 10" → smallest op_seq, etc.
+  const segments = rawSegments.map((s: any) => {
+    if (!s.part_number && s.raw_quote) {
+      const guess = fuzzyMatchPart(s.raw_quote, parts, aliasesByPart);
+      if (guess) {
+        s.part_number = guess;
+        s.confidence = s.confidence === "high" ? "medium" : (s.confidence || "low");
+      }
+    }
+    if (s.part_number && s.op_seq == null && s.raw_quote) {
+      const partSteps = stepsByPart[s.part_number] || [];
+      const guessSeq = fuzzyMatchOp(s.raw_quote, partSteps);
+      if (guessSeq != null) {
+        s.op_seq = guessSeq;
+        const step = partSteps.find(ps => ps.op_seq === guessSeq);
+        if (step) s.op_name = step.op_name;
+      }
+    }
+    return s;
+  });
+
   return json({ extraction: { segments } });
+}
+
+// Token-overlap match: operator says "filter" → match "Filter Head".
+// Operator says "adapter 2nd op" → "Adapter Plate". Picks the part whose
+// part_number / name / aliases has the highest meaningful overlap.
+function fuzzyMatchPart(
+  raw: string,
+  parts: Array<{ part_number: string; name: string }>,
+  aliasesByPart: Record<string, string[]>,
+): string | null {
+  const stopwords = new Set([
+    "the","a","an","for","on","at","in","of","to","and","or","is","was","were",
+    "machine","cnc","vmc","lathe","press","good","reject","rejects","rejected",
+    "rejection","setup","setting","change","operation","op","first","second",
+    "third","fourth","fifth","1st","2nd","3rd","4th","5th","numbers","number",
+    "pieces","pcs","after","then","also","completed","done","finished",
+  ]);
+  const tokens = raw
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, " ")
+    .split(/\s+/)
+    .filter(t => t.length >= 3 && !stopwords.has(t) && !/^\d+$/.test(t));
+  if (tokens.length === 0) return null;
+
+  let best: { part_number: string; score: number } | null = null;
+  for (const p of parts) {
+    const hay = [
+      p.part_number.toLowerCase(),
+      p.name.toLowerCase(),
+      ...(aliasesByPart[p.part_number] || []).map(a => a.toLowerCase()),
+    ].join(" ");
+    let score = 0;
+    for (const t of tokens) {
+      if (hay.includes(t)) score += t.length; // longer tokens count more
+    }
+    if (score > 0 && (!best || score > best.score)) {
+      best = { part_number: p.part_number, score };
+    }
+  }
+  // Need at least one decent hit (4+ chars overlap)
+  return best && best.score >= 4 ? best.part_number : null;
+}
+
+// "1st"/"first"/"Op 1" → smallest op_seq; "2nd"/"second"/"Op 2" → next.
+// Named ops ("facing", "drilling") → match against op_name.
+function fuzzyMatchOp(
+  raw: string,
+  steps: Array<{ op_seq: number; op_name: string | null }>,
+): number | null {
+  if (steps.length === 0) return null;
+  if (steps.length === 1) return steps[0].op_seq; // single route step — use it
+  const sorted = [...steps].sort((a, b) => a.op_seq - b.op_seq);
+  const lower = raw.toLowerCase();
+
+  const ordinals: Array<[RegExp, number]> = [
+    [/\b(first|1st|one\s*st|op\s*0?1\b|op\s*10\b|operation\s*1\b|operation\s*10\b|number\s*1\b|number\s*one\b)\b/, 0],
+    [/\b(second|2nd|two\s*nd|op\s*0?2\b|op\s*20\b|operation\s*2\b|operation\s*20\b|number\s*2\b|number\s*two\b)\b/, 1],
+    [/\b(third|3rd|three\s*rd|op\s*0?3\b|op\s*30\b|operation\s*3\b|operation\s*30\b|number\s*3\b|number\s*three\b)\b/, 2],
+    [/\b(fourth|4th|op\s*0?4\b|op\s*40\b|operation\s*4\b|operation\s*40\b)\b/, 3],
+    [/\b(fifth|5th|op\s*0?5\b|op\s*50\b|operation\s*5\b|operation\s*50\b)\b/, 4],
+  ];
+  for (const [re, idx] of ordinals) {
+    if (re.test(lower) && sorted[idx]) return sorted[idx].op_seq;
+  }
+
+  // Named op match
+  for (const s of sorted) {
+    if (s.op_name && lower.includes(s.op_name.toLowerCase())) return s.op_seq;
+  }
+  return null;
 }
 
 async function callClaude(staticPrompt: string, dynamicPrompt: string): Promise<unknown> {
