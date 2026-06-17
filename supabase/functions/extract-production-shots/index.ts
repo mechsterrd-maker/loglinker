@@ -71,58 +71,66 @@ RULES:
 
 If the transcript has no usable production data, return {"shots": []}.`;
 
-const STAGE_PROMPT = `You are an extraction engine for an Indian SME manufacturing plant's daily stage log (machining operations — CNC, VMC, lathe, press, etc.).
+const STAGE_PROMPT = `You are an extraction engine for an Indian SME manufacturing plant's daily stage log.
 
-INPUT: an English transcript translated from a shift-end voice dictation. The original audio was in Tamil / Hindi / Tanglish / Hinglish / English / mixed. The supervisor lists production for one or more machines.
+INPUT: an English transcript translated by Whisper from a Tamil/Hindi/mixed voice dictation. Transcripts are often MESSY — missed words, no punctuation between segments, garbled part names, run-on sentences. Your job is to extract structured data anyway.
 
-YOUR JOB: be a decisive matcher. Operators speak loosely — your task is to figure out what they meant from the PARTS list. Do NOT throw your hands up. When there's a single plausible candidate, PICK IT.
+PRIMARY RULE — DO NOT LOSE SEGMENTS:
+Every machine code mentioned in the transcript (e.g. "CNC 1", "CNC 2", "VMC 3", "machine 4") MUST produce ONE segment in your output. EVEN IF parts or operations are unclear or unintelligible, ALWAYS create the segment — set part_number=null / op_seq=null and the human will pick. It is FAR worse to lose a segment than to leave a field null.
 
-LOOSE MATCHING (apply aggressively):
-- Substring match wins: operator says "filter" → match "Filter Head", "Filter Body", whichever part_number contains or starts with "filter". Same for "adapter" → "Adapter Plate", "Cover" → "Top Cover Assembly", etc.
-- Token overlap: any meaningful word the operator says should match a part whose name or aliases contain that word (skip stopwords like "the", "an", "for").
-- Customer aliases are first-class: "Bosch part" → any part whose aliases mention Bosch.
-- Common abbreviations: "FH" → "Filter Head", "BP" → "Bottom Plate", etc.
-- If two parts plausibly match, prefer the one whose route includes the operation the operator named.
+EXTRACTION ALGORITHM:
+1. Find every machine code mention in the transcript. Each one = one segment minimum.
+2. For each machine, look at the surrounding text (until the next machine code or end of transcript) and extract:
+   - qty_good: the first or most prominent number stated as production output ("2500 numbers", "two thousand pieces", "fifteen hundred").
+   - qty_rejected: the number associated with words like "reject"/"rejection"/"scrap". Default to 0 if not stated.
+   - reject_reason: short defect text after "rejection reason"/"because of"/"due to"/"reason". Examples: "blow", "gauge tight", "thread gauge problem", "finishing not good", "drill size oversize".
+   - part_number: match operator's words against PARTS list (see LOOSE MATCHING below). Null if no plausible match.
+   - op_seq + op_name: from route step (see OPERATION MAPPING). Null if ambiguous.
+   - setup_change: true ONLY if "setup change" / "setting change" / "changeover" / "after setting" appears near this machine.
 
-OPERATION MAPPING (always apply):
-- "first operation" / "1st op" / "Op 1" / "first stage" → the route step with the SMALLEST op_seq for that part.
-- "second operation" / "2nd op" / "Op 2" / "next stage" → the route step with the 2nd-smallest op_seq.
-- "third operation" / "3rd op" → 3rd-smallest op_seq. And so on.
-- "Op 10" / "Op 20" / "Op 30" with the explicit number → match the route step whose op_seq equals that number.
-- Named ops ("facing op", "drilling", "milling", "boring", "tapping") → match against op_name (substring OK).
-- If part is set but the operation phrase is vague AND the part has only one route step, USE that one step.
+LOOSE PART MATCHING (apply aggressively):
+- Word-stem match: "filter", "filtered", "filtering" ALL match any part containing "filter" (e.g. "Filter Head"). Same for "adapt"/"adapted" → "Adapter Plate", "cover"/"covered" → "Cover".
+- Substring match: any word from the transcript that appears inside a part's name → match. "Tackle" might match "Tackle Plate" or be unclear.
+- Customer/alias: "Bosch part" / "the Marvel one" → match any part whose aliases include that customer.
+- Common abbreviations: "FH" → "Filter Head", "BP" → "Bottom Plate".
+- If multiple parts plausibly match, prefer the one whose route includes the operation the operator named.
+- If no part is plausibly named, set part_number=null and KEEP the segment.
 
-DECISIVENESS:
-- "Single plausible candidate" = PICK IT (don't second-guess).
-- Only return part_number=null when there are TWO OR MORE equally plausible candidates with no disambiguator, OR when the operator named no part at all.
-- Same for op_seq: only null when the part has multiple steps and the operator gave zero hint.
+OPERATION MAPPING:
+- "first" / "1st" / "Op 1" / "Op 10" / "first stage" → SMALLEST op_seq for the matched part.
+- "second" / "2nd" / "Op 2" / "Op 20" → next-smallest op_seq.
+- "third" / "3rd" / "Op 3" / "Op 30" → next-smallest. Same pattern for 4th, 5th.
+- Named ops ("facing", "drilling", "milling", "boring", "tapping", "tap"/"tapped") → match against op_name (substring/stem OK).
+- If part has only ONE route step, use it.
+- If ambiguous, set op_seq=null (don't skip the segment).
 
 OUTPUT: strict JSON, NO markdown fences, NO commentary:
 {
   "segments": [
     {
-      "machine_code":  "exact code from MACHINES list, or null if unmatchable",
-      "part_number":   "exact part_number from PARTS list — be decisive — null only if truly ambiguous",
-      "op_seq":        <integer — route step op_seq, or null only if truly ambiguous>,
-      "op_name":       "exact op_name from the part's ROUTE STEPS, or null",
+      "machine_code":  "exact code from MACHINES list, or null only if not in list",
+      "part_number":   "exact part_number from PARTS list, or null",
+      "op_seq":        <integer or null>,
+      "op_name":       "exact op_name from part's route, or null",
       "qty_good":      <integer>,
-      "qty_rejected":  <integer>,
-      "reject_reason": "short defect name, or null if zero rejects",
-      "setup_change":  <boolean — true if operator mentioned setup change / part changeover>,
-      "confidence":    "high | medium | low — high when match is unambiguous, medium when you used loose matching, low when guessing",
-      "raw_quote":     "the phrase from the transcript this row came from"
+      "qty_rejected":  <integer — default 0 if not stated>,
+      "reject_reason": "short defect text, or null",
+      "setup_change":  <boolean>,
+      "confidence":    "high | medium | low — high when part+op match, medium when used loose matching, low when part/op null",
+      "raw_quote":     "the exact transcript phrase this segment came from"
     }
   ]
 }
 
-OTHER RULES:
-- If qty_good and qty_rejected can't both be extracted (or inferred zero), SKIP that segment — don't half-fill.
-- "no rejects" / "zero" / "all good" / "vendraavadhu illa" → qty_rejected=0, reject_reason=null.
-- "setup change" / "setting change" / "part change" / "changeover" / "new part started" → setup_change=true.
-- Ignore greetings, chatter, non-production sentences.
-- Number words → integers ("two hundred forty" → 240, "two thousand" → 2000, "fifteen hundred" → 1500).
+HARD DON'Ts:
+- DO NOT skip a segment because part or op is unclear. Set null and move on.
+- DO NOT drop segments to "clean up" the output. Every machine mention = one segment.
+- DO NOT invent qty_good when no number is stated near a machine.
+- DO NOT include greetings / chatter / non-production sentences as segments.
 
-If the transcript has no usable production data, return {"segments": []}.`;
+Number words → integers ("two hundred forty"→240, "two thousand"→2000, "fifteen hundred"→1500).
+
+If the transcript has ZERO machine mentions, return {"segments": []}.`;
 
 // =============================================================================
 // MODES
@@ -291,9 +299,17 @@ ${transcript.trim()}
   return json({ extraction: { segments } });
 }
 
-// Token-overlap match: operator says "filter" → match "Filter Head".
-// Operator says "adapter 2nd op" → "Adapter Plate". Picks the part whose
-// part_number / name / aliases has the highest meaningful overlap.
+// Token-overlap match with light stemming. Operator says "filtered"
+// (Whisper sometimes adds verb suffixes) → match "Filter Head". Strips
+// common English suffixes (-ed, -ing, -s) before comparing.
+function stemToken(t: string): string {
+  if (t.length <= 4) return t;
+  for (const suffix of ["ing", "ed", "es", "s"]) {
+    if (t.endsWith(suffix) && t.length - suffix.length >= 3) return t.slice(0, -suffix.length);
+  }
+  return t;
+}
+
 function fuzzyMatchPart(
   raw: string,
   parts: Array<{ part_number: string; name: string }>,
@@ -304,13 +320,15 @@ function fuzzyMatchPart(
     "machine","cnc","vmc","lathe","press","good","reject","rejects","rejected",
     "rejection","setup","setting","change","operation","op","first","second",
     "third","fourth","fifth","1st","2nd","3rd","4th","5th","numbers","number",
-    "pieces","pcs","after","then","also","completed","done","finished",
+    "pieces","pcs","after","then","also","completed","done","finished","reason",
+    "also","blow","tight","died","gauge","gage","oversize","oversized","instead",
   ]);
   const tokens = raw
     .toLowerCase()
     .replace(/[^\w\s-]/g, " ")
     .split(/\s+/)
-    .filter(t => t.length >= 3 && !stopwords.has(t) && !/^\d+$/.test(t));
+    .filter(t => t.length >= 3 && !stopwords.has(t) && !/^\d+$/.test(t))
+    .map(stemToken);
   if (tokens.length === 0) return null;
 
   let best: { part_number: string; score: number } | null = null;
@@ -322,13 +340,12 @@ function fuzzyMatchPart(
     ].join(" ");
     let score = 0;
     for (const t of tokens) {
-      if (hay.includes(t)) score += t.length; // longer tokens count more
+      if (hay.includes(t)) score += t.length;
     }
     if (score > 0 && (!best || score > best.score)) {
       best = { part_number: p.part_number, score };
     }
   }
-  // Need at least one decent hit (4+ chars overlap)
   return best && best.score >= 4 ? best.part_number : null;
 }
 
