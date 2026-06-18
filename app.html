@@ -23486,6 +23486,385 @@ function StageLogBatchVoiceModal({ plant, me, parts, machines, units, shifts, us
 }
 
 // =================================================================
+// TASK BATCH VOICE — dictate task assignments, AI extracts → review → bulk save
+// =================================================================
+// Manager dictates a stream of "X to do Y by Z" → Claude breaks it into
+// tasks, matches owner names to users, parses relative due dates ("by
+// Friday" → ISO), then a review grid + bulk insert into `actions`.
+function TaskBatchVoiceModal({ plant, me, users, onClose, onSaved }) {
+  const [originalFiles, setOriginalFiles] = useState([]);
+  const [preppedChunks, setPreppedChunks] = useState(null);
+  const [file, setFile] = useState(null);
+  const [compressing, setCompressing] = useState(false);
+  const [compressStage, setCompressStage] = useState('');
+  const [phase, setPhase] = useState('idle');
+  const [chunksDone, setChunksDone] = useState(0);
+  const [hintSubject, setHintSubject] = useState('');
+  const [transcript, setTranscript] = useState('');
+  const [showTranscript, setShowTranscript] = useState(false);
+  const [taskRows, setTaskRows] = useState([]);
+  const [projects, setProjects] = useState([]);
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [savedCount, setSavedCount] = useState(0);
+  const [recording, setRecording] = useState(false);
+  const [recElapsed, setRecElapsed] = useState(0);
+  const fileRef = useRef(null);
+  const mediaRecRef = useRef(null);
+  const recChunksRef = useRef([]);
+  const recStreamRef = useRef(null);
+  const recStartRef = useRef(0);
+  const recTimerRef = useRef(null);
+
+  const usersByName = useMemo(() => {
+    const map = {};
+    for (const u of users) map[u.full_name?.toLowerCase()] = u;
+    return map;
+  }, [users]);
+  const projectsByName = useMemo(() => Object.fromEntries(projects.map(p => [p.name?.toLowerCase(), p])), [projects]);
+
+  useEffect(() => {
+    sb.from('mcp_projects').select('id, code, name').eq('plant_id', plant.id).neq('status', 'completed').neq('status', 'cancelled').order('name')
+      .then(({ data }) => setProjects(data || []));
+  }, [plant.id]);
+
+  const invokeFn = async (path, init) => {
+    const session = (await sb.auth.getSession()).data.session;
+    const headers = Object.assign({}, init.headers || {});
+    if (session?.access_token) headers.Authorization = 'Bearer ' + session.access_token;
+    headers.apikey = SUPABASE_ANON_KEY;
+    const res = await fetch(SUPABASE_URL + '/functions/v1/' + path, Object.assign({}, init, { headers }));
+    const text = await res.text();
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch {}
+    if (!res.ok) throw new Error(parsed?.error || text || ('HTTP ' + res.status));
+    return parsed ?? text;
+  };
+
+  const runCompression = async (files) => {
+    setError(''); setTaskRows([]); setTranscript(''); setPreppedChunks(null); setOriginalFiles(files);
+    if (files.length === 0) { setFile(null); return; }
+    setCompressing(true); setCompressStage('decoding');
+    try {
+      const prepped = await prepareAudioChunks(files, (stage, info) => {
+        setCompressStage(stage + (info ? ' (' + info.current + '/' + info.total + ')' : ''));
+      });
+      setPreppedChunks(prepped);
+      const totalCompressed = prepped.chunks.reduce((s, b) => s + b.size, 0);
+      const baseName = (files[0].name || 'tasks').replace(/\.[^.]+$/, '');
+      const outName = (files.length > 1 ? baseName + '-and-' + (files.length - 1) + '-more' : baseName) + '.mp3';
+      setFile({ name: outName, size: totalCompressed, type: 'audio/mpeg' });
+    } catch (e) {
+      setError('Could not prep audio: ' + (e.message || e));
+      setFile(null); setPreppedChunks(null);
+    } finally {
+      setCompressing(false); setCompressStage('');
+    }
+  };
+
+  const pickFile = async (e) => {
+    const list = Array.from(e.target.files || []);
+    if (list.length === 0) return;
+    for (const f of list) {
+      if (!f.type.startsWith('audio/') && !/\.(mp3|m4a|wav|ogg|webm|mp4|aac|flac)$/i.test(f.name)) {
+        setError('"' + f.name + '" isn\'t an audio file.'); return;
+      }
+      if (f.size > 200 * 1024 * 1024) { setError('"' + f.name + '" is over 200 MB.'); return; }
+    }
+    await runCompression(list);
+  };
+
+  const startRec = async () => {
+    setError('');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recStreamRef.current = stream;
+      const mr = new MediaRecorder(stream);
+      recChunksRef.current = [];
+      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) recChunksRef.current.push(e.data); };
+      mr.onstop = async () => {
+        const blob = new Blob(recChunksRef.current, { type: 'audio/webm' });
+        const f = new File([blob], 'task-dictation-' + Date.now() + '.webm', { type: 'audio/webm' });
+        try { recStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
+        recStreamRef.current = null;
+        await runCompression([f]);
+      };
+      mr.start();
+      mediaRecRef.current = mr;
+      recStartRef.current = Date.now();
+      setRecElapsed(0);
+      setRecording(true);
+      recTimerRef.current = setInterval(() => setRecElapsed(Math.floor((Date.now() - recStartRef.current) / 1000)), 500);
+    } catch (e) {
+      setError('Mic access denied: ' + (e.message || e));
+    }
+  };
+  const stopRec = () => {
+    try { if (mediaRecRef.current && mediaRecRef.current.state !== 'inactive') mediaRecRef.current.stop(); } catch {}
+    if (recTimerRef.current) { clearInterval(recTimerRef.current); recTimerRef.current = null; }
+    setRecording(false);
+  };
+  useEffect(() => () => {
+    try {
+      const mr = mediaRecRef.current;
+      if (mr) { mr.onstop = null; if (mr.state !== 'inactive') mr.stop(); }
+    } catch {}
+    try { recStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
+    if (recTimerRef.current) clearInterval(recTimerRef.current);
+  }, []);
+  const fmtSec = (s) => Math.floor(s/60) + ':' + String(s%60).padStart(2, '0');
+
+  const transcribeChunk = async (blob, idx) => {
+    const fd = new FormData();
+    fd.set('audio', blob, 'chunk-' + (idx + 1) + '.mp3');
+    fd.set('plant_id', plant.id);
+    fd.set('mode', 'transcribe');
+    if (hintSubject.trim()) fd.set('hint_subject', hintSubject.trim());
+    const data = await invokeFn('extract-production-shots', { method: 'POST', body: fd });
+    return data.transcript || '';
+  };
+
+  // Resolve loose owner name from AI ("Raju" / "the supervisor") to a user id.
+  const resolveOwnerId = (name) => {
+    if (!name) return '';
+    const lower = String(name).toLowerCase().trim();
+    if (usersByName[lower]) return usersByName[lower].id;
+    // Try first-name match
+    for (const u of users) {
+      const first = u.full_name?.split(/\s+/)[0]?.toLowerCase();
+      if (first && first === lower) return u.id;
+    }
+    // Try substring contains
+    for (const u of users) {
+      if (u.full_name?.toLowerCase().includes(lower)) return u.id;
+    }
+    return '';
+  };
+
+  const resolveProjectId = (name) => {
+    if (!name) return '';
+    const lower = String(name).toLowerCase().trim();
+    if (projectsByName[lower]) return projectsByName[lower].id;
+    for (const p of projects) {
+      if (p.name?.toLowerCase().includes(lower)) return p.id;
+    }
+    return '';
+  };
+
+  const extract = async () => {
+    if (!preppedChunks) return;
+    const chunks = preppedChunks.chunks;
+    setError(''); setPhase('uploading'); setChunksDone(0);
+    try {
+      const limit = 3;
+      const transcripts = new Array(chunks.length).fill('');
+      let next = 0;
+      const workers = Array.from({ length: Math.min(limit, chunks.length) }, async () => {
+        while (true) {
+          const myIdx = next++;
+          if (myIdx >= chunks.length) return;
+          transcripts[myIdx] = await transcribeChunk(chunks[myIdx], myIdx);
+          setChunksDone(d => d + 1);
+        }
+      });
+      await Promise.all(workers);
+      const joined = transcripts.map((t, i) => chunks.length > 1 ? `[Part ${i + 1}]\n${t}` : t).join('\n\n').trim();
+      if (!joined) throw new Error('Transcription was empty — recording may be silent.');
+      setTranscript(joined);
+
+      setPhase('extracting');
+      const data = await invokeFn('extract-production-shots', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transcript: joined, plant_id: plant.id, category: 'tasks' }),
+      });
+      const ext = data.extraction || {};
+      const aiTasks = Array.isArray(ext.tasks) ? ext.tasks : [];
+
+      const rows = aiTasks.map((t, i) => ({
+        id: 'ai-' + i,
+        title: t.title || '',
+        owner_id: resolveOwnerId(t.owner_user_name),
+        owner_hint: t.owner_user_name || '',
+        project_id: resolveProjectId(t.project_name),
+        project_hint: t.project_name || '',
+        due_at: t.due_date && /^\d{4}-\d{2}-\d{2}$/.test(t.due_date) ? t.due_date + 'T17:30' : '',
+        priority: t.priority || 'medium',
+        raw_quote: t.raw_quote || '',
+      }));
+      setTaskRows(rows);
+      if (rows.length === 0) setShowTranscript(true);
+      setPhase('review');
+    } catch (e) {
+      setError(e.message || String(e));
+      setPhase('idle');
+    }
+  };
+
+  const updateRow = (idx, patch) => setTaskRows(prev => prev.map((r, i) => i === idx ? { ...r, ...patch } : r));
+  const removeRow = (idx) => setTaskRows(prev => prev.filter((_, i) => i !== idx));
+  const addRow = () => setTaskRows(prev => [...prev, {
+    id: 'manual-' + Date.now(),
+    title: '', owner_id: '', owner_hint: '',
+    project_id: '', project_hint: '',
+    due_at: '', priority: 'medium', raw_quote: '',
+  }]);
+
+  const saveAll = async () => {
+    setError(''); setSaving(true);
+    try {
+      const valid = taskRows.filter(r => r.title.trim());
+      if (valid.length === 0) throw new Error('At least one task needs a title.');
+      const rows = valid.map(r => ({
+        plant_id: plant.id,
+        source_type: 'voice',
+        title: r.title.trim(),
+        owner_id: r.owner_id || null,
+        project_id: r.project_id || null,
+        assigned_by: me.id,
+        due_at: r.due_at ? new Date(r.due_at).toISOString() : null,
+        status: 'open',
+      }));
+      const { error: err } = await sb.from('actions').insert(rows);
+      if (err) throw err;
+      setSavedCount(rows.length);
+      showToast('✓ ' + rows.length + ' task' + (rows.length === 1 ? '' : 's') + ' assigned by voice');
+      setTimeout(() => onSaved(), 1200);
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const isWorking = compressing || phase === 'uploading' || phase === 'extracting' || saving;
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget && !isWorking) onClose(); }}>
+      <div class="modal" style="max-width:780px">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">🎙️ Voice batch — assign tasks</div>
+            <div style="font-size:11px;color:var(--slate-500);font-weight:400">Dictate the tasks. AI extracts each one, matches owner names to people, and parses "by Friday" → date.</div>
+          </div>
+          <button class="close-btn" onClick=${onClose} disabled=${isWorking}>×</button>
+        </div>
+
+        ${error && html`<div class="alert error" style="font-size:12px">${error}</div>`}
+        ${savedCount > 0 && html`<div class="alert" style="background:var(--emerald-50);border-color:var(--emerald-300);color:var(--emerald-700);font-size:12px">✓ ${savedCount} task${savedCount===1?'':'s'} assigned.</div>`}
+
+        ${phase === 'idle' && originalFiles.length === 0 && html`
+          <div class="card" style="padding:14px">
+            <div class="field">
+              <label>Record straight from the mic</label>
+              ${!recording ? html`
+                <button type="button" class="btn" onClick=${startRec} style="width:100%;background:linear-gradient(135deg,var(--rose-600,#e11d48),var(--rose-500,#f43f5e));color:white">🎙️ Start recording</button>
+              ` : html`
+                <button type="button" class="btn" onClick=${stopRec} style="width:100%;background:var(--slate-800);color:white;display:flex;align-items:center;justify-content:center;gap:10px">
+                  <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--rose-500,#f43f5e);animation:pulse 1.2s infinite"></span>
+                  ⏹ Stop · ${fmtSec(recElapsed)}
+                </button>
+              `}
+            </div>
+            <div class="field">
+              <label style="font-size:11px;color:var(--slate-500)">Or pick a file</label>
+              <input ref=${fileRef} type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg,.webm" multiple onChange=${pickFile} style="font-size:13px" disabled=${recording} />
+            </div>
+            <div style="background:var(--slate-50);border:1px solid var(--slate-200);padding:8px 10px;border-radius:6px;font-size:11px;color:var(--slate-600);margin:8px 0">
+              💡 Speak naturally: <i>"Raju to fix the broken sensor on CNC 3 by Friday. Suresh, call Bosch about delayed shipment by tomorrow. Someone update the inspection checklist next week."</i>
+            </div>
+          </div>
+        `}
+
+        ${originalFiles.length > 0 && phase === 'idle' && html`
+          <div class="card" style="padding:14px;margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <div style="font-size:13px;font-weight:700">🎵 ${originalFiles.length} part${originalFiles.length===1?'':'s'}</div>
+              <button type="button" class="btn ghost small" onClick=${() => runCompression([])} disabled=${isWorking} style="padding:4px 10px;font-size:11px">✕ Start over</button>
+            </div>
+            ${compressing && html`<div style="padding:12px;text-align:center;background:var(--slate-50);border-radius:6px;margin-bottom:8px"><div class="spinner" style="margin:0 auto 6px"></div><div style="font-size:12px">${compressStage}</div></div>`}
+            ${file && !compressing && preppedChunks && html`<div style="background:var(--teal-50);border:1px solid var(--teal-200);padding:8px 10px;border-radius:6px;margin-bottom:8px;font-size:12px">✓ Ready · <b>${(file.size/1024/1024).toFixed(1)} MB</b> in <b>${preppedChunks.chunks.length} chunk${preppedChunks.chunks.length===1?'':'s'}</b> · ${Math.round(preppedChunks.trimmedDurationSec / 60)} min of speech</div>`}
+            ${file && !compressing && html`<button class="btn" onClick=${extract} style="width:100%">🤖 Transcribe & extract tasks</button>`}
+          </div>
+        `}
+
+        ${phase === 'uploading' && preppedChunks && html`
+          <div class="card" style="padding:20px;text-align:center">
+            <div class="spinner" style="margin:0 auto 10px"></div>
+            <div style="font-size:13px;font-weight:600">Translating chunk ${Math.min(chunksDone + 1, preppedChunks.chunks.length)} of ${preppedChunks.chunks.length}…</div>
+          </div>
+        `}
+
+        ${phase === 'extracting' && html`<div class="card" style="padding:20px;text-align:center"><div class="spinner" style="margin:0 auto 10px"></div><div style="font-size:13px;font-weight:600">AI is breaking out the tasks…</div></div>`}
+
+        ${phase === 'review' && html`
+          ${taskRows.length === 0 && html`
+            <div style="background:var(--amber-50);border:1px solid var(--amber-300);padding:10px 12px;border-radius:8px;margin-bottom:10px;font-size:12px;color:var(--amber-800);line-height:1.5">
+              <b>🤔 AI didn't find any tasks in this recording.</b> Check the transcript below — if it looks right, tap <b>+ Add row manually</b>.
+            </div>
+          `}
+          <div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
+            <div style="font-size:12px;color:var(--slate-600)">${taskRows.length} task${taskRows.length===1?'':'s'} extracted${taskRows.length > 0 ? ' · amber rows need an owner pick' : ''}</div>
+            <button type="button" class="btn small ghost" onClick=${() => setShowTranscript(v => !v)} style="font-size:11px;padding:3px 8px">${showTranscript ? 'Hide' : 'Show'} transcript</button>
+          </div>
+          ${showTranscript && html`<div style="background:var(--slate-50);border:1px solid var(--slate-200);padding:8px 10px;border-radius:6px;font-size:11px;font-family:monospace;white-space:pre-wrap;max-height:120px;overflow-y:auto;margin-bottom:10px">${transcript}</div>`}
+          <div style="display:flex;flex-direction:column;gap:8px;max-height:55vh;overflow-y:auto;padding-right:4px">
+            ${taskRows.map((r, idx) => {
+              const missing = !r.title || !r.owner_id;
+              return html`
+                <div key=${r.id} style="border:1px solid ${missing ? 'var(--amber-300)' : 'var(--slate-200)'};border-radius:8px;padding:10px;background:${missing ? 'var(--amber-50)' : 'white'}">
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:6px;margin-bottom:6px">
+                    <div style="flex:1;font-size:11px;color:var(--slate-500);font-style:italic">${r.raw_quote ? '"' + r.raw_quote + '"' : 'manual row'}${r.owner_hint && !r.owner_id ? html` · <span style="color:var(--amber-700)">AI heard "${r.owner_hint}" — pick from list</span>` : ''}</div>
+                    <button type="button" onClick=${() => removeRow(idx)} title="Remove" style="background:none;border:1px solid var(--rose-200);color:var(--rose-600);padding:2px 8px;font-size:11px;border-radius:4px;cursor:pointer">✕</button>
+                  </div>
+                  <div class="field" style="margin-bottom:6px">
+                    <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Task</label>
+                    <input type="text" value=${r.title} onChange=${e => updateRow(idx, { title: e.target.value })} style="width:100%;font-size:13px;padding:6px 8px;border:1px solid var(--slate-200);border-radius:4px" />
+                  </div>
+                  <div style="display:grid;grid-template-columns:1.5fr 1.5fr 1.5fr 1fr;gap:6px">
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Assigned to</label>
+                      <select value=${r.owner_id} onChange=${e => updateRow(idx, { owner_id: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px">
+                        <option value="">— unassigned —</option>
+                        ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+                      </select>
+                    </div>
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Project</label>
+                      <select value=${r.project_id} onChange=${e => updateRow(idx, { project_id: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px">
+                        <option value="">— none —</option>
+                        ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+                      </select>
+                    </div>
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Due</label>
+                      <input type="datetime-local" value=${r.due_at} onChange=${e => updateRow(idx, { due_at: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px" />
+                    </div>
+                    <div>
+                      <label style="font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase">Priority</label>
+                      <select value=${r.priority} onChange=${e => updateRow(idx, { priority: e.target.value })} style="width:100%;font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:4px">
+                        <option value="low">Low</option>
+                        <option value="medium">Med</option>
+                        <option value="high">High</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              `;
+            })}
+            <button type="button" class="btn ghost small" onClick=${addRow} style="font-size:11px">+ Add row manually</button>
+          </div>
+          <div style="display:flex;gap:6px;margin-top:12px">
+            <button type="button" class="btn ghost" onClick=${onClose} disabled=${saving} style="flex:1">Cancel</button>
+            <button class="btn" onClick=${saveAll} disabled=${saving || taskRows.length === 0} style="flex:2">${saving ? 'Saving…' : '✓ Save ' + taskRows.length + ' task' + (taskRows.length === 1 ? '' : 's')}</button>
+          </div>
+        `}
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
 // SIRI MODE — voice-first manager assistant (read + locate + navigate)
 // =================================================================
 // Manager-only (plant_head | admin). Full-screen orb with continuous
@@ -26171,7 +26550,10 @@ function ActionHub({ plant, me, navAction }) {
       <button class=${'auth-tab' + (statusFilter === 'all' ? ' active' : '')} onClick=${() => setStatusFilter('all')}>All</button>
     </div>
 
-    <div class="section-h">Tasks · ${filteredActions.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('action'); }}>+ Add</button></div>
+    <div class="section-h">Tasks · ${filteredActions.length}<span style="display:flex;gap:6px;flex-wrap:wrap">
+      <button class="btn small" style="background:linear-gradient(135deg,var(--indigo-600,#4f46e5),var(--indigo-500,#6366f1));color:white;font-size:11px;padding:4px 10px" onClick=${() => setModal('task_voice')} title="Voice batch — dictate tasks, AI assigns">🎙️ Batch</button>
+      <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('action'); }}>+ Add</button>
+    </span></div>
 
     ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
       filteredActions.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✓</div>No tasks in this filter</div></div>` :
@@ -26193,6 +26575,7 @@ function ActionHub({ plant, me, navAction }) {
     }
 
     ${modal === 'action' && html`<${ActionModal} plant=${plant} me=${me} users=${users} departments=${departments} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'task_voice' && html`<${TaskBatchVoiceModal} plant=${plant} me=${me} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
   `;
 }
 
