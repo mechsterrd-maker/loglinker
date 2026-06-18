@@ -22567,6 +22567,72 @@ if (typeof document !== 'undefined' && !document.getElementById('voice-pulse-css
 }
 
 // =================================================================
+// RECORDING VISUALIZER — live frequency bars while mic is active
+// =================================================================
+// Pure UX confirmation that the mic is hearing the user. Connects an
+// AnalyserNode to the live MediaStream, animates 32 frequency bars on a
+// canvas at requestAnimationFrame rate. Closes the AudioContext when the
+// stream prop changes / component unmounts so we don't leak audio nodes.
+function RecordingVisualizer({ stream }) {
+  const canvasRef = useRef(null);
+  const rafRef = useRef(null);
+  const ctxRef = useRef(null);
+
+  useEffect(() => {
+    if (!stream || !canvasRef.current) return;
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const audioCtx = new AudioCtx();
+    ctxRef.current = audioCtx;
+    const source = audioCtx.createMediaStreamSource(stream);
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 128;
+    analyser.smoothingTimeConstant = 0.7;
+    source.connect(analyser);
+
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const data = new Uint8Array(analyser.frequencyBinCount);
+
+    const draw = () => {
+      analyser.getByteFrequencyData(data);
+      const dpr = window.devicePixelRatio || 1;
+      const w = canvas.width = canvas.clientWidth * dpr;
+      const h = canvas.height = canvas.clientHeight * dpr;
+      ctx.clearRect(0, 0, w, h);
+
+      const barCount = 28;
+      const barWidth = w / barCount;
+      const gap = barWidth * 0.25;
+
+      for (let i = 0; i < barCount; i++) {
+        const dataIdx = Math.floor(i * data.length / barCount);
+        const v = data[dataIdx] / 255;
+        const barHeight = Math.max(3 * dpr, v * h * 0.85);
+        const x = i * barWidth;
+        const y = (h - barHeight) / 2;
+        // Teal → rose gradient based on intensity (louder = warmer)
+        const hue = 170 - v * 170;
+        const sat = 70 + v * 20;
+        const light = 55 + v * 10;
+        ctx.fillStyle = `hsl(${hue}, ${sat}%, ${light}%)`;
+        ctx.fillRect(x + gap / 2, y, barWidth - gap, barHeight);
+      }
+      rafRef.current = requestAnimationFrame(draw);
+    };
+    draw();
+
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      try { audioCtx.close(); } catch {}
+      ctxRef.current = null;
+    };
+  }, [stream]);
+
+  return html`<canvas ref=${canvasRef} style="display:block;width:100%;height:48px;background:rgba(15,23,42,0.04);border-radius:6px;margin-top:6px" />`;
+}
+
+// =================================================================
 // SHOT BATCH VOICE — end-of-shift dictation → N shots in one go
 // =================================================================
 // Same architecture as VoiceNotesModule (MoM): browser compresses +
@@ -22594,6 +22660,7 @@ function ShotBatchVoiceModal({ plant, me, units, shifts, machines, dies, onClose
   const mediaRecRef = useRef(null);
   const recChunksRef = useRef([]);
   const recStreamRef = useRef(null);
+  const [recStream, setRecStream] = useState(null);
   const recStartRef = useRef(0);
   const recTimerRef = useRef(null);
 
@@ -22653,6 +22720,7 @@ function ShotBatchVoiceModal({ plant, me, units, shifts, machines, dies, onClose
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       recStreamRef.current = stream;
+      setRecStream(stream);
       const mr = new MediaRecorder(stream);
       recChunksRef.current = [];
       mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) recChunksRef.current.push(e.data); };
@@ -22661,6 +22729,7 @@ function ShotBatchVoiceModal({ plant, me, units, shifts, machines, dies, onClose
         const f = new File([blob], 'shift-dictation-' + Date.now() + '.webm', { type: 'audio/webm' });
         try { recStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
         recStreamRef.current = null;
+        setRecStream(null);
         await runCompression([f]);
       };
       mr.start();
@@ -22865,6 +22934,7 @@ function ShotBatchVoiceModal({ plant, me, units, shifts, machines, dies, onClose
                   <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--rose-500,#f43f5e);animation:pulse 1.2s infinite"></span>
                   ⏹ Stop · ${fmtSec(recElapsed)}
                 </button>
+                <${RecordingVisualizer} stream=${recStream} />
               `}
               <div style="font-size:11px;color:var(--slate-500);margin-top:6px">Or upload an audio file below if you recorded outside the app.</div>
             </div>
@@ -23028,6 +23098,7 @@ function StageLogBatchVoiceModal({ plant, me, parts, machines, units, shifts, us
   const mediaRecRef = useRef(null);
   const recChunksRef = useRef([]);
   const recStreamRef = useRef(null);
+  const [recStream, setRecStream] = useState(null);
   const recStartRef = useRef(0);
   const recTimerRef = useRef(null);
 
@@ -23093,6 +23164,7 @@ function StageLogBatchVoiceModal({ plant, me, parts, machines, units, shifts, us
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       recStreamRef.current = stream;
+      setRecStream(stream);
       const mr = new MediaRecorder(stream);
       recChunksRef.current = [];
       mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) recChunksRef.current.push(e.data); };
@@ -23101,6 +23173,7 @@ function StageLogBatchVoiceModal({ plant, me, parts, machines, units, shifts, us
         const f = new File([blob], 'shift-dictation-' + Date.now() + '.webm', { type: 'audio/webm' });
         try { recStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
         recStreamRef.current = null;
+        setRecStream(null);
         await runCompression([f]);
       };
       mr.start();
@@ -23354,6 +23427,7 @@ function StageLogBatchVoiceModal({ plant, me, parts, machines, units, shifts, us
                   <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--rose-500,#f43f5e);animation:pulse 1.2s infinite"></span>
                   ⏹ Stop · ${fmtSec(recElapsed)}
                 </button>
+                <${RecordingVisualizer} stream=${recStream} />
               `}
               ${!category && html`<div style="font-size:11px;color:var(--amber-700);margin-top:4px">Pick a category first.</div>`}
             </div>
@@ -23513,6 +23587,7 @@ function TaskBatchVoiceModal({ plant, me, users, onClose, onSaved }) {
   const mediaRecRef = useRef(null);
   const recChunksRef = useRef([]);
   const recStreamRef = useRef(null);
+  const [recStream, setRecStream] = useState(null);
   const recStartRef = useRef(0);
   const recTimerRef = useRef(null);
 
@@ -23579,6 +23654,7 @@ function TaskBatchVoiceModal({ plant, me, users, onClose, onSaved }) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       recStreamRef.current = stream;
+      setRecStream(stream);
       const mr = new MediaRecorder(stream);
       recChunksRef.current = [];
       mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) recChunksRef.current.push(e.data); };
@@ -23587,6 +23663,7 @@ function TaskBatchVoiceModal({ plant, me, users, onClose, onSaved }) {
         const f = new File([blob], 'task-dictation-' + Date.now() + '.webm', { type: 'audio/webm' });
         try { recStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
         recStreamRef.current = null;
+        setRecStream(null);
         await runCompression([f]);
       };
       mr.start();
@@ -23764,6 +23841,7 @@ function TaskBatchVoiceModal({ plant, me, users, onClose, onSaved }) {
                   <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--rose-500,#f43f5e);animation:pulse 1.2s infinite"></span>
                   ⏹ Stop · ${fmtSec(recElapsed)}
                 </button>
+                <${RecordingVisualizer} stream=${recStream} />
               `}
             </div>
             <div class="field">
