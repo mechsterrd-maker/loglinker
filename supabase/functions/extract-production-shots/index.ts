@@ -132,6 +132,54 @@ Number words → integers ("two hundred forty"→240, "two thousand"→2000, "fi
 
 If the transcript has ZERO machine mentions, return {"segments": []}.`;
 
+const TASK_PROMPT = `You are an extraction engine for a manager dictating tasks (action items) to assign to team members.
+
+INPUT: an English transcript translated by Whisper from a Tamil/Hindi/Tanglish voice dictation. Manager lists things-to-do, who-does-them, and by-when. Example: "Raju to fix the broken sensor on CNC 3 by Friday. Also Suresh needs to call Bosch about the delayed shipment, due tomorrow. Someone should update the inspection checklist next week."
+
+YOUR JOB: extract every distinct task as a separate row.
+
+EXTRACTION ALGORITHM:
+1. Identify each task statement — usually triggered by a person's name + verb, "someone should", "we need to", "I want", "please", etc.
+2. For each task, extract:
+   - title: a short imperative sentence (e.g. "Fix broken sensor on CNC-3"). Strip filler words. Capitalise first letter. No trailing period.
+   - owner_user_name: exact full_name from USERS list (loose match — see below). Null if no person was named.
+   - project_name: exact name from PROJECTS list, or null if not mentioned.
+   - due_date: ISO date YYYY-MM-DD if the manager said a date. Resolve relative phrases against TODAY'S DATE in IST.
+     - "tomorrow" → today+1
+     - "next Friday" / "by Friday" → next upcoming Friday
+     - "in 2 weeks" → today+14
+     - "next week" → today+7 (best guess; mark as low confidence)
+     - "end of month" → last day of current IST month
+     - If no date said, null.
+   - priority: "high" if urgent/critical/asap/today mentioned, "low" if "whenever"/"low priority" mentioned, else "medium".
+   - raw_quote: the exact transcript phrase this task came from.
+
+OWNER MATCHING (loose):
+- Operator says first name only ("Raju", "Suresh", "Priya") → match against full_name in USERS list. If multiple users share that first name, pick the one with matching role/department if mentioned, else first match.
+- "the supervisor" / "QA team" / "stores" → null (set owner_user_name=null; human will pick).
+- Nicknames or alternate spellings: match phonetically ("Suresh" / "Sureesh", "Raju" / "Razu").
+
+OUTPUT: strict JSON, NO markdown fences, NO commentary:
+{
+  "tasks": [
+    {
+      "title":           "short imperative sentence",
+      "owner_user_name": "exact full_name from USERS, or null",
+      "project_name":    "exact name from PROJECTS, or null",
+      "due_date":        "YYYY-MM-DD, or null",
+      "priority":        "high | medium | low",
+      "raw_quote":       "the phrase from transcript"
+    }
+  ]
+}
+
+HARD DON'Ts:
+- DO NOT skip a task because the assignee is unclear. Set owner_user_name=null.
+- DO NOT invent dates the manager didn't mention.
+- DO NOT include greetings, chatter, or status reports as tasks. Only actual assignments / instructions.
+
+If transcript has zero clear tasks, return {"tasks": []}.`;
+
 // =============================================================================
 // MODES
 // =============================================================================
@@ -414,6 +462,41 @@ async function callClaude(staticPrompt: string, dynamicPrompt: string): Promise<
   catch { throw new Error("claude returned invalid JSON: " + String(raw).slice(0, 200)); }
 }
 
+async function extractTasks(
+  supabase: ReturnType<typeof createClient>,
+  plantId: string,
+  transcript: string,
+): Promise<Response> {
+  const [usersRes, projectsRes] = await Promise.all([
+    supabase.from("users").select("full_name, role").eq("plant_id", plantId).eq("status", "active").order("full_name"),
+    supabase.from("mcp_projects").select("code, name, status").eq("plant_id", plantId).neq("status", "completed").neq("status", "cancelled").order("name"),
+  ]);
+  const users = (usersRes.data || []) as Array<{ full_name: string; role: string | null }>;
+  const projects = (projectsRes.data || []) as Array<{ code: string | null; name: string; status: string }>;
+
+  const now = new Date();
+  const istHour = (now.getUTCHours() + 5 + Math.floor((now.getUTCMinutes() + 30) / 60)) % 24;
+  const istDate = new Date(now.getTime() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const dow = new Date(now.getTime() + 5.5 * 60 * 60 * 1000).toLocaleDateString("en-US", { weekday: "long" });
+
+  const dynamic = `TODAY'S DATE (IST): ${istDate} (${dow}, hour ${istHour})
+
+USERS (${users.length}):
+${users.map(u => `  • ${u.full_name}${u.role ? " — " + u.role : ""}`).join("\n") || "  (none)"}
+
+PROJECTS (${projects.length}):
+${projects.map(p => `  • ${p.code ? p.code + " · " : ""}${p.name} (${p.status})`).join("\n") || "  (none)"}
+
+TRANSCRIPT:
+"""
+${transcript.trim()}
+"""`;
+
+  const a = await callClaude(TASK_PROMPT, dynamic);
+  const tasks = Array.isArray((a as any)?.tasks) ? (a as any).tasks : [];
+  return json({ extraction: { tasks } });
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   try {
@@ -427,6 +510,7 @@ Deno.serve(async (req) => {
 
     const category = (body.category || "pdc").toLowerCase();
     if (category === "pdc") return await extractPdc(supabase, body.plant_id, body.transcript);
+    if (category === "tasks") return await extractTasks(supabase, body.plant_id, body.transcript);
     return await extractStage(supabase, body.plant_id, category, body.transcript);
   } catch (e) {
     return json({ error: e instanceof Error ? e.message : String(e) }, 500);
