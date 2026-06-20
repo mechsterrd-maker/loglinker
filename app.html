@@ -2065,6 +2065,8 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${tab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} /></${Page}>
       <${Page} active=${tab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'attendance'}><${AttendanceModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'self_attendance'}><${SelfAttendancePage} plant=${plant} me=${me} reload=${reload} /></${Page}>
+      <${Page} active=${tab === 'attendance_setup'}><${AttendanceSetupPage} plant=${plant} me=${me} reload=${reload} /></${Page}>
       <${Page} active=${tab === 'quality'}><${Quality} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'maintenance'}><${Maintenance} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'stocks'}><${Stocks} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -2145,7 +2147,9 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
         { key:'documents', label:'Documents', icon:'documents' },
         { key:'reports', label:'Reports', icon:'documents' },
         { key:'chat', label:'Chat', icon:'chat' },
+        { key:'self_attendance', label:'Punch IN', icon:'home' },
         { key:'attendance', label:'Attendance', icon:'home' },
+        { key:'attendance_setup', label:'Att. Setup', icon:'home' },
         { key:'petty_cash', label:'Petty Cash', icon:'documents' },
       ]
     : [
@@ -2159,7 +2163,9 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
         { key:'schedules', label:'Schedules', icon:'schedules' },
         { key:'reports', label:'Reports', icon:'documents' },
         { key:'chat', label:'Chat', icon:'chat' },
+        { key:'self_attendance', label:'Punch IN', icon:'home' },
         { key:'attendance', label:'Attendance', icon:'home' },
+        { key:'attendance_setup', label:'Att. Setup', icon:'home' },
         { key:'petty_cash', label:'Petty Cash', icon:'documents' },
       ];
   // Per-plant module gating. When plants.enabled_tabs is set (non-empty),
@@ -2439,10 +2445,12 @@ function Home({ plant, me, setTab, go, reload }) {
           // Tile catalog — single source of truth. Each key is the override
           // identifier stored in plants.quick_entry_tiles.
           const CATALOG = {
-            actions:     { tab:'actions',    sub:'new',         emoji:'✅', label:'Task' },
-            chat:        { tab:'chat',                          emoji:'💬', label:'Chat' },
-            attendance:  { tab:'attendance',                    emoji:'📅', label:'Attendance' },
-            petty_cash:  { tab:'petty_cash',                    emoji:'💰', label:'Petty Cash' },
+            actions:         { tab:'actions',         sub:'new', emoji:'✅', label:'Task' },
+            chat:            { tab:'chat',                       emoji:'💬', label:'Chat' },
+            attendance:      { tab:'attendance',                 emoji:'📅', label:'Attendance' },
+            self_attendance: { tab:'self_attendance',            emoji:'📍', label:'Punch IN' },
+            attendance_setup:{ tab:'attendance_setup',           emoji:'⚙️', label:'Att. Setup' },
+            petty_cash:      { tab:'petty_cash',                 emoji:'💰', label:'Petty Cash' },
             projects:    { tab:'projects',                      emoji:'📐', label:'Projects' },
             new_dc:      { tab:'sales_docs', sub:'new_dc',      emoji:'📦', label:'DC' },
             new_po:      { tab:'sales_docs', sub:'new_po',      emoji:'🛒', label:'PO' },
@@ -12020,6 +12028,319 @@ function AttendanceModule({ plant, me, activeUnit }) {
         <strong>Legend:</strong> P = Present · A = Absent · HD = Half Day · L = Leave · WO = Week Off · H = Holiday
       </div>
     `}
+  `;
+}
+
+// =================================================================
+// SELF ATTENDANCE — GPS + QR-anchored punch IN / punch OUT
+// =================================================================
+// Operator opens this page on their phone, taps Punch IN, scans the
+// factory's QR code via camera, and we capture GPS. The RPC validates
+// both server-side (QR must match plant.attendance_qr_secret, GPS must
+// be within plant.geofence_radius_m of plant.geofence_lat/lng).
+function SelfAttendancePage({ plant, me, reload }) {
+  const [today, setToday] = useState(null);
+  const [phase, setPhase] = useState('idle'); // idle | camera | gps | submitting | done
+  const [error, setError] = useState('');
+  const [scannedCode, setScannedCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const detectorRef = useRef(null);
+  const rafRef = useRef(null);
+
+  const refresh = useCallback(async () => {
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const { data } = await sb.from('mcp_attendance')
+      .select('*').eq('plant_id', plant.id).eq('user_id', me.id).eq('date', todayStr).maybeSingle();
+    setToday(data);
+  }, [plant.id, me.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  // Tidy up the camera when the component unmounts or scanning stops.
+  const stopCamera = () => {
+    if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    try { streamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
+    streamRef.current = null;
+  };
+  useEffect(() => () => stopCamera(), []);
+
+  const startScan = async (punchType) => {
+    setError(''); setScannedCode('');
+    if (!window.BarcodeDetector) {
+      setError('Your browser can\'t scan QR codes natively. Update Chrome (Android) or Safari (iOS 17+), or ask your supervisor to mark manually.');
+      return;
+    }
+    setPhase('camera');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      streamRef.current = stream;
+      // Wait for the video element to mount on the next render before binding.
+      setTimeout(() => {
+        if (!videoRef.current) return;
+        videoRef.current.srcObject = stream;
+        videoRef.current.play().catch(() => {});
+        detectorRef.current = new window.BarcodeDetector({ formats: ['qr_code'] });
+        const loop = async () => {
+          if (!videoRef.current || !detectorRef.current) return;
+          try {
+            const codes = await detectorRef.current.detect(videoRef.current);
+            if (codes && codes.length > 0) {
+              const raw = codes[0].rawValue || '';
+              setScannedCode(raw);
+              stopCamera();
+              await captureGpsAndSubmit(punchType, raw);
+              return;
+            }
+          } catch (_) {}
+          rafRef.current = requestAnimationFrame(loop);
+        };
+        rafRef.current = requestAnimationFrame(loop);
+      }, 50);
+    } catch (e) {
+      setError('Camera access denied: ' + e.message);
+      setPhase('idle');
+    }
+  };
+
+  const captureGpsAndSubmit = async (punchType, qrCode) => {
+    setPhase('gps');
+    if (!navigator.geolocation) {
+      setError('Your device has no GPS support'); setPhase('idle'); return;
+    }
+    navigator.geolocation.getCurrentPosition(async (pos) => {
+      setPhase('submitting');
+      setBusy(true);
+      try {
+        const fn = punchType === 'in' ? 'attendance_self_mark_in' : 'attendance_self_mark_out';
+        const { data, error: err } = await sb.rpc(fn, {
+          p_plant_id: plant.id,
+          p_qr: qrCode,
+          p_lat: pos.coords.latitude,
+          p_lng: pos.coords.longitude,
+        });
+        if (err) throw err;
+        if (!data?.success) {
+          setError(data?.error || 'Failed to mark');
+          setPhase('idle');
+        } else {
+          showToast('✓ ' + (data.message || 'Marked'));
+          setPhase('done');
+          await refresh();
+          setTimeout(() => setPhase('idle'), 1500);
+        }
+      } catch (e) {
+        setError(e.message || String(e));
+        setPhase('idle');
+      } finally {
+        setBusy(false);
+      }
+    }, (err) => {
+      setError('GPS failed: ' + err.message + ' — allow location permission and retry');
+      setPhase('idle');
+    }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 });
+  };
+
+  const cancelScan = () => { stopCamera(); setPhase('idle'); };
+
+  // Plant must have attendance enabled + geofence pinned for self-mark to work.
+  const ready = plant.attendance_mode === 'self_gps_qr' && plant.attendance_qr_secret && plant.geofence_lat;
+
+  const punchedIn = today?.in_time && !today?.out_time;
+  const punchedOut = today?.in_time && today?.out_time;
+
+  return html`
+    <div class="page-header">
+      <h1>📍 Self Attendance</h1>
+      <div class="sub">Punch IN at the factory gate · scans QR + checks GPS</div>
+    </div>
+
+    ${!ready && html`
+      <div class="alert" style="background:var(--amber-50);border-color:var(--amber-300);color:var(--amber-800);padding:14px;border-radius:8px;margin-bottom:14px">
+        <strong>Not yet configured</strong><br/>
+        Your plant admin needs to pin the factory's GPS location and generate a QR code first.
+        ${(me.role === 'admin' || me.role === 'plant_head') && html`
+          <div style="margin-top:8px"><a href="#" onClick=${(e) => { e.preventDefault(); reload && reload(); }} style="color:var(--teal-700);font-weight:700;text-decoration:none">Go to Attendance Setup →</a></div>
+        `}
+      </div>
+    `}
+
+    <div class="card" style="padding:18px;text-align:center;margin-bottom:14px">
+      <div style="font-size:11px;color:var(--slate-500);font-weight:700;letter-spacing:0.05em;text-transform:uppercase;margin-bottom:8px">Today · ${new Date().toLocaleDateString('en-IN', { weekday:'long', day:'2-digit', month:'short' })}</div>
+      ${punchedOut ? html`
+        <div style="font-size:34px;margin-bottom:6px">✅</div>
+        <div style="font-size:18px;font-weight:700;color:var(--emerald-700)">Day complete</div>
+        <div style="font-size:13px;color:var(--slate-600);margin-top:4px">IN ${today.in_time?.slice(0,5)} · OUT ${today.out_time?.slice(0,5)}${today.hours_worked ? ' · ' + today.hours_worked + ' hrs' : ''}</div>
+      ` : punchedIn ? html`
+        <div style="font-size:34px;margin-bottom:6px">⏱</div>
+        <div style="font-size:18px;font-weight:700;color:var(--teal-700)">Working since ${today.in_time?.slice(0,5)}</div>
+      ` : html`
+        <div style="font-size:34px;margin-bottom:6px">⏰</div>
+        <div style="font-size:18px;font-weight:700;color:var(--slate-700)">Not punched in yet</div>
+      `}
+    </div>
+
+    ${error && phase === 'idle' && html`<div class="alert error" style="font-size:13px;margin-bottom:10px">⚠ ${error}</div>`}
+
+    ${phase === 'idle' && ready && html`
+      ${!punchedIn && !punchedOut && html`
+        <button class="btn" disabled=${busy} onClick=${() => startScan('in')} style="width:100%;padding:18px;font-size:17px;font-weight:700;background:linear-gradient(135deg,var(--emerald-600),var(--emerald-500))">🛡 Punch IN — scan factory QR</button>
+      `}
+      ${punchedIn && html`
+        <button class="btn" disabled=${busy} onClick=${() => startScan('out')} style="width:100%;padding:18px;font-size:17px;font-weight:700;background:linear-gradient(135deg,var(--rose-600,#e11d48),var(--rose-500,#f43f5e))">🛡 Punch OUT — scan factory QR</button>
+      `}
+    `}
+
+    ${(phase === 'camera') && html`
+      <div class="card" style="padding:0;overflow:hidden;background:black">
+        <video ref=${videoRef} playsinline muted style="width:100%;display:block;max-height:70vh;object-fit:cover"></video>
+        <div style="position:relative">
+          <div style="background:rgba(0,0,0,0.7);color:white;padding:10px 14px;font-size:13px;text-align:center">📷 Point camera at the QR posted at the factory gate</div>
+        </div>
+      </div>
+      <button class="btn ghost" onClick=${cancelScan} style="width:100%;margin-top:10px">Cancel</button>
+    `}
+
+    ${phase === 'gps' && html`
+      <div class="card" style="padding:24px;text-align:center">
+        <div class="spinner" style="margin:0 auto 10px"></div>
+        <div style="font-size:14px;font-weight:600">Reading your location…</div>
+      </div>
+    `}
+    ${phase === 'submitting' && html`
+      <div class="card" style="padding:24px;text-align:center">
+        <div class="spinner" style="margin:0 auto 10px"></div>
+        <div style="font-size:14px;font-weight:600">Verifying & marking…</div>
+      </div>
+    `}
+    ${phase === 'done' && html`
+      <div class="card" style="padding:24px;text-align:center;background:var(--emerald-50);border-color:var(--emerald-300)">
+        <div style="font-size:40px">✓</div>
+        <div style="font-size:14px;font-weight:600;color:var(--emerald-800);margin-top:6px">Punched successfully</div>
+      </div>
+    `}
+  `;
+}
+
+// =================================================================
+// ATTENDANCE SETUP — admin pins the geofence + manages QR
+// =================================================================
+function AttendanceSetupPage({ plant, me, reload }) {
+  const isAdmin = me?.role === 'admin' || me?.role === 'plant_head';
+  const [mode, setMode] = useState(plant.attendance_mode || 'supervisor');
+  const [lat, setLat] = useState(plant.geofence_lat || '');
+  const [lng, setLng] = useState(plant.geofence_lng || '');
+  const [radius, setRadius] = useState(plant.geofence_radius_m || 150);
+  const [secret, setSecret] = useState(plant.attendance_qr_secret || '');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [savedMsg, setSavedMsg] = useState('');
+
+  if (!isAdmin) {
+    return html`<div class="card" style="padding:20px;text-align:center;color:var(--slate-500)">Only plant admin / plant head can configure attendance.</div>`;
+  }
+
+  const useCurrentLocation = () => {
+    setError('');
+    if (!navigator.geolocation) { setError('No GPS on this device'); return; }
+    navigator.geolocation.getCurrentPosition((pos) => {
+      setLat(pos.coords.latitude.toFixed(7));
+      setLng(pos.coords.longitude.toFixed(7));
+    }, (err) => setError('GPS error: ' + err.message), { enableHighAccuracy: true });
+  };
+
+  const save = async () => {
+    setBusy(true); setError(''); setSavedMsg('');
+    try {
+      const { error: err } = await sb.from('plants').update({
+        attendance_mode: mode,
+        geofence_lat: lat || null,
+        geofence_lng: lng || null,
+        geofence_radius_m: parseInt(radius) || 150,
+      }).eq('id', plant.id);
+      if (err) throw err;
+      setSavedMsg('✓ Saved');
+      reload && reload();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const regenerateQr = async () => {
+    if (!confirm('This invalidates the existing QR poster. Anyone already at the factory will need the new QR. Continue?')) return;
+    setBusy(true); setError('');
+    try {
+      const { data, error: err } = await sb.rpc('regenerate_attendance_qr', { p_plant_id: plant.id });
+      if (err) throw err;
+      setSecret(data);
+      showToast('✓ New QR generated — print the updated poster');
+      reload && reload();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  // 3rd-party QR rendering — quickchart.io serves a clean SVG with no auth.
+  const qrUrl = secret ? `https://quickchart.io/qr?text=${encodeURIComponent(secret)}&size=320&margin=2` : null;
+
+  return html`
+    <div class="page-header">
+      <h1>📍 Attendance Setup</h1>
+      <div class="sub">Pin the factory's GPS location + generate the gate QR poster</div>
+    </div>
+
+    ${error && html`<div class="alert error" style="font-size:13px;margin-bottom:10px">⚠ ${error}</div>`}
+    ${savedMsg && html`<div class="alert" style="background:var(--emerald-50);border-color:var(--emerald-300);color:var(--emerald-700);font-size:13px;margin-bottom:10px">${savedMsg}</div>`}
+
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:10px">1 · Attendance mode</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        ${[
+          { v:'supervisor', t:'👨‍💼 Supervisor marks (default)', d:'A supervisor uses the Attendance page to mark each employee daily. No GPS / QR needed.' },
+          { v:'self_gps_qr', t:'🛡 Self mark via GPS + QR', d:'Employees punch IN/OUT on their phone — must scan the factory QR AND be within the geofence.' },
+        ].map(opt => html`
+          <button key=${opt.v} type="button" onClick=${() => setMode(opt.v)}
+            style=${'text-align:left;padding:10px 12px;font-size:13px;border-radius:8px;cursor:pointer;border:2px solid '+(mode===opt.v?'var(--teal-500)':'var(--slate-200)')+';background:'+(mode===opt.v?'var(--teal-50)':'white')}>
+            <div style=${'font-weight:700;color:'+(mode===opt.v?'var(--teal-800)':'var(--slate-800)')}>${opt.t}</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:3px">${opt.d}</div>
+          </button>
+        `)}
+      </div>
+    </div>
+
+    ${mode === 'self_gps_qr' && html`
+      <div class="card" style="padding:16px;margin-bottom:14px">
+        <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:10px">2 · Geofence (factory location)</div>
+        <div class="field-row">
+          <div class="field"><label>Latitude</label><input type="number" step="0.0000001" value=${lat} onChange=${e => setLat(e.target.value)} placeholder="13.0827" /></div>
+          <div class="field"><label>Longitude</label><input type="number" step="0.0000001" value=${lng} onChange=${e => setLng(e.target.value)} placeholder="80.2707" /></div>
+        </div>
+        <button class="btn small ghost" onClick=${useCurrentLocation} style="margin-bottom:10px">📍 Use my current location</button>
+        <div class="field"><label>Radius · metres (employees within this distance can punch)</label>
+          <input type="number" min="50" max="2000" step="10" value=${radius} onChange=${e => setRadius(e.target.value)} />
+          <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Suggested: 100-200 m for a single shop floor · 500+ m if employees punch from the parking lot.</div>
+        </div>
+      </div>
+
+      <div class="card" style="padding:16px;margin-bottom:14px">
+        <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:10px">3 · QR poster for the gate</div>
+        ${qrUrl ? html`
+          <div style="text-align:center;padding:14px;background:white;border:1px solid var(--slate-200);border-radius:10px">
+            <img src=${qrUrl} alt="Attendance QR" style="max-width:280px;width:100%;height:auto" />
+            <div style="font-size:11px;color:var(--slate-500);margin-top:8px;word-break:break-all;font-family:monospace">${secret}</div>
+            <div style="display:flex;gap:6px;margin-top:10px;justify-content:center">
+              <button class="btn small" onClick=${() => window.print()} style="background:var(--slate-700)">🖨 Print poster</button>
+              <button class="btn small ghost" onClick=${regenerateQr} disabled=${busy} style="color:var(--rose-700)">↻ Regenerate</button>
+            </div>
+          </div>
+        ` : html`
+          <div style="text-align:center;padding:20px;background:var(--slate-50);border-radius:10px">
+            <div style="font-size:13px;color:var(--slate-600);margin-bottom:10px">No QR generated yet.</div>
+            <button class="btn" disabled=${busy} onClick=${regenerateQr}>Generate QR poster</button>
+          </div>
+        `}
+      </div>
+    `}
+
+    <button class="btn" disabled=${busy} onClick=${save} style="width:100%;padding:14px;font-size:15px;font-weight:700">${busy ? 'Saving…' : '✓ Save attendance settings'}</button>
   `;
 }
 
