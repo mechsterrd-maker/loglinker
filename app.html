@@ -2114,12 +2114,42 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
 
       <div class="tabbar">
-        <${TabBtn} icon="home" label="Home" active=${tab === 'home'} onClick=${() => setTab('home')} />
-        ${fab
-          ? html`<${TabBtn} icon="production" label="Projects" active=${tab === 'projects'} onClick=${() => setTab('projects')} />`
-          : html`<${TabBtn} icon="production" label="Production" active=${tab === 'production'} onClick=${() => setTab('production')} />`}
-        <${TabBtn} icon="quality" label="Quality" active=${tab === 'quality'} onClick=${() => setTab('quality')} />
-        <${TabBtn} icon="chat" label="Chat" active=${tab === 'chat'} onClick=${() => setTab('chat')} badge=${unreadCount} />
+        ${(() => {
+          // Build the mobile tab list. When plants.enabled_tabs is set,
+          // honour it (capped to 4 buttons + More) so Starter Pack plants
+          // don't show modules they don't use.
+          const allMobile = [
+            { key:'home',            icon:'home',       label:'Home' },
+            { key:'self_attendance', icon:'home',       label:'Punch IN' },
+            { key:'attendance',      icon:'home',       label:'Attendance' },
+            { key:'petty_cash',      icon:'documents',  label:'Petty Cash' },
+            { key:'actions',         icon:'actions',    label:'Tasks' },
+            { key:fab ? 'projects' : 'production', icon:'production', label: fab ? 'Projects' : 'Production' },
+            { key:'quality',         icon:'quality',    label:'Quality' },
+            { key:'chat',            icon:'chat',       label:'Chat' },
+          ];
+          const enabled = Array.isArray(plant?.enabled_tabs) && plant.enabled_tabs.length > 0
+            ? new Set(['home', ...plant.enabled_tabs])
+            : null;
+          let mobileTabs;
+          if (enabled) {
+            mobileTabs = allMobile.filter(t => enabled.has(t.key)).slice(0, 4);
+          } else {
+            // Legacy default: Home / Production-or-Projects / Quality / Chat
+            mobileTabs = [
+              allMobile[0],
+              allMobile[5],
+              allMobile[6],
+              allMobile[7],
+            ];
+          }
+          return mobileTabs.map(t => html`
+            <${TabBtn} key=${t.key} icon=${t.icon} label=${t.label}
+              active=${tab === t.key}
+              onClick=${() => setTab(t.key)}
+              badge=${t.key === 'chat' ? unreadCount : undefined} />
+          `);
+        })()}
         <${TabBtn} icon="more" label="More" active=${!mobilePrimaryKeys.includes(tab)} onClick=${() => setTab('more')} />
       </div>
 
@@ -12136,7 +12166,18 @@ function SelfAttendancePage({ plant, me, reload }) {
         setBusy(false);
       }
     }, (err) => {
-      setError('GPS failed: ' + err.message + ' — allow location permission and retry');
+      let msg;
+      if (err.code === 1) {
+        // PERMISSION_DENIED — give actionable, browser-aware instructions.
+        msg = '📵 Location permission is blocked.\nTap the 🔒 lock icon next to the address bar → Permissions → Location → Allow. Then refresh and retry.';
+      } else if (err.code === 2) {
+        msg = '📡 GPS unavailable — move near a window or to an open area, then retry.';
+      } else if (err.code === 3) {
+        msg = '⏱ GPS timed out — please try again (it can be slow indoors).';
+      } else {
+        msg = 'GPS failed: ' + err.message;
+      }
+      setError(msg);
       setPhase('idle');
     }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 });
   };
@@ -12180,7 +12221,7 @@ function SelfAttendancePage({ plant, me, reload }) {
       `}
     </div>
 
-    ${error && phase === 'idle' && html`<div class="alert error" style="font-size:13px;margin-bottom:10px">⚠ ${error}</div>`}
+    ${error && phase === 'idle' && html`<div class="alert error" style="font-size:13px;margin-bottom:10px;white-space:pre-line;line-height:1.5">⚠ ${error}</div>`}
 
     ${phase === 'idle' && ready && html`
       ${!punchedIn && !punchedOut && html`
