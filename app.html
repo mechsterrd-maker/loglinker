@@ -1622,6 +1622,7 @@ const MORE_GROUPS = [
       { key:'tpm',           icon:'🛠', label:'TPM Daily Checks',     sub:'30-sec machine checks · oil, coolant, leaks, guards' },
       { key:'maintenance',   icon:'🔧', label:'Maintenance',          sub:'Breakdowns log, machine status' },
       { key:'cutting',       icon:'✂️', label:'Cutting Planner',      sub:'1D cutting optimisation for rods, tubes, bars · auto layout with kerf · waste %' },
+      { key:'attendance',    icon:'📅', label:'Attendance',           sub:'Daily P/A/HD/Leave per employee · monthly summary · payroll CSV' },
       { key:'petty_cash',    icon:'💰', label:'Petty Cash',           sub:'Expenses · advances · recollection · who owes how much' },
       { key:'jobwork',       icon:'🏭', label:'Sub-Contracting',      sub:'Send / receive parts at job-work vendors · 180-day GST clock' },
       { key:'supplier_chase',icon:'🛒', label:'Supplier Chase', mfg:true, sub:'Raw material runway vs upcoming schedule · auto-alerts which vendor to chase' },
@@ -1732,6 +1733,14 @@ function visibleMoreGroups(plant, myPerms) {
     // If !hasAnyPerm we intentionally do NOT filter — a user with zero
     // permissions (e.g. mid-migration) keeps the legacy menu rather than an
     // empty one. Real restriction requires at least one explicit grant.
+  }
+  // Third pass: plant-level module gating via plants.enabled_tabs.
+  // When set, only show items whose key is in the list. 'home' is implicit.
+  if (Array.isArray(plant?.enabled_tabs) && plant.enabled_tabs.length > 0) {
+    const allow = new Set(['home', ...plant.enabled_tabs]);
+    groups = groups
+      .map(g => ({ ...g, items: g.items.filter(it => allow.has(it.key)) }))
+      .filter(g => g.items.length > 0);
   }
   return groups;
 }
@@ -2054,6 +2063,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
 
       <${Page} active=${tab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} /></${Page}>
       <${Page} active=${tab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${tab === 'attendance'}><${AttendanceModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'quality'}><${Quality} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'maintenance'}><${Maintenance} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'stocks'}><${Stocks} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -2123,7 +2133,7 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
   const toggleNavGroup = (key) => setNavOpenGroups(prev => ({ ...prev, [key]: !prev[key] }));
   // Top-level tabs always visible in desktop nav. Fabrication plants get Projects
   // in place of the PDC Production/Schedules surface.
-  const tabs = isFab(plant)
+  const allTabs = isFab(plant)
     ? [
         { key:'home', label:'Home', icon:'home' },
         { key:'projects', label:'Projects', icon:'production' },
@@ -2134,6 +2144,8 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
         { key:'documents', label:'Documents', icon:'documents' },
         { key:'reports', label:'Reports', icon:'documents' },
         { key:'chat', label:'Chat', icon:'chat' },
+        { key:'attendance', label:'Attendance', icon:'home' },
+        { key:'petty_cash', label:'Petty Cash', icon:'documents' },
       ]
     : [
         { key:'home', label:'Home', icon:'home' },
@@ -2146,7 +2158,16 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
         { key:'schedules', label:'Schedules', icon:'schedules' },
         { key:'reports', label:'Reports', icon:'documents' },
         { key:'chat', label:'Chat', icon:'chat' },
+        { key:'attendance', label:'Attendance', icon:'home' },
+        { key:'petty_cash', label:'Petty Cash', icon:'documents' },
       ];
+  // Per-plant module gating. When plants.enabled_tabs is set (non-empty),
+  // only show those tabs in the order they're declared in enabled_tabs.
+  // 'home' is always implicitly available so nobody locks themselves out.
+  const enabled = Array.isArray(plant?.enabled_tabs) && plant.enabled_tabs.length > 0
+    ? new Set(['home', ...plant.enabled_tabs])
+    : null;
+  const tabs = enabled ? allTabs.filter(t => enabled.has(t.key)) : allTabs;
   // Everything else lives in the More dropdown — IATF modules + secondary routes
   const inMore = MORE_FLAT_KEYS.includes(tab) && !tabs.some(t => t.key === tab);
   const icons = {
@@ -2411,6 +2432,8 @@ function Home({ plant, me, setTab, go, reload }) {
           const CATALOG = {
             actions:     { tab:'actions',    sub:'new',         emoji:'✅', label:'Task' },
             chat:        { tab:'chat',                          emoji:'💬', label:'Chat' },
+            attendance:  { tab:'attendance',                    emoji:'📅', label:'Attendance' },
+            petty_cash:  { tab:'petty_cash',                    emoji:'💰', label:'Petty Cash' },
             projects:    { tab:'projects',                      emoji:'📐', label:'Projects' },
             new_dc:      { tab:'sales_docs', sub:'new_dc',      emoji:'📦', label:'DC' },
             new_po:      { tab:'sales_docs', sub:'new_po',      emoji:'🛒', label:'PO' },
@@ -11700,6 +11723,296 @@ function SupplierChaseModule({ plant, me }) {
   `;
 }
 
+
+// =================================================================
+// ATTENDANCE — daily P/A/HD/Leave marking per employee
+// =================================================================
+// One row per (employee, date) in mcp_attendance. Day-status driven: the
+// common Indian SME pattern (P/A/HD/L/WO/H/WFH). Optional IN/OUT times.
+// Default view = today; supervisors mark with one tap per row. Bulk
+// "mark all present" + monthly summary + CSV export for payroll.
+function AttendanceModule({ plant, me, activeUnit }) {
+  const [employees, setEmployees] = useState([]);
+  const [records, setRecords] = useState([]); // attendance rows for the visible date range
+  const [view, setView] = useState('day'); // 'day' | 'month'
+  const [date, setDate] = useState(new Date().toISOString().slice(0,10));
+  const [monthDate, setMonthDate] = useState(new Date().toISOString().slice(0,7) + '-01');
+  const [search, setSearch] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [savingId, setSavingId] = useState(null);
+  const isAdmin = me?.role === 'admin' || me?.role === 'plant_head';
+
+  const STATUSES = [
+    { key:'present',  label:'P',  pillBg:'var(--emerald-50)',  pillFg:'var(--emerald-700)',  pillBorder:'var(--emerald-300)' },
+    { key:'half_day', label:'HD', pillBg:'var(--amber-50)',    pillFg:'var(--amber-700)',    pillBorder:'var(--amber-300)' },
+    { key:'absent',   label:'A',  pillBg:'var(--rose-50)',     pillFg:'var(--rose-700)',     pillBorder:'var(--rose-300)' },
+    { key:'leave',    label:'L',  pillBg:'var(--slate-100)',   pillFg:'var(--slate-700)',    pillBorder:'var(--slate-300)' },
+    { key:'week_off', label:'WO', pillBg:'var(--slate-50)',    pillFg:'var(--slate-500)',    pillBorder:'var(--slate-200)' },
+    { key:'holiday',  label:'H',  pillBg:'var(--indigo-50,#eef2ff)', pillFg:'var(--indigo-700,#4338ca)', pillBorder:'var(--indigo-300,#a5b4fc)' },
+  ];
+  const statusByKey = useMemo(() => Object.fromEntries(STATUSES.map(s => [s.key, s])), []);
+  const monthEnd = (() => {
+    const [y, m] = monthDate.split('-').map(Number);
+    return new Date(y, m, 0).toISOString().slice(0,10);
+  })();
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const rangeFrom = view === 'month' ? monthDate : date;
+    const rangeTo   = view === 'month' ? monthEnd  : date;
+    const [emp, rec] = await Promise.all([
+      sb.from('users').select('id, full_name, role, phone').eq('plant_id', plant.id).eq('status', 'active').order('full_name'),
+      sb.from('mcp_attendance').select('id, user_id, date, status, in_time, out_time, hours_worked, notes')
+        .eq('plant_id', plant.id).gte('date', rangeFrom).lte('date', rangeTo),
+    ]);
+    setEmployees(emp.data || []);
+    setRecords(rec.data || []);
+    setLoading(false);
+  }, [plant.id, view, date, monthDate, monthEnd]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const recByEmpDate = useMemo(() => {
+    const m = {};
+    for (const r of records) {
+      (m[r.user_id] = m[r.user_id] || {})[r.date] = r;
+    }
+    return m;
+  }, [records]);
+
+  const visibleEmployees = useMemo(() => {
+    if (!search.trim()) return employees;
+    const q = search.toLowerCase();
+    return employees.filter(e => (e.full_name || '').toLowerCase().includes(q));
+  }, [employees, search]);
+
+  const mark = async (employeeId, newStatus) => {
+    setSavingId(employeeId);
+    try {
+      const existing = recByEmpDate[employeeId]?.[date];
+      if (existing) {
+        const { error } = await sb.from('mcp_attendance')
+          .update({ status: newStatus, marked_by: me.id })
+          .eq('id', existing.id);
+        if (error) throw error;
+      } else {
+        const { error } = await sb.from('mcp_attendance').insert({
+          plant_id: plant.id,
+          unit_id: activeUnit?.unit_id || null,
+          user_id: employeeId,
+          date: date,
+          status: newStatus,
+          marked_by: me.id,
+        });
+        if (error) throw error;
+      }
+      await refresh();
+    } catch (e) { alert('Save failed: ' + e.message); }
+    finally { setSavingId(null); }
+  };
+
+  const markAll = async (statusKey) => {
+    if (!confirm('Mark all ' + visibleEmployees.length + ' employees as ' + statusByKey[statusKey]?.label + ' for ' + date + '?')) return;
+    setLoading(true);
+    try {
+      // Build payload — upsert one row per employee for this date.
+      const rows = visibleEmployees.map(e => ({
+        plant_id: plant.id,
+        unit_id: activeUnit?.unit_id || null,
+        user_id: e.id,
+        date: date,
+        status: statusKey,
+        marked_by: me.id,
+      }));
+      const { error } = await sb.from('mcp_attendance').upsert(rows, { onConflict: 'plant_id,user_id,date' });
+      if (error) throw error;
+      await refresh();
+      showToast('✓ Marked ' + rows.length + ' employees as ' + statusByKey[statusKey]?.label);
+    } catch (e) { alert('Bulk save failed: ' + e.message); }
+    finally { setLoading(false); }
+  };
+
+  const exportCSV = () => {
+    const days = [];
+    if (view === 'month') {
+      const [y, m] = monthDate.split('-').map(Number);
+      const last = new Date(y, m, 0).getDate();
+      for (let d = 1; d <= last; d++) {
+        days.push(new Date(y, m-1, d).toISOString().slice(0,10));
+      }
+    } else {
+      days.push(date);
+    }
+    const header = ['Employee', 'Role', 'Phone', ...days];
+    const rows = visibleEmployees.map(e => {
+      const cells = [e.full_name || '', e.role || '', e.phone || ''];
+      for (const d of days) {
+        const r = recByEmpDate[e.id]?.[d];
+        cells.push(r ? (statusByKey[r.status]?.label || r.status) : '');
+      }
+      return cells;
+    });
+    const csv = [header, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv], { type:'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'attendance_' + (view === 'month' ? monthDate.slice(0,7) : date) + '.csv';
+    a.click(); URL.revokeObjectURL(url);
+  };
+
+  // Day-view summary tile
+  const todayRec = records.filter(r => r.date === date);
+  const summary = STATUSES.map(s => ({
+    ...s, count: todayRec.filter(r => r.status === s.key).length,
+  }));
+  const markedToday = todayRec.length;
+  const unmarkedToday = employees.length - markedToday;
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  return html`
+    <div class="page-header">
+      <div><h1>📅 Attendance</h1><div class="sub">${employees.length} employees · ${plant.name}${activeUnit ? ' · ' + activeUnit.unit_name : ''}</div></div>
+    </div>
+
+    <div class="auth-tabs" style="margin-bottom:14px">
+      <button class=${'auth-tab' + (view === 'day' ? ' active' : '')} onClick=${() => setView('day')}>Day</button>
+      <button class=${'auth-tab' + (view === 'month' ? ' active' : '')} onClick=${() => setView('month')}>Month</button>
+    </div>
+
+    ${view === 'day' && html`
+      <div class="card" style="padding:10px 12px;margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+        <div class="field" style="margin:0;flex:1;min-width:140px">
+          <label style="font-size:11px">Date</label>
+          <input type="date" value=${date} max=${new Date().toISOString().slice(0,10)} onChange=${e => setDate(e.target.value)} style="font-size:13px" />
+        </div>
+        <div class="field" style="margin:0;flex:2;min-width:160px">
+          <label style="font-size:11px">Search employee</label>
+          <input type="text" value=${search} onInput=${e => setSearch(e.target.value)} placeholder="🔍 Name…" style="font-size:13px" />
+        </div>
+        <button class="btn small" onClick=${exportCSV} style="background:var(--slate-700);font-size:11px;padding:6px 10px">📥 CSV</button>
+      </div>
+
+      <div class="stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(75px,1fr));gap:6px;margin-bottom:14px">
+        ${summary.map(s => html`
+          <div class="stat" style=${'padding:8px;background:'+s.pillBg+';border:1px solid '+s.pillBorder}>
+            <div class="stat-num" style=${'font-size:18px;color:'+s.pillFg}>${s.count}</div>
+            <div class="stat-label" style="font-size:10px;color:var(--slate-600)">${s.label}</div>
+          </div>
+        `)}
+        ${unmarkedToday > 0 && html`
+          <div class="stat" style="padding:8px;background:var(--slate-100);border:1px dashed var(--slate-300)">
+            <div class="stat-num" style="font-size:18px;color:var(--slate-500)">${unmarkedToday}</div>
+            <div class="stat-label" style="font-size:10px;color:var(--slate-600)">Unmarked</div>
+          </div>
+        `}
+      </div>
+
+      ${isAdmin && html`
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">
+          <button type="button" class="btn small" onClick=${() => markAll('present')} style="background:var(--emerald-600);font-size:11px;padding:6px 12px">✓ Mark all P</button>
+          <button type="button" class="btn small ghost" onClick=${() => markAll('week_off')} style="font-size:11px;padding:6px 12px">Mark all WO</button>
+          <button type="button" class="btn small ghost" onClick=${() => markAll('holiday')} style="font-size:11px;padding:6px 12px">Mark all H</button>
+        </div>
+      `}
+
+      <div style="display:flex;flex-direction:column;gap:6px">
+        ${visibleEmployees.map(e => {
+          const rec = recByEmpDate[e.id]?.[date];
+          const current = rec?.status;
+          return html`
+            <div key=${e.id} class="list-item" style=${'padding:8px 12px;'+(current?'':'border-left:3px solid var(--amber-300)')}>
+              <div style="display:flex;align-items:center;gap:10px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:13px;font-weight:600;color:var(--slate-800)">${e.full_name}</div>
+                  ${e.role && html`<div style="font-size:11px;color:var(--slate-500)">${typeof roleLabel === 'function' ? roleLabel(e.role) : e.role}</div>`}
+                </div>
+                <div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end">
+                  ${STATUSES.map(s => {
+                    const on = current === s.key;
+                    const busy = savingId === e.id;
+                    return html`
+                      <button key=${s.key} type="button" disabled=${busy} onClick=${() => mark(e.id, s.key)}
+                        title=${s.key}
+                        style=${'padding:6px 10px;font-size:12px;font-weight:700;border-radius:6px;cursor:'+(busy?'wait':'pointer')+';border:1px solid '+(on?s.pillBorder:'var(--slate-200)')+';background:'+(on?s.pillBg:'white')+';color:'+(on?s.pillFg:'var(--slate-500)')}>${s.label}</button>
+                    `;
+                  })}
+                </div>
+              </div>
+            </div>
+          `;
+        })}
+      </div>
+    `}
+
+    ${view === 'month' && html`
+      <div class="card" style="padding:10px 12px;margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+        <div class="field" style="margin:0;flex:1;min-width:160px">
+          <label style="font-size:11px">Month</label>
+          <input type="month" value=${monthDate.slice(0,7)} onChange=${e => setMonthDate(e.target.value + '-01')} style="font-size:13px" />
+        </div>
+        <div class="field" style="margin:0;flex:2;min-width:160px">
+          <label style="font-size:11px">Search employee</label>
+          <input type="text" value=${search} onInput=${e => setSearch(e.target.value)} placeholder="🔍 Name…" style="font-size:13px" />
+        </div>
+        <button class="btn small" onClick=${exportCSV} style="background:var(--slate-700);font-size:11px;padding:6px 10px">📥 CSV</button>
+      </div>
+      <div class="card" style="padding:0;overflow:auto">
+        <table style="width:100%;font-size:11px;border-collapse:collapse;min-width:800px">
+          <thead>
+            <tr style="background:var(--slate-100);position:sticky;top:0;z-index:1">
+              <th style="text-align:left;padding:8px 10px;font-weight:600;color:var(--slate-700);font-size:10px;text-transform:uppercase;border-right:1px solid var(--slate-200)">Employee</th>
+              ${(() => {
+                const [y, m] = monthDate.split('-').map(Number);
+                const last = new Date(y, m, 0).getDate();
+                const cells = [];
+                for (let d = 1; d <= last; d++) {
+                  cells.push(html`<th style="padding:6px 4px;font-weight:600;color:var(--slate-700);font-size:10px;text-align:center;min-width:28px">${d}</th>`);
+                }
+                return cells;
+              })()}
+              <th style="padding:6px 8px;font-weight:600;color:var(--slate-700);font-size:10px;text-align:right;border-left:1px solid var(--slate-200)">P</th>
+              <th style="padding:6px 8px;font-weight:600;color:var(--slate-700);font-size:10px;text-align:right">A</th>
+              <th style="padding:6px 8px;font-weight:600;color:var(--slate-700);font-size:10px;text-align:right">L</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${visibleEmployees.map(e => {
+              const [y, m] = monthDate.split('-').map(Number);
+              const last = new Date(y, m, 0).getDate();
+              const days = [];
+              let p = 0, a = 0, l = 0;
+              for (let d = 1; d <= last; d++) {
+                const ds = `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+                const r = recByEmpDate[e.id]?.[ds];
+                const s = r ? statusByKey[r.status] : null;
+                if (r?.status === 'present') p++;
+                else if (r?.status === 'absent') a++;
+                else if (r?.status === 'leave' || r?.status === 'half_day') l += (r.status === 'half_day' ? 0.5 : 1);
+                days.push(html`
+                  <td style=${'padding:0;text-align:center;border-right:1px solid var(--slate-100);background:'+(s?s.pillBg:'white')}>
+                    <span style=${'font-size:10px;font-weight:700;color:'+(s?s.pillFg:'var(--slate-300)')}>${s?s.label:'·'}</span>
+                  </td>
+                `);
+              }
+              return html`
+                <tr key=${e.id} style="border-bottom:1px solid var(--slate-100)">
+                  <td style="padding:6px 10px;border-right:1px solid var(--slate-200);font-weight:500;white-space:nowrap">${e.full_name}</td>
+                  ${days}
+                  <td style="padding:6px 8px;text-align:right;color:var(--emerald-700);font-weight:600;border-left:1px solid var(--slate-200)">${p}</td>
+                  <td style="padding:6px 8px;text-align:right;color:var(--rose-600);font-weight:600">${a}</td>
+                  <td style="padding:6px 8px;text-align:right;color:var(--slate-600);font-weight:600">${l}</td>
+                </tr>
+              `;
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div style="font-size:11px;color:var(--slate-500);margin-top:10px;line-height:1.6">
+        <strong>Legend:</strong> P = Present · A = Absent · HD = Half Day · L = Leave · WO = Week Off · H = Holiday
+      </div>
+    `}
+  `;
+}
 
 // =================================================================
 // PETTY CASH — expenses · advances · recollection
