@@ -23800,6 +23800,7 @@ function TaskBatchVoiceModal({ plant, me, users, onClose, onSaved }) {
         project_id: r.project_id || null,
         assigned_by: me.id,
         due_at: r.due_at ? new Date(r.due_at).toISOString() : null,
+        priority: r.priority || 'medium',
         status: 'open',
       }));
       const { error: err } = await sb.from('actions').insert(rows);
@@ -26660,11 +26661,15 @@ function ActionHub({ plant, me, navAction }) {
 // ============= TASK ROW =============
 function TaskRow({ action, onTap }) {
   const overdue = action.due_at && new Date(action.due_at) < new Date() && action.status !== 'completed' && action.status !== 'cancelled';
+  const pri = action.priority || 'medium';
+  const priDot = pri === 'high' ? '🔴' : pri === 'low' ? '🟢' : '🟡';
   return html`
     <div class="list-item" onClick=${onTap}>
       <div class="list-item-row">
         <div class="list-item-main">
-          <div class="list-item-title" style=${action.status === 'completed' ? 'text-decoration:line-through;color:var(--slate-500)' : ''}>${action.title}</div>
+          <div class="list-item-title" style=${action.status === 'completed' ? 'text-decoration:line-through;color:var(--slate-500)' : ''}>
+            <span title=${pri + ' priority'} style="margin-right:6px">${priDot}</span>${action.title}
+          </div>
           <div class="list-item-sub">
             ${action.owner_user?.full_name || '— unassigned'}
             ${action.department ? ' · ' + action.department : ''}
@@ -26890,7 +26895,7 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
   // is still on the row for legacy task sources (NCR / MoM cron) so we just
   // leave it null from this form.
   const [form, setForm] = useState(editTarget ? {...editTarget, due_at: editTarget.due_at ? editTarget.due_at.slice(0,16) : ''} : {
-    title:'', owner_id:'', project_id:'', due_at:'', source_type:'manual'
+    title:'', owner_id:'', project_id:'', due_at:'', priority:'medium', source_type:'manual'
   });
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -26917,6 +26922,7 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
         project_id: form.project_id || null,
         assigned_by: me.id,
         due_at: form.due_at ? new Date(form.due_at).toISOString() : null,
+        priority: form.priority || 'medium',
         status: form.status || 'open',
       };
       if (form.status === 'completed' && !editTarget?.completed_at) {
@@ -26963,6 +26969,19 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
           <div class="field">
             <label>Deadline</label>
             <input type="datetime-local" value=${form.due_at} onChange=${e => setForm({...form, due_at: e.target.value})} />
+          </div>
+          <div class="field">
+            <label>Priority</label>
+            <div style="display:flex;gap:6px">
+              ${[
+                { v:'low',    label:'🟢 Low',    bg:'var(--emerald-50)', fg:'var(--emerald-700)', border:'var(--emerald-300)' },
+                { v:'medium', label:'🟡 Medium', bg:'var(--amber-50)',   fg:'var(--amber-700)',   border:'var(--amber-300)' },
+                { v:'high',   label:'🔴 High',   bg:'var(--rose-50)',    fg:'var(--rose-700)',    border:'var(--rose-300)' },
+              ].map(p => html`
+                <button key=${p.v} type="button" onClick=${() => setForm({...form, priority: p.v})}
+                  style=${'flex:1;padding:8px 10px;font-size:12px;font-weight:600;border-radius:6px;cursor:pointer;border:1px solid '+(form.priority===p.v?p.border:'var(--slate-200)')+';background:'+(form.priority===p.v?p.bg:'white')+';color:'+(form.priority===p.v?p.fg:'var(--slate-600)')}>${p.label}</button>
+              `)}
+            </div>
           </div>
           ${editTarget && html`
             <div class="field"><label>Status</label>
