@@ -50,7 +50,9 @@ BEGIN
   IF v_role NOT IN ('plant_head', 'admin') THEN
     RAISE EXCEPTION 'Only plant head / admin can regenerate the attendance QR';
   END IF;
-  v_new := encode(gen_random_bytes(16), 'hex');
+  -- gen_random_uuid() is built into Postgres 13+ (no pgcrypto needed).
+  -- Two UUIDs concatenated → 64 hex chars: plenty of entropy for a QR.
+  v_new := replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', '');
   UPDATE plants SET attendance_qr_secret = v_new WHERE id = p_plant_id;
   RETURN v_new;
 END $$;
