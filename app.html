@@ -2513,7 +2513,7 @@ function Home({ plant, me, setTab, go, reload }) {
 }
 
 // ============= PRODUCTION =============
-function Production({ plant, me }) {
+function Production({ plant, me, activeUnit }) {
   const [view, setView] = useState('overview');
   const [machines, setMachines] = useState([]);
   const [dies, setDies] = useState([]);
@@ -2534,28 +2534,37 @@ function Production({ plant, me }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [m, d, s, p, u, sh, us, t, si] = await Promise.all([
+    // Unit scope: when an activeUnit is set, parts + stock items belonging to
+    // other units are hidden. Rows with unit_id=NULL ("shared") stay visible.
+    const u = activeUnit?.unit_id;
+    let partsQ = sb.from('mcp_pdc_parts').select('*').order('part_number');
+    let stockQ = sb.from('mcp_stocks_items').select('id, code, name, current_qty, uom, unit_id').order('code');
+    if (u) {
+      partsQ = partsQ.or(`unit_id.eq.${u},unit_id.is.null`);
+      stockQ = stockQ.or(`unit_id.eq.${u},unit_id.is.null`);
+    }
+    const [m, d, s, p, units, sh, us, t, si] = await Promise.all([
       sb.from('machines').select('*, units(name)').order('code'),
       sb.from('mcp_pdc_dies').select('*, cavities').order('code'),
       sb.from('mcp_pdc_shots').select('*, cavities, pieces_good, pieces_rejected, units(name), shifts(name), mcp_pdc_dies(code,part_number,cavities), machines(code), users:operator_user_id(full_name)').order('recorded_at', { ascending:false }).limit(50),
-      sb.from('mcp_pdc_parts').select('*').order('part_number'),
+      partsQ,
       sb.from('units').select('*').order('name'),
       sb.from('shifts').select('*').order('start_time'),
       sb.from('users').select('*').order('full_name'),
       sb.from('tools_master').select('*').eq('is_active', true).order('code'),
-      sb.from('mcp_stocks_items').select('id, code, name, current_qty, uom').order('code'),
+      stockQ,
     ]);
     setMachines(m.data || []);
     setDies(d.data || []);
     setShots(s.data || []);
     setParts(p.data || []);
-    setUnits(u.data || []);
+    setUnits(units.data || []);
     setShifts(sh.data || []);
     setUsers(us.data || []);
     setTools(t.data || []);
     setStockItems(si.data || []);
     setLoading(false);
-  }, []);
+  }, [activeUnit?.unit_id]);
 
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
@@ -2833,7 +2842,7 @@ function Production({ plant, me }) {
       }
     `}
 
-    ${modal === 'part' && html`<${PartModal} plant=${plant} me=${me} dies=${dies} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'part' && html`<${PartModal} plant=${plant} me=${me} dies=${dies} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'machine' && html`<${MachineModal} plant=${plant} units=${units} users=${users} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'machine_bulk' && html`<${MachineBulkAddModal} plant=${plant} units=${units} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'die' && html`<${DieModal} plant=${plant} me=${me} parts=${parts} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
@@ -3238,7 +3247,7 @@ function ToolForecastView({ plant, setModal, setEditTarget }) {
 }
 
 // ============= MACHINE MODAL =============
-function PartModal({ plant, me, dies, editTarget, onClose, onSaved }) {
+function PartModal({ plant, me, dies, activeUnit, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget || {
     part_number: '', revision: 'A', name: '', description: '',
     part_type: 'finished', status: 'active',
@@ -3267,7 +3276,12 @@ function PartModal({ plant, me, dies, editTarget, onClose, onSaved }) {
         default_die_id: form.default_die_id || null,
         notes: form.notes || null,
       };
-      if (!editTarget) payload.created_by = me.id;
+      if (!editTarget) {
+        payload.created_by = me.id;
+        // Stamp the active unit so the part is unit-scoped from day one.
+        // (Null when no activeUnit = plant-wide / shared.)
+        if (activeUnit?.unit_id) payload.unit_id = activeUnit.unit_id;
+      }
       const { error } = editTarget
         ? await sb.from('mcp_pdc_parts').update(payload).eq('id', editTarget.id)
         : await sb.from('mcp_pdc_parts').insert(payload);
@@ -25715,7 +25729,7 @@ function SparePurchaseRequestModal({ plant, me, users, parentAction, machineId, 
 }
 
 // ============= STOCKS =============
-function Stocks({ plant, me }) {
+function Stocks({ plant, me, activeUnit }) {
   const [items, setItems] = useState([]);
   const [transactions, setTransactions] = useState([]);
   const [pendingReceptions, setPendingReceptions] = useState([]); // doc-backed GRNs awaiting verification
@@ -25736,8 +25750,13 @@ function Stocks({ plant, me }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    // Unit scope: hide other units' items when an activeUnit is set. NULL =
+    // shared (visible everywhere).
+    const u = activeUnit?.unit_id;
+    let itemsQ = sb.from('mcp_stocks_items').select('*').order('name');
+    if (u) itemsQ = itemsQ.or(`unit_id.eq.${u},unit_id.is.null`);
     const [i, t, recs] = await Promise.all([
-      sb.from('mcp_stocks_items').select('*').order('name'),
+      itemsQ,
       sb.from('mcp_stocks_transactions').select('*, mcp_stocks_items(code,name,uom,category), users:performed_by(full_name)').order('created_at', { ascending:false }).limit(500),
       sb.from('mcp_logistics_grn_receptions').select('id, document_id, vendor_name, reference_no, reception_date, status, source, mcp_logistics_documents(doc_number, doc_date, total_value, doc_type)').eq('plant_id', plant.id).eq('status', 'pending_verification').order('reception_date', { ascending: false }).limit(50),
     ]);
@@ -25745,7 +25764,7 @@ function Stocks({ plant, me }) {
     setTransactions(t.data || []);
     setPendingReceptions(recs.data || []);
     setLoading(false);
-  }, [plant.id]);
+  }, [plant.id, activeUnit?.unit_id]);
 
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
@@ -26060,7 +26079,7 @@ function Stocks({ plant, me }) {
     `}
     `}
 
-    ${modal === 'item' && html`<${ItemModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'item' && html`<${ItemModal} plant=${plant} me=${me} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'txn' && html`<${TxnModal} plant=${plant} me=${me} item=${editTarget} isAdmin=${isAdmin} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'receive_picker' && html`<${ReceiveFromDocPicker} plant=${plant} me=${me} pendingReceptions=${pendingReceptions} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'pick_part_for_stock' && html`<${PickPartForStockModal} plant=${plant} stockItems=${items} onPick=${(p) => { setEditTarget(p); setModal('track_stock'); }} onClose=${() => setModal(null)} />`}
@@ -26069,7 +26088,7 @@ function Stocks({ plant, me }) {
   `;
 }
 
-function ItemModal({ plant, me, editTarget, onClose, onSaved }) {
+function ItemModal({ plant, me, activeUnit, editTarget, onClose, onSaved }) {
   const isEdit = !!editTarget;
   const alreadyOpened = isEdit && !!editTarget.opening_recorded_at;
   const [form, setForm] = useState(editTarget || { code:'', name:'', category:'general', uom:'nos', reorder_level:'', unit_cost:'', opening_qty: 0 });
@@ -26088,6 +26107,7 @@ function ItemModal({ plant, me, editTarget, onClose, onSaved }) {
         reorder_level: form.reorder_level ? parseFloat(form.reorder_level) : null,
         unit_cost: form.unit_cost ? parseFloat(form.unit_cost) : null,
       };
+      if (!isEdit && activeUnit?.unit_id) payload.unit_id = activeUnit.unit_id;
       if (isEdit) {
         const { error } = await sb.from('mcp_stocks_items').update(payload).eq('id', editTarget.id);
         if (error) throw error;
@@ -27466,7 +27486,7 @@ function GroupCreateModal({ plant, me, user, onClose, onSaved }) {
 }
 
 // ============= DOCUMENTS / BILLS / VENDORS =============
-function Documents({ plant, me }) {
+function Documents({ plant, me, activeUnit }) {
   const [docs, setDocs] = useState([]);
   const [vendors, setVendors] = useState([]);
   const [jobworkStock, setJobworkStock] = useState([]);
@@ -27490,11 +27510,14 @@ function Documents({ plant, me }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    const u = activeUnit?.unit_id;
+    let docsQ = sb.from('mcp_logistics_documents')
+      .select('*, mcp_logistics_vendors(name, gstin, payment_terms_days)')
+      .order('doc_date', { ascending: false, nullsFirst: false })
+      .limit(500);
+    if (u) docsQ = docsQ.or(`unit_id.eq.${u},unit_id.is.null`);
     const [d, v, jw, r, iu, o] = await Promise.all([
-      sb.from('mcp_logistics_documents')
-        .select('*, mcp_logistics_vendors(name, gstin, payment_terms_days)')
-        .order('doc_date', { ascending: false, nullsFirst: false })
-        .limit(500),
+      docsQ,
       sb.from('mcp_logistics_vendors').select('*').eq('plant_id', plant.id).order('name'),
       sb.from('v_vendor_jobwork_stock').select('*').eq('plant_id', plant.id).order('vendor_name'),
       sb.from('v_returnables_open').select('*').eq('plant_id', plant.id).limit(500),
@@ -27508,7 +27531,7 @@ function Documents({ plant, me }) {
     setInterunits(iu.data || []);
     setOcrUsage(o.data || null);
     setLoading(false);
-  }, []);
+  }, [activeUnit?.unit_id]);
 
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
@@ -31022,21 +31045,21 @@ function QuickTaskInGroupModal({ plant, me, group, onClose, onSaved }) {
 // =================================================================
 // SCHEDULES — Customer monthly schedules + plan-vs-actual tracking
 // =================================================================
-function Schedules({ plant, me }) {
+function Schedules({ plant, me, activeUnit }) {
   const [view, setView] = useState('schedules'); // 'schedules' | 'plan_vs_supply' | 'customers' | 'mapping'
   const [activeSchedule, setActiveSchedule] = useState(null);
   const [activeCustomer, setActiveCustomer] = useState(null);
 
   if (activeSchedule) {
-    return html`<${ScheduleDetail} plant=${plant} me=${me} schedule=${activeSchedule} onClose=${() => setActiveSchedule(null)} />`;
+    return html`<${ScheduleDetail} plant=${plant} me=${me} activeUnit=${activeUnit} schedule=${activeSchedule} onClose=${() => setActiveSchedule(null)} />`;
   }
   if (activeCustomer) {
-    return html`<${CustomerDetail} plant=${plant} me=${me} customer=${activeCustomer} onClose=${() => setActiveCustomer(null)} />`;
+    return html`<${CustomerDetail} plant=${plant} me=${me} activeUnit=${activeUnit} customer=${activeCustomer} onClose=${() => setActiveCustomer(null)} />`;
   }
 
   return html`
     <div class="page-header">
-      <div><h1>📅 Schedules</h1><div class="sub">Customer demand vs supply</div></div>
+      <div><h1>📅 Schedules</h1><div class="sub">Customer demand vs supply${activeUnit ? ' · ' + activeUnit.unit_name : ''}</div></div>
     </div>
 
     <div class="auth-tabs" style="margin-bottom:16px">
@@ -31047,11 +31070,11 @@ function Schedules({ plant, me }) {
       <button class=${'auth-tab' + (view === 'mapping' ? ' active' : '')} onClick=${() => setView('mapping')}>🔗 Bill Mapping</button>
     </div>
 
-    ${view === 'schedules' ? html`<${SchedulesList} plant=${plant} me=${me} onOpen=${setActiveSchedule} />` :
-      view === 'plan_vs_supply' ? html`<${PlanVsSupplyView} plant=${plant} me=${me} />` :
-      view === 'lines' ? html`<${ScheduleLinesManagerView} plant=${plant} me=${me} />` :
-      view === 'mapping' ? html`<${BillMappingView} plant=${plant} me=${me} />` :
-      html`<${CustomersList} plant=${plant} me=${me} onOpen=${setActiveCustomer} />`}
+    ${view === 'schedules' ? html`<${SchedulesList} plant=${plant} me=${me} activeUnit=${activeUnit} onOpen=${setActiveSchedule} />` :
+      view === 'plan_vs_supply' ? html`<${PlanVsSupplyView} plant=${plant} me=${me} activeUnit=${activeUnit} />` :
+      view === 'lines' ? html`<${ScheduleLinesManagerView} plant=${plant} me=${me} activeUnit=${activeUnit} />` :
+      view === 'mapping' ? html`<${BillMappingView} plant=${plant} me=${me} activeUnit=${activeUnit} />` :
+      html`<${CustomersList} plant=${plant} me=${me} activeUnit=${activeUnit} onOpen=${setActiveCustomer} />`}
   `;
 }
 
@@ -32760,7 +32783,7 @@ function ScheduleLinesManagerView({ plant, me }) {
 }
 
 // ============= SCHEDULES LIST =============
-function SchedulesList({ plant, me, onOpen }) {
+function SchedulesList({ plant, me, activeUnit, onOpen }) {
   const [schedules, setSchedules] = useState([]);
   const [customers, setCustomers] = useState([]);
   const [parts, setParts] = useState([]);
@@ -32769,17 +32792,24 @@ function SchedulesList({ plant, me, onOpen }) {
 
   const refresh = async () => {
     setLoading(true);
+    const u = activeUnit?.unit_id;
+    let schedQ = sb.from('mcp_sched_schedules').select('*, customer:customer_id(name, short_code)').order('schedule_month', { ascending: false }).limit(50);
+    let partsQ = sb.from('mcp_pdc_parts').select('id, name, part_number, customer_part_number, unit_id').order('name');
+    if (u) {
+      schedQ = schedQ.or(`unit_id.eq.${u},unit_id.is.null`);
+      partsQ = partsQ.or(`unit_id.eq.${u},unit_id.is.null`);
+    }
     const [s, c, p] = await Promise.all([
-      sb.from('mcp_sched_schedules').select('*, customer:customer_id(name, short_code)').order('schedule_month', { ascending: false }).limit(50),
+      schedQ,
       sb.from('mcp_sched_customers').select('*').eq('active', true).order('name'),
-      sb.from('mcp_pdc_parts').select('id, name, part_number, customer_part_number').order('name'),
+      partsQ,
     ]);
     setSchedules(s.data || []);
     setCustomers(c.data || []);
     setParts(p.data || []);
     setLoading(false);
   };
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => { refresh(); }, [activeUnit?.unit_id]);
 
   // Realtime
   useEffect(() => {
