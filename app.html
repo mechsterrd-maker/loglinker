@@ -26550,18 +26550,25 @@ function ActionHub({ plant, me, navAction }) {
     let q = sb.from('actions').select('*, owner_user:owner_id(full_name, role), assigner:assigned_by(full_name)').order('created_at', { ascending:false });
     if (statusFilter === 'open') q = q.in('status', ['open','in_progress']);
     else if (statusFilter === 'done') q = q.eq('status', 'completed');
-    const [a, u, d] = await Promise.all([
+    // Three independent queries — nesting users → user_unit_access → units in
+    // one PostgREST embed silently returned an empty rowset, so split out:
+    //   (a) actions, (b) plant users, (c) departments, (d) unit access map
+    const [a, u, d, ua] = await Promise.all([
       q.limit(200),
-      // Plant-wide users + their unit access, so the picker can show
-      // "Ramkumar · Unit 1" and make cross-unit assignment obvious.
-      sb.from('users')
-        .select('*, user_unit_access(unit:units(name))')
-        .eq('plant_id', plant.id)
-        .order('full_name'),
-      sb.from('departments').select('*').order('name')
+      sb.from('users').select('*').eq('plant_id', plant.id).order('full_name'),
+      sb.from('departments').select('*').order('name'),
+      sb.from('user_unit_access').select('user_id, unit:units(name)').eq('plant_id', plant.id),
     ]);
+    const accessByUser = {};
+    for (const row of (ua.data || [])) {
+      (accessByUser[row.user_id] = accessByUser[row.user_id] || []).push(row.unit?.name);
+    }
+    const enrichedUsers = (u.data || []).map(usr => ({
+      ...usr,
+      unit_names: (accessByUser[usr.id] || []).filter(Boolean),
+    }));
     setActions(a.data || []);
-    setUsers(u.data || []);
+    setUsers(enrichedUsers);
     setDepartments(d.data || []);
     setLoading(false);
   }, [statusFilter, plant.id]);
@@ -26908,7 +26915,7 @@ function WatcherPicker({ users, value, onChange }) {
         const haystack = [
           u.full_name || '',
           u.role || '',
-          ...(u.user_unit_access || []).map(a => a.unit?.name || ''),
+          ...(u.unit_names || []),
         ].join(' ').toLowerCase();
         return haystack.includes(lower);
       })
@@ -26934,7 +26941,7 @@ function WatcherPicker({ users, value, onChange }) {
           const on = value.includes(u.id);
           const name = u.full_name || '(no name)';
           const role = u.role ? (typeof roleLabel === 'function' ? roleLabel(u.role) : u.role) : '';
-          const units = (u.user_unit_access || []).map(a => a.unit?.name).filter(Boolean);
+          const units = u.unit_names || [];
           const subParts = [role, units.length ? '🏭 ' + units.join(', ') : ''].filter(Boolean);
           return html`
             <label key=${u.id} style=${'display:block;cursor:pointer;border-bottom:1px solid var(--slate-100);background:'+(on?'var(--teal-50)':'white')}>
@@ -27067,8 +27074,7 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
             <select value=${form.owner_id || ''} onChange=${e => setForm({...form, owner_id: e.target.value})}>
               <option value="">— Unassigned —</option>
               ${users.map(u => {
-                const units = (u.user_unit_access || []).map(a => a.unit?.name).filter(Boolean);
-                const unitTag = units.length ? ' · ' + units.join(', ') : '';
+                const unitTag = (u.unit_names && u.unit_names.length) ? ' · ' + u.unit_names.join(', ') : '';
                 return html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + roleLabel(u.role) : ''}${unitTag}</option>`;
               })}
             </select>
