@@ -26895,8 +26895,10 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
   // is still on the row for legacy task sources (NCR / MoM cron) so we just
   // leave it null from this form.
   const [form, setForm] = useState(editTarget ? {...editTarget, due_at: editTarget.due_at ? editTarget.due_at.slice(0,16) : ''} : {
-    title:'', owner_id:'', project_id:'', due_at:'', priority:'medium', source_type:'manual'
+    title:'', owner_id:'', project_id:'', due_at:'', priority:'medium',
+    report_to_mode:'group', source_type:'manual'
   });
+  const [watchers, setWatchers] = useState([]); // uuid[] — only used when report_to_mode='direct'
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -26909,6 +26911,13 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
       .order('name')
       .then(({ data }) => setProjects(data || []));
   }, [plant.id]);
+
+  // Load existing watchers when editing a 'direct' task
+  useEffect(() => {
+    if (!editTarget?.id || editTarget.report_to_mode !== 'direct') return;
+    sb.from('action_watchers').select('user_id').eq('action_id', editTarget.id)
+      .then(({ data }) => setWatchers((data || []).map(w => w.user_id)));
+  }, [editTarget?.id]);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -26923,15 +26932,43 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
         assigned_by: me.id,
         due_at: form.due_at ? new Date(form.due_at).toISOString() : null,
         priority: form.priority || 'medium',
+        report_to_mode: form.report_to_mode || 'group',
         status: form.status || 'open',
       };
       if (form.status === 'completed' && !editTarget?.completed_at) {
         payload.completed_at = new Date().toISOString();
       }
-      const { error } = editTarget
-        ? await sb.from('actions').update(payload).eq('id', editTarget.id)
-        : await sb.from('actions').insert(payload);
-      if (error) throw error;
+      let savedId;
+      if (editTarget) {
+        const { error } = await sb.from('actions').update(payload).eq('id', editTarget.id);
+        if (error) throw error;
+        savedId = editTarget.id;
+      } else {
+        const { data, error } = await sb.from('actions').insert(payload).select('id').single();
+        if (error) throw error;
+        savedId = data.id;
+      }
+
+      // 'direct' mode: replace watchers, then fan the create-notification
+      // out via RPC (broadcast can't happen in the AFTER INSERT trigger because
+      // the watcher rows weren't visible yet).
+      if (payload.report_to_mode === 'direct') {
+        if (editTarget) await sb.from('action_watchers').delete().eq('action_id', savedId);
+        const watcherRows = watchers.filter(uid => uid && uid !== me.id).map(uid => ({
+          action_id: savedId, user_id: uid, plant_id: plant.id, added_by: me.id,
+        }));
+        if (watcherRows.length > 0) {
+          const { error: wErr } = await sb.from('action_watchers').insert(watcherRows);
+          if (wErr) throw wErr;
+        }
+        if (!editTarget) {
+          await sb.rpc('broadcast_action_create', { p_action_id: savedId });
+        }
+      } else if (editTarget && (editTarget.report_to_mode === 'direct') && payload.report_to_mode !== 'direct') {
+        // Switched away from 'direct' — clear stale watchers
+        await sb.from('action_watchers').delete().eq('action_id', savedId);
+      }
+
       showToast(editTarget ? 'Task updated' : 'Task added');
       onSaved();
     } catch (err) { setError(err.message); } finally { setLoading(false); }
@@ -26983,6 +27020,42 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
               `)}
             </div>
           </div>
+          <div class="field">
+            <label>Report status updates to</label>
+            <div style="display:flex;flex-direction:column;gap:4px">
+              ${[
+                { v:'self',   icon:'🙋', title:'Just me',     sub:'No chat broadcast. Only you (and the assignee) see updates.' },
+                { v:'direct', icon:'👥', title:'Me + people', sub:'Status updates DM to each person you add. No group spam.' },
+                { v:'group',  icon:'🏢', title:'All Hands',   sub:'Posts to the company-wide group chat (existing behaviour).' },
+              ].map(opt => html`
+                <button key=${opt.v} type="button" onClick=${() => setForm({...form, report_to_mode: opt.v})}
+                  style=${'text-align:left;padding:8px 10px;font-size:12px;border-radius:6px;cursor:pointer;border:1px solid '+(form.report_to_mode===opt.v?'var(--teal-500)':'var(--slate-200)')+';background:'+(form.report_to_mode===opt.v?'var(--teal-50)':'white')+';color:var(--slate-800)'}>
+                  <div style="font-weight:600">${opt.icon} ${opt.title}</div>
+                  <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${opt.sub}</div>
+                </button>
+              `)}
+            </div>
+          </div>
+          ${form.report_to_mode === 'direct' && html`
+            <div class="field">
+              <label>People to DM <span style="font-weight:400;color:var(--slate-500);font-size:11px">· status updates land in their 1:1 chat with you</span></label>
+              <div style="display:flex;flex-wrap:wrap;gap:5px;max-height:160px;overflow-y:auto;padding:6px;border:1px solid var(--slate-200);border-radius:6px;background:var(--slate-50)">
+                ${users.filter(u => u.id !== me.id).map(u => {
+                  const on = watchers.includes(u.id);
+                  return html`
+                    <label key=${u.id} style=${'display:inline-flex;align-items:center;gap:5px;padding:4px 9px;border:1px solid '+(on?'var(--teal-500)':'var(--slate-200)')+';background:'+(on?'var(--teal-50)':'white')+';border-radius:999px;font-size:12px;cursor:pointer'}>
+                      <input type="checkbox" checked=${on} onChange=${e => {
+                        if (e.target.checked) setWatchers([...watchers, u.id]);
+                        else setWatchers(watchers.filter(x => x !== u.id));
+                      }} style="margin:0" />
+                      ${u.full_name}
+                    </label>
+                  `;
+                })}
+              </div>
+              ${watchers.length === 0 && html`<div style="font-size:11px;color:var(--amber-700);margin-top:4px">Pick at least one person — otherwise updates only show in your own task list.</div>`}
+            </div>
+          `}
           ${editTarget && html`
             <div class="field"><label>Status</label>
               <select value=${form.status} onChange=${e => setForm({...form, status: e.target.value})}>
