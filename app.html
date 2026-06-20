@@ -26889,6 +26889,56 @@ function TaskDetail({ plant, me, task: initialTask, users, onClose }) {
   `;
 }
 
+// =================================================================
+// WATCHER PICKER — searchable user list for "Me + people" task mode
+// =================================================================
+// Plain row-per-user list, full name + role visible, with a search box.
+// Each row is a tappable area (28px+ target). Selected rows fill teal.
+// Shows the picked count in the header for quick visual confirmation.
+function WatcherPicker({ users, value, onChange }) {
+  const [q, setQ] = useState('');
+  const lower = q.trim().toLowerCase();
+  const filtered = lower
+    ? users.filter(u => (u.full_name || '').toLowerCase().includes(lower) || (u.role || '').toLowerCase().includes(lower))
+    : users;
+  const toggle = (id) => {
+    if (value.includes(id)) onChange(value.filter(x => x !== id));
+    else onChange([...value, id]);
+  };
+  const initials = (name) => (name || '?').split(/\s+/).map(w => w[0]).join('').slice(0,2).toUpperCase();
+  return html`
+    <div style="border:1px solid var(--slate-200);border-radius:8px;background:white;overflow:hidden">
+      <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--slate-100);background:var(--slate-50)">
+        <input type="text" value=${q} onInput=${e => setQ(e.target.value)} placeholder="🔍 Search by name or role…"
+          style="flex:1;padding:5px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white" />
+        <span style="font-size:11px;color:var(--slate-500);white-space:nowrap">${value.length} selected</span>
+      </div>
+      ${filtered.length === 0 ? html`
+        <div style="padding:14px;text-align:center;font-size:12px;color:var(--slate-500)">No people match "${q}"</div>
+      ` : html`
+        <div style="max-height:220px;overflow-y:auto">
+          ${filtered.map(u => {
+            const on = value.includes(u.id);
+            return html`
+              <div key=${u.id} onClick=${() => toggle(u.id)}
+                style=${'display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--slate-100);background:'+(on?'var(--teal-50)':'white')}>
+                <input type="checkbox" checked=${on} onChange=${() => toggle(u.id)} onClick=${e => e.stopPropagation()} style="margin:0" />
+                <div style=${'width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:white;flex-shrink:0;background:'+(on?'var(--teal-600)':'var(--slate-400)')}>
+                  ${initials(u.full_name)}
+                </div>
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:13px;font-weight:600;color:var(--slate-800);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${u.full_name || '?'}</div>
+                  ${u.role && html`<div style="font-size:11px;color:var(--slate-500);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${typeof roleLabel === 'function' ? roleLabel(u.role) : u.role}</div>`}
+                </div>
+              </div>
+            `;
+          })}
+        </div>
+      `}
+    </div>
+  `;
+}
+
 function ActionModal({ plant, me, users, departments, editTarget, onClose, onSaved }) {
   // Marvel 15-Jun: task assignment must be simple — what, project, assigned
   // to, deadline. No department, no description field. The department column
@@ -27039,20 +27089,7 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
           ${form.report_to_mode === 'direct' && html`
             <div class="field">
               <label>People to DM <span style="font-weight:400;color:var(--slate-500);font-size:11px">· status updates land in their 1:1 chat with you</span></label>
-              <div style="display:flex;flex-wrap:wrap;gap:5px;max-height:160px;overflow-y:auto;padding:6px;border:1px solid var(--slate-200);border-radius:6px;background:var(--slate-50)">
-                ${users.filter(u => u.id !== me.id).map(u => {
-                  const on = watchers.includes(u.id);
-                  return html`
-                    <label key=${u.id} style=${'display:inline-flex;align-items:center;gap:5px;padding:4px 9px;border:1px solid '+(on?'var(--teal-500)':'var(--slate-200)')+';background:'+(on?'var(--teal-50)':'white')+';border-radius:999px;font-size:12px;cursor:pointer'}>
-                      <input type="checkbox" checked=${on} onChange=${e => {
-                        if (e.target.checked) setWatchers([...watchers, u.id]);
-                        else setWatchers(watchers.filter(x => x !== u.id));
-                      }} style="margin:0" />
-                      ${u.full_name}
-                    </label>
-                  `;
-                })}
-              </div>
+              <${WatcherPicker} users=${users.filter(u => u.id !== me.id)} value=${watchers} onChange=${setWatchers} />
               ${watchers.length === 0 && html`<div style="font-size:11px;color:var(--amber-700);margin-top:4px">Pick at least one person — otherwise updates only show in your own task list.</div>`}
             </div>
           `}
