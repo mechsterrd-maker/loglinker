@@ -26552,14 +26552,19 @@ function ActionHub({ plant, me, navAction }) {
     else if (statusFilter === 'done') q = q.eq('status', 'completed');
     const [a, u, d] = await Promise.all([
       q.limit(200),
-      sb.from('users').select('*').order('full_name'),
+      // Plant-wide users + their unit access, so the picker can show
+      // "Ramkumar · Unit 1" and make cross-unit assignment obvious.
+      sb.from('users')
+        .select('*, user_unit_access(unit:units(name))')
+        .eq('plant_id', plant.id)
+        .order('full_name'),
       sb.from('departments').select('*').order('name')
     ]);
     setActions(a.data || []);
     setUsers(u.data || []);
     setDepartments(d.data || []);
     setLoading(false);
-  }, [statusFilter]);
+  }, [statusFilter, plant.id]);
 
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
@@ -26899,9 +26904,14 @@ function WatcherPicker({ users, value, onChange }) {
   const [q, setQ] = useState('');
   const lower = q.trim().toLowerCase();
   const filtered = lower
-    ? users.filter(u =>
-        (u.full_name || '').toLowerCase().includes(lower) ||
-        (u.role || '').toLowerCase().includes(lower))
+    ? users.filter(u => {
+        const haystack = [
+          u.full_name || '',
+          u.role || '',
+          ...(u.user_unit_access || []).map(a => a.unit?.name || ''),
+        ].join(' ').toLowerCase();
+        return haystack.includes(lower);
+      })
     : users;
   const toggle = (id) => {
     if (value.includes(id)) onChange(value.filter(x => x !== id));
@@ -26924,6 +26934,8 @@ function WatcherPicker({ users, value, onChange }) {
           const on = value.includes(u.id);
           const name = u.full_name || '(no name)';
           const role = u.role ? (typeof roleLabel === 'function' ? roleLabel(u.role) : u.role) : '';
+          const units = (u.user_unit_access || []).map(a => a.unit?.name).filter(Boolean);
+          const subParts = [role, units.length ? '🏭 ' + units.join(', ') : ''].filter(Boolean);
           return html`
             <label key=${u.id} style=${'display:block;cursor:pointer;border-bottom:1px solid var(--slate-100);background:'+(on?'var(--teal-50)':'white')}>
               <div style="display:flex;align-items:center;gap:12px;padding:10px 14px">
@@ -26931,7 +26943,7 @@ function WatcherPicker({ users, value, onChange }) {
                   style="margin:0;width:18px;height:18px;flex-shrink:0;cursor:pointer" />
                 <div style="flex:1">
                   <div style=${'font-size:14px;font-weight:600;color:'+(on?'var(--teal-800)':'var(--slate-800)')}>${name}</div>
-                  ${role && html`<div style="font-size:11px;color:var(--slate-500);margin-top:2px">${role}</div>`}
+                  ${subParts.length > 0 && html`<div style="font-size:11px;color:var(--slate-500);margin-top:2px">${subParts.join(' · ')}</div>`}
                 </div>
                 ${on && html`<span style="color:var(--teal-600);font-weight:700;font-size:16px">✓</span>`}
               </div>
@@ -27051,10 +27063,14 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
             </select>
           </div>
           <div class="field">
-            <label>Assigned to</label>
+            <label>Assigned to <span style="font-weight:400;color:var(--slate-500);font-size:11px">· any unit in this plant</span></label>
             <select value=${form.owner_id || ''} onChange=${e => setForm({...form, owner_id: e.target.value})}>
               <option value="">— Unassigned —</option>
-              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + roleLabel(u.role) : ''}</option>`)}
+              ${users.map(u => {
+                const units = (u.user_unit_access || []).map(a => a.unit?.name).filter(Boolean);
+                const unitTag = units.length ? ' · ' + units.join(', ') : '';
+                return html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + roleLabel(u.role) : ''}${unitTag}</option>`;
+              })}
             </select>
           </div>
           <div class="field">
