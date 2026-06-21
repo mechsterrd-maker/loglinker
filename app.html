@@ -1693,6 +1693,14 @@ const MORE_GROUPS = [
 ];
 const MORE_FLAT_KEYS = MORE_GROUPS.flatMap(g => g.items.map(i => i.key));
 
+// Opt-in modules. Unlike core modules, these are NOT auto-surfaced to legacy
+// plants (enabled_tabs = NULL). They appear ONLY when a plant explicitly lists
+// them in enabled_tabs — e.g. Starter Pack plants. This stops a newly added
+// module (attendance, petty cash, self-attendance) from showing up in every
+// existing plant the moment it ships. To roll a module out to an existing
+// plant, add its key to that plant's plants.enabled_tabs.
+const OPT_IN_TAB_KEYS = new Set(['self_attendance', 'attendance', 'attendance_setup', 'petty_cash']);
+
 // Fabrication & site-works plants don't run PDC casting — they get Projects,
 // commercial docs and expenses instead of the manufacturing/casting surface.
 // Legacy plants (business_type = null, e.g. krishnas fittings) are unaffected.
@@ -1737,10 +1745,16 @@ function visibleMoreGroups(plant, myPerms) {
   }
   // Third pass: plant-level module gating via plants.enabled_tabs.
   // When set, only show items whose key is in the list. 'home' is implicit.
+  // When NOT set (legacy plant = show everything), opt-in modules are still
+  // hidden — they must be explicitly enabled per plant.
   if (Array.isArray(plant?.enabled_tabs) && plant.enabled_tabs.length > 0) {
     const allow = new Set(['home', ...plant.enabled_tabs]);
     groups = groups
       .map(g => ({ ...g, items: g.items.filter(it => allow.has(it.key)) }))
+      .filter(g => g.items.length > 0);
+  } else {
+    groups = groups
+      .map(g => ({ ...g, items: g.items.filter(it => !OPT_IN_TAB_KEYS.has(it.key)) }))
       .filter(g => g.items.length > 0);
   }
   return groups;
@@ -2204,7 +2218,9 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
   const enabled = Array.isArray(plant?.enabled_tabs) && plant.enabled_tabs.length > 0
     ? new Set(['home', ...plant.enabled_tabs])
     : null;
-  const tabs = enabled ? allTabs.filter(t => enabled.has(t.key)) : allTabs;
+  const tabs = enabled
+    ? allTabs.filter(t => enabled.has(t.key))
+    : allTabs.filter(t => !OPT_IN_TAB_KEYS.has(t.key));
   // Everything else lives in the More dropdown — IATF modules + secondary routes
   const inMore = MORE_FLAT_KEYS.includes(tab) && !tabs.some(t => t.key === tab);
   const icons = {
