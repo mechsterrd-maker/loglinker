@@ -21603,6 +21603,7 @@ const NPD_DOC_KINDS = [
   { key:'rfq',              label:'RFQ',                 emoji:'📥' },
   { key:'customer_drawing', label:'Customer drawing',    emoji:'📐' },
   { key:'balloon_drawing',  label:'Ballooned drawing',   emoji:'🎯' },
+  { key:'fai_report',       label:'FAI report',          emoji:'📑' },
   { key:'model_3d',         label:'3D model',            emoji:'🧊' },
   { key:'quote',            label:'Quote',               emoji:'💬' },
   { key:'feasibility',      label:'Feasibility (FMR)',   emoji:'🔍' },
@@ -21764,21 +21765,30 @@ async function npdUrlToFile(url, name, type) {
 function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
   const drawingRef = useRef(null);
   const modelRef = useRef(null);
-  const [uploading, setUploading] = useState('');     // 'drawing' | 'model' | ''
+  const resultRef = useRef(null);
+  const faiRef = useRef(null);
+  const [uploading, setUploading] = useState('');     // 'drawing' | 'model' | 'balloon_drawing' | 'fai_report' | ''
   const [loadingCad, setLoadingCad] = useState(false);
   const [cad, setCad] = useState(null);               // { file, mode:'3d' } | null
   const [decision, setDecision] = useState(p.feasibility_decision || '');
   const [notes, setNotes] = useState(p.feasibility_notes || '');
 
-  const drawingDocs = docs.filter(d => d.kind === 'balloon_drawing' || d.kind === 'customer_drawing');
-  const modelDocs = docs.filter(d => d.kind === 'model_3d');
+  const drawingDocs  = docs.filter(d => d.kind === 'customer_drawing');
+  const modelDocs    = docs.filter(d => d.kind === 'model_3d');
+  const balloonDocs  = docs.filter(d => d.kind === 'balloon_drawing');
+  const faiDocs      = docs.filter(d => d.kind === 'fai_report');
 
-  // Auto-ballooning runs in CadNexa's dedicated tool on the live site. We pass
-  // the stored drawing URL so the tool can pull it in.
+  // Open CadNexa's Auto-Balloon tool on the live site, passing the stored
+  // drawing URL + a return context so the tool can (when wired on its side)
+  // post the ballooned PDF / FAI report back here. No noopener: we keep the
+  // window handle so the round-trip can message us via window.opener.
   const openBalloonTool = (fileUrl, name) => {
-    let u = 'https://cadnexa.com/app.html?tool=autoBalloon';
-    if (fileUrl) u += '&fileUrl=' + encodeURIComponent(fileUrl) + '&fileName=' + encodeURIComponent(name || '');
-    window.open(u, '_blank', 'noopener,noreferrer');
+    const qs = new URLSearchParams({ tool: 'autoBalloon' });
+    if (fileUrl) { qs.set('fileUrl', fileUrl); qs.set('fileName', name || ''); }
+    qs.set('returnTo', location.origin);
+    qs.set('projectId', p.id);
+    qs.set('projectCode', p.project_code || '');
+    window.open('https://cadnexa.com/app.html?' + qs.toString(), '_blank');
   };
 
   const uploadTo = async (file, kind) => {
@@ -21802,13 +21812,46 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
     if (!file) return;
     setUploading('drawing');
     try {
-      const publicUrl = await uploadTo(file, 'balloon_drawing');
-      await update({ balloon_drawing_url: publicUrl });
+      const publicUrl = await uploadTo(file, 'customer_drawing');
       onReload();
       openBalloonTool(publicUrl, file.name);
     } catch (e) { alert('Upload failed: ' + e.message); }
     finally { setUploading(''); }
   };
+
+  // Attach a CadNexa result (ballooned drawing / FAI report PDF) back onto the project.
+  const uploadResult = async (file, kind) => {
+    if (!file) return;
+    setUploading(kind);
+    try {
+      const publicUrl = await uploadTo(file, kind);
+      if (kind === 'balloon_drawing') await update({ balloon_drawing_url: publicUrl });
+      onReload();
+      showToast(kind === 'fai_report' ? '📑 FAI report added' : '🎯 Ballooned drawing added');
+    } catch (e) { alert('Upload failed: ' + e.message); }
+    finally { setUploading(''); }
+  };
+
+  // Round-trip receiver: when the CadNexa Auto-Balloon tool is wired to post a
+  // result back (CNX_RESULT with a base64 dataUrl or a url), file it against
+  // this project automatically as a ballooned drawing or FAI report.
+  useEffect(() => {
+    const onMsg = async (e) => {
+      const d = e && e.data;
+      if (!d || d.type !== 'CNX_RESULT') return;
+      if (d.projectId && d.projectId !== p.id) return;
+      const kind = d.kind === 'fai_report' ? 'fai_report' : 'balloon_drawing';
+      try {
+        let file;
+        if (d.dataUrl) { const r = await fetch(d.dataUrl); const b = await r.blob(); file = new File([b], d.name || (kind + '.pdf'), { type: b.type || 'application/pdf' }); }
+        else if (d.url) { file = await npdUrlToFile(d.url, d.name || (kind + '.pdf'), d.contentType); }
+        else return;
+        await uploadResult(file, kind);
+      } catch (err) { console.warn('[CNX_RESULT]', err); }
+    };
+    window.addEventListener('message', onMsg);
+    return () => window.removeEventListener('message', onMsg);
+  }, [p.id]);
 
   // Upload a 3D part → store, then open the CadNexa 3D viewer.
   const uploadModel = async (file) => {
@@ -21861,6 +21904,13 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
       <button class="btn ghost small" style="padding:4px 9px" disabled=${loadingCad} onClick=${() => openModel3D(doc)}>🧊 Open 3D</button>
     </div>
   `;
+  const resultRow = (doc) => html`
+    <div key=${doc.id} style="display:flex;align-items:center;gap:6px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:7px;margin-top:6px">
+      <span style="font-size:16px">${NPD_DOC_KIND_BY_KEY[doc.kind]?.emoji || '📄'}</span>
+      <div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${doc.title}</div><div style="font-size:10px;color:var(--slate-400)">${NPD_DOC_KIND_BY_KEY[doc.kind]?.label || doc.kind}</div></div>
+      <a href=${doc.file_url} target="_blank" rel="noopener" style="font-size:11px;color:var(--slate-500);text-decoration:none">↗ open</a>
+    </div>
+  `;
 
   return html`
     <div class="card">
@@ -21889,6 +21939,27 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
       </button>
       ${loadingCad && html`<span style="font-size:11px;color:var(--slate-500);margin-left:8px">Opening CadNexa…</span>`}
       ${modelDocs.map(d => modelRow(d))}
+    </div>
+
+    <div class="card" style="margin-top:10px">
+      <div class="card-title">📑 Ballooned drawing &amp; FAI report</div>
+      <div style="font-size:11.5px;color:var(--slate-500);margin-bottom:8px;line-height:1.45">
+        After ballooning, attach the exported PDFs back here. If CadNexa sends them automatically they land here on their own; otherwise add the downloaded files in one tap.
+      </div>
+      <input ref=${resultRef} type="file" accept=".pdf,image/*,application/pdf" style="display:none"
+        onChange=${e => { const f = e.target.files[0]; if (f) uploadResult(f, 'balloon_drawing'); e.target.value=''; }} />
+      <input ref=${faiRef} type="file" accept=".pdf,application/pdf" style="display:none"
+        onChange=${e => { const f = e.target.files[0]; if (f) uploadResult(f, 'fai_report'); e.target.value=''; }} />
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn small" disabled=${uploading==='balloon_drawing'} onClick=${() => resultRef.current && resultRef.current.click()}>
+          ${uploading==='balloon_drawing' ? 'Uploading…' : '🎯 ＋ Ballooned drawing'}
+        </button>
+        <button class="btn ghost small" disabled=${uploading==='fai_report'} onClick=${() => faiRef.current && faiRef.current.click()}>
+          ${uploading==='fai_report' ? 'Uploading…' : '📑 ＋ FAI report'}
+        </button>
+      </div>
+      ${balloonDocs.map(d => resultRow(d))}
+      ${faiDocs.map(d => resultRow(d))}
     </div>
 
     <div class="card" style="margin-top:10px">
