@@ -1657,7 +1657,7 @@ const MORE_GROUPS = [
       { key:'actions',             icon:'✓',  label:'Action Hub',                sub:'All open commitments, owners, due dates' },
       { key:'projects',            icon:'📐', label:'Projects',                  sub:'Fabrication & site-work job tracking · progress, weight, milestones' },
       { key:'cad3d',               icon:'🧊', label:'3D Models · CadNexa',       sub:'View, measure & estimate STEP/STL/CAD parts inside the plant' },
-      { key:'npd',                 icon:'🧪', label:'NPD Projects (APQP)', iatf:true, sub:'RFQ → SOP lifecycle, PPAP auto-feed, commercials' },
+      { key:'npd',                 icon:'🧪', label:'NPD Projects (APQP)', sub:'RFQ → SOP lifecycle, PPAP auto-feed, commercials' },
       { key:'ppap',                icon:'📑', label:'PPAP Submissions',   iatf:true, sub:'Part approval status (IATF 8.3.4.4)' },
       { key:'mom',                 icon:'📝', label:'MOM (Minutes of Meeting)',  sub:'Internal / customer / supplier · action items auto-task' },
       { key:'voice_notes',         icon:'🎙', label:'Voice Notes (Tamil → English)', sub:'Upload meeting recording · AI translates + extracts action items · creates MoM + tasks' },
@@ -1699,7 +1699,7 @@ const MORE_FLAT_KEYS = MORE_GROUPS.flatMap(g => g.items.map(i => i.key));
 // module (attendance, petty cash, self-attendance) from showing up in every
 // existing plant the moment it ships. To roll a module out to an existing
 // plant, add its key to that plant's plants.enabled_tabs.
-const OPT_IN_TAB_KEYS = new Set(['self_attendance', 'attendance', 'attendance_setup', 'petty_cash']);
+const OPT_IN_TAB_KEYS = new Set(['self_attendance', 'attendance', 'attendance_setup', 'petty_cash', 'npd']);
 
 // Fabrication & site-works plants don't run PDC casting — they get Projects,
 // commercial docs and expenses instead of the manufacturing/casting surface.
@@ -1753,8 +1753,11 @@ function visibleMoreGroups(plant, myPerms) {
       .map(g => ({ ...g, items: g.items.filter(it => allow.has(it.key)) }))
       .filter(g => g.items.length > 0);
   } else {
+    // Legacy plant (show everything) minus opt-in modules, except those the
+    // plant has been additively granted via plants.extra_modules.
+    const extra = new Set(Array.isArray(plant?.extra_modules) ? plant.extra_modules : []);
     groups = groups
-      .map(g => ({ ...g, items: g.items.filter(it => !OPT_IN_TAB_KEYS.has(it.key)) }))
+      .map(g => ({ ...g, items: g.items.filter(it => !OPT_IN_TAB_KEYS.has(it.key) || extra.has(it.key)) }))
       .filter(g => g.items.length > 0);
   }
   return groups;
@@ -2218,9 +2221,10 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
   const enabled = Array.isArray(plant?.enabled_tabs) && plant.enabled_tabs.length > 0
     ? new Set(['home', ...plant.enabled_tabs])
     : null;
+  const extraModules = new Set(Array.isArray(plant?.extra_modules) ? plant.extra_modules : []);
   const tabs = enabled
     ? allTabs.filter(t => enabled.has(t.key))
-    : allTabs.filter(t => !OPT_IN_TAB_KEYS.has(t.key));
+    : allTabs.filter(t => !OPT_IN_TAB_KEYS.has(t.key) || extraModules.has(t.key));
   // Everything else lives in the More dropdown — IATF modules + secondary routes
   const inMore = MORE_FLAT_KEYS.includes(tab) && !tabs.some(t => t.key === tab);
   const icons = {
