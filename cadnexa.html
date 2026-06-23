@@ -5659,6 +5659,42 @@ document.getElementById('dovl')?.addEventListener('drop',e=>{e.preventDefault();
   var t = 0, h = setInterval(function(){ t++; if (consumed || t > 12) clearInterval(h); else ask(); }, 350);
 })();
 
+// ===== Loglinkr NPD auto-balloon hand-off =====
+// Opened with ?cxauto=balloon (from Loglinkr's NPD Feasibility "🎯 Balloon"):
+// wait for the shared 3D model to finish loading, then jump straight into the
+// 2D drafter with balloon + hole-table dimensioning, so the user lands on the
+// ballooned drawing instead of the 3D viewer.
+(function(){
+  var auto;
+  try { auto = new URLSearchParams(window.location.search).get('cxauto'); } catch(_){ return; }
+  if (auto !== 'balloon') return;
+  var fired = false, tries = 0;
+  var iv = setInterval(function(){
+    tries++;
+    if (fired || tries > 160) { clearInterval(iv); return; }   // ~80s ceiling
+    try {
+      if (typeof loaded !== 'undefined' && loaded && typeof mainGroup !== 'undefined' && mainGroup && mainGroup.children.length) {
+        fired = true; clearInterval(iv);
+        try { if (window._d2AutoDimOpts) window._d2AutoDimOpts.datum = 'balloontable'; } catch(_){}
+        setTimeout(function(){
+          try { smart2DExport(); } catch(e){ console.warn('[cxauto] open 2D failed', e); }
+          // Once the drafter overlay + edges exist, auto-run the ballooning.
+          var t2 = 0, iv2 = setInterval(function(){
+            t2++;
+            if (t2 > 40) { clearInterval(iv2); return; }
+            try {
+              if (typeof _d2 !== 'undefined' && _d2 && _d2.ovl && _d2.lines && _d2.lines.length) {
+                clearInterval(iv2);
+                setTimeout(function(){ try { d2AutoDim(); } catch(e){ console.warn('[cxauto] auto-dim failed', e); } }, 250);
+              }
+            } catch(_){}
+          }, 250);
+        }, 700);
+      }
+    } catch(_){}
+  }, 500);
+})();
+
 // ===== SAMPLE FILE AUTO-LOAD (activation fix) =====
 // When user clicks "Try with sample STEP file" on homepage, app.html appends ?sample=1
 // ═══════════════════════════════════════════════════════════════════════
