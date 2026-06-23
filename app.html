@@ -21762,24 +21762,26 @@ async function npdUrlToFile(url, name, type) {
 }
 
 function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
-  const drawingRef = useRef(null);
   const modelRef = useRef(null);
-  const [uploading, setUploading] = useState('');     // 'drawing' | 'model' | ''
+  const [uploading, setUploading] = useState(false);
   const [loadingCad, setLoadingCad] = useState(false);
   const [cad, setCad] = useState(null);               // { file, mode:'balloon'|'3d' } | null
   const [decision, setDecision] = useState(p.feasibility_decision || '');
   const [notes, setNotes] = useState(p.feasibility_notes || '');
 
-  const drawingDocs = docs.filter(d => d.kind === 'customer_drawing' || d.kind === 'balloon_drawing');
   const modelDocs = docs.filter(d => d.kind === 'model_3d');
 
-  // Upload a file → storage + mcp_npd_documents row + stamp the project field,
-  // then immediately hand it to CadNexa.
-  const uploadAndOpen = async (file, kind, projectField, mode) => {
+  // Upload a 3D part → storage + mcp_npd_documents row + stamp model_3d_url,
+  // then hand it straight to CadNexa in the chosen mode.
+  const uploadModel = async (file, mode) => {
     if (!file) return;
-    setUploading(kind === 'model_3d' ? 'model' : 'drawing');
+    const ext = (file.name.split('.').pop() || '').toLowerCase();
+    if (!NPD_3D_EXT.includes(ext)) {
+      alert('CadNexa balloons & views 3D parts. Please upload a 3D model: ' + NPD_3D_EXT.join(', ').toUpperCase() + '.\n(Store the customer 2D drawing PDF in the Documents tab.)');
+      return;
+    }
+    setUploading(true);
     try {
-      const ext = (file.name.split('.').pop() || 'bin').toLowerCase();
       const path = 'npd/' + p.plant_id + '/' + p.id + '/' + crypto.randomUUID() + '.' + ext;
       const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, file, {
         cacheControl: '3600', contentType: file.type || 'application/octet-stream',
@@ -21787,15 +21789,15 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
       if (upErr) throw upErr;
       const { data: { publicUrl } } = sb.storage.from('chat-attachments').getPublicUrl(path);
       await sb.from('mcp_npd_documents').insert({
-        plant_id: p.plant_id, project_id: p.id, kind,
+        plant_id: p.plant_id, project_id: p.id, kind: 'model_3d',
         title: file.name.replace(/\.[^.]+$/, ''), file_url: publicUrl,
         file_size: file.size, content_type: file.type, uploaded_by: me.id,
       });
-      await update({ [projectField]: publicUrl });
+      await update({ model_3d_url: publicUrl });
       onReload();
       setCad({ file, mode });
     } catch (e) { alert('Upload failed: ' + e.message); }
-    finally { setUploading(''); }
+    finally { setUploading(false); }
   };
 
   const openExisting = async (doc, mode) => {
@@ -21818,41 +21820,31 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
 
   if (cad) return html`<${CadNexaHandoff} plant=${plant} me=${me} file=${cad.file} mode=${cad.mode} onClose=${() => setCad(null)} />`;
 
-  const fileRow = (doc, mode, btnLabel) => html`
-    <div key=${doc.id} style="display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:7px;margin-top:6px">
-      <span style="font-size:16px">${NPD_DOC_KIND_BY_KEY[doc.kind]?.emoji || '📎'}</span>
+  const modelRow = (doc) => html`
+    <div key=${doc.id} style="display:flex;align-items:center;gap:6px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:7px;margin-top:6px">
+      <span style="font-size:16px">🧊</span>
       <div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${doc.title}</div></div>
       <a href=${doc.file_url} target="_blank" rel="noopener" style="font-size:11px;color:var(--slate-500);text-decoration:none">↗</a>
-      <button class="btn ghost small" style="padding:4px 9px" disabled=${loadingCad} onClick=${() => openExisting(doc, mode)}>${btnLabel}</button>
+      <button class="btn small" style="padding:4px 9px" disabled=${loadingCad} onClick=${() => openExisting(doc, 'balloon')}>🎯 Balloon</button>
+      <button class="btn ghost small" style="padding:4px 9px" disabled=${loadingCad} onClick=${() => openExisting(doc, '3d')}>🧊 3D</button>
     </div>
   `;
 
   return html`
     <div class="card">
-      <div class="card-title">🎯 Drawing &amp; auto-balloon</div>
+      <div class="card-title">🧊 Part model · CadNexa</div>
       <div style="font-size:11.5px;color:var(--slate-500);margin-bottom:8px;line-height:1.45">
-        Upload the customer drawing (PDF / image) and open it in CadNexa. There, run
-        <strong>⚙️ Auto-Dimension → Balloon + Hole Table</strong> to balloon every feature for the feasibility/PPAP study.
-      </div>
-      <input ref=${drawingRef} type="file" accept=".pdf,.png,.jpg,.jpeg,.webp,image/*,application/pdf" style="display:none"
-        onChange=${e => { const f = e.target.files[0]; if (f) uploadAndOpen(f, 'balloon_drawing', 'balloon_drawing_url', 'balloon'); e.target.value=''; }} />
-      <button class="btn small" disabled=${uploading==='drawing'} onClick=${() => drawingRef.current && drawingRef.current.click()}>
-        ${uploading==='drawing' ? 'Uploading…' : '＋ Upload drawing & balloon'}
-      </button>
-      ${drawingDocs.map(d => fileRow(d, 'balloon', '🎯 Balloon'))}
-    </div>
-
-    <div class="card" style="margin-top:10px">
-      <div class="card-title">🧊 3D model</div>
-      <div style="font-size:11.5px;color:var(--slate-500);margin-bottom:8px;line-height:1.45">
-        Upload a STEP / STL / IGES / GLB part to view, measure &amp; weigh it in CadNexa 3D during feasibility.
+        Upload the <strong>3D part</strong> (STEP / IGES / STL / GLB). CadNexa balloons the 2D drawing <em>from the model</em> —
+        <strong>🎯 Balloon</strong> opens the 2D drafter and auto-numbers every feature (balloons + hole table);
+        <strong>🧊 3D</strong> opens the viewer to measure &amp; weigh. <span style="color:var(--slate-400)">(Customer 2D PDF drawing → Documents tab.)</span>
       </div>
       <input ref=${modelRef} type="file" accept=${'.' + NPD_3D_EXT.join(',.')} style="display:none"
-        onChange=${e => { const f = e.target.files[0]; if (f) uploadAndOpen(f, 'model_3d', 'model_3d_url', '3d'); e.target.value=''; }} />
-      <button class="btn small" disabled=${uploading==='model'} onClick=${() => modelRef.current && modelRef.current.click()}>
-        ${uploading==='model' ? 'Uploading…' : '＋ Upload 3D model'}
+        onChange=${e => { const f = e.target.files[0]; if (f) uploadModel(f, 'balloon'); e.target.value=''; }} />
+      <button class="btn small" disabled=${uploading} onClick=${() => modelRef.current && modelRef.current.click()}>
+        ${uploading ? 'Uploading…' : '＋ Upload 3D part & balloon'}
       </button>
-      ${modelDocs.map(d => fileRow(d, '3d', '🧊 Open 3D'))}
+      ${loadingCad && html`<span style="font-size:11px;color:var(--slate-500);margin-left:8px">Opening CadNexa…</span>`}
+      ${modelDocs.map(d => modelRow(d))}
     </div>
 
     <div class="card" style="margin-top:10px">
@@ -21886,22 +21878,29 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
 function CadNexaHandoff({ plant, me, file, mode, onClose }) {
   const iframeRef = useRef(null);
   const src = useMemo(() => {
-    const qs = new URLSearchParams({
+    const params = {
       embed: '1', plant: plant?.name || '', plant_id: plant?.id || '',
       user: me?.full_name || '', email: me?.email || '',
-    }).toString();
-    return '/cadnexa?' + qs;
-  }, [plant?.id, me?.full_name]);
+    };
+    if (mode === 'balloon') params.cxauto = 'balloon';  // CadNexa auto-opens 2D drafter + balloons once the model loads
+    return '/cadnexa?' + new URLSearchParams(params).toString();
+  }, [plant?.id, me?.full_name, mode]);
 
   useEffect(() => {
-    const send = (target) => { try { target && target.postMessage({ type: 'CADNEXA_SHARED_FILE', file }, '*'); } catch(_){} };
+    const cw = () => iframeRef.current && iframeRef.current.contentWindow;
+    const sendFile = (t) => { try { t && t.postMessage({ type: 'CADNEXA_SHARED_FILE', file }, '*'); } catch(_){} };
+    // Unlock CadNexa's engineering tools inside the NPD embed (2D drawing /
+    // ballooning / BOM / estimator). loglinkr and CadNexa are one product, so
+    // plant users get the full feasibility toolset, not the locked guest view.
+    const sendAuth = (t) => { try { t && t.postMessage({ type: 'CNX_AUTH', capabilities: { view3d:true, drawing2d:true, balloonTool:true, faiReport:true, bom:true, estimator:true, rfq:true }, effectivePlan: 'bundle', isDemoMode:false, isAnonymous:false }, '*'); } catch(_){} };
     const onMsg = (e) => {
-      const d = e && e.data;
-      if (d && d.type === 'CADNEXA_REQUEST_SHARED_FILE') send(e.source || (iframeRef.current && iframeRef.current.contentWindow));
+      const d = e && e.data; if (!d) return;
+      if (d.type === 'CADNEXA_REQUEST_SHARED_FILE') sendFile(e.source || cw());
+      if (d.type === 'CNX_REQUEST_AUTH') sendAuth(e.source || cw());
     };
     window.addEventListener('message', onMsg);
-    // Belt-and-suspenders: also push a few times after load in case we missed the request.
-    let n = 0; const h = setInterval(() => { n++; if (n > 8) { clearInterval(h); return; } send(iframeRef.current && iframeRef.current.contentWindow); }, 400);
+    // Belt-and-suspenders: push auth + file a few times in case we miss a request.
+    let n = 0; const h = setInterval(() => { n++; if (n > 10) { clearInterval(h); return; } sendAuth(cw()); sendFile(cw()); }, 400);
     const onKey = (e) => { if (e.key === 'Escape') onClose(); };
     window.addEventListener('keydown', onKey);
     const prev = document.body.style.overflow; document.body.style.overflow = 'hidden';
@@ -21914,7 +21913,7 @@ function CadNexaHandoff({ plant, me, file, mode, onClose }) {
         <span>${mode === '3d' ? '🧊 CadNexa 3D' : '🎯 CadNexa · auto-balloon'}</span>
         <span style="opacity:.6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${file?.name || ''}</span>
         <span style="flex:1"></span>
-        ${mode !== '3d' ? html`<span style="opacity:.7">Run ⚙️ Auto-Dimension for ballooning</span>` : ''}
+        ${mode !== '3d' ? html`<span style="opacity:.7">Ballooning the loaded part…</span>` : ''}
       </div>
       <iframe ref=${iframeRef} src=${src} title="CadNexa"
         allow="fullscreen; clipboard-write; camera; microphone" allowFullScreen
