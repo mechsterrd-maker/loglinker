@@ -21351,7 +21351,8 @@ function TpmTemplateEditor({ plant, me, machineId, onClose }) {
 // actual_date; the trigger cascades phase changes to All Hands chat
 // and auto-creates a PPAP submission row when phase reaches 'ppap'.
 const NPD_PHASES = [
-  { key:'rfq',       label:'RFQ',       emoji:'📥', target:'quote_target_date',     actual:'quote_sent_date' },
+  { key:'rfq',         label:'RFQ',         emoji:'📥', target:'feasibility_target_date', actual:'feasibility_actual_date' },
+  { key:'feasibility', label:'Feasibility', emoji:'🔍', target:'quote_target_date',       actual:'quote_sent_date' },
   { key:'quoted',    label:'Quoted',    emoji:'💬', target:'award_target_date',     actual:'award_actual_date' },
   { key:'awarded',   label:'Awarded',   emoji:'🏆', target:'tooling_target_date',   actual:'tooling_actual_date' },
   { key:'tooling',   label:'Tooling',   emoji:'🛠',  target:'prototype_target_date', actual:'prototype_actual_date' },
@@ -21394,7 +21395,7 @@ function NpdModule({ plant, me, setTab }) {
   if (activeId) {
     const proj = projects.find(p => p.id === activeId);
     if (!proj) { setActiveId(null); return null; }
-    return html`<${NpdDetail} project=${proj} customers=${customers} users=${users} me=${me} onClose=${() => setActiveId(null)} onChanged=${refresh} />`;
+    return html`<${NpdDetail} project=${proj} plant=${plant} customers=${customers} users=${users} me=${me} onClose=${() => setActiveId(null)} onChanged=${refresh} />`;
   }
 
   const today = new Date().toISOString().slice(0,10);
@@ -21597,6 +21598,8 @@ function NpdCreateModal({ plant, me, customers, users, onClose, onSaved }) {
 const NPD_DOC_KINDS = [
   { key:'rfq',              label:'RFQ',                 emoji:'📥' },
   { key:'customer_drawing', label:'Customer drawing',    emoji:'📐' },
+  { key:'balloon_drawing',  label:'Ballooned drawing',   emoji:'🎯' },
+  { key:'model_3d',         label:'3D model',            emoji:'🧊' },
   { key:'quote',            label:'Quote',               emoji:'💬' },
   { key:'feasibility',      label:'Feasibility (FMR)',   emoji:'🔍' },
   { key:'tech_review',      label:'Tech review minutes', emoji:'🧠' },
@@ -21621,10 +21624,10 @@ const NPD_UPDATE_KINDS = [
 ];
 
 // ============= NPD DETAIL =============
-function NpdDetail({ project, customers, users, me, onClose, onChanged }) {
+function NpdDetail({ project, plant, customers, users, me, onClose, onChanged }) {
   const [p, setP] = useState(project);
   const [busy, setBusy] = useState(false);
-  const [view, setView] = useState('timeline'); // timeline | commercials | docs | updates
+  const [view, setView] = useState('timeline'); // timeline | feasibility | commercials | docs | updates
   const [docs, setDocs] = useState([]);
   const [updates, setUpdates] = useState([]);
 
@@ -21687,6 +21690,7 @@ function NpdDetail({ project, customers, users, me, onClose, onChanged }) {
 
     <div class="auth-tabs" style="margin:14px 0;flex-wrap:wrap">
       <button class=${'auth-tab' + (view === 'timeline' ? ' active' : '')} onClick=${() => setView('timeline')}>📅 Timeline</button>
+      <button class=${'auth-tab' + (view === 'feasibility' ? ' active' : '')} onClick=${() => setView('feasibility')}>🔍 Feasibility${p.feasibility_decision ? ' ✓' : ''}</button>
       <button class=${'auth-tab' + (view === 'commercials' ? ' active' : '')} onClick=${() => setView('commercials')}>💰 Commercials</button>
       <button class=${'auth-tab' + (view === 'docs' ? ' active' : '')} onClick=${() => setView('docs')}>📎 Documents · ${docs.length}</button>
       <button class=${'auth-tab' + (view === 'updates' ? ' active' : '')} onClick=${() => setView('updates')}>💬 Updates · ${updates.length}</button>
@@ -21696,6 +21700,7 @@ function NpdDetail({ project, customers, users, me, onClose, onChanged }) {
       <div class="card" style="padding:0">
         ${[
           { label:'RFQ received', target:null, actual:'rfq_received_date' },
+          { label:'Feasibility', target:'feasibility_target_date', actual:'feasibility_actual_date' },
           { label:'Quote', target:'quote_target_date', actual:'quote_sent_date' },
           { label:'Award', target:'award_target_date', actual:'award_actual_date' },
           { label:'Tooling start', target:'tooling_target_date', actual:'tooling_actual_date' },
@@ -21725,9 +21730,194 @@ function NpdDetail({ project, customers, users, me, onClose, onChanged }) {
       ${p.notes && html`<div class="alert info" style="margin-top:14px"><strong>Notes:</strong> ${p.notes}</div>`}
     `}
 
+    ${view === 'feasibility' && html`<${NpdFeasibility} p=${p} me=${me} plant=${plant} busy=${busy} update=${update} docs=${docs} onReload=${reloadChildren} />`}
     ${view === 'commercials' && html`<${NpdCommercials} p=${p} busy=${busy} update=${update} />`}
     ${view === 'docs' && html`<${NpdDocuments} project=${p} me=${me} docs=${docs} onReload=${reloadChildren} />`}
     ${view === 'updates' && html`<${NpdUpdates} project=${p} me=${me} updates=${updates} onReload=${reloadChildren} />`}
+  `;
+}
+
+// ============= NPD FEASIBILITY (CadNexa ballooning + 3D model) =============
+// Sits between RFQ and Quote. Lets the engineer push a customer drawing into
+// CadNexa for auto-ballooning, load a 3D model into the CadNexa 3D viewer, and
+// record a go/no-go decision. Files are stored against the project so they can
+// be reopened later. The CadNexa handoff uses the iframe file bridge
+// (CADNEXA_REQUEST_SHARED_FILE → CADNEXA_SHARED_FILE).
+const FEAS_DECISIONS = [
+  { key:'feasible',              label:'✅ Feasible',                 cls:'emerald' },
+  { key:'feasible_with_changes', label:'🛠 Feasible with changes',    cls:'amber' },
+  { key:'not_feasible',          label:'⛔ Not feasible',             cls:'rose' },
+];
+const NPD_3D_EXT = ['step','stp','stl','iges','igs','glb','gltf','fbx','obj'];
+
+async function npdUrlToFile(url, name, type) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('fetch ' + res.status);
+  const blob = await res.blob();
+  return new File([blob], name || 'file', { type: type || blob.type || 'application/octet-stream' });
+}
+
+function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
+  const drawingRef = useRef(null);
+  const modelRef = useRef(null);
+  const [uploading, setUploading] = useState('');     // 'drawing' | 'model' | ''
+  const [loadingCad, setLoadingCad] = useState(false);
+  const [cad, setCad] = useState(null);               // { file, mode:'balloon'|'3d' } | null
+  const [decision, setDecision] = useState(p.feasibility_decision || '');
+  const [notes, setNotes] = useState(p.feasibility_notes || '');
+
+  const drawingDocs = docs.filter(d => d.kind === 'customer_drawing' || d.kind === 'balloon_drawing');
+  const modelDocs = docs.filter(d => d.kind === 'model_3d');
+
+  // Upload a file → storage + mcp_npd_documents row + stamp the project field,
+  // then immediately hand it to CadNexa.
+  const uploadAndOpen = async (file, kind, projectField, mode) => {
+    if (!file) return;
+    setUploading(kind === 'model_3d' ? 'model' : 'drawing');
+    try {
+      const ext = (file.name.split('.').pop() || 'bin').toLowerCase();
+      const path = 'npd/' + p.plant_id + '/' + p.id + '/' + crypto.randomUUID() + '.' + ext;
+      const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, file, {
+        cacheControl: '3600', contentType: file.type || 'application/octet-stream',
+      });
+      if (upErr) throw upErr;
+      const { data: { publicUrl } } = sb.storage.from('chat-attachments').getPublicUrl(path);
+      await sb.from('mcp_npd_documents').insert({
+        plant_id: p.plant_id, project_id: p.id, kind,
+        title: file.name.replace(/\.[^.]+$/, ''), file_url: publicUrl,
+        file_size: file.size, content_type: file.type, uploaded_by: me.id,
+      });
+      await update({ [projectField]: publicUrl });
+      onReload();
+      setCad({ file, mode });
+    } catch (e) { alert('Upload failed: ' + e.message); }
+    finally { setUploading(''); }
+  };
+
+  const openExisting = async (doc, mode) => {
+    setLoadingCad(true);
+    try {
+      const f = await npdUrlToFile(doc.file_url, doc.title, doc.content_type);
+      setCad({ file: f, mode });
+    } catch (e) { alert('Could not load into CadNexa: ' + e.message); }
+    finally { setLoadingCad(false); }
+  };
+
+  const saveDecision = async () => {
+    const patch = { feasibility_decision: decision || null, feasibility_notes: notes || null };
+    if (decision && !p.feasibility_actual_date) patch.feasibility_actual_date = new Date().toISOString().slice(0,10);
+    if ((decision === 'feasible' || decision === 'feasible_with_changes') && (p.phase === 'rfq' || p.phase === 'feasibility')) {
+      patch.phase = 'quoted';
+    }
+    await update(patch);
+  };
+
+  if (cad) return html`<${CadNexaHandoff} plant=${plant} me=${me} file=${cad.file} mode=${cad.mode} onClose=${() => setCad(null)} />`;
+
+  const fileRow = (doc, mode, btnLabel) => html`
+    <div key=${doc.id} style="display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:7px;margin-top:6px">
+      <span style="font-size:16px">${NPD_DOC_KIND_BY_KEY[doc.kind]?.emoji || '📎'}</span>
+      <div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${doc.title}</div></div>
+      <a href=${doc.file_url} target="_blank" rel="noopener" style="font-size:11px;color:var(--slate-500);text-decoration:none">↗</a>
+      <button class="btn ghost small" style="padding:4px 9px" disabled=${loadingCad} onClick=${() => openExisting(doc, mode)}>${btnLabel}</button>
+    </div>
+  `;
+
+  return html`
+    <div class="card">
+      <div class="card-title">🎯 Drawing &amp; auto-balloon</div>
+      <div style="font-size:11.5px;color:var(--slate-500);margin-bottom:8px;line-height:1.45">
+        Upload the customer drawing (PDF / image) and open it in CadNexa. There, run
+        <strong>⚙️ Auto-Dimension → Balloon + Hole Table</strong> to balloon every feature for the feasibility/PPAP study.
+      </div>
+      <input ref=${drawingRef} type="file" accept=".pdf,.png,.jpg,.jpeg,.webp,image/*,application/pdf" style="display:none"
+        onChange=${e => { const f = e.target.files[0]; if (f) uploadAndOpen(f, 'balloon_drawing', 'balloon_drawing_url', 'balloon'); e.target.value=''; }} />
+      <button class="btn small" disabled=${uploading==='drawing'} onClick=${() => drawingRef.current && drawingRef.current.click()}>
+        ${uploading==='drawing' ? 'Uploading…' : '＋ Upload drawing & balloon'}
+      </button>
+      ${drawingDocs.map(d => fileRow(d, 'balloon', '🎯 Balloon'))}
+    </div>
+
+    <div class="card" style="margin-top:10px">
+      <div class="card-title">🧊 3D model</div>
+      <div style="font-size:11.5px;color:var(--slate-500);margin-bottom:8px;line-height:1.45">
+        Upload a STEP / STL / IGES / GLB part to view, measure &amp; weigh it in CadNexa 3D during feasibility.
+      </div>
+      <input ref=${modelRef} type="file" accept=${'.' + NPD_3D_EXT.join(',.')} style="display:none"
+        onChange=${e => { const f = e.target.files[0]; if (f) uploadAndOpen(f, 'model_3d', 'model_3d_url', '3d'); e.target.value=''; }} />
+      <button class="btn small" disabled=${uploading==='model'} onClick=${() => modelRef.current && modelRef.current.click()}>
+        ${uploading==='model' ? 'Uploading…' : '＋ Upload 3D model'}
+      </button>
+      ${modelDocs.map(d => fileRow(d, '3d', '🧊 Open 3D'))}
+    </div>
+
+    <div class="card" style="margin-top:10px">
+      <div class="card-title">🔍 Feasibility decision</div>
+      <div class="field"><label>Target date</label>
+        <input type="date" value=${p.feasibility_target_date || ''} disabled=${busy}
+          onChange=${e => update({ feasibility_target_date: e.target.value || null })} />
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin:8px 0">
+        ${FEAS_DECISIONS.map(d => html`
+          <button key=${d.key} type="button" onClick=${() => setDecision(d.key)}
+            class=${'btn ' + (decision === d.key ? '' : 'ghost') + ' small'}
+            style=${'padding:6px 12px' + (decision === d.key ? '' : ';opacity:.8')}>${d.label}</button>
+        `)}
+      </div>
+      <div class="field"><label>Feasibility notes</label>
+        <textarea rows=${3} value=${notes} onChange=${e => setNotes(e.target.value)}
+          placeholder="Process route, tooling concept, risks, DFM changes requested…"></textarea>
+      </div>
+      ${p.feasibility_actual_date && html`<div style="font-size:11px;color:var(--emerald-700);margin-bottom:8px">Feasibility marked ${p.feasibility_actual_date}</div>`}
+      <button class="btn" disabled=${busy || !decision} onClick=${saveDecision}>
+        ${busy ? 'Saving…' : 'Save feasibility' + ((decision === 'feasible' || decision === 'feasible_with_changes') && (p.phase === 'rfq' || p.phase === 'feasibility') ? ' → move to Quoted' : '')}
+      </button>
+    </div>
+  `;
+}
+
+// CadNexa fullscreen handoff: embeds the viewer and pushes `file` into it via
+// the postMessage bridge. CadNexa polls the parent with CADNEXA_REQUEST_SHARED_FILE;
+// we answer with CADNEXA_SHARED_FILE { file } (a real File, structured-cloned).
+function CadNexaHandoff({ plant, me, file, mode, onClose }) {
+  const iframeRef = useRef(null);
+  const src = useMemo(() => {
+    const qs = new URLSearchParams({
+      embed: '1', plant: plant?.name || '', plant_id: plant?.id || '',
+      user: me?.full_name || '', email: me?.email || '',
+    }).toString();
+    return '/cadnexa?' + qs;
+  }, [plant?.id, me?.full_name]);
+
+  useEffect(() => {
+    const send = (target) => { try { target && target.postMessage({ type: 'CADNEXA_SHARED_FILE', file }, '*'); } catch(_){} };
+    const onMsg = (e) => {
+      const d = e && e.data;
+      if (d && d.type === 'CADNEXA_REQUEST_SHARED_FILE') send(e.source || (iframeRef.current && iframeRef.current.contentWindow));
+    };
+    window.addEventListener('message', onMsg);
+    // Belt-and-suspenders: also push a few times after load in case we missed the request.
+    let n = 0; const h = setInterval(() => { n++; if (n > 8) { clearInterval(h); return; } send(iframeRef.current && iframeRef.current.contentWindow); }, 400);
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    const prev = document.body.style.overflow; document.body.style.overflow = 'hidden';
+    return () => { window.removeEventListener('message', onMsg); window.removeEventListener('keydown', onKey); clearInterval(h); document.body.style.overflow = prev; };
+  }, [file]);
+
+  return html`
+    <div style="position:fixed;inset:0;z-index:9999;background:#0e1118;display:flex;flex-direction:column">
+      <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:#0e1118;color:#cbd5e1;font-size:12px;border-bottom:1px solid #1e293b">
+        <span>${mode === '3d' ? '🧊 CadNexa 3D' : '🎯 CadNexa · auto-balloon'}</span>
+        <span style="opacity:.6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${file?.name || ''}</span>
+        <span style="flex:1"></span>
+        ${mode !== '3d' ? html`<span style="opacity:.7">Run ⚙️ Auto-Dimension for ballooning</span>` : ''}
+      </div>
+      <iframe ref=${iframeRef} src=${src} title="CadNexa"
+        allow="fullscreen; clipboard-write; camera; microphone" allowFullScreen
+        style="border:0;flex:1;width:100%;display:block;background:#0e1118"></iframe>
+      <button onClick=${onClose} aria-label="Close"
+        style="position:absolute;top:max(8px,env(safe-area-inset-top));right:max(12px,env(safe-area-inset-right));z-index:10000;width:40px;height:40px;border-radius:50%;border:0;background:rgba(15,23,42,.82);color:#fff;font-size:20px;cursor:pointer;backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center">×</button>
+    </div>
   `;
 }
 
