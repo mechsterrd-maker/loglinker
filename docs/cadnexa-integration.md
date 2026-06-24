@@ -36,11 +36,75 @@ In `app.html` boot, read the query string. If `tool === 'autoBalloon'`:
 2. Auto-run the ballooning routine once the drawing is loaded.
 3. Remember `returnTo` and `projectId` for the export step below.
 
+### HOOK A (recommended) — self-contained loader, no internal function names
+
+Paste this once near the end of CadNexa `app.html` (before `</body>`). It fetches
+the drawing and feeds it into the existing **"Drop drawing here"** upload box by
+setting the file `<input>` and firing a synthetic drop — so it works without
+knowing CadNexa's internal loader names. Verified against the tool UI
+("Drop drawing here · PDF · JPG · PNG" + "✨ Auto-detect dimensions").
+
+```js
+<script>
+(function loglinkrAutoBalloon () {
+  var q = new URLSearchParams(location.search);
+  if (q.get('tool') !== 'autoBalloon') return;
+  var fileUrl  = q.get('fileUrl'); if (!fileUrl) return;
+  var fileName = q.get('fileName') || 'drawing.pdf';
+
+  // Keep return context so exports can post back to loglinkr (see HOOK B).
+  window.__cnxReturn = { returnTo: q.get('returnTo') || '', projectId: q.get('projectId') || '', opener: window.opener || null };
+
+  function deliver (file) {
+    var input = document.querySelector('input[type=file]');
+    if (input) {                                   // react-dropzone hidden input
+      var dt = new DataTransfer(); dt.items.add(file);
+      input.files = dt.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    // also simulate a real drop in case the zone is drop-only
+    try {
+      var zone = document.querySelector('[data-dropzone],.dropzone') || document.body;
+      var dt2 = new DataTransfer(); dt2.items.add(file);
+      ['dragenter','dragover','drop'].forEach(function (t) {
+        var ev = new DragEvent(t, { bubbles: true, cancelable: true });
+        Object.defineProperty(ev, 'dataTransfer', { value: dt2 });
+        zone.dispatchEvent(ev);
+      });
+    } catch (_) {}
+  }
+
+  function go (tries) {
+    tries = tries || 0;
+    if (!document.querySelector('input[type=file]') && tries < 40) { return setTimeout(function(){ go(tries+1); }, 250); }
+    fetch(fileUrl).then(function (r) { return r.blob(); }).then(function (b) {
+      var lower = fileName.toLowerCase();
+      var type = b.type || (lower.endsWith('.pdf') ? 'application/pdf' : 'image/' + lower.split('.').pop());
+      deliver(new File([b], fileName, { type: type }));
+      // Optional: auto-click "Auto-detect dimensions" once the file is in.
+      // setTimeout(function(){ var btn=[].find.call(document.querySelectorAll('button'),function(x){return /Auto-detect dimensions/i.test(x.textContent);}); if(btn) btn.click(); }, 1200);
+    }).catch(function (e) { console.warn('[autoBalloon] fetch failed', e); });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function(){ go(); });
+  else go();
+})();
+</script>
+```
+
+> Note: the drawing's `fileUrl` is a public Supabase URL on loglinkr's storage —
+> a cross-origin `fetch` from cadnexa.com works as long as that bucket allows
+> public GET (it does today). If a CORS error appears, allow `cadnexa.com` on
+> the storage bucket.
+
+### HOOK A (alternative) — wire to CadNexa's own loader (if you prefer)
+
 ```js
 // --- HOOK A: loglinkr Auto-Balloon deep link -------------------------------
 (function initLoglinkrAutoBalloon () {
   const q = new URLSearchParams(location.search);
   if (q.get('tool') !== 'autoBalloon') return;
+
+  window.__cnxReturn = {
 
   window.__cnxReturn = {
     returnTo:  q.get('returnTo')  || '',          // loglinkr origin to post back to
