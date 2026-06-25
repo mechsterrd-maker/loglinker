@@ -12523,7 +12523,7 @@ function QuotationEditor({ plant, me, quote, onClose, onSaved }) {
     } catch (e) { alert('Save failed: ' + e.message); } finally { setBusy(false); }
   };
 
-  const print = () => quotationPrint({ ...form, qty, mat_weight_g: matWeight, mat_cost: matCost, grand_total: grandTotal }, items, plant);
+  const print = () => quotationPrint({ ...form, qty, mat_weight_g: matWeight, mat_cost: matCost, grand_total: grandTotal }, items, plant).catch(e => alert('PDF failed: ' + (e.message||e)));
 
   if (loadingItems) return html`<div class="loader"><div class="spinner"></div></div>`;
 
@@ -12633,62 +12633,66 @@ function QuotationEditor({ plant, me, quote, onClose, onSaved }) {
 
 // Clean printable quotation → opens a hidden iframe and triggers the browser
 // print dialog (Save as PDF / share).
-function quotationPrint(q, items, plant) {
-  const esc = (s) => String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-  const matDesc = [q.mat_dia?('⌀'+q.mat_dia+'mm'):'', q.mat_length?(q.mat_length+'mm cut'):'', q.mat_weight_g?(Math.round(q.mat_weight_g)+'g'):'', q.mat_rate?('@ ₹'+q.mat_rate+'/kg'):''].filter(Boolean).join(' · ');
-  const rows = [`<tr><td>Material cost</td><td>${esc(q.material||'')}${matDesc?' — '+esc(matDesc):''}</td><td class="r">${inr(q.mat_cost)}</td></tr>`];
-  let processTotal = 0;
-  (items||[]).forEach(it => {
-    const pr = Number(it.price)||0;
-    if (!it.process && !it.description && !pr) return;
-    processTotal += pr;
-    rows.push(`<tr><td>${esc(it.process||'')}</td><td>${esc(it.description||'')}</td><td class="r">${inr(pr)}</td></tr>`);
-  });
-  const qty = Number(q.qty)||1;
+function quoteLoadScript(src) { return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => rej(new Error('load failed: ' + src)); document.head.appendChild(s); }); }
+async function ensureJsPDF() {
+  if (!(window.jspdf && window.jspdf.jsPDF)) await quoteLoadScript('https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js');
+  if (!(window.jspdf.jsPDF.API && window.jspdf.jsPDF.API.autoTable)) await quoteLoadScript('https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.min.js');
+}
+// jsPDF (helvetica) has no ₹ glyph — use "Rs." in the PDF.
+const rs = (n) => 'Rs. ' + (Math.round((Number(n)||0)*100)/100).toLocaleString('en-IN', { minimumFractionDigits:2, maximumFractionDigits:2 });
+
+// Generate the quotation as a real PDF and download it named "<part>_quote.pdf".
+async function quotationPrint(q, items, plant) {
+  await ensureJsPDF();
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit:'mm', format:'a4' });
+  const PW = 210, M = 14, qty = Number(q.qty)||1;
+
+  doc.setFont('helvetica','bold'); doc.setFontSize(20); doc.setTextColor(13,148,136);
+  doc.text('QUOTATION', M, 20);
+  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(71,85,105);
+  doc.text((q.quote_no?('No: '+q.quote_no+'    '):'') + 'Date: ' + new Date().toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'}), M, 26);
+  doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(15,23,42);
+  doc.text(String(plant.name||''), PW-M, 19, { align:'right' });
+  if (q.customer_name) { doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(71,85,105); doc.text('To: ' + q.customer_name, PW-M, 25, { align:'right' }); }
+  doc.setDrawColor(13,148,136); doc.setLineWidth(0.6); doc.line(M, 30, PW-M, 30);
+  doc.setFont('helvetica','normal'); doc.setFontSize(9.5); doc.setTextColor(15,23,42);
+  let meta = 'Product: ' + (q.product_name||'');
+  if (q.material) meta += '     Material: ' + q.material;
+  if (qty>1) meta += '     Qty: ' + qty;
+  doc.text(meta, M, 37);
+
+  let processTotal = 0; const body = [];
+  const matDesc = [q.mat_dia?('Dia '+q.mat_dia+'mm'):'', q.mat_length?(q.mat_length+'mm cut'):'', q.mat_weight_g?(Math.round(q.mat_weight_g)+'g'):'', q.mat_rate?('@ Rs.'+q.mat_rate+'/kg'):''].filter(Boolean).join(' · ');
+  body.push(['Material cost', (q.material||'') + (matDesc?(' — '+matDesc):''), rs(q.mat_cost)]);
+  (items||[]).forEach(it => { const pr = Number(it.price)||0; if (!it.process && !it.description && !pr) return; processTotal += pr; body.push([it.process||'', it.description||'', rs(pr)]); });
   const bk = computeQuoteBreakup(q.mat_cost, processTotal, qty, q);
-  rows.push(`<tr class="sub"><td colspan="2">Prime cost (material + process)</td><td class="r">${inr(bk.prime)}</td></tr>`);
-  bk.lines.forEach(l => rows.push(`<tr><td>${esc(l.label)}</td><td>${esc(l.note||'')}</td><td class="r">${inr(l.amt)}</td></tr>`));
-  const grand = bk.final;
+  const primeIdx = body.length;
+  body.push(['Prime cost (material + process)', '', rs(bk.prime)]);
+  bk.lines.forEach(l => body.push([l.label, l.note||'', rs(l.amt)]));
+
+  doc.autoTable({
+    startY: 41, head: [['Process','Description','Price (INR)']], body,
+    styles: { fontSize:9, cellPadding:2.2, lineColor:[226,232,240], lineWidth:0.1, textColor:[30,41,59] },
+    headStyles: { fillColor:[13,148,136], textColor:255, fontStyle:'bold' },
+    alternateRowStyles: { fillColor:[248,250,252] },
+    columnStyles: { 0:{cellWidth:42}, 2:{halign:'right', cellWidth:30} },
+    didParseCell: (d) => { if (d.section==='body' && d.row.index===primeIdx) { d.cell.styles.fontStyle='bold'; d.cell.styles.fillColor=[238,242,247]; } },
+    margin: { left:M, right:M },
+  });
+
+  let y = doc.lastAutoTable.finalY + 9;
+  doc.setDrawColor(15,23,42); doc.setLineWidth(0.5); doc.line(PW-M-72, y-4, PW-M, y-4);
+  doc.setFont('helvetica','bold'); doc.setFontSize(13); doc.setTextColor(13,148,136);
+  doc.text('Grand Total' + (qty>1?' / piece':''), PW-M-72, y+1);
+  doc.text(rs(bk.final), PW-M, y+1, { align:'right' });
+  y += 8;
+  if (qty>1) { doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(71,85,105); doc.text('Order value x ' + qty + ' pcs', PW-M-72, y); doc.text(rs(bk.final*qty), PW-M, y, { align:'right' }); y += 7; }
+  if (q.notes) { doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(71,85,105); const ls = doc.splitTextToSize('Notes: ' + q.notes, PW-2*M); doc.text(ls, M, y+5); }
+  doc.setFontSize(8); doc.setTextColor(148,163,184); doc.text('Generated by Loglinkr · ' + (plant.name||''), M, 289);
+
   const fileTitle = ((q.product_name ? String(q.product_name).trim() : 'Quotation').replace(/[\\/:*?"<>|]+/g,' ').trim() || 'Quotation') + '_quote';
-  const docHtml = `<!doctype html><html><head><meta charset="utf-8"><title>${esc(fileTitle)}</title><style>
-    @page{size:A4;margin:14mm} *{box-sizing:border-box} body{font-family:Arial,Helvetica,sans-serif;color:#0f172a;margin:0}
-    h1{color:#0d9488;font-size:23px;margin:0 0 2px;letter-spacing:.5px} .meta{font-size:12px;color:#475569}
-    .hdr{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #0d9488;padding-bottom:10px;margin-bottom:12px}
-    .plant{font-size:16px;font-weight:700;color:#0f172a}
-    table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12.5px}
-    th{background:#0d9488;color:#fff;text-align:left;padding:8px 10px;font-size:11px;letter-spacing:.3px}
-    th.r,td.r{text-align:right;white-space:nowrap} td{padding:8px 10px;border-bottom:1px solid #e2e8f0}
-    tbody tr:nth-child(even){background:#f8fafc} tr.sub td{font-weight:700;background:#eef2f7}
-    .total{display:flex;justify-content:flex-end;margin-top:14px} .box{min-width:250px}
-    .line{display:flex;justify-content:space-between;font-size:13px;padding:3px 0;color:#475569}
-    .grand{display:flex;justify-content:space-between;font-size:17px;font-weight:800;border-top:2px solid #0f172a;margin-top:6px;padding-top:8px;color:#0d9488}
-    .notes{margin-top:18px;font-size:11.5px;color:#475569;white-space:pre-wrap}
-    .foot{margin-top:30px;font-size:10.5px;color:#94a3b8;border-top:1px solid #e2e8f0;padding-top:8px}
-  </style></head><body>
-    <div class="hdr">
-      <div><h1>QUOTATION</h1><div class="meta">${q.quote_no?('No: '+esc(q.quote_no)+' · '):''}Date: ${new Date().toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}</div></div>
-      <div style="text-align:right"><div class="plant">${esc(plant.name||'')}</div>${q.customer_name?('<div class="meta">To: '+esc(q.customer_name)+'</div>'):''}</div>
-    </div>
-    <div class="meta"><b>Product:</b> ${esc(q.product_name||'')}${q.material?(' &nbsp;|&nbsp; <b>Material:</b> '+esc(q.material)):''}${qty>1?(' &nbsp;|&nbsp; <b>Qty:</b> '+qty):''}</div>
-    <table><thead><tr><th style="width:24%">Process</th><th>Description</th><th class="r" style="width:18%">Price (INR)</th></tr></thead><tbody>${rows.join('')}</tbody></table>
-    <div class="total"><div class="box">
-      <div class="grand"><span>Grand Total${qty>1?' / piece':''}</span><span>${inr(grand)}</span></div>
-      ${qty>1?('<div class="line"><span>Order value × '+qty+' pcs</span><span>'+inr(grand*qty)+'</span></div>'):''}
-    </div></div>
-    ${q.notes?('<div class="notes"><b>Notes:</b> '+esc(q.notes)+'</div>'):''}
-    <div class="foot">Generated by Loglinkr · ${esc(plant.name||'')}</div>
-  </body></html>`;
-  const ifr = document.createElement('iframe');
-  ifr.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0';
-  document.body.appendChild(ifr);
-  ifr.srcdoc = docHtml;
-  ifr.onload = () => {
-    const prev = document.title;
-    try { ifr.contentWindow.document.title = fileTitle; document.title = fileTitle; } catch(_){}  // print dialog uses title as the default filename
-    try { ifr.contentWindow.focus(); ifr.contentWindow.print(); } catch(_){}
-    try { document.title = prev; } catch(_){}
-    setTimeout(() => ifr.remove(), 60000);
-  };
+  doc.save(fileTitle + '.pdf');
 }
 
 // =================================================================
