@@ -12115,32 +12115,60 @@ function SelfAttendancePage({ plant, me, reload }) {
   };
   useEffect(() => () => stopCamera(), []);
 
+  // jsQR fallback for browsers without BarcodeDetector (iOS Safari, Firefox,
+  // desktop Safari — i.e. most non-Android phones). Lazy-loaded on first scan.
+  const loadJsQR = () => new Promise((resolve, reject) => {
+    if (window.jsQR) return resolve(window.jsQR);
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js';
+    s.onload = () => resolve(window.jsQR);
+    s.onerror = () => reject(new Error('load failed'));
+    document.head.appendChild(s);
+  });
+
   const startScan = async (punchType) => {
     setError(''); setScannedCode('');
-    if (!window.BarcodeDetector) {
-      setError('Your browser can\'t scan QR codes natively. Update Chrome (Android) or Safari (iOS 17+), or ask your supervisor to mark manually.');
-      return;
-    }
     setPhase('camera');
+    const hasNative = !!window.BarcodeDetector;
+    let jsqr = null;
+    if (!hasNative) {
+      try { jsqr = await loadJsQR(); }
+      catch (_) { setError('Could not load the QR scanner — check your connection and retry.'); setPhase('idle'); return; }
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
       streamRef.current = stream;
       // Wait for the video element to mount on the next render before binding.
       setTimeout(() => {
-        if (!videoRef.current) return;
-        videoRef.current.srcObject = stream;
-        videoRef.current.play().catch(() => {});
-        detectorRef.current = new window.BarcodeDetector({ formats: ['qr_code'] });
+        const video = videoRef.current;
+        if (!video) return;
+        video.srcObject = stream;
+        video.play().catch(() => {});
+        if (hasNative) detectorRef.current = new window.BarcodeDetector({ formats: ['qr_code'] });
+        const canvas = hasNative ? null : document.createElement('canvas');
+        const ctx = canvas ? canvas.getContext('2d', { willReadFrequently: true }) : null;
+        const onCode = async (raw) => {
+          if (!raw) return false;
+          setScannedCode(raw);
+          stopCamera();
+          await captureGpsAndSubmit(punchType, raw);
+          return true;
+        };
         const loop = async () => {
-          if (!videoRef.current || !detectorRef.current) return;
+          if (!videoRef.current) return;
           try {
-            const codes = await detectorRef.current.detect(videoRef.current);
-            if (codes && codes.length > 0) {
-              const raw = codes[0].rawValue || '';
-              setScannedCode(raw);
-              stopCamera();
-              await captureGpsAndSubmit(punchType, raw);
-              return;
+            if (hasNative) {
+              const codes = await detectorRef.current.detect(video);
+              if (codes && codes.length && await onCode(codes[0].rawValue || '')) return;
+            } else if (jsqr && video.videoWidth) {
+              // Decode at reduced resolution for speed.
+              const tw = 640, scale = video.videoWidth > tw ? tw / video.videoWidth : 1;
+              canvas.width = Math.round(video.videoWidth * scale);
+              canvas.height = Math.round(video.videoHeight * scale);
+              ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+              const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+              const res = jsqr(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
+              if (res && res.data && await onCode(res.data)) return;
             }
           } catch (_) {}
           rafRef.current = requestAnimationFrame(loop);
