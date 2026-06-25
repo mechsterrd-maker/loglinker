@@ -11856,12 +11856,20 @@ function AttendanceModule({ plant, me, activeUnit }) {
   }, [employees, search]);
 
   const mark = async (employeeId, newStatus) => {
+    // On Duty can carry hours so payroll pays OT beyond the shift.
+    const extra = {};
+    if (newStatus === 'on_duty') {
+      const h = prompt('On Duty — hours worked? (blank = full day; more than the shift = overtime)');
+      if (h === null) return;                       // cancelled
+      const hn = h.trim() === '' ? null : Number(h);
+      extra.hours_worked = (hn && hn > 0) ? hn : null;
+    }
     setSavingId(employeeId);
     try {
       const existing = recByEmpDate[employeeId]?.[date];
       if (existing) {
         const { error } = await sb.from('mcp_attendance')
-          .update({ status: newStatus, marked_by: me.id })
+          .update({ status: newStatus, marked_by: me.id, ...extra })
           .eq('id', existing.id);
         if (error) throw error;
       } else {
@@ -11872,6 +11880,7 @@ function AttendanceModule({ plant, me, activeUnit }) {
           date: date,
           status: newStatus,
           marked_by: me.id,
+          ...extra,
         });
         if (error) throw error;
       }
@@ -12159,7 +12168,7 @@ function PayrollModule({ plant, me }) {
     const leaveAllow = Number(cfg.paid_leave_days) || 0;     // forgiven leave days / month
     const dailyRate = divisor>0 ? salary/divisor : 0;
     const hourly = shift>0 ? dailyRate/shift : 0;
-    let normalDelta=0, sundayHolidayOT=0, presentDays=0, leaveDays=0, absentDays=0, worked=0;
+    let normalDelta=0, sundayHolidayOT=0, odOT=0, presentDays=0, leaveDays=0, absentDays=0, worked=0;
     for (const dstr of days) {
       const r = recByUserDate[emp.id]?.[dstr];
       if (!r) continue;
@@ -12171,9 +12180,10 @@ function PayrollModule({ plant, me }) {
       if (!h || h<=0) continue;
       worked += h;
       if (isSun(dstr) || holidaySet.has(dstr)) sundayHolidayOT += h;     // weekend/holiday → all OT
+      else if (r.status==='on_duty') odOT += Math.max(0, h - shift);     // on duty → OT only beyond shift, never short
       else normalDelta += (h - shift);                                    // net vs shift, settled monthly
     }
-    const otHours = Math.max(0, normalDelta) + sundayHolidayOT;
+    const otHours = Math.max(0, normalDelta) + sundayHolidayOT + odOT;
     const shortHours = Math.max(0, -normalDelta);
     const billableShort = Math.max(0, shortHours - permAllow);           // after permission allowance
     const lopLeave = Math.max(0, leaveDays - leaveAllow);                 // leave beyond allowance
@@ -12852,8 +12862,12 @@ function SelfAttendancePage({ plant, me, reload }) {
   const markOnDuty = () => {
     const note = prompt('On Duty — where / why? (optional)');
     if (note === null) return;   // cancelled
+    const hStr = prompt('Hours worked today? (blank = full day; enter more than your shift to claim overtime)');
+    if (hStr === null) return;   // cancelled
+    const hn = hStr.trim() === '' ? null : Number(hStr);
+    const hours = (hn && hn > 0) ? hn : null;
     setError(''); setBusy(true);
-    const submit = (lat, lng) => sb.rpc('attendance_self_mark_onduty', { p_plant_id: plant.id, p_lat: lat, p_lng: lng, p_note: note || null })
+    const submit = (lat, lng) => sb.rpc('attendance_self_mark_onduty', { p_plant_id: plant.id, p_lat: lat, p_lng: lng, p_note: note || null, p_hours: hours })
       .then(({ data, error: err }) => {
         if (err) throw err;
         if (!data?.success) { setError(data?.error || 'Failed to mark On Duty'); return; }
@@ -12923,9 +12937,9 @@ function SelfAttendancePage({ plant, me, reload }) {
       `}
     `}
 
-    ${phase === 'idle' && !punchedOut && today?.status !== 'on_duty' && html`
-      <button class="btn" disabled=${busy} onClick=${markOnDuty} style="width:100%;padding:14px;font-size:15px;font-weight:700;margin-top:10px;background:linear-gradient(135deg,#0284c7,#0ea5e9)">🚗 Mark On Duty (off-site)</button>
-      <div style="font-size:11px;color:var(--slate-400);text-align:center;margin-top:6px">Out on field / customer visit? Log On Duty — no gate QR needed.</div>
+    ${phase === 'idle' && !punchedOut && html`
+      <button class="btn" disabled=${busy} onClick=${markOnDuty} style="width:100%;padding:14px;font-size:15px;font-weight:700;margin-top:10px;background:linear-gradient(135deg,#0284c7,#0ea5e9)">🚗 ${today?.status === 'on_duty' ? 'Update On Duty (hours / reason)' : 'Mark On Duty (off-site)'}</button>
+      <div style="font-size:11px;color:var(--slate-400);text-align:center;margin-top:6px">Out on field / customer visit? Log On Duty — no gate QR needed. Enter hours to claim overtime.</div>
     `}
 
     ${(phase === 'camera') && html`
