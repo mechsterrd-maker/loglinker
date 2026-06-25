@@ -1671,6 +1671,7 @@ const MORE_GROUPS = [
     sub: 'Money flow · sales / vendor / GRN',
     items: [
       { key:'sales_docs',          icon:'📤', label:'Make Documents',            sub:'DC · Invoice · PO · Packing list · per-plant continuous numbering' },
+      { key:'quotation',           icon:'🧮', label:'Quotation · Costing',       sub:'Machining part quotes — material cost from bar size + process charges' },
       { key:'doc_formats',         icon:'🎨', label:'Doc Formats',               sub:'AI-built print templates for every document type' },
       { key:'documents',           icon:'📄', label:'Documents · Bills',         sub:'OCR vendor invoices/DCs, payments, vendors' },
       { key:'movements',           icon:'🔀', label:'Movements',                 sub:'In/out material flow, GRN verification' },
@@ -1699,7 +1700,7 @@ const MORE_FLAT_KEYS = MORE_GROUPS.flatMap(g => g.items.map(i => i.key));
 // module (attendance, petty cash, self-attendance) from showing up in every
 // existing plant the moment it ships. To roll a module out to an existing
 // plant, add its key to that plant's plants.enabled_tabs.
-const OPT_IN_TAB_KEYS = new Set(['self_attendance', 'attendance', 'attendance_setup', 'petty_cash', 'npd']);
+const OPT_IN_TAB_KEYS = new Set(['self_attendance', 'attendance', 'attendance_setup', 'petty_cash', 'npd', 'quotation']);
 
 // Fabrication & site-works plants don't run PDC casting — they get Projects,
 // commercial docs and expenses instead of the manufacturing/casting surface.
@@ -2112,6 +2113,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${tab === 'risk_register'}><${RiskRegisterModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'contingency'}><${ContingencyModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${tab === 'npd'}><${NpdModule} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
+      <${Page} active=${tab === 'quotation'}><${QuotationModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'tpm'}><${TpmModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'rejection_types'}><${RejectionTypesModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${tab === 'cad3d'}><${CadNexaEmbed} plant=${plant} me=${me} user=${user} /></${Page}>
@@ -12352,6 +12354,271 @@ function PayrollHolidays({ plant, holidays, onChange }) {
         `)}
     </div>
   `;
+}
+
+// =================================================================
+// QUOTATION / COSTING — machining part quotes. Material cost auto-computed
+// from bar geometry (dia/width × length × density × rate) + process charges.
+// grand_total = material cost + sum(process prices).
+// =================================================================
+const QUOTE_MATERIALS = [
+  { name:'EN1A (free-cutting steel)', density:7.85 },
+  { name:'EN8 / EN19 (alloy steel)',  density:7.85 },
+  { name:'Mild steel',                density:7.85 },
+  { name:'Stainless steel',           density:8.0 },
+  { name:'Cast iron',                 density:7.2 },
+  { name:'Aluminium',                 density:2.7 },
+  { name:'Brass',                     density:8.5 },
+  { name:'Copper',                    density:8.96 },
+];
+
+// Cross-section × length × density → grams. dia/width/length in mm.
+function quoteWeightGrams(shape, dia, width, length, density) {
+  const d = Number(dia)||0, w = Number(width)||0, L = Number(length)||0, rho = Number(density)||0;
+  if (!L || !rho) return 0;
+  let areaCm2;
+  if (shape === 'flat') areaCm2 = (d/10) * (w/10);
+  else if (shape === 'tube') areaCm2 = Math.PI/4 * ((d/10)*(d/10) - (w/10)*(w/10));
+  else areaCm2 = Math.PI/4 * (d/10)*(d/10);
+  if (areaCm2 <= 0) return 0;
+  return areaCm2 * (L/10) * rho;
+}
+
+const inr = (n) => '₹' + (Math.round((Number(n)||0)*100)/100).toLocaleString('en-IN', { minimumFractionDigits:2, maximumFractionDigits:2 });
+
+function QuotationModule({ plant, me }) {
+  const [quotes, setQuotes] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [activeId, setActiveId] = useState(null);
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('mcp_quotations').select('*').eq('plant_id', plant.id).order('created_at', { ascending:false });
+    setQuotes(data || []); setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  if (activeId) {
+    const quote = activeId === 'new' ? null : quotes.find(q => q.id === activeId);
+    return html`<${QuotationEditor} plant=${plant} me=${me} quote=${quote} onClose=${() => setActiveId(null)} onSaved=${() => { setActiveId(null); refresh(); }} />`;
+  }
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap">
+      <div><h1>🧮 Quotation · Costing</h1><div class="sub">Machining part quotes · material + process breakup</div></div>
+      <button class="btn small" onClick=${() => setActiveId('new')}>+ New Quote</button>
+    </div>
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>`
+      : quotes.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🧮</div><div style="font-size:13px">No quotations yet. Tap <b>+ New Quote</b> to cost a part.</div></div></div>`
+      : quotes.map(q => html`
+        <div class="card" key=${q.id} onClick=${() => setActiveId(q.id)} style="cursor:pointer;margin-bottom:8px;padding:12px 14px">
+          <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">
+            <div style="flex:1;min-width:150px">
+              <div style="font-size:11px;color:var(--slate-500);font-weight:600">${q.quote_no || '—'}</div>
+              <div style="font-size:14px;font-weight:600">${q.product_name}</div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${q.customer_name || ''}${q.material ? (q.customer_name?' · ':'') + q.material : ''}</div>
+            </div>
+            <div style="text-align:right">
+              <div style="font-size:16px;font-weight:700;color:var(--teal-700)">${inr(q.grand_total)}</div>
+              <div style="font-size:10px;color:var(--slate-400)">${new Date(q.created_at).toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'2-digit'})}</div>
+            </div>
+          </div>
+        </div>
+      `)}
+  `;
+}
+
+function QuotationEditor({ plant, me, quote, onClose, onSaved }) {
+  const isNew = !quote;
+  const [form, setForm] = useState({
+    quote_no: quote?.quote_no || '', customer_name: quote?.customer_name || '', product_name: quote?.product_name || '',
+    material: quote?.material || 'EN1A (free-cutting steel)', mat_shape: quote?.mat_shape || 'round',
+    mat_dia: quote?.mat_dia ?? '', mat_width: quote?.mat_width ?? '', mat_length: quote?.mat_length ?? '',
+    mat_density: quote?.mat_density ?? 7.85, mat_rate: quote?.mat_rate ?? '', qty: quote?.qty ?? 1,
+    notes: quote?.notes || '', status: quote?.status || 'draft',
+  });
+  const [items, setItems] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [loadingItems, setLoadingItems] = useState(!isNew);
+
+  useEffect(() => {
+    if (isNew) {
+      (async () => {
+        const yr = new Date().getFullYear().toString().slice(-2);
+        const { data } = await sb.from('mcp_quotations').select('quote_no').eq('plant_id', plant.id).like('quote_no', 'Q-'+yr+'-%').order('quote_no',{ascending:false}).limit(1);
+        let n = 1; if (data && data[0]) { const m = (data[0].quote_no||'').match(/(\d+)$/); if (m) n = parseInt(m[1],10)+1; }
+        setForm(f => ({ ...f, quote_no: f.quote_no || ('Q-'+yr+'-'+String(n).padStart(3,'0')) }));
+      })();
+      setItems([{ process:'CNC turning', description:'', price:'' }]);
+    } else {
+      (async () => {
+        const { data } = await sb.from('mcp_quotation_items').select('*').eq('quotation_id', quote.id).order('sort_order');
+        setItems((data||[]).length ? data.map(d => ({ ...d })) : [{ process:'', description:'', price:'' }]);
+        setLoadingItems(false);
+      })();
+    }
+  }, []);
+
+  const matWeight = quoteWeightGrams(form.mat_shape, form.mat_dia, form.mat_width, form.mat_length, form.mat_density);
+  const matCost = (matWeight/1000) * (Number(form.mat_rate)||0);
+  const itemsTotal = items.reduce((s,it) => s + (Number(it.price)||0), 0);
+  const grandTotal = matCost + itemsTotal;
+  const qty = Number(form.qty)||1;
+
+  const setItem = (i, patch) => setItems(its => its.map((it,idx) => idx===i ? { ...it, ...patch } : it));
+  const addItem = () => setItems(its => [...its, { process:'', description:'', price:'' }]);
+  const removeItem = (i) => setItems(its => its.filter((_,idx) => idx!==i));
+  const pickDensity = (name) => { const m = QUOTE_MATERIALS.find(x => x.name === name); if (m) setForm(f => ({ ...f, mat_density: m.density })); };
+
+  const save = async () => {
+    if (!form.product_name.trim()) { alert('Enter a product / part name'); return; }
+    setBusy(true);
+    try {
+      const payload = {
+        plant_id: plant.id, quote_no: form.quote_no || null, customer_name: form.customer_name || null,
+        product_name: form.product_name.trim(), material: form.material || null, mat_shape: form.mat_shape,
+        mat_dia: form.mat_dia===''?null:Number(form.mat_dia), mat_width: form.mat_width===''?null:Number(form.mat_width),
+        mat_length: form.mat_length===''?null:Number(form.mat_length), mat_density: Number(form.mat_density)||null,
+        mat_rate: form.mat_rate===''?null:Number(form.mat_rate), mat_weight_g: Math.round(matWeight*100)/100,
+        mat_cost: Math.round(matCost*100)/100, qty, notes: form.notes||null, status: form.status,
+        grand_total: Math.round(grandTotal*100)/100, updated_at: new Date().toISOString(),
+      };
+      let qid = quote?.id;
+      if (isNew) { payload.created_by = me.id; const { data, error } = await sb.from('mcp_quotations').insert(payload).select('id').single(); if (error) throw error; qid = data.id; }
+      else { const { error } = await sb.from('mcp_quotations').update(payload).eq('id', qid); if (error) throw error; await sb.from('mcp_quotation_items').delete().eq('quotation_id', qid); }
+      const rows = items.filter(it => it.process || it.description || (it.price!=='' && it.price!=null)).map((it,idx) => ({
+        quotation_id: qid, process: it.process||null, description: it.description||null, price: Number(it.price)||0, sort_order: idx,
+      }));
+      if (rows.length) { const { error } = await sb.from('mcp_quotation_items').insert(rows); if (error) throw error; }
+      showToast('✓ Quotation saved'); onSaved();
+    } catch (e) { alert('Save failed: ' + e.message); } finally { setBusy(false); }
+  };
+
+  const print = () => quotationPrint({ ...form, qty, mat_weight_g: matWeight, mat_cost: matCost, grand_total: grandTotal }, items, plant);
+
+  if (loadingItems) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:120px"><h1 style="font-size:18px">${isNew ? 'New Quotation' : (form.quote_no || 'Quotation')}</h1></div>
+      <button class="btn ghost small" onClick=${print}>🖨 Print / PDF</button>
+      <button class="btn small" disabled=${busy} onClick=${save}>${busy?'Saving…':'Save'}</button>
+    </div>
+
+    <div class="card">
+      <div class="field-row">
+        <div class="field"><label>Quote No.</label><input type="text" value=${form.quote_no} onChange=${e=>setForm({...form,quote_no:e.target.value})} style="font-family:monospace" /></div>
+        <div class="field"><label>Customer</label><input type="text" value=${form.customer_name} onChange=${e=>setForm({...form,customer_name:e.target.value})} placeholder="optional" /></div>
+      </div>
+      <div class="field-row">
+        <div class="field" style="flex:2"><label>Product / Part name *</label><input type="text" value=${form.product_name} onChange=${e=>setForm({...form,product_name:e.target.value})} placeholder="e.g. Outer bush" /></div>
+        <div class="field" style="flex:0 0 78px"><label>Qty</label><input type="number" min=${1} value=${form.qty} onChange=${e=>setForm({...form,qty:e.target.value})} /></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:10px">
+      <div class="card-title">🪚 Material cost</div>
+      <div class="field-row">
+        <div class="field" style="flex:2"><label>Material</label><input type="text" value=${form.material} onChange=${e=>setForm({...form,material:e.target.value})} placeholder="e.g. EN1A 36 dia rod" /></div>
+        <div class="field" style="flex:1"><label>Density preset</label>
+          <select value="" onChange=${e=>{ if(e.target.value) pickDensity(e.target.value); e.target.value=''; }}>
+            <option value="">— pick —</option>
+            ${QUOTE_MATERIALS.map(m => html`<option key=${m.name} value=${m.name}>${m.name}</option>`)}
+          </select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field" style="flex:0 0 104px"><label>Shape</label>
+          <select value=${form.mat_shape} onChange=${e=>setForm({...form,mat_shape:e.target.value})}>
+            <option value="round">Round bar</option><option value="flat">Flat bar</option><option value="tube">Tube</option>
+          </select>
+        </div>
+        <div class="field"><label>${form.mat_shape==='flat'?'Thick (mm)':'Dia / OD (mm)'}</label><input type="number" step="0.1" value=${form.mat_dia} onChange=${e=>setForm({...form,mat_dia:e.target.value})} /></div>
+        ${form.mat_shape!=='round' && html`<div class="field"><label>${form.mat_shape==='flat'?'Width (mm)':'ID (mm)'}</label><input type="number" step="0.1" value=${form.mat_width} onChange=${e=>setForm({...form,mat_width:e.target.value})} /></div>`}
+        <div class="field"><label>Cut length (mm)</label><input type="number" step="0.1" value=${form.mat_length} onChange=${e=>setForm({...form,mat_length:e.target.value})} /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Density (g/cc)</label><input type="number" step="0.01" value=${form.mat_density} onChange=${e=>setForm({...form,mat_density:e.target.value})} /></div>
+        <div class="field"><label>Rate (₹/kg)</label><input type="number" step="0.01" value=${form.mat_rate} onChange=${e=>setForm({...form,mat_rate:e.target.value})} placeholder="e.g. 77" /></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;background:var(--teal-50);border:1px solid var(--teal-200);border-radius:8px;padding:8px 12px">
+        <span style="font-size:12px;color:var(--slate-600)">${matWeight?(Math.round(matWeight)+' g'):'—'}${form.mat_rate?(' × ₹'+form.mat_rate+'/kg'):''}</span>
+        <span style="font-size:15px;font-weight:700;color:var(--teal-700)">${inr(matCost)}</span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:10px">
+      <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">Process charges<button class="btn ghost small" style="padding:3px 9px" onClick=${addItem}>+ Add</button></div>
+      ${items.map((it,i) => html`
+        <div key=${i} style="border:1px solid var(--slate-200);border-radius:8px;padding:8px 10px;margin-top:6px">
+          <div class="field-row" style="margin-bottom:2px">
+            <div class="field" style="flex:1;margin-bottom:4px"><label style="font-size:10px">Process</label><input type="text" value=${it.process||''} onChange=${e=>setItem(i,{process:e.target.value})} placeholder="CNC turning" /></div>
+            <div class="field" style="flex:0 0 92px;margin-bottom:4px"><label style="font-size:10px">Price ₹</label><input type="number" step="0.01" value=${it.price??''} onChange=${e=>setItem(i,{price:e.target.value})} /></div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:end">
+            <div class="field" style="flex:1;margin-bottom:0"><label style="font-size:10px">Description</label><input type="text" value=${it.description||''} onChange=${e=>setItem(i,{description:e.target.value})} placeholder="operations…" /></div>
+            <button class="btn ghost small" style="color:var(--rose-600);padding:5px 9px;margin-bottom:1px" onClick=${()=>removeItem(i)}>✕</button>
+          </div>
+        </div>
+      `)}
+    </div>
+
+    <div class="card" style="margin-top:10px">
+      <div style="display:flex;justify-content:space-between"><span style="font-size:13px;color:var(--slate-600)">Material</span><span style="font-weight:600">${inr(matCost)}</span></div>
+      <div style="display:flex;justify-content:space-between;margin-top:4px"><span style="font-size:13px;color:var(--slate-600)">Process charges</span><span style="font-weight:600">${inr(itemsTotal)}</span></div>
+      <div style="display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:2px solid var(--slate-200)"><span style="font-size:15px;font-weight:700">Grand Total${qty>1?' / piece':''}</span><span style="font-size:20px;font-weight:800;color:var(--teal-700)">${inr(grandTotal)}</span></div>
+      ${qty>1 && html`<div style="display:flex;justify-content:space-between;margin-top:4px"><span style="font-size:12px;color:var(--slate-500)">× ${qty} pcs</span><span style="font-size:13px;font-weight:600;color:var(--slate-600)">${inr(grandTotal*qty)}</span></div>`}
+    </div>
+
+    <div class="card" style="margin-top:10px"><div class="field" style="margin-bottom:0"><label>Notes (terms, validity…)</label><textarea rows=${2} value=${form.notes} onChange=${e=>setForm({...form,notes:e.target.value})}></textarea></div></div>
+    <button class="btn" style="margin-top:10px;width:100%" disabled=${busy} onClick=${save}>${busy?'Saving…':'Save quotation'}</button>
+  `;
+}
+
+// Clean printable quotation → opens a hidden iframe and triggers the browser
+// print dialog (Save as PDF / share).
+function quotationPrint(q, items, plant) {
+  const esc = (s) => String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const matDesc = [q.mat_dia?('⌀'+q.mat_dia+'mm'):'', q.mat_length?(q.mat_length+'mm cut'):'', q.mat_weight_g?(Math.round(q.mat_weight_g)+'g'):'', q.mat_rate?('@ ₹'+q.mat_rate+'/kg'):''].filter(Boolean).join(' · ');
+  const rows = [`<tr><td>Material cost</td><td>${esc(q.material||'')}${matDesc?' — '+esc(matDesc):''}</td><td class="r">${inr(q.mat_cost)}</td></tr>`];
+  (items||[]).forEach(it => {
+    if (!it.process && !it.description && !(Number(it.price))) return;
+    rows.push(`<tr><td>${esc(it.process||'')}</td><td>${esc(it.description||'')}</td><td class="r">${inr(Number(it.price)||0)}</td></tr>`);
+  });
+  const grand = Number(q.grand_total)||0, qty = Number(q.qty)||1;
+  const docHtml = `<!doctype html><html><head><meta charset="utf-8"><style>
+    @page{size:A4;margin:14mm} *{box-sizing:border-box} body{font-family:Arial,Helvetica,sans-serif;color:#0f172a;margin:0}
+    h1{color:#0d9488;font-size:23px;margin:0 0 2px;letter-spacing:.5px} .meta{font-size:12px;color:#475569}
+    .hdr{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #0d9488;padding-bottom:10px;margin-bottom:12px}
+    .plant{font-size:16px;font-weight:700;color:#0f172a}
+    table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12.5px}
+    th{background:#0d9488;color:#fff;text-align:left;padding:8px 10px;font-size:11px;letter-spacing:.3px}
+    th.r,td.r{text-align:right;white-space:nowrap} td{padding:8px 10px;border-bottom:1px solid #e2e8f0}
+    tbody tr:nth-child(even){background:#f8fafc}
+    .total{display:flex;justify-content:flex-end;margin-top:14px} .box{min-width:250px}
+    .line{display:flex;justify-content:space-between;font-size:13px;padding:3px 0;color:#475569}
+    .grand{display:flex;justify-content:space-between;font-size:17px;font-weight:800;border-top:2px solid #0f172a;margin-top:6px;padding-top:8px;color:#0d9488}
+    .notes{margin-top:18px;font-size:11.5px;color:#475569;white-space:pre-wrap}
+    .foot{margin-top:30px;font-size:10.5px;color:#94a3b8;border-top:1px solid #e2e8f0;padding-top:8px}
+  </style></head><body>
+    <div class="hdr">
+      <div><h1>QUOTATION</h1><div class="meta">${q.quote_no?('No: '+esc(q.quote_no)+' · '):''}Date: ${new Date().toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}</div></div>
+      <div style="text-align:right"><div class="plant">${esc(plant.name||'')}</div>${q.customer_name?('<div class="meta">To: '+esc(q.customer_name)+'</div>'):''}</div>
+    </div>
+    <div class="meta"><b>Product:</b> ${esc(q.product_name||'')}${q.material?(' &nbsp;|&nbsp; <b>Material:</b> '+esc(q.material)):''}${qty>1?(' &nbsp;|&nbsp; <b>Qty:</b> '+qty):''}</div>
+    <table><thead><tr><th style="width:24%">Process</th><th>Description</th><th class="r" style="width:18%">Price (INR)</th></tr></thead><tbody>${rows.join('')}</tbody></table>
+    <div class="total"><div class="box">
+      <div class="grand"><span>Grand Total${qty>1?' / piece':''}</span><span>${inr(grand)}</span></div>
+      ${qty>1?('<div class="line"><span>Order value × '+qty+' pcs</span><span>'+inr(grand*qty)+'</span></div>'):''}
+    </div></div>
+    ${q.notes?('<div class="notes"><b>Notes:</b> '+esc(q.notes)+'</div>'):''}
+    <div class="foot">Generated by Loglinkr · ${esc(plant.name||'')}</div>
+  </body></html>`;
+  const ifr = document.createElement('iframe');
+  ifr.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0';
+  document.body.appendChild(ifr);
+  ifr.srcdoc = docHtml;
+  ifr.onload = () => { try { ifr.contentWindow.focus(); ifr.contentWindow.print(); } catch(_){} setTimeout(() => ifr.remove(), 60000); };
 }
 
 // =================================================================
