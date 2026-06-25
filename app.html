@@ -12140,39 +12140,57 @@ function PayrollModule({ plant, me }) {
     return out;
   }, [month]);
   const isSun = (dstr) => { const [y,m,d]=dstr.split('-').map(Number); return new Date(Date.UTC(y,m-1,d)).getUTCDay()===0; };
+  const timeToH = (t) => { if (!t) return null; const [hh,mm] = String(t).split(':').map(Number); return hh + (mm||0)/60; };
+  const shiftHoursOf = (cfg) => {
+    const s = timeToH(cfg.shift_start), e = timeToH(cfg.shift_end);
+    if (s!=null && e!=null) { let d = e - s; if (d<=0) d += 24; return Math.round(d*100)/100; }
+    return Number(cfg.shift_hours) || 8;
+  };
 
   const computeRow = (emp) => {
     const cfg = config[emp.id] || {};
     const salary = Number(cfg.monthly_salary) || 0;
-    const shift = Number(cfg.shift_hours) || 8;
+    const shift = shiftHoursOf(cfg);
     const mult = Number(cfg.ot_multiplier) || 1.5;
-    const hourly = (divisor>0 && shift>0) ? salary/divisor/shift : 0;
-    let regHours=0, otHours=0, presentDays=0, worked=0;
+    const permAllow = Number(cfg.permission_hours) || 0;     // forgiven short-time hours / month
+    const leaveAllow = Number(cfg.paid_leave_days) || 0;     // forgiven leave days / month
+    const dailyRate = divisor>0 ? salary/divisor : 0;
+    const hourly = shift>0 ? dailyRate/shift : 0;
+    let normalDelta=0, sundayHolidayOT=0, presentDays=0, leaveDays=0, absentDays=0, worked=0;
     for (const dstr of days) {
       const r = recByUserDate[emp.id]?.[dstr];
       if (!r) continue;
       if (r.status==='present' || r.status==='wfh') presentDays += 1;
       else if (r.status==='half_day') presentDays += 0.5;
+      else if (r.status==='leave') leaveDays += 1;
+      else if (r.status==='absent') absentDays += 1;
       const h = r.hours_worked != null ? Number(r.hours_worked) : 0;
       if (!h || h<=0) continue;
       worked += h;
-      if (isSun(dstr) || holidaySet.has(dstr)) otHours += h;
-      else { regHours += Math.min(h, shift); otHours += Math.max(0, h - shift); }
+      if (isSun(dstr) || holidaySet.has(dstr)) sundayHolidayOT += h;     // weekend/holiday → all OT
+      else normalDelta += (h - shift);                                    // net vs shift, settled monthly
     }
+    const otHours = Math.max(0, normalDelta) + sundayHolidayOT;
+    const shortHours = Math.max(0, -normalDelta);
+    const billableShort = Math.max(0, shortHours - permAllow);           // after permission allowance
+    const lopLeave = Math.max(0, leaveDays - leaveAllow);                 // leave beyond allowance
     const otPay = otHours * hourly * mult;
-    return { cfg, salary, shift, mult, hourly, regHours, otHours, presentDays, worked, otPay, gross: salary + otPay, configured: !!config[emp.id] };
+    const shortDeduct = billableShort * hourly;
+    const leaveDeduct = lopLeave * dailyRate;
+    const deduct = shortDeduct + leaveDeduct;
+    return { cfg, salary, shift, mult, hourly, otHours, shortHours, billableShort, presentDays, leaveDays, absentDays, lopLeave, worked, otPay, deduct, gross: salary + otPay - deduct, configured: !!config[emp.id] };
   };
 
   const rows = employees.map(e => ({ emp: e, ...computeRow(e) }));
-  const totals = rows.reduce((a,r) => ({ otPay:a.otPay+r.otPay, gross:a.gross+r.gross, otHours:a.otHours+r.otHours }), { otPay:0, gross:0, otHours:0 });
+  const totals = rows.reduce((a,r) => ({ otPay:a.otPay+r.otPay, deduct:a.deduct+r.deduct, gross:a.gross+r.gross, otHours:a.otHours+r.otHours }), { otPay:0, deduct:0, gross:0, otHours:0 });
   const money = (n) => '₹' + Math.round(n||0).toLocaleString('en-IN');
   const hrs = (n) => Math.round((n||0)*10)/10;
 
   const setDivisorSaved = async (d) => { setDivisor(d); await sb.from('plants').update({ payroll_days_divisor: d }).eq('id', plant.id); };
 
   const exportCSV = () => {
-    const header = ['Employee','Monthly Salary','Shift hrs','OT x','Present days','Total hours','OT hours','Hourly rate','OT pay','Gross'];
-    const data = rows.map(r => [r.emp.full_name||'', r.salary, r.shift, r.mult, r.presentDays, hrs(r.worked), hrs(r.otHours), Math.round(r.hourly*100)/100, Math.round(r.otPay), Math.round(r.gross)]);
+    const header = ['Employee','Monthly Salary','Shift hrs','OT x','Present days','Leave days','Unpaid leave','Total hours','OT hours','Short hrs','Hourly rate','OT pay','Deduction','Gross'];
+    const data = rows.map(r => [r.emp.full_name||'', r.salary, r.shift, r.mult, r.presentDays, r.leaveDays, r.lopLeave, hrs(r.worked), hrs(r.otHours), hrs(r.shortHours), Math.round(r.hourly*100)/100, Math.round(r.otPay), Math.round(r.deduct), Math.round(r.gross)]);
     const csv = [header, ...data].map(rr => rr.map(c => '"'+String(c).replace(/"/g,'""')+'"').join(',')).join('\n');
     const blob = new Blob([csv], { type:'text/csv' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'payroll_' + month + '.csv'; a.click(); URL.revokeObjectURL(a.href);
@@ -12202,6 +12220,7 @@ function PayrollModule({ plant, me }) {
     <div class="stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:6px;margin-bottom:12px">
       <div class="stat" style="padding:8px;background:var(--amber-50);border:1px solid var(--amber-200)"><div class="stat-num" style="font-size:16px;color:var(--amber-700)">${hrs(totals.otHours)}</div><div class="stat-label" style="font-size:10px">Total OT hrs</div></div>
       <div class="stat" style="padding:8px;background:var(--teal-50);border:1px solid var(--teal-200)"><div class="stat-num" style="font-size:15px;color:var(--teal-700)">${money(totals.otPay)}</div><div class="stat-label" style="font-size:10px">Total OT pay</div></div>
+      <div class="stat" style="padding:8px;background:var(--rose-50);border:1px solid var(--rose-200)"><div class="stat-num" style="font-size:15px;color:var(--rose-600)">${money(totals.deduct)}</div><div class="stat-label" style="font-size:10px">Deductions</div></div>
       <div class="stat" style="padding:8px;background:var(--emerald-50);border:1px solid var(--emerald-200)"><div class="stat-num" style="font-size:15px;color:var(--emerald-700)">${money(totals.gross)}</div><div class="stat-label" style="font-size:10px">Gross payout</div></div>
     </div>
 
@@ -12212,7 +12231,9 @@ function PayrollModule({ plant, me }) {
           <th style="padding:7px 8px;text-align:right">Salary</th>
           <th style="padding:7px 8px;text-align:right">Present</th>
           <th style="padding:7px 8px;text-align:right">OT hrs</th>
+          <th style="padding:7px 8px;text-align:right">Short hrs</th>
           <th style="padding:7px 8px;text-align:right">OT pay</th>
+          <th style="padding:7px 8px;text-align:right">Deduct</th>
           <th style="padding:7px 8px;text-align:right">Gross</th>
         </tr></thead>
         <tbody>
@@ -12222,7 +12243,9 @@ function PayrollModule({ plant, me }) {
               <td style="padding:7px 8px;text-align:right">${money(r.salary)}</td>
               <td style="padding:7px 8px;text-align:right">${r.presentDays}</td>
               <td style="padding:7px 8px;text-align:right;color:var(--amber-700);font-weight:600">${hrs(r.otHours)}</td>
+              <td style="padding:7px 8px;text-align:right;color:${r.shortHours>0?'var(--rose-500)':'var(--slate-400)'}">${hrs(r.shortHours)}</td>
               <td style="padding:7px 8px;text-align:right;color:var(--teal-700);font-weight:600">${money(r.otPay)}</td>
+              <td style="padding:7px 8px;text-align:right;color:${r.deduct>0?'var(--rose-600)':'var(--slate-400)'}">${r.deduct>0?'−'+money(r.deduct).slice(1):'₹0'}</td>
               <td style="padding:7px 8px;text-align:right;font-weight:700">${money(r.gross)}</td>
             </tr>
           `)}
@@ -12230,7 +12253,7 @@ function PayrollModule({ plant, me }) {
       </table>
     </div>
     <div style="font-size:11px;color:var(--slate-500);margin-top:8px;line-height:1.5">
-      Tap a row to set salary, shift hours &amp; OT rate. OT = hours beyond the shift on normal days; <strong>all</strong> hours on Sundays &amp; holidays. Hourly = salary ÷ ${divisor} ÷ shift.
+      Tap a row to set shift timing, salary, OT rate &amp; allowances. Each day's hours net against the shift across the month — extra is OT, shortfall is short-time (deducted at the hourly rate after the permission allowance). <strong>All</strong> Sunday/holiday hours are OT. Leave within the allowance isn't deducted. Hourly = salary ÷ ${divisor} ÷ shift.
     </div>
 
     ${editEmp && html`<${PayrollConfigModal} plant=${plant} employee=${editEmp} config=${config[editEmp.id]} onClose=${() => setEditEmp(null)} onSaved=${() => { setEditEmp(null); refresh(); }} />`}
@@ -12239,15 +12262,28 @@ function PayrollModule({ plant, me }) {
 
 function PayrollConfigModal({ plant, employee, config, onClose, onSaved }) {
   const [salary, setSalary] = useState(config?.monthly_salary ?? '');
-  const [shift, setShift] = useState(config?.shift_hours ?? 8);
+  const [start, setStart] = useState((config?.shift_start || '09:00').slice(0,5));
+  const [end, setEnd] = useState((config?.shift_end || '17:30').slice(0,5));
   const [mult, setMult] = useState(config?.ot_multiplier ?? 1.5);
+  const [perm, setPerm] = useState(config?.permission_hours ?? 0);
+  const [leave, setLeave] = useState(config?.paid_leave_days ?? 0);
   const [busy, setBusy] = useState(false);
+
+  // Derived shift hours for the live hint (e.g. 9:00–17:30 → 8.5h).
+  const toH = (t) => { const [h,m] = String(t).split(':').map(Number); return (h||0)+(m||0)/60; };
+  let shiftH = toH(end) - toH(start); if (shiftH<=0) shiftH += 24; shiftH = Math.round(shiftH*100)/100;
+
   const save = async () => {
     setBusy(true);
     try {
       const { error } = await sb.from('mcp_payroll_config').upsert({
         plant_id: plant.id, user_id: employee.id,
-        monthly_salary: Number(salary)||0, shift_hours: Number(shift)||8, ot_multiplier: Number(mult)||1.5,
+        monthly_salary: Number(salary)||0,
+        shift_start: start || null, shift_end: end || null,
+        shift_hours: shiftH,
+        ot_multiplier: Number(mult)||1.5,
+        permission_hours: Number(perm)||0,
+        paid_leave_days: Number(leave)||0,
         updated_at: new Date().toISOString(),
       }, { onConflict: 'plant_id,user_id' });
       if (error) throw error;
@@ -12260,15 +12296,22 @@ function PayrollConfigModal({ plant, employee, config, onClose, onSaved }) {
         <div class="modal-header"><div class="modal-title">Pay · ${employee.full_name}</div><button class="close-btn" onClick=${onClose}>×</button></div>
         <div class="field"><label>Monthly salary (₹)</label><input type="number" min=${0} value=${salary} onChange=${e => setSalary(e.target.value)} placeholder="e.g. 18000" /></div>
         <div class="field-row">
-          <div class="field"><label>Shift hours / day</label><input type="number" min=${1} step="0.5" value=${shift} onChange=${e => setShift(e.target.value)} /></div>
-          <div class="field"><label>OT multiplier</label>
-            <select value=${mult} onChange=${e => setMult(e.target.value)}>
-              <option value=${1}>1× (same rate)</option>
-              <option value=${1.5}>1.5×</option>
-              <option value=${2}>2×</option>
-            </select>
-          </div>
+          <div class="field"><label>Shift start</label><input type="time" value=${start} onChange=${e => setStart(e.target.value)} /></div>
+          <div class="field"><label>Shift end</label><input type="time" value=${end} onChange=${e => setEnd(e.target.value)} /></div>
         </div>
+        <div style="font-size:11px;color:var(--slate-500);margin:-4px 0 8px">Shift = <strong>${shiftH} h/day</strong>. Working more is OT; less is short-time.</div>
+        <div class="field"><label>OT multiplier</label>
+          <select value=${mult} onChange=${e => setMult(e.target.value)}>
+            <option value=${1}>1× (same rate)</option>
+            <option value=${1.5}>1.5×</option>
+            <option value=${2}>2×</option>
+          </select>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Permission allowance (hrs/mo)</label><input type="number" min=${0} step="0.5" value=${perm} onChange=${e => setPerm(e.target.value)} /></div>
+          <div class="field"><label>Paid leave (days/mo)</label><input type="number" min=${0} step="0.5" value=${leave} onChange=${e => setLeave(e.target.value)} /></div>
+        </div>
+        <div style="font-size:11px;color:var(--slate-500);margin:-4px 0 10px">Short-time up to the permission hours and leave up to the paid-leave days are <strong>not deducted</strong>.</div>
         <button class="btn" disabled=${busy} onClick=${save}>${busy?'Saving…':'Save pay'}</button>
       </div>
     </div>
