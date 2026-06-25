@@ -11814,6 +11814,7 @@ function AttendanceModule({ plant, me, activeUnit }) {
   const STATUSES = [
     { key:'present',  label:'P',  pillBg:'var(--emerald-50)',  pillFg:'var(--emerald-700)',  pillBorder:'var(--emerald-300)' },
     { key:'half_day', label:'HD', pillBg:'var(--amber-50)',    pillFg:'var(--amber-700)',    pillBorder:'var(--amber-300)' },
+    { key:'on_duty',  label:'OD', pillBg:'var(--sky-50,#f0f9ff)', pillFg:'var(--sky-700,#0369a1)', pillBorder:'var(--sky-300,#7dd3fc)' },
     { key:'absent',   label:'A',  pillBg:'var(--rose-50)',     pillFg:'var(--rose-700)',     pillBorder:'var(--rose-300)' },
     { key:'leave',    label:'L',  pillBg:'var(--slate-100)',   pillFg:'var(--slate-700)',    pillBorder:'var(--slate-300)' },
     { key:'week_off', label:'WO', pillBg:'var(--slate-50)',    pillFg:'var(--slate-500)',    pillBorder:'var(--slate-200)' },
@@ -12162,7 +12163,7 @@ function PayrollModule({ plant, me }) {
     for (const dstr of days) {
       const r = recByUserDate[emp.id]?.[dstr];
       if (!r) continue;
-      if (r.status==='present' || r.status==='wfh') presentDays += 1;
+      if (r.status==='present' || r.status==='wfh' || r.status==='on_duty') presentDays += 1;
       else if (r.status==='half_day') presentDays += 0.5;
       else if (r.status==='leave') leaveDays += 1;
       else if (r.status==='absent') absentDays += 1;
@@ -12846,6 +12847,30 @@ function SelfAttendancePage({ plant, me, reload }) {
 
   const cancelScan = () => { stopCamera(); setPhase('idle'); };
 
+  // On Duty — off-site work, no gate QR / geofence. Captures GPS (best-effort)
+  // + an optional reason. Counts as a present day in payroll.
+  const markOnDuty = () => {
+    const note = prompt('On Duty — where / why? (optional)');
+    if (note === null) return;   // cancelled
+    setError(''); setBusy(true);
+    const submit = (lat, lng) => sb.rpc('attendance_self_mark_onduty', { p_plant_id: plant.id, p_lat: lat, p_lng: lng, p_note: note || null })
+      .then(({ data, error: err }) => {
+        if (err) throw err;
+        if (!data?.success) { setError(data?.error || 'Failed to mark On Duty'); return; }
+        showToast('🚗 ' + (data.message || 'Marked On Duty'));
+        refresh();
+      })
+      .catch(e => setError(e.message || String(e)))
+      .finally(() => setBusy(false));
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        pos => submit(pos.coords.latitude, pos.coords.longitude),
+        () => submit(null, null),            // GPS optional for OD
+        { enableHighAccuracy:false, timeout:8000, maximumAge:60000 }
+      );
+    } else submit(null, null);
+  };
+
   // Plant must have attendance enabled + geofence pinned for self-mark to work.
   const ready = plant.attendance_mode === 'self_gps_qr' && plant.attendance_qr_secret && plant.geofence_lat;
 
@@ -12870,7 +12895,11 @@ function SelfAttendancePage({ plant, me, reload }) {
 
     <div class="card" style="padding:18px;text-align:center;margin-bottom:14px">
       <div style="font-size:11px;color:var(--slate-500);font-weight:700;letter-spacing:0.05em;text-transform:uppercase;margin-bottom:8px">Today · ${new Date().toLocaleDateString('en-IN', { weekday:'long', day:'2-digit', month:'short' })}</div>
-      ${punchedOut ? html`
+      ${today?.status === 'on_duty' ? html`
+        <div style="font-size:34px;margin-bottom:6px">🚗</div>
+        <div style="font-size:18px;font-weight:700;color:var(--sky-700,#0369a1)">On Duty today</div>
+        ${today.notes && html`<div style="font-size:12px;color:var(--slate-500);margin-top:4px">${today.notes}</div>`}
+      ` : punchedOut ? html`
         <div style="font-size:34px;margin-bottom:6px">✅</div>
         <div style="font-size:18px;font-weight:700;color:var(--emerald-700)">Day complete</div>
         <div style="font-size:13px;color:var(--slate-600);margin-top:4px">IN ${today.in_time?.slice(0,5)} · OUT ${today.out_time?.slice(0,5)}${today.hours_worked ? ' · ' + today.hours_worked + ' hrs' : ''}</div>
@@ -12892,6 +12921,11 @@ function SelfAttendancePage({ plant, me, reload }) {
       ${punchedIn && html`
         <button class="btn" disabled=${busy} onClick=${() => startScan('out')} style="width:100%;padding:18px;font-size:17px;font-weight:700;background:linear-gradient(135deg,var(--rose-600,#e11d48),var(--rose-500,#f43f5e))">🛡 Punch OUT — scan factory QR</button>
       `}
+    `}
+
+    ${phase === 'idle' && !punchedOut && today?.status !== 'on_duty' && html`
+      <button class="btn" disabled=${busy} onClick=${markOnDuty} style="width:100%;padding:14px;font-size:15px;font-weight:700;margin-top:10px;background:linear-gradient(135deg,#0284c7,#0ea5e9)">🚗 Mark On Duty (off-site)</button>
+      <div style="font-size:11px;color:var(--slate-400);text-align:center;margin-top:6px">Out on field / customer visit? Log On Duty — no gate QR needed.</div>
     `}
 
     ${(phase === 'camera') && html`
