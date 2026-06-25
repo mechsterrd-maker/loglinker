@@ -11951,7 +11951,10 @@ function AttendanceModule({ plant, me, activeUnit }) {
     <div class="auth-tabs" style="margin-bottom:14px">
       <button class=${'auth-tab' + (view === 'day' ? ' active' : '')} onClick=${() => setView('day')}>Day</button>
       <button class=${'auth-tab' + (view === 'month' ? ' active' : '')} onClick=${() => setView('month')}>Month</button>
+      ${isAdmin && html`<button class=${'auth-tab' + (view === 'payroll' ? ' active' : '')} onClick=${() => setView('payroll')}>💰 Payroll</button>`}
     </div>
+
+    ${view === 'payroll' && html`<${PayrollModule} plant=${plant} me=${me} />`}
 
     ${view === 'day' && html`
       <div class="card" style="padding:10px 12px;margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end">
@@ -12085,6 +12088,225 @@ function AttendanceModule({ plant, me, activeUnit }) {
         <strong>Legend:</strong> P = Present · A = Absent · HD = Half Day · L = Leave · WO = Week Off · H = Holiday
       </div>
     `}
+  `;
+}
+
+// =================================================================
+// PAYROLL — monthly salary + overtime computed from attendance hours.
+// OT model: normal day → hours beyond the shift; Sunday / govt holiday → ALL
+// hours. hourly = salary ÷ divisor ÷ shift; OT pay = OT hrs × hourly × mult;
+// gross = salary + OT pay. Divisor (26/30) is a plant setting.
+// =================================================================
+function PayrollModule({ plant, me }) {
+  const [month, setMonth] = useState(new Date().toISOString().slice(0,7));
+  const [employees, setEmployees] = useState([]);
+  const [config, setConfig] = useState({});      // user_id -> cfg row
+  const [holidays, setHolidays] = useState([]);
+  const [records, setRecords] = useState([]);
+  const [divisor, setDivisor] = useState(plant.payroll_days_divisor || 26);
+  const [loading, setLoading] = useState(true);
+  const [editEmp, setEditEmp] = useState(null);
+  const [showHolidays, setShowHolidays] = useState(false);
+
+  const monthStart = month + '-01';
+  const monthEnd = (() => { const [y,m] = month.split('-').map(Number); return month + '-' + String(new Date(y,m,0).getDate()).padStart(2,'0'); })();
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [emp, cfg, hol, rec] = await Promise.all([
+      sb.from('users').select('id, full_name, role').eq('plant_id', plant.id).eq('status','active').order('full_name'),
+      sb.from('mcp_payroll_config').select('*').eq('plant_id', plant.id),
+      sb.from('mcp_plant_holidays').select('*').eq('plant_id', plant.id).order('date'),
+      sb.from('mcp_attendance').select('user_id, date, status, hours_worked').eq('plant_id', plant.id).gte('date', monthStart).lte('date', monthEnd),
+    ]);
+    setEmployees(emp.data || []);
+    setConfig(Object.fromEntries((cfg.data||[]).map(c => [c.user_id, c])));
+    setHolidays(hol.data || []);
+    setRecords(rec.data || []);
+    setLoading(false);
+  }, [plant.id, monthStart, monthEnd]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const holidaySet = useMemo(() => new Set(holidays.map(h => h.date)), [holidays]);
+  const recByUserDate = useMemo(() => {
+    const m = {};
+    for (const r of records) (m[r.user_id] = m[r.user_id]||{})[r.date] = r;
+    return m;
+  }, [records]);
+  const days = useMemo(() => {
+    const [y,m] = month.split('-').map(Number);
+    const last = new Date(y,m,0).getDate();
+    const out = []; for (let d=1; d<=last; d++) out.push(month + '-' + String(d).padStart(2,'0'));
+    return out;
+  }, [month]);
+  const isSun = (dstr) => { const [y,m,d]=dstr.split('-').map(Number); return new Date(Date.UTC(y,m-1,d)).getUTCDay()===0; };
+
+  const computeRow = (emp) => {
+    const cfg = config[emp.id] || {};
+    const salary = Number(cfg.monthly_salary) || 0;
+    const shift = Number(cfg.shift_hours) || 8;
+    const mult = Number(cfg.ot_multiplier) || 1.5;
+    const hourly = (divisor>0 && shift>0) ? salary/divisor/shift : 0;
+    let regHours=0, otHours=0, presentDays=0, worked=0;
+    for (const dstr of days) {
+      const r = recByUserDate[emp.id]?.[dstr];
+      if (!r) continue;
+      if (r.status==='present' || r.status==='wfh') presentDays += 1;
+      else if (r.status==='half_day') presentDays += 0.5;
+      const h = r.hours_worked != null ? Number(r.hours_worked) : 0;
+      if (!h || h<=0) continue;
+      worked += h;
+      if (isSun(dstr) || holidaySet.has(dstr)) otHours += h;
+      else { regHours += Math.min(h, shift); otHours += Math.max(0, h - shift); }
+    }
+    const otPay = otHours * hourly * mult;
+    return { cfg, salary, shift, mult, hourly, regHours, otHours, presentDays, worked, otPay, gross: salary + otPay, configured: !!config[emp.id] };
+  };
+
+  const rows = employees.map(e => ({ emp: e, ...computeRow(e) }));
+  const totals = rows.reduce((a,r) => ({ otPay:a.otPay+r.otPay, gross:a.gross+r.gross, otHours:a.otHours+r.otHours }), { otPay:0, gross:0, otHours:0 });
+  const money = (n) => '₹' + Math.round(n||0).toLocaleString('en-IN');
+  const hrs = (n) => Math.round((n||0)*10)/10;
+
+  const setDivisorSaved = async (d) => { setDivisor(d); await sb.from('plants').update({ payroll_days_divisor: d }).eq('id', plant.id); };
+
+  const exportCSV = () => {
+    const header = ['Employee','Monthly Salary','Shift hrs','OT x','Present days','Total hours','OT hours','Hourly rate','OT pay','Gross'];
+    const data = rows.map(r => [r.emp.full_name||'', r.salary, r.shift, r.mult, r.presentDays, hrs(r.worked), hrs(r.otHours), Math.round(r.hourly*100)/100, Math.round(r.otPay), Math.round(r.gross)]);
+    const csv = [header, ...data].map(rr => rr.map(c => '"'+String(c).replace(/"/g,'""')+'"').join(',')).join('\n');
+    const blob = new Blob([csv], { type:'text/csv' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'payroll_' + month + '.csv'; a.click(); URL.revokeObjectURL(a.href);
+  };
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  return html`
+    <div class="card" style="padding:10px 12px;margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+      <div class="field" style="margin:0;flex:1;min-width:130px">
+        <label style="font-size:11px">Month</label>
+        <input type="month" value=${month} onChange=${e => setMonth(e.target.value)} style="font-size:13px" />
+      </div>
+      <div class="field" style="margin:0;min-width:110px">
+        <label style="font-size:11px">Salary ÷ days</label>
+        <select value=${divisor} onChange=${e => setDivisorSaved(Number(e.target.value))} style="font-size:13px">
+          <option value=${26}>26 days</option>
+          <option value=${30}>30 days</option>
+        </select>
+      </div>
+      <button class="btn small ghost" onClick=${() => setShowHolidays(s=>!s)} style="font-size:11px;padding:6px 10px">📅 Holidays · ${holidays.length}</button>
+      <button class="btn small" onClick=${exportCSV} style="background:var(--slate-700);font-size:11px;padding:6px 10px">📥 CSV</button>
+    </div>
+
+    ${showHolidays && html`<${PayrollHolidays} plant=${plant} holidays=${holidays} onChange=${refresh} />`}
+
+    <div class="stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:6px;margin-bottom:12px">
+      <div class="stat" style="padding:8px;background:var(--amber-50);border:1px solid var(--amber-200)"><div class="stat-num" style="font-size:16px;color:var(--amber-700)">${hrs(totals.otHours)}</div><div class="stat-label" style="font-size:10px">Total OT hrs</div></div>
+      <div class="stat" style="padding:8px;background:var(--teal-50);border:1px solid var(--teal-200)"><div class="stat-num" style="font-size:15px;color:var(--teal-700)">${money(totals.otPay)}</div><div class="stat-label" style="font-size:10px">Total OT pay</div></div>
+      <div class="stat" style="padding:8px;background:var(--emerald-50);border:1px solid var(--emerald-200)"><div class="stat-num" style="font-size:15px;color:var(--emerald-700)">${money(totals.gross)}</div><div class="stat-label" style="font-size:10px">Gross payout</div></div>
+    </div>
+
+    <div class="card" style="padding:0;overflow:auto">
+      <table style="width:100%;font-size:12px;border-collapse:collapse;min-width:560px">
+        <thead><tr style="background:var(--slate-100)">
+          <th style="padding:7px 10px;text-align:left">Employee</th>
+          <th style="padding:7px 8px;text-align:right">Salary</th>
+          <th style="padding:7px 8px;text-align:right">Present</th>
+          <th style="padding:7px 8px;text-align:right">OT hrs</th>
+          <th style="padding:7px 8px;text-align:right">OT pay</th>
+          <th style="padding:7px 8px;text-align:right">Gross</th>
+        </tr></thead>
+        <tbody>
+          ${rows.map(r => html`
+            <tr key=${r.emp.id} onClick=${() => setEditEmp(r.emp)} style="border-bottom:1px solid var(--slate-100);cursor:pointer">
+              <td style="padding:7px 10px"><div style="font-weight:600">${r.emp.full_name}</div><div style="font-size:10px;color:${r.configured?'var(--slate-400)':'var(--rose-500)'}">${r.configured ? (r.shift+'h · '+r.mult+'× OT') : '⚙ tap to set pay'}</div></td>
+              <td style="padding:7px 8px;text-align:right">${money(r.salary)}</td>
+              <td style="padding:7px 8px;text-align:right">${r.presentDays}</td>
+              <td style="padding:7px 8px;text-align:right;color:var(--amber-700);font-weight:600">${hrs(r.otHours)}</td>
+              <td style="padding:7px 8px;text-align:right;color:var(--teal-700);font-weight:600">${money(r.otPay)}</td>
+              <td style="padding:7px 8px;text-align:right;font-weight:700">${money(r.gross)}</td>
+            </tr>
+          `)}
+        </tbody>
+      </table>
+    </div>
+    <div style="font-size:11px;color:var(--slate-500);margin-top:8px;line-height:1.5">
+      Tap a row to set salary, shift hours &amp; OT rate. OT = hours beyond the shift on normal days; <strong>all</strong> hours on Sundays &amp; holidays. Hourly = salary ÷ ${divisor} ÷ shift.
+    </div>
+
+    ${editEmp && html`<${PayrollConfigModal} plant=${plant} employee=${editEmp} config=${config[editEmp.id]} onClose=${() => setEditEmp(null)} onSaved=${() => { setEditEmp(null); refresh(); }} />`}
+  `;
+}
+
+function PayrollConfigModal({ plant, employee, config, onClose, onSaved }) {
+  const [salary, setSalary] = useState(config?.monthly_salary ?? '');
+  const [shift, setShift] = useState(config?.shift_hours ?? 8);
+  const [mult, setMult] = useState(config?.ot_multiplier ?? 1.5);
+  const [busy, setBusy] = useState(false);
+  const save = async () => {
+    setBusy(true);
+    try {
+      const { error } = await sb.from('mcp_payroll_config').upsert({
+        plant_id: plant.id, user_id: employee.id,
+        monthly_salary: Number(salary)||0, shift_hours: Number(shift)||8, ot_multiplier: Number(mult)||1.5,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'plant_id,user_id' });
+      if (error) throw error;
+      showToast('✓ Pay saved'); onSaved();
+    } catch (e) { alert('Save failed: ' + e.message); } finally { setBusy(false); }
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target===e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">Pay · ${employee.full_name}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        <div class="field"><label>Monthly salary (₹)</label><input type="number" min=${0} value=${salary} onChange=${e => setSalary(e.target.value)} placeholder="e.g. 18000" /></div>
+        <div class="field-row">
+          <div class="field"><label>Shift hours / day</label><input type="number" min=${1} step="0.5" value=${shift} onChange=${e => setShift(e.target.value)} /></div>
+          <div class="field"><label>OT multiplier</label>
+            <select value=${mult} onChange=${e => setMult(e.target.value)}>
+              <option value=${1}>1× (same rate)</option>
+              <option value=${1.5}>1.5×</option>
+              <option value=${2}>2×</option>
+            </select>
+          </div>
+        </div>
+        <button class="btn" disabled=${busy} onClick=${save}>${busy?'Saving…':'Save pay'}</button>
+      </div>
+    </div>
+  `;
+}
+
+function PayrollHolidays({ plant, holidays, onChange }) {
+  const [date, setDate] = useState('');
+  const [name, setName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const add = async () => {
+    if (!date) return;
+    setBusy(true);
+    try {
+      const { error } = await sb.from('mcp_plant_holidays').upsert({ plant_id: plant.id, date, name: name||null }, { onConflict: 'plant_id,date' });
+      if (error) throw error;
+      setDate(''); setName(''); onChange();
+    } catch (e) { alert(e.message); } finally { setBusy(false); }
+  };
+  const remove = async (id) => { await sb.from('mcp_plant_holidays').delete().eq('id', id); onChange(); };
+  return html`
+    <div class="card" style="margin-bottom:10px">
+      <div class="card-title">📅 Govt holidays — working these = overtime</div>
+      <div class="field-row" style="align-items:end">
+        <div class="field" style="flex:1"><label>Date</label><input type="date" value=${date} onChange=${e => setDate(e.target.value)} /></div>
+        <div class="field" style="flex:1.4"><label>Name</label><input type="text" value=${name} onChange=${e => setName(e.target.value)} placeholder="e.g. Diwali" /></div>
+        <button class="btn small" disabled=${busy||!date} onClick=${add}>＋ Add</button>
+      </div>
+      ${holidays.length === 0
+        ? html`<div style="font-size:11px;color:var(--slate-500)">No holidays added. Sundays are already treated as overtime automatically.</div>`
+        : holidays.map(h => html`
+          <div key=${h.id} style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--slate-100)">
+            <span style="font-size:12px;font-weight:600">${h.date}</span>
+            <span style="flex:1;font-size:12px;color:var(--slate-600)">${h.name||''}</span>
+            <button class="btn ghost small" style="color:var(--rose-600);padding:3px 8px" onClick=${() => remove(h.id)}>Remove</button>
+          </div>
+        `)}
+    </div>
   `;
 }
 
