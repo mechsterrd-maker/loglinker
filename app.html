@@ -12177,7 +12177,8 @@ function PayrollModule({ plant, me }) {
     const otPay = otHours * hourly * mult;
     const shortDeduct = billableShort * hourly;
     const leaveDeduct = lopLeave * dailyRate;
-    const deduct = shortDeduct + leaveDeduct;
+    const absentDeduct = absentDays * dailyRate;             // absent = loss of pay at the day rate
+    const deduct = shortDeduct + leaveDeduct + absentDeduct;
     return { cfg, salary, shift, mult, hourly, otHours, shortHours, billableShort, presentDays, leaveDays, absentDays, lopLeave, worked, otPay, deduct, gross: salary + otPay - deduct, configured: !!config[emp.id] };
   };
 
@@ -12189,8 +12190,8 @@ function PayrollModule({ plant, me }) {
   const setDivisorSaved = async (d) => { setDivisor(d); await sb.from('plants').update({ payroll_days_divisor: d }).eq('id', plant.id); };
 
   const exportCSV = () => {
-    const header = ['Employee','Monthly Salary','Shift hrs','OT x','Present days','Leave days','Unpaid leave','Total hours','OT hours','Short hrs','Hourly rate','OT pay','Deduction','Gross'];
-    const data = rows.map(r => [r.emp.full_name||'', r.salary, r.shift, r.mult, r.presentDays, r.leaveDays, r.lopLeave, hrs(r.worked), hrs(r.otHours), hrs(r.shortHours), Math.round(r.hourly*100)/100, Math.round(r.otPay), Math.round(r.deduct), Math.round(r.gross)]);
+    const header = ['Employee','Monthly Salary','Shift hrs','OT x','Present days','Leave days','Absent days','Unpaid leave','Total hours','OT hours','Short hrs','Hourly rate','OT pay','Deduction','Gross'];
+    const data = rows.map(r => [r.emp.full_name||'', r.salary, r.shift, r.mult, r.presentDays, r.leaveDays, r.absentDays, r.lopLeave, hrs(r.worked), hrs(r.otHours), hrs(r.shortHours), Math.round(r.hourly*100)/100, Math.round(r.otPay), Math.round(r.deduct), Math.round(r.gross)]);
     const csv = [header, ...data].map(rr => rr.map(c => '"'+String(c).replace(/"/g,'""')+'"').join(',')).join('\n');
     const blob = new Blob([csv], { type:'text/csv' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'payroll_' + month + '.csv'; a.click(); URL.revokeObjectURL(a.href);
@@ -12239,7 +12240,7 @@ function PayrollModule({ plant, me }) {
         <tbody>
           ${rows.map(r => html`
             <tr key=${r.emp.id} onClick=${() => setEditEmp(r.emp)} style="border-bottom:1px solid var(--slate-100);cursor:pointer">
-              <td style="padding:7px 10px"><div style="font-weight:600">${r.emp.full_name}</div><div style="font-size:10px;color:${r.configured?'var(--slate-400)':'var(--rose-500)'}">${r.configured ? (r.shift+'h · '+r.mult+'× OT') : '⚙ tap to set pay'}</div></td>
+              <td style="padding:7px 10px"><div style="font-weight:600">${r.emp.full_name}</div><div style="font-size:10px;color:${r.configured?'var(--slate-400)':'var(--rose-500)'}">${r.configured ? (r.shift+'h · '+r.mult+'× OT' + (r.absentDays?' · '+r.absentDays+' abs':'') + (r.lopLeave?' · '+r.lopLeave+' LOP':'')) : '⚙ tap to set pay'}</div></td>
               <td style="padding:7px 8px;text-align:right">${money(r.salary)}</td>
               <td style="padding:7px 8px;text-align:right">${r.presentDays}</td>
               <td style="padding:7px 8px;text-align:right;color:var(--amber-700);font-weight:600">${hrs(r.otHours)}</td>
@@ -12253,7 +12254,7 @@ function PayrollModule({ plant, me }) {
       </table>
     </div>
     <div style="font-size:11px;color:var(--slate-500);margin-top:8px;line-height:1.5">
-      Tap a row to set shift timing, salary, OT rate &amp; allowances. Each day's hours net against the shift across the month — extra is OT, shortfall is short-time (deducted at the hourly rate after the permission allowance). <strong>All</strong> Sunday/holiday hours are OT. Leave within the allowance isn't deducted. Hourly = salary ÷ ${divisor} ÷ shift.
+      Tap a row to set shift timing, salary, OT rate &amp; allowances. Each day's hours net against the shift across the month — extra is OT, shortfall is short-time (deducted at the hourly rate after the permission allowance). <strong>All</strong> Sunday/holiday hours are OT. Leave within the allowance isn't deducted; <strong>absent days</strong> and leave beyond the allowance are deducted at the day rate. Hourly = salary ÷ ${divisor} ÷ shift.
     </div>
 
     ${editEmp && html`<${PayrollConfigModal} plant=${plant} employee=${editEmp} config=${config[editEmp.id]} onClose=${() => setEditEmp(null)} onSaved=${() => { setEditEmp(null); refresh(); }} />`}
