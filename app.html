@@ -12386,6 +12386,27 @@ function quoteWeightGrams(shape, dia, width, length, density) {
 
 const inr = (n) => '₹' + (Math.round((Number(n)||0)*100)/100).toLocaleString('en-IN', { minimumFractionDigits:2, maximumFractionDigits:2 });
 
+// Build the cost cascade from prime (material + process) up to selling price.
+// ld: { rej_pct, inward_transport, supply_transport, packing_pct, inspection_pct, overhead_pct, profit_pct }
+// Percentages compound on the running subtotal; transports are lot lump sums ÷ qty.
+function computeQuoteBreakup(matCost, processTotal, qty, ld) {
+  const n = (v) => Number(v) || 0;
+  const q = Math.max(1, n(qty));
+  const prime = n(matCost) + n(processTotal);
+  let r = prime;
+  const lines = [];
+  const add = (label, amt, note) => { if (amt > 0) lines.push({ label, amt, note: note || '' }); r += amt; };
+  const pct = (label, p) => add(label + ' @ ' + n(p) + '%', r * n(p) / 100);
+  pct('Rejection', ld.rej_pct);
+  add('Inward transport', n(ld.inward_transport) / q, n(ld.inward_transport) ? (inr(n(ld.inward_transport)) + ' ÷ ' + q + ' pcs') : '');
+  add('Supply transport', n(ld.supply_transport) / q, n(ld.supply_transport) ? (inr(n(ld.supply_transport)) + ' ÷ ' + q + ' pcs') : '');
+  pct('Packing', ld.packing_pct);
+  pct('Inspection', ld.inspection_pct);
+  pct('Overhead', ld.overhead_pct);
+  pct('Profit', ld.profit_pct);
+  return { prime, lines, final: r };
+}
+
 function QuotationModule({ plant, me }) {
   const [quotes, setQuotes] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -12434,6 +12455,9 @@ function QuotationEditor({ plant, me, quote, onClose, onSaved }) {
     material: quote?.material || 'EN1A (free-cutting steel)', mat_shape: quote?.mat_shape || 'round',
     mat_dia: quote?.mat_dia ?? '', mat_width: quote?.mat_width ?? '', mat_length: quote?.mat_length ?? '',
     mat_density: quote?.mat_density ?? 7.85, mat_rate: quote?.mat_rate ?? '', qty: quote?.qty ?? 1,
+    rej_pct: quote?.rej_pct ?? 2, packing_pct: quote?.packing_pct ?? 3, inspection_pct: quote?.inspection_pct ?? 0.5,
+    overhead_pct: quote?.overhead_pct ?? 5, profit_pct: quote?.profit_pct ?? 10,
+    inward_transport: quote?.inward_transport ?? '', supply_transport: quote?.supply_transport ?? '',
     notes: quote?.notes || '', status: quote?.status || 'draft',
   });
   const [items, setItems] = useState([]);
@@ -12461,8 +12485,9 @@ function QuotationEditor({ plant, me, quote, onClose, onSaved }) {
   const matWeight = quoteWeightGrams(form.mat_shape, form.mat_dia, form.mat_width, form.mat_length, form.mat_density);
   const matCost = (matWeight/1000) * (Number(form.mat_rate)||0);
   const itemsTotal = items.reduce((s,it) => s + (Number(it.price)||0), 0);
-  const grandTotal = matCost + itemsTotal;
   const qty = Number(form.qty)||1;
+  const breakup = computeQuoteBreakup(matCost, itemsTotal, qty, form);
+  const grandTotal = breakup.final;
 
   const setItem = (i, patch) => setItems(its => its.map((it,idx) => idx===i ? { ...it, ...patch } : it));
   const addItem = () => setItems(its => [...its, { process:'', description:'', price:'' }]);
@@ -12480,6 +12505,9 @@ function QuotationEditor({ plant, me, quote, onClose, onSaved }) {
         mat_length: form.mat_length===''?null:Number(form.mat_length), mat_density: Number(form.mat_density)||null,
         mat_rate: form.mat_rate===''?null:Number(form.mat_rate), mat_weight_g: Math.round(matWeight*100)/100,
         mat_cost: Math.round(matCost*100)/100, qty, notes: form.notes||null, status: form.status,
+        rej_pct: Number(form.rej_pct)||0, packing_pct: Number(form.packing_pct)||0, inspection_pct: Number(form.inspection_pct)||0,
+        overhead_pct: Number(form.overhead_pct)||0, profit_pct: Number(form.profit_pct)||0,
+        inward_transport: form.inward_transport===''?0:Number(form.inward_transport), supply_transport: form.supply_transport===''?0:Number(form.supply_transport),
         grand_total: Math.round(grandTotal*100)/100, updated_at: new Date().toISOString(),
       };
       let qid = quote?.id;
@@ -12564,10 +12592,30 @@ function QuotationEditor({ plant, me, quote, onClose, onSaved }) {
     </div>
 
     <div class="card" style="margin-top:10px">
+      <div class="card-title">📊 Loadings &amp; margin</div>
+      <div class="field-row">
+        <div class="field"><label>Rejection %</label><input type="number" step="0.1" value=${form.rej_pct} onChange=${e=>setForm({...form,rej_pct:e.target.value})} /></div>
+        <div class="field"><label>Packing %</label><input type="number" step="0.1" value=${form.packing_pct} onChange=${e=>setForm({...form,packing_pct:e.target.value})} /></div>
+        <div class="field"><label>Inspection %</label><input type="number" step="0.1" value=${form.inspection_pct} onChange=${e=>setForm({...form,inspection_pct:e.target.value})} /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Overhead %</label><input type="number" step="0.1" value=${form.overhead_pct} onChange=${e=>setForm({...form,overhead_pct:e.target.value})} /></div>
+        <div class="field"><label>Profit %</label><input type="number" step="0.1" value=${form.profit_pct} onChange=${e=>setForm({...form,profit_pct:e.target.value})} /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Inward transport (₹ / lot)</label><input type="number" step="0.01" value=${form.inward_transport} onChange=${e=>setForm({...form,inward_transport:e.target.value})} placeholder="lump sum ÷ qty" /></div>
+        <div class="field"><label>Supply transport (₹ / lot)</label><input type="number" step="0.01" value=${form.supply_transport} onChange=${e=>setForm({...form,supply_transport:e.target.value})} placeholder="lump sum ÷ qty" /></div>
+      </div>
+      <div style="font-size:10.5px;color:var(--slate-400);line-height:1.4">Percentages cascade in order (rejection → transport → packing → inspection → overhead → profit). Transport is the <b>lot total</b>, auto-divided by Qty (${qty}).</div>
+    </div>
+
+    <div class="card" style="margin-top:10px">
       <div style="display:flex;justify-content:space-between"><span style="font-size:13px;color:var(--slate-600)">Material</span><span style="font-weight:600">${inr(matCost)}</span></div>
       <div style="display:flex;justify-content:space-between;margin-top:4px"><span style="font-size:13px;color:var(--slate-600)">Process charges</span><span style="font-weight:600">${inr(itemsTotal)}</span></div>
+      <div style="display:flex;justify-content:space-between;margin-top:6px;padding-top:6px;border-top:1px solid var(--slate-200)"><span style="font-size:13px;font-weight:700">Prime cost</span><span style="font-weight:700">${inr(breakup.prime)}</span></div>
+      ${breakup.lines.map((l,li) => html`<div key=${li} style="display:flex;justify-content:space-between;margin-top:4px;gap:8px"><span style="font-size:12px;color:var(--slate-500)">+ ${l.label}${l.note?html` <span style="color:var(--slate-400)">${l.note}</span>`:''}</span><span style="font-size:12px;color:var(--slate-600);white-space:nowrap">${inr(l.amt)}</span></div>`)}
       <div style="display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:2px solid var(--slate-200)"><span style="font-size:15px;font-weight:700">Grand Total${qty>1?' / piece':''}</span><span style="font-size:20px;font-weight:800;color:var(--teal-700)">${inr(grandTotal)}</span></div>
-      ${qty>1 && html`<div style="display:flex;justify-content:space-between;margin-top:4px"><span style="font-size:12px;color:var(--slate-500)">× ${qty} pcs</span><span style="font-size:13px;font-weight:600;color:var(--slate-600)">${inr(grandTotal*qty)}</span></div>`}
+      ${qty>1 && html`<div style="display:flex;justify-content:space-between;margin-top:4px"><span style="font-size:12px;color:var(--slate-500)">Order value × ${qty} pcs</span><span style="font-size:13px;font-weight:600;color:var(--slate-600)">${inr(grandTotal*qty)}</span></div>`}
     </div>
 
     <div class="card" style="margin-top:10px"><div class="field" style="margin-bottom:0"><label>Notes (terms, validity…)</label><textarea rows=${2} value=${form.notes} onChange=${e=>setForm({...form,notes:e.target.value})}></textarea></div></div>
@@ -12581,11 +12629,18 @@ function quotationPrint(q, items, plant) {
   const esc = (s) => String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
   const matDesc = [q.mat_dia?('⌀'+q.mat_dia+'mm'):'', q.mat_length?(q.mat_length+'mm cut'):'', q.mat_weight_g?(Math.round(q.mat_weight_g)+'g'):'', q.mat_rate?('@ ₹'+q.mat_rate+'/kg'):''].filter(Boolean).join(' · ');
   const rows = [`<tr><td>Material cost</td><td>${esc(q.material||'')}${matDesc?' — '+esc(matDesc):''}</td><td class="r">${inr(q.mat_cost)}</td></tr>`];
+  let processTotal = 0;
   (items||[]).forEach(it => {
-    if (!it.process && !it.description && !(Number(it.price))) return;
-    rows.push(`<tr><td>${esc(it.process||'')}</td><td>${esc(it.description||'')}</td><td class="r">${inr(Number(it.price)||0)}</td></tr>`);
+    const pr = Number(it.price)||0;
+    if (!it.process && !it.description && !pr) return;
+    processTotal += pr;
+    rows.push(`<tr><td>${esc(it.process||'')}</td><td>${esc(it.description||'')}</td><td class="r">${inr(pr)}</td></tr>`);
   });
-  const grand = Number(q.grand_total)||0, qty = Number(q.qty)||1;
+  const qty = Number(q.qty)||1;
+  const bk = computeQuoteBreakup(q.mat_cost, processTotal, qty, q);
+  rows.push(`<tr class="sub"><td colspan="2">Prime cost (material + process)</td><td class="r">${inr(bk.prime)}</td></tr>`);
+  bk.lines.forEach(l => rows.push(`<tr><td>${esc(l.label)}</td><td>${esc(l.note||'')}</td><td class="r">${inr(l.amt)}</td></tr>`));
+  const grand = bk.final;
   const docHtml = `<!doctype html><html><head><meta charset="utf-8"><style>
     @page{size:A4;margin:14mm} *{box-sizing:border-box} body{font-family:Arial,Helvetica,sans-serif;color:#0f172a;margin:0}
     h1{color:#0d9488;font-size:23px;margin:0 0 2px;letter-spacing:.5px} .meta{font-size:12px;color:#475569}
@@ -12594,7 +12649,7 @@ function quotationPrint(q, items, plant) {
     table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12.5px}
     th{background:#0d9488;color:#fff;text-align:left;padding:8px 10px;font-size:11px;letter-spacing:.3px}
     th.r,td.r{text-align:right;white-space:nowrap} td{padding:8px 10px;border-bottom:1px solid #e2e8f0}
-    tbody tr:nth-child(even){background:#f8fafc}
+    tbody tr:nth-child(even){background:#f8fafc} tr.sub td{font-weight:700;background:#eef2f7}
     .total{display:flex;justify-content:flex-end;margin-top:14px} .box{min-width:250px}
     .line{display:flex;justify-content:space-between;font-size:13px;padding:3px 0;color:#475569}
     .grand{display:flex;justify-content:space-between;font-size:17px;font-weight:800;border-top:2px solid #0f172a;margin-top:6px;padding-top:8px;color:#0d9488}
