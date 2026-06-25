@@ -11901,23 +11901,30 @@ function AttendanceModule({ plant, me, activeUnit }) {
   const exportCSV = () => {
     const days = [];
     if (view === 'month') {
+      const ym = monthDate.slice(0,7);
       const [y, m] = monthDate.split('-').map(Number);
       const last = new Date(y, m, 0).getDate();
-      for (let d = 1; d <= last; d++) {
-        days.push(new Date(y, m-1, d).toISOString().slice(0,10));
-      }
+      for (let d = 1; d <= last; d++) days.push(ym + '-' + String(d).padStart(2,'0'));
     } else {
       days.push(date);
     }
-    const header = ['Employee', 'Role', 'Phone', ...days];
-    const rows = visibleEmployees.map(e => {
-      const cells = [e.full_name || '', e.role || '', e.phone || ''];
+    // Long format — one row per employee per marked day, with punch times &
+    // hours so it can feed payroll / overtime. Unmarked days are skipped.
+    const header = ['Employee', 'Role', 'Phone', 'Date', 'Status', 'In', 'Out', 'Hours'];
+    const rows = [];
+    for (const e of visibleEmployees) {
       for (const d of days) {
         const r = recByEmpDate[e.id]?.[d];
-        cells.push(r ? (statusByKey[r.status]?.label || r.status) : '');
+        if (!r) continue;
+        rows.push([
+          e.full_name || '', e.role || '', e.phone || '', d,
+          statusByKey[r.status]?.label || r.status,
+          r.in_time ? String(r.in_time).slice(0,5) : '',
+          r.out_time ? String(r.out_time).slice(0,5) : '',
+          r.hours_worked != null ? r.hours_worked : '',
+        ]);
       }
-      return cells;
-    });
+    }
     const csv = [header, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n');
     const blob = new Blob([csv], { type:'text/csv' });
     const url = URL.createObjectURL(blob);
