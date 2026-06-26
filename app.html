@@ -12941,19 +12941,17 @@ function SelfAttendancePage({ plant, me, reload }) {
 
   // On Duty — off-site work, no gate QR / geofence. Captures GPS (best-effort)
   // + an optional reason. Counts as a present day in payroll.
-  const markOnDuty = () => {
-    const note = prompt('On Duty — where / why? (optional)');
-    if (note === null) return;   // cancelled
-    const hStr = prompt('Hours worked today? (blank = full day; enter more than your shift to claim overtime)');
-    if (hStr === null) return;   // cancelled
-    const hn = hStr.trim() === '' ? null : Number(hStr);
-    const hours = (hn && hn > 0) ? hn : null;
+  // On Duty = real punch IN / OUT from anywhere (off-site), no gate QR/geofence.
+  // Records IST times + GPS; hours feed payroll OT beyond the shift.
+  const punchOnDuty = (dir) => {
+    let note = null;
+    if (dir === 'in') { note = prompt('On Duty — where / why? (optional)'); if (note === null) return; }
     setError(''); setBusy(true);
-    const submit = (lat, lng) => sb.rpc('attendance_self_mark_onduty', { p_plant_id: plant.id, p_lat: lat, p_lng: lng, p_note: note || null, p_hours: hours })
+    const submit = (lat, lng) => sb.rpc('attendance_self_onduty_punch', { p_plant_id: plant.id, p_lat: lat, p_lng: lng, p_dir: dir, p_note: note || null })
       .then(({ data, error: err }) => {
         if (err) throw err;
-        if (!data?.success) { setError(data?.error || 'Failed to mark On Duty'); return; }
-        showToast('🚗 ' + (data.message || 'Marked On Duty'));
+        if (!data?.success) { setError(data?.error || 'Failed'); return; }
+        showToast('🚗 ' + (data.message || 'Done'));
         refresh();
       })
       .catch(e => setError(e.message || String(e)))
@@ -12970,8 +12968,11 @@ function SelfAttendancePage({ plant, me, reload }) {
   // Plant must have attendance enabled + geofence pinned for self-mark to work.
   const ready = plant.attendance_mode === 'self_gps_qr' && plant.attendance_qr_secret && plant.geofence_lat;
 
-  const punchedIn = today?.in_time && !today?.out_time;
-  const punchedOut = today?.in_time && today?.out_time;
+  const isOD = today?.status === 'on_duty';
+  const odIn = isOD && today?.in_time && !today?.out_time;       // on duty, not yet punched out
+  const odDone = isOD && today?.in_time && today?.out_time;       // on duty, completed
+  const punchedIn = !isOD && today?.in_time && !today?.out_time;  // gate punch (exclude OD)
+  const punchedOut = !isOD && today?.in_time && today?.out_time;
 
   return html`
     <div class="page-header">
@@ -12991,9 +12992,10 @@ function SelfAttendancePage({ plant, me, reload }) {
 
     <div class="card" style="padding:18px;text-align:center;margin-bottom:14px">
       <div style="font-size:11px;color:var(--slate-500);font-weight:700;letter-spacing:0.05em;text-transform:uppercase;margin-bottom:8px">Today · ${new Date().toLocaleDateString('en-IN', { weekday:'long', day:'2-digit', month:'short' })}</div>
-      ${today?.status === 'on_duty' ? html`
+      ${isOD ? html`
         <div style="font-size:34px;margin-bottom:6px">🚗</div>
-        <div style="font-size:18px;font-weight:700;color:var(--sky-700,#0369a1)">On Duty today</div>
+        <div style="font-size:18px;font-weight:700;color:var(--sky-700,#0369a1)">${odDone ? 'On Duty — done' : 'On Duty'}</div>
+        <div style="font-size:13px;color:var(--slate-600);margin-top:4px">${today.in_time ? 'IN ' + String(today.in_time).slice(0,5) : ''}${today.out_time ? ' · OUT ' + String(today.out_time).slice(0,5) : (today.in_time ? ' · working' : '')}${today.hours_worked ? ' · ' + today.hours_worked + ' hrs' : ''}</div>
         ${today.notes && html`<div style="font-size:12px;color:var(--slate-500);margin-top:4px">${today.notes}</div>`}
       ` : punchedOut ? html`
         <div style="font-size:34px;margin-bottom:6px">✅</div>
@@ -13019,9 +13021,12 @@ function SelfAttendancePage({ plant, me, reload }) {
       `}
     `}
 
-    ${phase === 'idle' && !punchedOut && html`
-      <button class="btn" disabled=${busy} onClick=${markOnDuty} style="width:100%;padding:14px;font-size:15px;font-weight:700;margin-top:10px;background:linear-gradient(135deg,#0284c7,#0ea5e9)">🚗 ${today?.status === 'on_duty' ? 'Update On Duty (hours / reason)' : 'Mark On Duty (off-site)'}</button>
-      <div style="font-size:11px;color:var(--slate-400);text-align:center;margin-top:6px">Out on field / customer visit? Log On Duty — no gate QR needed. Enter hours to claim overtime.</div>
+    ${phase === 'idle' && !punchedIn && !punchedOut && !odDone && !odIn && html`
+      <button class="btn" disabled=${busy} onClick=${() => punchOnDuty('in')} style="width:100%;padding:14px;font-size:15px;font-weight:700;margin-top:10px;background:linear-gradient(135deg,#0284c7,#0ea5e9)">🚗 On Duty — Punch IN (off-site)</button>
+      <div style="font-size:11px;color:var(--slate-400);text-align:center;margin-top:6px">Out on field / customer visit? No gate QR needed.</div>
+    `}
+    ${phase === 'idle' && odIn && html`
+      <button class="btn" disabled=${busy} onClick=${() => punchOnDuty('out')} style="width:100%;padding:16px;font-size:16px;font-weight:700;background:linear-gradient(135deg,#0369a1,#0284c7)">🚗 On Duty — Punch OUT</button>
     `}
 
     ${(phase === 'camera') && html`

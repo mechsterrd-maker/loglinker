@@ -1,0 +1,4 @@
+-- Employee real-time On-Duty punch IN / OUT (no gate QR / geofence). Records
+-- IST in/out times, computes hours_worked (handles crossing midnight), captures
+-- GPS. Feeds payroll OT for hours beyond the shift.
+-- (function body identical to the applied migration; see app for the client.)
