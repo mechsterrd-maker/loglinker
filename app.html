@@ -1774,6 +1774,25 @@ function makeCanViewModule(myPerms) {
   return (key) => set.has(key);
 }
 
+// Access guard for whole-page (tab) rendering. Decides whether the active tab
+// should render its module or an "Access denied" card. Mirrors the safety nets
+// in visibleMoreGroups so owners and zero-permission users are never locked out:
+//  - RBAC off for this plant            -> enforce:false, everything allowed
+//  - caller is plant_head / admin       -> enforce:false (full access)
+//  - caller has NO explicit permissions -> enforce:false (legacy / mid-migration)
+//  - otherwise                          -> enforce:true; canView(key) gates tabs
+// 'home' is always viewable so nobody can strand themselves on a blank screen.
+function moduleAccessGuard(myPerms) {
+  const allowAll = { enforce: false, canView: () => true };
+  if (!myPerms || !myPerms.rbac_enforced) return allowAll;
+  const isOwner = (myPerms.roles || []).some(r => r.slug === 'plant_head' || r.slug === 'admin');
+  const hasAnyPerm = (myPerms.permissions || []).length > 0;
+  if (isOwner || !hasAnyPerm) return allowAll;
+  const cv = makeCanViewModule(myPerms);
+  const ALWAYS = new Set(['home']);
+  return { enforce: true, canView: (key) => ALWAYS.has(key) || cv(key) };
+}
+
 // Generic permission check used by individual components/buttons.
 // Treats '*' as covering every action on a module.
 function canDo(myPerms, moduleKey, action) {
@@ -2050,6 +2069,18 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   // PDC Production tab for Projects.
   const mobilePrimaryKeys = fab ? ['home','projects','quality','chat'] : ['home','production','quality','chat'];
 
+  // RBAC page-render gate. When enforced, a tab the user can't view renders an
+  // Access-denied card instead of the module. We redirect the page switch to a
+  // sentinel so none of the real (lazy-mounted) pages mount, then render the
+  // denial. Tabs outside the permission matrix (RBAC_MODULE_KEYS) are never
+  // gated here. Owners / zero-perm users bypass via moduleAccessGuard.
+  const accessGuard = moduleAccessGuard(myPerms);
+  const denied = accessGuard.enforce && RBAC_MODULE_KEYS.has(tab) && !accessGuard.canView(tab);
+  const pageTab = denied ? '__denied__' : tab;
+  // A nav tab is shown only if it's allowed: not gated (off / outside matrix)
+  // or explicitly viewable. Shared by the mobile tabbar below.
+  const tabAllowed = (key) => !accessGuard.enforce || !RBAC_MODULE_KEYS.has(key) || accessGuard.canView(key);
+
   return html`
     <div class="app">
       <${TopNavDesktop} plant=${plant} me=${me} myPerms=${myPerms} initials=${initials} tab=${tab} setTab=${setTab} logout=${logout} onProfile=${() => setProfileOpen(true)} unreadCount=${unreadCount} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />
@@ -2080,57 +2111,58 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       </div>
       ${profileOpen && html`<${ProfileModal} me=${me} user=${user} plant=${plant} activeUnit=${activeUnit} logout=${logout} onClose=${() => setProfileOpen(false)} onSaved=${() => { setProfileOpen(false); reload && reload(); }} />`}
 
-      <${Page} active=${tab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} /></${Page}>
-      <${Page} active=${tab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'attendance'}><${AttendanceModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'self_attendance'}><${SelfAttendancePage} plant=${plant} me=${me} reload=${reload} /></${Page}>
-      <${Page} active=${tab === 'attendance_setup'}><${AttendanceSetupPage} plant=${plant} me=${me} reload=${reload} /></${Page}>
-      <${Page} active=${tab === 'quality'}><${Quality} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'maintenance'}><${Maintenance} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'stocks'}><${Stocks} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'actions'}><${ActionHub} plant=${plant} me=${me} activeUnit=${activeUnit} navAction=${navAction} /></${Page}>
-      <${Page} active=${tab === 'documents'}><${Documents} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'schedules'}><${Schedules} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'movements'}><${MovementsPage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'trace'}><${TracePage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'reports'}><${Reports} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} /></${Page}>
-      <${Page} active=${tab === 'performance'}><${PerformanceDashboards} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'chat'}><${Chat} plant=${plant} me=${me} myPerms=${myPerms} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} navAction=${navAction} setTab=${setTab} /></${Page}>
-      <${Page} active=${tab === 'people'}><${People} plant=${plant} me=${me} myPerms=${myPerms} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
-      <${Page} active=${tab === 'masters'}><${MastersHub} plant=${plant} me=${me} myPerms=${myPerms} setTab=${setTab} /></${Page}>
-      <${Page} active=${tab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
-      <${Page} active=${tab === 'calibration'}><${CalibrationModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'training'}><${TrainingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'ppap'}><${PpapModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'pfmea'}><${PfmeaModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'lpa'}><${LpaModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'mgmt_review'}><${MgmtReviewModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'csr'}><${CsrModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'scl'}><${SclModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'iap'}><${InternalAuditPlanModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'pm_schedule'}><${PmScheduleModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'quality_objectives'}><${QualityObjectivesModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'risk_register'}><${RiskRegisterModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'contingency'}><${ContingencyModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${tab === 'npd'}><${NpdModule} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
-      <${Page} active=${tab === 'quotation'}><${QuotationModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'tpm'}><${TpmModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'rejection_types'}><${RejectionTypesModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'cad3d'}><${CadNexaEmbed} plant=${plant} me=${me} user=${user} /></${Page}>
-      <${Page} active=${tab === 'iatf_docs'}><${IatfDocsLibrary} /></${Page}>
-      <${Page} active=${tab === 'mom'}><${MomModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'voice_notes'}><${VoiceNotesModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} /></${Page}>
-      <${Page} active=${tab === 'doc_formats'}><${DocFormatsModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'projects'}><${ProjectTracker} plant=${plant} me=${me} myPerms=${myPerms} go=${go} /></${Page}>
-      <${Page} active=${tab === 'cutting'}><${CuttingPlanner} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'expenses'}><${ExpenseLedger} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'machine_prod'}><${MachineProductionModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'petty_cash'}><${PettyCashModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${tab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
+      <${Page} active=${pageTab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} /></${Page}>
+      <${Page} active=${pageTab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'attendance'}><${AttendanceModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'self_attendance'}><${SelfAttendancePage} plant=${plant} me=${me} reload=${reload} /></${Page}>
+      <${Page} active=${pageTab === 'attendance_setup'}><${AttendanceSetupPage} plant=${plant} me=${me} reload=${reload} /></${Page}>
+      <${Page} active=${pageTab === 'quality'}><${Quality} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'maintenance'}><${Maintenance} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'stocks'}><${Stocks} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'actions'}><${ActionHub} plant=${plant} me=${me} activeUnit=${activeUnit} navAction=${navAction} /></${Page}>
+      <${Page} active=${pageTab === 'documents'}><${Documents} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'schedules'}><${Schedules} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'movements'}><${MovementsPage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'trace'}><${TracePage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'reports'}><${Reports} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} /></${Page}>
+      <${Page} active=${pageTab === 'performance'}><${PerformanceDashboards} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'chat'}><${Chat} plant=${plant} me=${me} myPerms=${myPerms} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} navAction=${navAction} setTab=${setTab} /></${Page}>
+      <${Page} active=${pageTab === 'people'}><${People} plant=${plant} me=${me} myPerms=${myPerms} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
+      <${Page} active=${pageTab === 'masters'}><${MastersHub} plant=${plant} me=${me} myPerms=${myPerms} setTab=${setTab} /></${Page}>
+      <${Page} active=${pageTab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
+      <${Page} active=${pageTab === 'calibration'}><${CalibrationModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'training'}><${TrainingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'ppap'}><${PpapModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'pfmea'}><${PfmeaModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'lpa'}><${LpaModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'mgmt_review'}><${MgmtReviewModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'csr'}><${CsrModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'scl'}><${SclModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'iap'}><${InternalAuditPlanModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'pm_schedule'}><${PmScheduleModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'quality_objectives'}><${QualityObjectivesModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'risk_register'}><${RiskRegisterModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'contingency'}><${ContingencyModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'npd'}><${NpdModule} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
+      <${Page} active=${pageTab === 'quotation'}><${QuotationModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'tpm'}><${TpmModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'rejection_types'}><${RejectionTypesModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'cad3d'}><${CadNexaEmbed} plant=${plant} me=${me} user=${user} /></${Page}>
+      <${Page} active=${pageTab === 'iatf_docs'}><${IatfDocsLibrary} /></${Page}>
+      <${Page} active=${pageTab === 'mom'}><${MomModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'voice_notes'}><${VoiceNotesModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} /></${Page}>
+      <${Page} active=${pageTab === 'doc_formats'}><${DocFormatsModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'projects'}><${ProjectTracker} plant=${plant} me=${me} myPerms=${myPerms} go=${go} /></${Page}>
+      <${Page} active=${pageTab === 'cutting'}><${CuttingPlanner} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'expenses'}><${ExpenseLedger} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'machine_prod'}><${MachineProductionModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'petty_cash'}><${PettyCashModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
+      <${Page} active=${denied}><${AccessDenied} moduleKey=${tab} /></${Page}>
 
       <div class="tabbar">
         ${(() => {
@@ -2162,7 +2194,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
               allMobile[7],
             ];
           }
-          return mobileTabs.map(t => html`
+          return mobileTabs.filter(t => tabAllowed(t.key)).map(t => html`
             <${TabBtn} key=${t.key} icon=${t.icon} label=${t.label}
               active=${tab === t.key}
               onClick=${() => setTab(t.key)}
@@ -2224,9 +2256,14 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
     ? new Set(['home', ...plant.enabled_tabs])
     : null;
   const extraModules = new Set(Array.isArray(plant?.extra_modules) ? plant.extra_modules : []);
-  const tabs = enabled
+  // RBAC: hide top-level tabs the user's role can't view (owners / zero-perm
+  // users bypass; tabs outside the permission matrix are never gated).
+  const navGuard = moduleAccessGuard(myPerms);
+  const navAllowed = (key) => !navGuard.enforce || !RBAC_MODULE_KEYS.has(key) || navGuard.canView(key);
+  const tabs = (enabled
     ? allTabs.filter(t => enabled.has(t.key))
-    : allTabs.filter(t => !OPT_IN_TAB_KEYS.has(t.key) || extraModules.has(t.key));
+    : allTabs.filter(t => !OPT_IN_TAB_KEYS.has(t.key) || extraModules.has(t.key))
+  ).filter(t => navAllowed(t.key));
   // Everything else lives in the More dropdown — IATF modules + secondary routes
   const inMore = MORE_FLAT_KEYS.includes(tab) && !tabs.some(t => t.key === tab);
   const icons = {
@@ -2393,6 +2430,24 @@ function Page({ active, children }) {
   // tabs reloads fresh data (the desired auto-refresh behavior).
   if (!active) return html`<div class="page" style="display:none"></div>`;
   return html`<div class="page active">${children}</div>`;
+}
+
+// Shown in place of a module when the signed-in user's role doesn't grant
+// 'view' on it (RBAC enforced + explicit permissions, non-owner). The role
+// matrix in People → Roles is where access is granted.
+function AccessDenied({ moduleKey }) {
+  const mod = RBAC_MODULES.find(m => m.key === moduleKey);
+  const label = mod ? mod.label : 'this module';
+  return html`
+    <div class="page-pad" style="max-width:520px;margin:48px auto;text-align:center">
+      <div style="font-size:48px;line-height:1">🔒</div>
+      <h2 style="margin:16px 0 8px;font-size:20px;color:var(--slate-800)">Access restricted</h2>
+      <p style="color:var(--slate-500);font-size:14px;line-height:1.6">
+        Your role doesn't have permission to open <strong>${label}</strong>.
+        Ask a plant admin to grant you access in <strong>People → Roles</strong>.
+      </p>
+    </div>
+  `;
 }
 
 function TabBtn({ icon, label, active, onClick, badge }) {
@@ -7363,6 +7418,10 @@ const RBAC_MODULES = [
   { key:'jobwork', label:'Sub-Contracting', group:'commercial' },
   { key:'supplier_chase', label:'Supplier Chase', group:'commercial' },
   { key:'customer_complaints', label:'Customer Complaints', group:'quality' },
+  { key:'self_attendance', label:'Punch IN / My Attendance', group:'workforce' },
+  { key:'attendance', label:'Attendance Register', group:'workforce' },
+  { key:'attendance_setup', label:'Attendance / Payroll Setup', group:'workforce' },
+  { key:'quotation', label:'Quotation / Costing', group:'commercial' },
   { key:'reports', label:'Reports', group:'audit' },
   { key:'performance', label:'Performance Dashboards', group:'audit' },
   { key:'trace', label:'Trace / Audit Investigation', group:'audit' },
@@ -7372,9 +7431,14 @@ const RBAC_MODULE_GROUPS = {
   ops: 'Shop Floor & Quality',
   projects: 'Projects · Tasks · CAD',
   commercial: 'Commercial · Bills · Money',
+  workforce: 'Workforce · Attendance · Payroll',
   quality: 'Customer & Quality Feedback',
   audit: 'Reports & Audit',
 };
+// Fast set of keys that participate in the permission matrix. Used by the
+// page-render access guard to decide which tabs are gateable — a tab NOT in
+// this set is never blocked (it can't be granted/denied in the grid anyway).
+const RBAC_MODULE_KEYS = new Set(RBAC_MODULES.map(m => m.key));
 const RBAC_ACTIONS = ['view','create','edit','delete','approve','export'];
 const RBAC_ACTION_LABELS = { view:'View', create:'Create', edit:'Edit', delete:'Delete', approve:'Approve', export:'Export' };
 
