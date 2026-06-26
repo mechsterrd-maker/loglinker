@@ -11796,6 +11796,30 @@ function SupplierChaseModule({ plant, me }) {
 // =================================================================
 // ATTENDANCE — daily P/A/HD/Leave marking per employee
 // =================================================================
+// Month + year dropdowns — a cross-browser replacement for <input type="month">,
+// which Safari (macOS/iOS) does NOT support and silently renders as a typable
+// text box with no picker. Value/onChange use the same 'YYYY-MM' contract.
+function MonthField({ value, onChange, style }) {
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const now = new Date();
+  const curY = now.getFullYear();
+  const [vy, vm] = (value || '').split('-');
+  const y = vy || String(curY);
+  const m = vm || String(now.getMonth() + 1).padStart(2, '0');
+  const years = [];
+  for (let yy = curY + 1; yy >= curY - 6; yy--) years.push(String(yy));
+  const selStyle = 'font-size:13px;padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;background:white;color:var(--slate-800)';
+  return html`
+    <div style=${'display:flex;gap:6px;width:100%;' + (style || '')}>
+      <select aria-label="Month" value=${m} onChange=${e => onChange(`${y}-${e.target.value}`)} style=${selStyle + ';flex:1 1 0;min-width:96px'}>
+        ${MONTHS.map((mn, i) => html`<option value=${String(i + 1).padStart(2, '0')}>${mn}</option>`)}
+      </select>
+      <select aria-label="Year" value=${y} onChange=${e => onChange(`${e.target.value}-${m}`)} style=${selStyle + ';flex:0 0 88px'}>
+        ${years.map(yy => html`<option value=${yy}>${yy}</option>`)}
+      </select>
+    </div>`;
+}
+
 // One row per (employee, date) in mcp_attendance. Day-status driven: the
 // common Indian SME pattern (P/A/HD/L/WO/H/WFH). Optional IN/OUT times.
 // Default view = today; supervisors mark with one tap per row. Bulk
@@ -11809,6 +11833,7 @@ function AttendanceModule({ plant, me, activeUnit }) {
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
   const [savingId, setSavingId] = useState(null);
+  const [odEntry, setOdEntry] = useState(null); // On-Duty in/out time modal: {employeeId,name,in_time,out_time}
   const isAdmin = me?.role === 'admin' || me?.role === 'plant_head';
 
   const STATUSES = [
@@ -11855,21 +11880,15 @@ function AttendanceModule({ plant, me, activeUnit }) {
     return employees.filter(e => (e.full_name || '').toLowerCase().includes(q));
   }, [employees, search]);
 
-  const mark = async (employeeId, newStatus) => {
-    // On Duty can carry hours so payroll pays OT beyond the shift.
-    const extra = {};
-    if (newStatus === 'on_duty') {
-      const h = prompt('On Duty — hours worked? (blank = full day; more than the shift = overtime)');
-      if (h === null) return;                       // cancelled
-      const hn = h.trim() === '' ? null : Number(h);
-      extra.hours_worked = (hn && hn > 0) ? hn : null;
-    }
+  // Shared upsert for one (employee, date) row — used by status taps and the
+  // On-Duty in/out modal. `fields` overrides status / times / hours.
+  const writeAttendance = async (employeeId, fields) => {
     setSavingId(employeeId);
     try {
       const existing = recByEmpDate[employeeId]?.[date];
       if (existing) {
         const { error } = await sb.from('mcp_attendance')
-          .update({ status: newStatus, marked_by: me.id, ...extra })
+          .update({ marked_by: me.id, ...fields })
           .eq('id', existing.id);
         if (error) throw error;
       } else {
@@ -11878,15 +11897,51 @@ function AttendanceModule({ plant, me, activeUnit }) {
           unit_id: activeUnit?.unit_id || null,
           user_id: employeeId,
           date: date,
-          status: newStatus,
           marked_by: me.id,
-          ...extra,
+          ...fields,
         });
         if (error) throw error;
       }
       await refresh();
     } catch (e) { alert('Save failed: ' + e.message); }
     finally { setSavingId(null); }
+  };
+
+  const mark = async (employeeId, newStatus) => {
+    // On Duty opens an in/out time entry so payroll can pay OT beyond the shift.
+    if (newStatus === 'on_duty') {
+      const existing = recByEmpDate[employeeId]?.[date];
+      const emp = employees.find(x => x.id === employeeId);
+      setOdEntry({
+        employeeId,
+        name: emp?.full_name || '',
+        in_time:  existing?.in_time  ? String(existing.in_time).slice(0,5)  : '',
+        out_time: existing?.out_time ? String(existing.out_time).slice(0,5) : '',
+      });
+      return;
+    }
+    await writeAttendance(employeeId, { status: newStatus });
+  };
+
+  // Save the On-Duty modal: derive hours from in/out (handles a shift that
+  // crosses midnight) and persist times + status in one upsert.
+  const saveOnDuty = async () => {
+    const { employeeId, in_time, out_time } = odEntry;
+    let hours = null;
+    if (in_time && out_time) {
+      const [ih, im] = in_time.split(':').map(Number);
+      const [oh, om] = out_time.split(':').map(Number);
+      let mins = (oh * 60 + om) - (ih * 60 + im);
+      if (mins < 0) mins += 24 * 60;
+      hours = Math.round((mins / 60) * 100) / 100;
+    }
+    setOdEntry(null);
+    await writeAttendance(employeeId, {
+      status: 'on_duty',
+      in_time: in_time || null,
+      out_time: out_time || null,
+      hours_worked: hours,
+    });
   };
 
   const markAll = async (statusKey) => {
@@ -11956,6 +12011,33 @@ function AttendanceModule({ plant, me, activeUnit }) {
   if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
 
   return html`
+    ${odEntry && html`
+      <div onClick=${() => setOdEntry(null)} style="position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:50;display:flex;align-items:center;justify-content:center;padding:16px">
+        <div onClick=${e => e.stopPropagation()} class="card" style="max-width:360px;width:100%;padding:18px">
+          <div style="font-size:15px;font-weight:700;color:var(--slate-800);margin-bottom:2px">🚗 On Duty — ${odEntry.name}</div>
+          <div style="font-size:12px;color:var(--slate-500);margin-bottom:14px">${date} · enter in & out time (leave blank for a full day)</div>
+          <div style="display:flex;gap:10px;margin-bottom:10px">
+            <div class="field" style="margin:0;flex:1"><label style="font-size:11px">In time</label>
+              <input type="time" value=${odEntry.in_time} onChange=${e => setOdEntry({ ...odEntry, in_time: e.target.value })} style="font-size:14px" /></div>
+            <div class="field" style="margin:0;flex:1"><label style="font-size:11px">Out time</label>
+              <input type="time" value=${odEntry.out_time} onChange=${e => setOdEntry({ ...odEntry, out_time: e.target.value })} style="font-size:14px" /></div>
+          </div>
+          ${(() => {
+            if (!odEntry.in_time || !odEntry.out_time) return null;
+            const [ih, im] = odEntry.in_time.split(':').map(Number);
+            const [oh, om] = odEntry.out_time.split(':').map(Number);
+            let mins = (oh * 60 + om) - (ih * 60 + im); if (mins < 0) mins += 1440;
+            const hrs = Math.round((mins / 60) * 100) / 100;
+            return html`<div style="font-size:12px;color:var(--sky-700,#0369a1);margin-bottom:14px;font-weight:600">≈ ${hrs} hrs${(oh * 60 + om) < (ih * 60 + im) ? ' (crosses midnight)' : ''}</div>`;
+          })()}
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button type="button" class="btn small ghost" onClick=${() => setOdEntry(null)}>Cancel</button>
+            <button type="button" class="btn small" onClick=${saveOnDuty} style="background:var(--sky-600,#0284c7)">Save On Duty</button>
+          </div>
+        </div>
+      </div>
+    `}
+
     <div class="page-header">
       <div><h1>📅 Attendance</h1><div class="sub">${employees.length} employees · ${plant.name}${activeUnit ? ' · ' + activeUnit.unit_name : ''}</div></div>
     </div>
@@ -12037,7 +12119,7 @@ function AttendanceModule({ plant, me, activeUnit }) {
       <div class="card" style="padding:10px 12px;margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end">
         <div class="field" style="margin:0;flex:1;min-width:160px">
           <label style="font-size:11px">Month</label>
-          <input type="month" value=${monthDate.slice(0,7)} onChange=${e => setMonthDate(e.target.value + '-01')} style="font-size:13px" />
+          <${MonthField} value=${monthDate.slice(0,7)} onChange=${v => setMonthDate(v + '-01')} />
         </div>
         <div class="field" style="margin:0;flex:2;min-width:160px">
           <label style="font-size:11px">Search employee</label>
@@ -12216,7 +12298,7 @@ function PayrollModule({ plant, me }) {
     <div class="card" style="padding:10px 12px;margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end">
       <div class="field" style="margin:0;flex:1;min-width:130px">
         <label style="font-size:11px">Month</label>
-        <input type="month" value=${month} onChange=${e => setMonth(e.target.value)} style="font-size:13px" />
+        <${MonthField} value=${month} onChange=${v => setMonth(v)} />
       </div>
       <div class="field" style="margin:0;min-width:110px">
         <label style="font-size:11px">Salary ÷ days</label>
