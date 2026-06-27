@@ -1,0 +1,5 @@
+-- Owner status must come from a genuine BUILT-IN plant_head/admin role, not any
+-- role that happens to have that slug. my_permissions() now returns is_builtin
+-- per role; the client treats only is_builtin owners as owners. create_plant_role
+-- also now rejects reserved slugs. Already applied to production.
+-- (Full bodies in the matching apply_migration.)
