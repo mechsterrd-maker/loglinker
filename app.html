@@ -1700,7 +1700,31 @@ const MORE_FLAT_KEYS = MORE_GROUPS.flatMap(g => g.items.map(i => i.key));
 // module (attendance, petty cash, self-attendance) from showing up in every
 // existing plant the moment it ships. To roll a module out to an existing
 // plant, add its key to that plant's plants.enabled_tabs.
-const OPT_IN_TAB_KEYS = new Set(['self_attendance', 'attendance', 'attendance_setup', 'petty_cash', 'npd', 'quotation']);
+const OPT_IN_TAB_KEYS = new Set(['self_attendance', 'attendance', 'attendance_setup', 'petty_cash', 'npd', 'quotation', 'people']);
+
+// Display metadata for the top-level tabs (home/attendance/people/…). These are
+// NOT in MORE_GROUPS, so for whitelist plants (Starter Pack: plants.enabled_tabs
+// is set) the mobile More page uses this to list every enabled module — the
+// 4-slot bottom bar can't fit them all, and they'd otherwise be unreachable.
+const TOP_TAB_META = {
+  home:            { icon:'🏠', label:'Home',                       sub:'Dashboard & shortcuts' },
+  self_attendance: { icon:'📍', label:'Punch IN',                   sub:'Mark your own attendance' },
+  attendance:      { icon:'🗓️', label:'Attendance Register',        sub:'Mark & review the team' },
+  attendance_setup:{ icon:'⚙️', label:'Attendance / Payroll Setup', sub:'Shifts, holidays, payroll' },
+  petty_cash:      { icon:'💵', label:'Petty Cash',                 sub:'Cash in / out ledger' },
+  actions:         { icon:'✅', label:'Tasks',                      sub:'Action hub' },
+  people:          { icon:'👥', label:'Team & Roles',               sub:'Add employees · role access matrix' },
+  production:      { icon:'🏭', label:'Production',                  sub:'Shop-floor logging' },
+  projects:        { icon:'📐', label:'Projects',                   sub:'Project tracker' },
+  quality:         { icon:'🔬', label:'Quality',                    sub:'NCRs · inspections' },
+  maintenance:     { icon:'🔧', label:'Maintenance',                sub:'Breakdowns · PM' },
+  stocks:          { icon:'📦', label:'Stocks',                     sub:'Inventory' },
+  documents:       { icon:'📄', label:'Documents',                  sub:'Bills & files' },
+  schedules:       { icon:'📅', label:'Schedules',                  sub:'Planning' },
+  reports:         { icon:'📊', label:'Reports',                    sub:'Summaries' },
+  chat:            { icon:'💬', label:'Chat',                       sub:'Team messaging' },
+  quotation:       { icon:'🧾', label:'Quotation / Costing',        sub:'Machining quotes' },
+};
 
 // Fabrication & site-works plants don't run PDC casting — they get Projects,
 // commercial docs and expenses instead of the manufacturing/casting surface.
@@ -2232,6 +2256,7 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
         { key:'attendance', label:'Attendance', icon:'home' },
         { key:'attendance_setup', label:'Att. Setup', icon:'home' },
         { key:'petty_cash', label:'Petty Cash', icon:'documents' },
+        { key:'people', label:'Team', icon:'people' },
       ]
     : [
         { key:'home', label:'Home', icon:'home' },
@@ -2248,6 +2273,7 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
         { key:'attendance', label:'Attendance', icon:'home' },
         { key:'attendance_setup', label:'Att. Setup', icon:'home' },
         { key:'petty_cash', label:'Petty Cash', icon:'documents' },
+        { key:'people', label:'Team', icon:'people' },
       ];
   // Per-plant module gating. When plants.enabled_tabs is set (non-empty),
   // only show those tabs in the order they're declared in enabled_tabs.
@@ -9070,6 +9096,38 @@ function More({ plant, me, myPerms, user, logout, setTab, activeUnit, accessible
 
   return html`
     <div class="page-header"><div><h1>More</h1><div class="sub">Modules, account, settings</div></div></div>
+
+    ${(() => {
+      // Whitelist plants (Starter Pack) list their top-level modules here, since
+      // these tabs aren't in MORE_GROUPS and the bottom bar only fits four. RBAC:
+      // an enforced plant hides modules the user can't view (owners see all).
+      const enabledTabs = Array.isArray(plant?.enabled_tabs) ? plant.enabled_tabs : [];
+      if (enabledTabs.length === 0) return null;
+      const guard = moduleAccessGuard(myPerms);
+      const keys = ['home', ...enabledTabs].filter((k, i, a) => a.indexOf(k) === i)
+        .filter(k => TOP_TAB_META[k])
+        .filter(k => !guard.enforce || !RBAC_MODULE_KEYS.has(k) || guard.canView(k));
+      if (keys.length === 0) return null;
+      return html`
+        <div class="section-h">Plant modules</div>
+        <div class="card" style="padding:0;margin-bottom:8px;overflow:hidden">
+          ${keys.map(k => {
+            const meta = TOP_TAB_META[k]; const isActive = k === tab;
+            return html`
+              <div class="list-item" key=${k} onClick=${() => setTab(k)} style=${'border-bottom:1px solid var(--slate-100);'+(isActive?'background:var(--teal-50);border-left:3px solid var(--teal-600)':'')}>
+                <div class="list-item-row">
+                  <div class="list-item-main">
+                    <div class="list-item-title" style=${isActive?'color:var(--teal-800);font-weight:600':''}>${meta.icon}  ${meta.label}${isActive?' · current':''}</div>
+                    <div class="list-item-sub">${meta.sub}</div>
+                  </div>
+                  <span style="color:var(--slate-400);font-size:18px">${isActive?'●':'›'}</span>
+                </div>
+              </div>
+            `;
+          })}
+        </div>
+      `;
+    })()}
 
     <div class="section-h" style="display:flex;justify-content:space-between;align-items:center">
       <span>Modules</span>
