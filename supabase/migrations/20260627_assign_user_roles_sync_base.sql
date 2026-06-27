@@ -1,0 +1,7 @@
+-- "Replace + sync": assigning roles via the Roles modal now also aligns the
+-- legacy base role (users.role) with the most senior built-in role assigned, so
+-- a person's powers match the role shown — no stale built-in default underneath.
+-- Includes a guard against demoting a plant's last owner, and a one-time
+-- backfill of existing users. Already applied to production. (Full function body
+-- is in the matching apply_migration; this records the change in history.)
+-- See: assign_user_roles(p_user_id uuid, p_role_ids uuid[]) — SECURITY DEFINER.

@@ -1370,7 +1370,17 @@ function App() {
   const [user, setUser] = useState(null);
   const [plant, setPlant] = useState(null);
   const [me, setMe] = useState(null);
-  const [tab, setTab] = useState(DEEP_LINK?.tab || 'home');
+  const [tab, _setTab] = useState(() => DEEP_LINK?.tab || (window.location.hash || '').replace(/^#/, '') || 'home');
+  // Keep the current page in the URL hash so a refresh restores it (instead of
+  // dropping back to Home), and so the phone/Android back button moves between
+  // pages instead of exiting the app.
+  const setTab = useCallback((t) => {
+    _setTab(t);
+    try {
+      const cur = (window.location.hash || '').replace(/^#/, '');
+      if (cur !== t) window.history.pushState({ lltab: t }, '', '#' + t);
+    } catch (_) {}
+  }, []);
   const [loading, setLoading] = useState(true);
   const [pendingInvite, setPendingInvite] = useState(null);
   // RBAC Phase 1: my permissions in the current plant. Set after loadProfile.
@@ -1383,28 +1393,33 @@ function App() {
   const [accessibleUnits, setAccessibleUnits] = useState([]);
   const [activeUnit, setActiveUnit] = useState(null);
 
-  // Swipe-back guard: if a modal is open and the user accidentally triggers
-  // back-navigation (trackpad swipe, mouse forward/back button, browser back),
-  // close the modal instead of leaving the page and losing form data.
+  // Back button + tab history. A back-press first closes an open modal (so you
+  // don't lose form data); otherwise it navigates to the previous page using the
+  // URL hash. Only the Home page lets back fall through and exit the app — this
+  // replaces the old "swallow every back-press" behaviour that broke on Android.
   useEffect(() => {
-    if (!window.history.state || window.history.state.loglinkr_sentinel !== true) {
-      window.history.pushState({ loglinkr_sentinel: true }, '');
-    }
     const onPop = () => {
-      // Re-push the sentinel so further back attempts can still be intercepted.
-      window.history.pushState({ loglinkr_sentinel: true }, '');
-      // Find the topmost open modal-backdrop and dismiss it via its close button.
       const modals = document.querySelectorAll('.modal-backdrop.active');
       if (modals.length > 0) {
         const top = modals[modals.length - 1];
         const closeBtn = top.querySelector('.close-btn');
         if (closeBtn) closeBtn.click();
+        // Consume this back-press and keep the current page in history.
+        try { window.history.pushState({ lltab: tab }, '', '#' + tab); } catch (_) {}
+        return;
       }
-      // If no modal open, the back-press is swallowed silently — user stays on
-      // the current page (which is what they want when an accidental swipe fires).
+      // No modal — move to whatever page the URL now points at.
+      const h = (window.location.hash || '').replace(/^#/, '');
+      _setTab(h || 'home');
     };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
+  }, [tab]);
+  // Reflect the initial page in the URL so the very first refresh restores it.
+  useEffect(() => {
+    if (!window.location.hash) {
+      try { window.history.replaceState({ lltab: tab }, '', '#' + tab); } catch (_) {}
+    }
   }, []);
 
   // Load accessible units after auth
@@ -1515,9 +1530,10 @@ function App() {
     } catch (_e) {
       setMyPerms({ rbac_enforced: false, permissions: [], roles: [] });
     }
-    // Clear URL params on successful load
+    // Clear URL query params on successful load, but KEEP the #page hash so a
+    // refresh stays on the current page.
     if (window.location.search) {
-      window.history.replaceState({}, '', window.location.pathname);
+      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
     }
   };
 
@@ -7138,8 +7154,15 @@ function People({ plant, me, myPerms }) {
               </div>
               <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
                 <div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end">
-                  <span class=${'badge ' + (u.role === 'plant_head' ? 'teal' : u.status === 'inactive' ? '' : '')}>${roleLabel(u.role)}</span>
-                  ${(userRoles[u.id] || []).filter(r => r.slug !== u.role).map(r => html`<span key=${r.slug} class="badge teal" style="font-size:10px;opacity:.92" title="Assigned role">${r.display_name}</span>`)}
+                  ${(() => {
+                    // Show the person's actual assigned role(s) as a single clean
+                    // set. Fall back to the base role only if nothing is assigned.
+                    const assigned = userRoles[u.id] || [];
+                    const owner = s => s === 'plant_head' || s === 'admin';
+                    if (!assigned.length)
+                      return html`<span class=${'badge ' + (owner(u.role) ? 'teal' : '')}>${roleLabel(u.role)}</span>`;
+                    return assigned.map(r => html`<span key=${r.slug} class=${'badge ' + (owner(r.slug) ? 'teal' : '')}>${r.display_name}</span>`);
+                  })()}
                 </div>
                 ${canAssignRoles && html`<button class="btn small ghost" title="Manage the roles assigned to this user" onClick=${() => setRolesTarget(u)}>👥 Roles</button>`}
                 ${canReset && html`<button class="btn small ghost" title="Issue a one-tap link they can use to set a new password" onClick=${async () => {
