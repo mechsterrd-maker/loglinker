@@ -1919,6 +1919,9 @@ async function loadRoleLabels(plantId) {
       const m = {};
       for (const r of data) if (r.slug) m[r.slug] = r.display_name;
       ROLE_LABEL_MAP = m;
+      // Notify already-mounted views so renamed / newly-created role labels
+      // repaint immediately instead of waiting for a full reload.
+      try { window.dispatchEvent(new Event('loglinkr-roles-changed')); } catch (_) {}
     }
   } catch (_) { /* keep humanised fallback */ }
 }
@@ -2089,7 +2092,10 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   useEffect(() => {
     let alive = true;
     loadRoleLabels(plant?.id).then(() => { if (alive) bumpRoleLabels(v => v + 1); });
-    return () => { alive = false; };
+    // Repaint labels app-wide whenever any role is created / renamed / assigned.
+    const onRolesChanged = () => { if (alive) bumpRoleLabels(v => v + 1); };
+    window.addEventListener('loglinkr-roles-changed', onRolesChanged);
+    return () => { alive = false; window.removeEventListener('loglinkr-roles-changed', onRolesChanged); };
   }, [plant?.id]);
 
   const recalcUnread = useCallback(async () => {
@@ -7000,19 +7006,32 @@ function People({ plant, me, myPerms }) {
   const [loading, setLoading] = useState(true);
   const [resetShare, setResetShare] = useState(null); // { user, token, expires_at } when a reset link is freshly issued
   const [rolesTarget, setRolesTarget] = useState(null); // RBAC Phase 1: opens UserRolesModal for the picked user
+  const [userRoles, setUserRoles] = useState({}); // user_id -> [{slug, display_name}] assigned custom roles
 
   const refresh = async () => {
     setLoading(true);
-    const [u, us, sh, inv] = await Promise.all([
+    const [u, us, sh, inv, upr, prs] = await Promise.all([
       sb.from('units').select('*').order('created_at'),
       sb.from('users').select('*').order('created_at'),
       sb.from('shifts').select('*').order('start_time'),
       sb.from('user_invites').select('*').eq('status', 'pending').order('created_at', { ascending:false }),
+      sb.from('user_plant_roles').select('user_id, role_id'),
+      sb.from('plant_roles').select('id, slug, display_name').eq('plant_id', plant.id),
     ]);
     setUnits(u.data || []);
     setUsers(us.data || []);
     setShifts(sh.data || []);
     setInvites(inv.data || []);
+    // Map each user to their assigned roles so the Team list reflects role
+    // assignments immediately (the badge alone only shows the base role).
+    const roleById = {};
+    for (const r of (prs.data || [])) roleById[r.id] = r;
+    const rm = {};
+    for (const row of (upr.data || [])) {
+      const pr = roleById[row.role_id];
+      if (pr) (rm[row.user_id] = rm[row.user_id] || []).push(pr);
+    }
+    setUserRoles(rm);
     setLoading(false);
   };
 
@@ -7092,7 +7111,10 @@ function People({ plant, me, myPerms }) {
                 <div class="list-item-sub">${u.phone} · ${u.email || 'no email'}</div>
               </div>
               <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
-                <span class=${'badge ' + (u.role === 'plant_head' ? 'teal' : u.status === 'inactive' ? '' : '')}>${roleLabel(u.role)}</span>
+                <div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end">
+                  <span class=${'badge ' + (u.role === 'plant_head' ? 'teal' : u.status === 'inactive' ? '' : '')}>${roleLabel(u.role)}</span>
+                  ${(userRoles[u.id] || []).filter(r => r.slug !== u.role).map(r => html`<span key=${r.slug} class="badge teal" style="font-size:10px;opacity:.92" title="Assigned role">${r.display_name}</span>`)}
+                </div>
                 ${canAssignRoles && html`<button class="btn small ghost" title="Manage the roles assigned to this user" onClick=${() => setRolesTarget(u)}>👥 Roles</button>`}
                 ${canReset && html`<button class="btn small ghost" title="Issue a one-tap link they can use to set a new password" onClick=${async () => {
                   const { data, error } = await sb.rpc('issue_password_reset', { p_target_user_id: u.id });
@@ -7186,7 +7208,7 @@ function People({ plant, me, myPerms }) {
     ${modal === 'inviteView' && html`<${InviteViewModal} invite=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onCancel=${async () => { await sb.from('user_invites').delete().eq('id', editTarget.id); setModal(null); setEditTarget(null); refresh(); showToast('Invite cancelled'); }} />`}
     ${modal === 'operator' && html`<${OperatorModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${resetShare && html`<${ResetShareModal} plant=${plant} resetShare=${resetShare} onClose=${() => setResetShare(null)} />`}
-    ${rolesTarget && html`<${UserRolesModal} plant=${plant} user=${rolesTarget} me=${me} onClose=${() => setRolesTarget(null)} onSaved=${() => setRolesTarget(null)} />`}
+    ${rolesTarget && html`<${UserRolesModal} plant=${plant} user=${rolesTarget} me=${me} onClose=${() => setRolesTarget(null)} onSaved=${() => { setRolesTarget(null); refresh(); }} />`}
   `;
 }
 
