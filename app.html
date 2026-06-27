@@ -443,6 +443,43 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.s
 import htm from 'https://esm.sh/htm@3.1.1';
 
 const html = htm.bind(h);
+
+// ============ Preview-as-role (non-destructive RBAC preview) ============
+// Lets an admin render the whole app AS IF they held a given role, WITHOUT
+// changing their real permissions — zero lock-out risk, one-click exit.
+// Module-level store + a tiny subscription hook so any component can read or
+// set it without prop-drilling through the tree.
+let _previewRole = null;   // { id, slug, display_name, perms } | null
+const _previewSubs = new Set();
+function setPreviewRole(p) { _previewRole = p; _previewSubs.forEach(fn => fn()); }
+function usePreviewRole() {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const fn = () => force(x => x + 1);
+    _previewSubs.add(fn);
+    return () => _previewSubs.delete(fn);
+  }, []);
+  return _previewRole;
+}
+// Synthetic myPerms from a role's stored permissions. rbac_enforced is forced
+// true so the preview reflects the role's real limits even where enforcement
+// is otherwise off.
+function buildPreviewPerms(plant, role) {
+  return {
+    plant_id: plant.id,
+    rbac_enforced: true,
+    roles: [{ id: role.id, slug: role.slug, display_name: role.display_name }],
+    permissions: role.permissions || [],
+  };
+}
+function PreviewBanner({ role }) {
+  return html`
+    <div style="position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:9999;display:flex;align-items:center;gap:12px;background:#0f172a;color:white;padding:10px 16px;border-radius:999px;box-shadow:0 8px 24px rgba(0,0,0,.35);font-size:13px;max-width:92vw">
+      <span>🔍 Previewing as <b>${role.display_name}</b> · your real access is unchanged</span>
+      <button type="button" onClick=${() => setPreviewRole(null)}
+        style="background:white;color:#0f172a;border:none;border-radius:999px;padding:5px 13px;font-weight:700;font-size:12px;cursor:pointer;white-space:nowrap">Exit preview</button>
+    </div>`;
+}
 // React compatibility shim
 const React = { createElement: h };
 const createRoot = (container) => ({ render: (el) => render(el, container) });
@@ -1342,6 +1379,7 @@ function App() {
   // null until loaded — components must treat null as "still loading, allow nothing yet"
   // or "rbac not in effect for this plant" (we disambiguate via rbac_enforced).
   const [myPerms, setMyPerms] = useState(null);
+  const previewRole = usePreviewRole(); // non-destructive "preview as role" override
   const [accessibleUnits, setAccessibleUnits] = useState([]);
   const [activeUnit, setActiveUnit] = useState(null);
 
@@ -1588,7 +1626,13 @@ function App() {
     </div>`;
   }
 
-  return html`<${Shell} user=${user} plant=${plant} me=${me} myPerms=${myPerms} tab=${tab} setTab=${setTab} logout=${logout} reload=${() => loadProfile(user)} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />`;
+  // When previewing a role, the whole app renders from the role's synthetic
+  // perms instead of the admin's real ones. Owner's real access is untouched.
+  const effectivePerms = previewRole ? previewRole.perms : myPerms;
+  return html`
+    <${Shell} user=${user} plant=${plant} me=${me} myPerms=${effectivePerms} tab=${tab} setTab=${setTab} logout=${logout} reload=${() => loadProfile(user)} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />
+    ${previewRole && html`<${PreviewBanner} role=${previewRole} />`}
+  `;
 }
 
 // ============= APP SHELL =============
@@ -7142,7 +7186,7 @@ function People({ plant, me, myPerms }) {
     ${modal === 'inviteView' && html`<${InviteViewModal} invite=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onCancel=${async () => { await sb.from('user_invites').delete().eq('id', editTarget.id); setModal(null); setEditTarget(null); refresh(); showToast('Invite cancelled'); }} />`}
     ${modal === 'operator' && html`<${OperatorModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${resetShare && html`<${ResetShareModal} plant=${plant} resetShare=${resetShare} onClose=${() => setResetShare(null)} />`}
-    ${rolesTarget && html`<${UserRolesModal} plant=${plant} user=${rolesTarget} onClose=${() => setRolesTarget(null)} onSaved=${() => setRolesTarget(null)} />`}
+    ${rolesTarget && html`<${UserRolesModal} plant=${plant} user=${rolesTarget} me=${me} onClose=${() => setRolesTarget(null)} onSaved=${() => setRolesTarget(null)} />`}
   `;
 }
 
@@ -7640,6 +7684,7 @@ function RolesTab({ plant, me }) {
               <div class="list-item-sub">${r.member_count} user${r.member_count === 1 ? '' : 's'} · ${r.permissions.length} permission${r.permissions.length === 1 ? '' : 's'}${r.description ? ' · ' + r.description : ''}</div>
             </div>
             <div style="display:flex;gap:6px">
+              <button class="btn small ghost" title="See the app as this role — safe, doesn't change your own access" onClick=${() => setPreviewRole({ id:r.id, slug:r.slug, display_name:r.display_name, perms: buildPreviewPerms(plant, r) })}>👁 Preview</button>
               <button class="btn small" onClick=${() => setEditTarget(r)}>${r.is_builtin && (r.slug === 'plant_head' || r.slug === 'admin') ? 'View' : 'Edit'}</button>
               ${!r.is_builtin && html`<button class="btn small ghost" style="color:var(--rose-600)" onClick=${() => del(r)} title="Delete role">🗑</button>`}
             </div>
@@ -7817,7 +7862,7 @@ function RoleEditModal({ plant, role, onClose, onSaved }) {
 }
 
 // User row → role assignment modal (opened from People → Team → "Roles" button)
-function UserRolesModal({ plant, user, onClose, onSaved }) {
+function UserRolesModal({ plant, user, me, onClose, onSaved }) {
   const [roles, setRoles] = useState(null);
   const [selected, setSelected] = useState(new Set());
   const [busy, setBusy] = useState(false);
@@ -7832,7 +7877,20 @@ function UserRolesModal({ plant, user, onClose, onSaved }) {
       setSelected(new Set((links || []).map(l => l.role_id)));
     })();
   }, [plant.id, user.id]);
-  const toggle = (id) => { const n = new Set(selected); if (n.has(id)) n.delete(id); else n.add(id); setSelected(n); };
+  // Self-demotion guard: you can't remove your OWN last owner (plant_head/admin)
+  // role — that's the lock-out footgun. Use "Preview as role" to test instead.
+  const isSelf = me && user.id === me.id;
+  const ownerRoleIds = new Set((roles || []).filter(r => r.slug === 'plant_head' || r.slug === 'admin').map(r => r.id));
+  const selectedOwnerCount = [...selected].filter(id => ownerRoleIds.has(id)).length;
+  const lastOwnerLockedId = (id) => isSelf && ownerRoleIds.has(id) && selected.has(id) && selectedOwnerCount <= 1;
+  const toggle = (id) => {
+    if (lastOwnerLockedId(id)) {
+      setErr("You can't remove your own last owner role — you'd lock yourself out. To see what another role can access, use 👁 Preview instead.");
+      return;
+    }
+    setErr('');
+    const n = new Set(selected); if (n.has(id)) n.delete(id); else n.add(id); setSelected(n);
+  };
   const save = async () => {
     setBusy(true); setErr('');
     const { error } = await sb.rpc('assign_user_roles', { p_user_id: user.id, p_role_ids: Array.from(selected) });
@@ -7852,15 +7910,15 @@ function UserRolesModal({ plant, user, onClose, onSaved }) {
           <p style="font-size:13px;color:var(--slate-600);margin-bottom:10px;line-height:1.5">
             Pick one or more roles. The user gets the union of permissions across all selected roles.
           </p>
-          ${roles.map(r => html`
-            <label key=${r.id} style="display:flex;align-items:center;gap:10px;padding:9px 4px;border-bottom:1px solid var(--slate-100);cursor:pointer">
-              <input type="checkbox" checked=${selected.has(r.id)} onChange=${() => toggle(r.id)} />
+          ${roles.map(r => { const locked = lastOwnerLockedId(r.id); return html`
+            <label key=${r.id} style=${'display:flex;align-items:center;gap:10px;padding:9px 4px;border-bottom:1px solid var(--slate-100);cursor:' + (locked ? 'not-allowed' : 'pointer') + ';opacity:' + (locked ? '0.75' : '1')}>
+              <input type="checkbox" checked=${selected.has(r.id)} disabled=${locked} onChange=${() => toggle(r.id)} />
               <div style="flex:1;min-width:0">
-                <div style="font-weight:600">${r.display_name}${r.is_builtin ? html` <span style="font-size:10px;color:var(--slate-400);font-weight:400">· built-in</span>` : ''}</div>
+                <div style="font-weight:600">${r.display_name}${r.is_builtin ? html` <span style="font-size:10px;color:var(--slate-400);font-weight:400">· built-in</span>` : ''}${locked ? html` <span style="font-size:10px;color:var(--amber-700);font-weight:600">· 🔒 your own access</span>` : ''}</div>
                 <div style="font-size:11px;color:var(--slate-500)">${r.description || ''}</div>
               </div>
             </label>
-          `)}
+          `})}
           <div style="display:flex;gap:8px;margin-top:14px">
             <button class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
             <button class="btn" onClick=${save} disabled=${busy} style="flex:2">${busy ? 'Saving…' : 'Save roles'}</button>
