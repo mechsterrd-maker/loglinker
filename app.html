@@ -1674,6 +1674,7 @@ function App() {
   return html`
     <${Shell} user=${user} plant=${plant} me=${me} myPerms=${effectivePerms} tab=${tab} setTab=${setTab} logout=${logout} reload=${() => loadProfile(user)} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />
     ${previewRole && html`<${PreviewBanner} role=${previewRole} />`}
+    <${PostLoginInstallPrompt} />
   `;
 }
 
@@ -8008,10 +8009,24 @@ function UserRolesModal({ plant, user, me, onClose, onSaved }) {
 }
 
 function InviteModal({ plant, me, units, onClose, onSaved }) {
-  const [form, setForm] = useState({ full_name:'', phone:'', email:'', role:'supervisor', primary_unit_id: units[0]?.id || '' });
+  const [form, setForm] = useState({ full_name:'', phone:'', email:'', role:'supervisor', invited_role_id:null, primary_unit_id: units[0]?.id || '' });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [createdInvite, setCreatedInvite] = useState(null);
+  const [customRoles, setCustomRoles] = useState([]);
+  const [creatingRole, setCreatingRole] = useState(false);
+  const loadRoles = async () => {
+    try { const { data } = await sb.rpc('list_plant_roles', { p_plant_id: plant.id });
+      setCustomRoles((data || []).filter(r => !r.is_builtin && r.is_active !== false)); } catch (_) {}
+  };
+  useEffect(() => { loadRoles(); }, [plant.id]);
+  // Role dropdown can pick a standard (enum) role, a custom role (custom:<id>),
+  // or "+ Create a new role…" which opens the role builder inline.
+  const onRoleChange = (v) => {
+    if (v === '__new__') { setCreatingRole(true); return; }
+    if (v.indexOf('custom:') === 0) { setForm({ ...form, role: 'operator', invited_role_id: v.slice(7) }); return; }
+    setForm({ ...form, role: v, invited_role_id: null });
+  };
 
   const submit = async (e) => {
     e.preventDefault();
@@ -8038,6 +8053,7 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
         phone: '+91' + form.phone,
         email: form.email || null,
         role: form.role,
+        invited_role_id: form.invited_role_id,
         primary_unit_id: form.primary_unit_id || null,
         invite_code: code,
         status: 'pending'
@@ -8051,7 +8067,12 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
     const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
     const inviteUrl = baseUrl + '?code=' + createdInvite.invite_code;
     const waMessage = encodeURIComponent(
-      `Hi ${createdInvite.full_name}, you've been invited to join ${plant.name} on Loglinkr as ${roleLabel(createdInvite.role)}.\n\nSign up here: ${inviteUrl}\n\nOr enter code: ${createdInvite.invite_code}`
+      `Hi ${createdInvite.full_name}! You've been invited to *${plant.name}* on Loglinkr as ${roleLabel(createdInvite.role)}.\n\n` +
+      `▶ How to log in:\n` +
+      `1) Open this link: ${inviteUrl}\n` +
+      `2) Sign up with your email + a password — you'll be added to ${plant.name} automatically.\n\n` +
+      `📲 No link? Open *loglinkr.com*, tap "Have an invite code?", and enter your code:  *${createdInvite.invite_code}*\n\n` +
+      `💡 After logging in, tap "Install app" to keep Loglinkr on your home screen — opens like a normal app, no Play Store needed.`
     );
     const waUrl = createdInvite.phone ? 'https://wa.me/' + createdInvite.phone.replace(/\D/g,'') + '?text=' + waMessage : 'https://wa.me/?text=' + waMessage;
 
@@ -8071,7 +8092,7 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
           </div>
 
           <p style="font-size:12px;color:var(--slate-500);margin-bottom:14px;line-height:1.5">
-            They open the link → sign up with email + password → automatically added to your plant. No code typing needed.
+            They open the link → sign up with email + password → automatically added to your plant. No link? They can open <b>loglinkr.com</b> and enter the code above. After login they'll be prompted to <b>install the app</b>.
           </p>
 
           <a href=${waUrl} target="_blank" rel="noopener" class="btn" style="text-decoration:none;display:flex;align-items:center;justify-content:center;gap:8px;background:#25D366">
@@ -8098,14 +8119,18 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
           <div class="field"><label>Phone *</label><input type="tel" required maxLength=${10} value=${form.phone} onChange=${e => setForm({...form, phone: e.target.value.replace(/\D/g,'')})} placeholder="9876543210" /></div>
           <div class="field"><label>Email (optional)</label><input type="email" value=${form.email} onChange=${e => setForm({...form, email: e.target.value})} placeholder="they@email.com" /></div>
           <div class="field"><label>Role *</label>
-            <select required value=${form.role} onChange=${e => setForm({...form, role: e.target.value})}>
-              <option value="supervisor">Supervisor</option>
-              <option value="qa">Quality (QA)</option>
-              <option value="operator">Operator</option>
-              <option value="toolroom">Toolroom</option>
-              <option value="store">Store</option>
-              <option value="driver">Driver</option>
-              <option value="admin">Admin</option>
+            <select required value=${form.invited_role_id ? 'custom:'+form.invited_role_id : form.role} onChange=${e => onRoleChange(e.target.value)}>
+              <optgroup label="Standard roles">
+                <option value="supervisor">Supervisor</option>
+                <option value="qa">Quality (QA)</option>
+                <option value="operator">Operator</option>
+                <option value="toolroom">Toolroom</option>
+                <option value="store">Store</option>
+                <option value="driver">Driver</option>
+                <option value="admin">Admin</option>
+              </optgroup>
+              ${customRoles.length ? html`<optgroup label="Custom roles">${customRoles.map(r => html`<option key=${r.id} value=${'custom:'+r.id}>${r.display_name}</option>`)}</optgroup>` : ''}
+              <option value="__new__">+ Create a new role…</option>
             </select>
           </div>
           <div class="field"><label>Primary Unit</label>
@@ -8117,6 +8142,15 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
           <button class="btn" disabled=${loading}>${loading ? 'Creating…' : 'Generate invite'}</button>
         </form>
       </div>
+      ${creatingRole && html`<${RoleCreateModal} plant=${plant} onClose=${() => setCreatingRole(false)} onSaved=${async () => {
+        setCreatingRole(false);
+        const prev = new Set(customRoles.map(r => r.id));
+        const { data } = await sb.rpc('list_plant_roles', { p_plant_id: plant.id });
+        const all = (data || []).filter(r => !r.is_builtin && r.is_active !== false);
+        setCustomRoles(all);
+        const fresh = all.find(r => !prev.has(r.id));   // auto-select the role just created
+        if (fresh) setForm(f => ({ ...f, role: 'operator', invited_role_id: fresh.id }));
+      }} />`}
     </div>
   `;
 }
@@ -26505,6 +26539,55 @@ function PushNotifSetting({ me, plant }) {
       </div>
     </div>
   `;
+}
+
+// One-time install nudge shown automatically right after login, for users in a
+// browser tab (not the installed app). Appears once per device; reuses the same
+// install flow as the Home banner.
+function PostLoginInstallPrompt() {
+  const isStandalone = () =>
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
+    window.navigator.standalone === true ||
+    (document.referrer || '').indexOf('android-app://') === 0;
+  const isIos = () =>
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const alreadyShown = () => { try { return localStorage.getItem('loglinkr_postlogin_install') === '1'; } catch (_) { return false; } };
+  const [show, setShow] = useState(false);
+  const [iosHelp, setIosHelp] = useState(false);
+  useEffect(() => {
+    if (isStandalone() || alreadyShown()) return;
+    const t = setTimeout(() => { setShow(true); try { localStorage.setItem('loglinkr_postlogin_install', '1'); } catch (_) {} }, 1400);
+    return () => clearTimeout(t);
+  }, []);
+  if (!show) return null;
+  const close = () => setShow(false);
+  const install = async () => {
+    if (isIos()) { setIosHelp(true); return; }
+    if (deferredInstallPrompt) { const ok = await promptInstallApp(); if (ok) close(); return; }
+    window.open('/install', '_blank', 'noopener'); close();
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) close(); }}>
+      <div class="modal" style="max-width:380px;text-align:center">
+        <button class="close-btn" onClick=${close} style="position:absolute;right:12px;top:10px">×</button>
+        <div style="font-size:44px;line-height:1">📲</div>
+        <div style="font-size:18px;font-weight:700;color:var(--slate-800);margin-top:8px">Install Loglinkr on your phone</div>
+        <div style="font-size:13px;color:var(--slate-500);margin:8px 0 16px;line-height:1.5">Opens like a normal app — faster, push alerts, and no browser bar. No Play Store needed.</div>
+        ${iosHelp ? html`
+          <div style="text-align:left;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.55;color:var(--slate-700);margin-bottom:14px">
+            <b>On iPhone / iPad (open in Safari):</b>
+            <ol style="padding-left:18px;margin:6px 0 0;display:flex;flex-direction:column;gap:4px">
+              <li>Tap the <b>Share</b> button (square with an up-arrow).</li>
+              <li>Tap <b>Add to Home Screen</b> → <b>Add</b>.</li>
+            </ol>
+          </div>` : ''}
+        <div style="display:flex;gap:8px">
+          <button class="btn ghost" style="flex:1" onClick=${close}>Maybe later</button>
+          <button class="btn" style="flex:2" onClick=${iosHelp ? close : install}>${iosHelp ? 'Got it' : 'Install app'}</button>
+        </div>
+      </div>
+    </div>`;
 }
 
 // ============= HOME INSTALL BANNER =============
