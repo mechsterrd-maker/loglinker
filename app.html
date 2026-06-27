@@ -6732,6 +6732,7 @@ function MastersHub({ plant, me, myPerms, setTab }) {
   const [operators, setOperators] = useState([]);
   const [shifts, setShifts] = useState([]);
   const [users, setUsers] = useState([]);
+  const [userRoles, setUserRoles] = useState({}); // user_id -> assigned roles; keeps this Team list consistent with People > Team
   const [parts, setParts] = useState([]);
   const [machines, setMachines] = useState([]);
   const [dies, setDies] = useState([]);
@@ -6754,7 +6755,7 @@ function MastersHub({ plant, me, myPerms, setTab }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [un, op, sh, us, pa, ma, di, to, si, rt, ve, cu] = await Promise.all([
+    const [un, op, sh, us, pa, ma, di, to, si, rt, ve, cu, uprLinks, uprRoles] = await Promise.all([
       sb.from('units').select('*').eq('plant_id', plant.id).order('name'),
       sb.from('users').select('*').eq('plant_id', plant.id).eq('role','operator').order('full_name'),
       sb.from('shifts').select('*').eq('plant_id', plant.id).order('start_time'),
@@ -6767,8 +6768,14 @@ function MastersHub({ plant, me, myPerms, setTab }) {
       sb.from('mcp_pdc_rejection_types').select('*').eq('plant_id', plant.id).order('stage,ord'),
       sb.from('mcp_logistics_vendors').select('*').eq('plant_id', plant.id).order('name'),
       sb.from('mcp_sched_customers').select('*').eq('plant_id', plant.id).order('name'),
+      sb.from('user_plant_roles').select('user_id, role_id'),
+      sb.from('plant_roles').select('id, slug, display_name').eq('plant_id', plant.id),
     ]);
     setUnits(un.data||[]); setOperators(op.data||[]); setShifts(sh.data||[]); setUsers(us.data||[]);
+    // Each user's ASSIGNED role(s) — same source as People > Team, so both screens agree.
+    const _rb = {}; for (const r of (uprRoles.data||[])) _rb[r.id] = r;
+    const _rm = {}; for (const row of (uprLinks.data||[])) { const pr = _rb[row.role_id]; if (pr) (_rm[row.user_id] = _rm[row.user_id] || []).push(pr); }
+    setUserRoles(_rm);
     setParts(pa.data||[]); setMachines(ma.data||[]); setDies(di.data||[]); setTools(to.data||[]);
     setStockItems(si.data||[]); setRejectionTypes(rt.data||[]); setVendors(ve.data||[]); setCustomers(cu.data||[]);
     setLoading(false);
@@ -6875,7 +6882,7 @@ function MastersHub({ plant, me, myPerms, setTab }) {
           <${SectionHeader} icon="🧑‍💼" title="Team (login users)" n=${users.length} addLabel="+ Invite user" onAdd=${openInvite} />
           <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Login-enabled team members (admin, plant_head, supervisor, qa, store, etc.). <button type="button" onClick=${openInvite} style="background:none;border:0;color:var(--teal-700);font-weight:600;cursor:pointer;padding:0;font-size:11px;text-decoration:underline">Invite a new user →</button></div>
           ${list.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🧑‍💼</div><div>No team members yet</div><button class="btn small" style="margin-top:10px" onClick=${openInvite}>+ Invite user</button></div></div>` :
-            list.map(u => Row({ title: u.full_name, sub: u.phone + (u.email?' · '+u.email:''), badge: roleLabel(u.role), badgeColor: u.role==='admin'||u.role==='plant_head'?'teal':'', onClick: () => setTab('people') }))}
+            list.map(u => { const _ar = userRoles[u.id] || []; const _owner = _ar.some(r => r.slug==='admin' || r.slug==='plant_head') || u.role==='admin' || u.role==='plant_head'; return Row({ title: u.full_name, sub: u.phone + (u.email?' · '+u.email:''), badge: _ar.length ? _ar.map(r => r.display_name).join(', ') : roleLabel(u.role), badgeColor: _owner?'teal':'', onClick: () => setTab('people') }); })}
         `;
       }
       case 'parts': {
