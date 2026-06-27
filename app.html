@@ -443,6 +443,43 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.s
 import htm from 'https://esm.sh/htm@3.1.1';
 
 const html = htm.bind(h);
+
+// ============ Preview-as-role (non-destructive RBAC preview) ============
+// Lets an admin render the whole app AS IF they held a given role, WITHOUT
+// changing their real permissions — zero lock-out risk, one-click exit.
+// Module-level store + a tiny subscription hook so any component can read or
+// set it without prop-drilling through the tree.
+let _previewRole = null;   // { id, slug, display_name, perms } | null
+const _previewSubs = new Set();
+function setPreviewRole(p) { _previewRole = p; _previewSubs.forEach(fn => fn()); }
+function usePreviewRole() {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const fn = () => force(x => x + 1);
+    _previewSubs.add(fn);
+    return () => _previewSubs.delete(fn);
+  }, []);
+  return _previewRole;
+}
+// Synthetic myPerms from a role's stored permissions. rbac_enforced is forced
+// true so the preview reflects the role's real limits even where enforcement
+// is otherwise off.
+function buildPreviewPerms(plant, role) {
+  return {
+    plant_id: plant.id,
+    rbac_enforced: true,
+    roles: [{ id: role.id, slug: role.slug, display_name: role.display_name, is_builtin: role.is_builtin }],
+    permissions: role.permissions || [],
+  };
+}
+function PreviewBanner({ role }) {
+  return html`
+    <div style="position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:9999;display:flex;align-items:center;gap:12px;background:#0f172a;color:white;padding:10px 16px;border-radius:999px;box-shadow:0 8px 24px rgba(0,0,0,.35);font-size:13px;max-width:92vw">
+      <span>🔍 Previewing as <b>${role.display_name}</b> · your real access is unchanged</span>
+      <button type="button" onClick=${() => setPreviewRole(null)}
+        style="background:white;color:#0f172a;border:none;border-radius:999px;padding:5px 13px;font-weight:700;font-size:12px;cursor:pointer;white-space:nowrap">Exit preview</button>
+    </div>`;
+}
 // React compatibility shim
 const React = { createElement: h };
 const createRoot = (container) => ({ render: (el) => render(el, container) });
@@ -1333,7 +1370,17 @@ function App() {
   const [user, setUser] = useState(null);
   const [plant, setPlant] = useState(null);
   const [me, setMe] = useState(null);
-  const [tab, setTab] = useState(DEEP_LINK?.tab || 'home');
+  const [tab, _setTab] = useState(() => DEEP_LINK?.tab || (window.location.hash || '').replace(/^#/, '') || 'home');
+  // Keep the current page in the URL hash so a refresh restores it (instead of
+  // dropping back to Home), and so the phone/Android back button moves between
+  // pages instead of exiting the app.
+  const setTab = useCallback((t) => {
+    _setTab(t);
+    try {
+      const cur = (window.location.hash || '').replace(/^#/, '');
+      if (cur !== t) window.history.pushState({ lltab: t }, '', '#' + t);
+    } catch (_) {}
+  }, []);
   const [loading, setLoading] = useState(true);
   const [pendingInvite, setPendingInvite] = useState(null);
   // RBAC Phase 1: my permissions in the current plant. Set after loadProfile.
@@ -1342,31 +1389,37 @@ function App() {
   // null until loaded — components must treat null as "still loading, allow nothing yet"
   // or "rbac not in effect for this plant" (we disambiguate via rbac_enforced).
   const [myPerms, setMyPerms] = useState(null);
+  const previewRole = usePreviewRole(); // non-destructive "preview as role" override
   const [accessibleUnits, setAccessibleUnits] = useState([]);
   const [activeUnit, setActiveUnit] = useState(null);
 
-  // Swipe-back guard: if a modal is open and the user accidentally triggers
-  // back-navigation (trackpad swipe, mouse forward/back button, browser back),
-  // close the modal instead of leaving the page and losing form data.
+  // Back button + tab history. A back-press first closes an open modal (so you
+  // don't lose form data); otherwise it navigates to the previous page using the
+  // URL hash. Only the Home page lets back fall through and exit the app — this
+  // replaces the old "swallow every back-press" behaviour that broke on Android.
   useEffect(() => {
-    if (!window.history.state || window.history.state.loglinkr_sentinel !== true) {
-      window.history.pushState({ loglinkr_sentinel: true }, '');
-    }
     const onPop = () => {
-      // Re-push the sentinel so further back attempts can still be intercepted.
-      window.history.pushState({ loglinkr_sentinel: true }, '');
-      // Find the topmost open modal-backdrop and dismiss it via its close button.
       const modals = document.querySelectorAll('.modal-backdrop.active');
       if (modals.length > 0) {
         const top = modals[modals.length - 1];
         const closeBtn = top.querySelector('.close-btn');
         if (closeBtn) closeBtn.click();
+        // Consume this back-press and keep the current page in history.
+        try { window.history.pushState({ lltab: tab }, '', '#' + tab); } catch (_) {}
+        return;
       }
-      // If no modal open, the back-press is swallowed silently — user stays on
-      // the current page (which is what they want when an accidental swipe fires).
+      // No modal — move to whatever page the URL now points at.
+      const h = (window.location.hash || '').replace(/^#/, '');
+      _setTab(h || 'home');
     };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
+  }, [tab]);
+  // Reflect the initial page in the URL so the very first refresh restores it.
+  useEffect(() => {
+    if (!window.location.hash) {
+      try { window.history.replaceState({ lltab: tab }, '', '#' + tab); } catch (_) {}
+    }
   }, []);
 
   // Load accessible units after auth
@@ -1477,9 +1530,10 @@ function App() {
     } catch (_e) {
       setMyPerms({ rbac_enforced: false, permissions: [], roles: [] });
     }
-    // Clear URL params on successful load
+    // Clear URL query params on successful load, but KEEP the #page hash so a
+    // refresh stays on the current page.
     if (window.location.search) {
-      window.history.replaceState({}, '', window.location.pathname);
+      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
     }
   };
 
@@ -1494,6 +1548,32 @@ function App() {
     await sb.auth.signOut();
     location.reload();
   };
+
+  // Keep MY permissions live without a manual reload: refetch my_permissions
+  // when an admin changes my role assignments (realtime), when a role's
+  // permission grid is edited (realtime), or whenever I return to the app
+  // (pulse). So newly granted / revoked access takes effect instantly.
+  const refreshMyPerms = useCallback(async () => {
+    try {
+      const { data: perms } = await sb.rpc('my_permissions');
+      if (perms) {
+        setMyPerms(perms);
+        try { window.dispatchEvent(new Event('loglinkr-roles-changed')); } catch (_) {}
+      }
+    } catch (_) {}
+  }, []);
+  useEffect(() => {
+    if (!user?.id) return;
+    const onPulse = () => refreshMyPerms();
+    window.addEventListener('loglinkr-pulse', onPulse);
+    let t;
+    const debounced = () => { clearTimeout(t); t = setTimeout(refreshMyPerms, 250); };
+    const ch = sb.channel('my-perms-' + user.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'user_plant_roles', filter:'user_id=eq.' + user.id }, debounced)
+      .on('postgres_changes', { event:'*', schema:'public', table:'role_permissions' }, debounced)
+      .subscribe();
+    return () => { window.removeEventListener('loglinkr-pulse', onPulse); clearTimeout(t); sb.removeChannel(ch); };
+  }, [user?.id, refreshMyPerms]);
 
   if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
   // A reset link short-circuits everything else, signed in or not.
@@ -1588,7 +1668,14 @@ function App() {
     </div>`;
   }
 
-  return html`<${Shell} user=${user} plant=${plant} me=${me} myPerms=${myPerms} tab=${tab} setTab=${setTab} logout=${logout} reload=${() => loadProfile(user)} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />`;
+  // When previewing a role, the whole app renders from the role's synthetic
+  // perms instead of the admin's real ones. Owner's real access is untouched.
+  const effectivePerms = previewRole ? previewRole.perms : myPerms;
+  return html`
+    <${Shell} user=${user} plant=${plant} me=${me} myPerms=${effectivePerms} tab=${tab} setTab=${setTab} logout=${logout} reload=${() => loadProfile(user)} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />
+    ${previewRole && html`<${PreviewBanner} role=${previewRole} />`}
+    <${PostLoginInstallPrompt} />
+  `;
 }
 
 // ============= APP SHELL =============
@@ -1756,17 +1843,17 @@ function visibleMoreGroups(plant, myPerms) {
   // Safety net: a plant_head / admin is NEVER filtered, even if their role
   // link is somehow missing — owners must never get locked into an empty menu.
   if (myPerms && myPerms.rbac_enforced) {
-    const isOwner = (myPerms.roles || []).some(r => r.slug === 'plant_head' || r.slug === 'admin');
-    const hasAnyPerm = (myPerms.permissions || []).length > 0;
-    if (!isOwner && hasAnyPerm) {
+    const isOwner = (myPerms.base_role === 'plant_head' || myPerms.base_role === 'admin') || (myPerms.roles || []).some(r => r.is_builtin && (r.slug === 'plant_head' || r.slug === 'admin'));
+    const hasAnyRole = (myPerms.roles || []).length > 0;
+    if (!isOwner && hasAnyRole) {
       const canView = makeCanViewModule(myPerms);
       groups = groups
         .map(g => ({ ...g, items: g.items.filter(it => canView(it.key)) }))
         .filter(g => g.items.length > 0);
     }
-    // If !hasAnyPerm we intentionally do NOT filter — a user with zero
-    // permissions (e.g. mid-migration) keeps the legacy menu rather than an
-    // empty one. Real restriction requires at least one explicit grant.
+    // Only a user with NO assigned role at all (e.g. mid-migration) keeps the
+    // legacy menu. A role with zero permissions correctly yields an empty menu —
+    // that's an explicit "no access", not "unrestricted".
   }
   // Third pass: plant-level module gating via plants.enabled_tabs.
   // When set, only show items whose key is in the list. 'home' is implicit.
@@ -1809,9 +1896,9 @@ function makeCanViewModule(myPerms) {
 function moduleAccessGuard(myPerms) {
   const allowAll = { enforce: false, canView: () => true };
   if (!myPerms || !myPerms.rbac_enforced) return allowAll;
-  const isOwner = (myPerms.roles || []).some(r => r.slug === 'plant_head' || r.slug === 'admin');
-  const hasAnyPerm = (myPerms.permissions || []).length > 0;
-  if (isOwner || !hasAnyPerm) return allowAll;
+  const isOwner = (myPerms.base_role === 'plant_head' || myPerms.base_role === 'admin') || (myPerms.roles || []).some(r => r.is_builtin && (r.slug === 'plant_head' || r.slug === 'admin'));
+  const hasAnyRole = (myPerms.roles || []).length > 0;
+  if (isOwner || !hasAnyRole) return allowAll;
   const cv = makeCanViewModule(myPerms);
   const ALWAYS = new Set(['home']);
   return { enforce: true, canView: (key) => ALWAYS.has(key) || cv(key) };
@@ -1875,6 +1962,9 @@ async function loadRoleLabels(plantId) {
       const m = {};
       for (const r of data) if (r.slug) m[r.slug] = r.display_name;
       ROLE_LABEL_MAP = m;
+      // Notify already-mounted views so renamed / newly-created role labels
+      // repaint immediately instead of waiting for a full reload.
+      try { window.dispatchEvent(new Event('loglinkr-roles-changed')); } catch (_) {}
     }
   } catch (_) { /* keep humanised fallback */ }
 }
@@ -2045,7 +2135,10 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   useEffect(() => {
     let alive = true;
     loadRoleLabels(plant?.id).then(() => { if (alive) bumpRoleLabels(v => v + 1); });
-    return () => { alive = false; };
+    // Repaint labels app-wide whenever any role is created / renamed / assigned.
+    const onRolesChanged = () => { if (alive) bumpRoleLabels(v => v + 1); };
+    window.addEventListener('loglinkr-roles-changed', onRolesChanged);
+    return () => { alive = false; window.removeEventListener('loglinkr-roles-changed', onRolesChanged); };
   }, [plant?.id]);
 
   const recalcUnread = useCallback(async () => {
@@ -6640,6 +6733,7 @@ function MastersHub({ plant, me, myPerms, setTab }) {
   const [operators, setOperators] = useState([]);
   const [shifts, setShifts] = useState([]);
   const [users, setUsers] = useState([]);
+  const [userRoles, setUserRoles] = useState({}); // user_id -> assigned roles; keeps this Team list consistent with People > Team
   const [parts, setParts] = useState([]);
   const [machines, setMachines] = useState([]);
   const [dies, setDies] = useState([]);
@@ -6662,7 +6756,7 @@ function MastersHub({ plant, me, myPerms, setTab }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [un, op, sh, us, pa, ma, di, to, si, rt, ve, cu] = await Promise.all([
+    const [un, op, sh, us, pa, ma, di, to, si, rt, ve, cu, uprLinks, uprRoles] = await Promise.all([
       sb.from('units').select('*').eq('plant_id', plant.id).order('name'),
       sb.from('users').select('*').eq('plant_id', plant.id).eq('role','operator').order('full_name'),
       sb.from('shifts').select('*').eq('plant_id', plant.id).order('start_time'),
@@ -6675,8 +6769,14 @@ function MastersHub({ plant, me, myPerms, setTab }) {
       sb.from('mcp_pdc_rejection_types').select('*').eq('plant_id', plant.id).order('stage,ord'),
       sb.from('mcp_logistics_vendors').select('*').eq('plant_id', plant.id).order('name'),
       sb.from('mcp_sched_customers').select('*').eq('plant_id', plant.id).order('name'),
+      sb.from('user_plant_roles').select('user_id, role_id'),
+      sb.from('plant_roles').select('id, slug, display_name').eq('plant_id', plant.id),
     ]);
     setUnits(un.data||[]); setOperators(op.data||[]); setShifts(sh.data||[]); setUsers(us.data||[]);
+    // Each user's ASSIGNED role(s) — same source as People > Team, so both screens agree.
+    const _rb = {}; for (const r of (uprRoles.data||[])) _rb[r.id] = r;
+    const _rm = {}; for (const row of (uprLinks.data||[])) { const pr = _rb[row.role_id]; if (pr) (_rm[row.user_id] = _rm[row.user_id] || []).push(pr); }
+    setUserRoles(_rm);
     setParts(pa.data||[]); setMachines(ma.data||[]); setDies(di.data||[]); setTools(to.data||[]);
     setStockItems(si.data||[]); setRejectionTypes(rt.data||[]); setVendors(ve.data||[]); setCustomers(cu.data||[]);
     setLoading(false);
@@ -6783,7 +6883,7 @@ function MastersHub({ plant, me, myPerms, setTab }) {
           <${SectionHeader} icon="🧑‍💼" title="Team (login users)" n=${users.length} addLabel="+ Invite user" onAdd=${openInvite} />
           <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Login-enabled team members (admin, plant_head, supervisor, qa, store, etc.). <button type="button" onClick=${openInvite} style="background:none;border:0;color:var(--teal-700);font-weight:600;cursor:pointer;padding:0;font-size:11px;text-decoration:underline">Invite a new user →</button></div>
           ${list.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🧑‍💼</div><div>No team members yet</div><button class="btn small" style="margin-top:10px" onClick=${openInvite}>+ Invite user</button></div></div>` :
-            list.map(u => Row({ title: u.full_name, sub: u.phone + (u.email?' · '+u.email:''), badge: roleLabel(u.role), badgeColor: u.role==='admin'||u.role==='plant_head'?'teal':'', onClick: () => setTab('people') }))}
+            list.map(u => { const _ar = userRoles[u.id] || []; const _owner = _ar.some(r => r.slug==='admin' || r.slug==='plant_head') || u.role==='admin' || u.role==='plant_head'; return Row({ title: u.full_name, sub: u.phone + (u.email?' · '+u.email:''), badge: _ar.length ? _ar.map(r => r.display_name).join(', ') : roleLabel(u.role), badgeColor: _owner?'teal':'', onClick: () => setTab('people') }); })}
         `;
       }
       case 'parts': {
@@ -6956,19 +7056,32 @@ function People({ plant, me, myPerms }) {
   const [loading, setLoading] = useState(true);
   const [resetShare, setResetShare] = useState(null); // { user, token, expires_at } when a reset link is freshly issued
   const [rolesTarget, setRolesTarget] = useState(null); // RBAC Phase 1: opens UserRolesModal for the picked user
+  const [userRoles, setUserRoles] = useState({}); // user_id -> [{slug, display_name}] assigned custom roles
 
   const refresh = async () => {
     setLoading(true);
-    const [u, us, sh, inv] = await Promise.all([
+    const [u, us, sh, inv, upr, prs] = await Promise.all([
       sb.from('units').select('*').order('created_at'),
       sb.from('users').select('*').order('created_at'),
       sb.from('shifts').select('*').order('start_time'),
       sb.from('user_invites').select('*').eq('status', 'pending').order('created_at', { ascending:false }),
+      sb.from('user_plant_roles').select('user_id, role_id'),
+      sb.from('plant_roles').select('id, slug, display_name').eq('plant_id', plant.id),
     ]);
     setUnits(u.data || []);
     setUsers(us.data || []);
     setShifts(sh.data || []);
     setInvites(inv.data || []);
+    // Map each user to their assigned roles so the Team list reflects role
+    // assignments immediately (the badge alone only shows the base role).
+    const roleById = {};
+    for (const r of (prs.data || [])) roleById[r.id] = r;
+    const rm = {};
+    for (const row of (upr.data || [])) {
+      const pr = roleById[row.role_id];
+      if (pr) (rm[row.user_id] = rm[row.user_id] || []).push(pr);
+    }
+    setUserRoles(rm);
     setLoading(false);
   };
 
@@ -7048,7 +7161,17 @@ function People({ plant, me, myPerms }) {
                 <div class="list-item-sub">${u.phone} · ${u.email || 'no email'}</div>
               </div>
               <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
-                <span class=${'badge ' + (u.role === 'plant_head' ? 'teal' : u.status === 'inactive' ? '' : '')}>${roleLabel(u.role)}</span>
+                <div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end">
+                  ${(() => {
+                    // Show the person's actual assigned role(s) as a single clean
+                    // set. Fall back to the base role only if nothing is assigned.
+                    const assigned = userRoles[u.id] || [];
+                    const owner = s => s === 'plant_head' || s === 'admin';
+                    if (!assigned.length)
+                      return html`<span class=${'badge ' + (owner(u.role) ? 'teal' : '')}>${roleLabel(u.role)}</span>`;
+                    return assigned.map(r => html`<span key=${r.slug} class=${'badge ' + (owner(r.slug) ? 'teal' : '')}>${r.display_name}</span>`);
+                  })()}
+                </div>
                 ${canAssignRoles && html`<button class="btn small ghost" title="Manage the roles assigned to this user" onClick=${() => setRolesTarget(u)}>👥 Roles</button>`}
                 ${canReset && html`<button class="btn small ghost" title="Issue a one-tap link they can use to set a new password" onClick=${async () => {
                   const { data, error } = await sb.rpc('issue_password_reset', { p_target_user_id: u.id });
@@ -7142,7 +7265,7 @@ function People({ plant, me, myPerms }) {
     ${modal === 'inviteView' && html`<${InviteViewModal} invite=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onCancel=${async () => { await sb.from('user_invites').delete().eq('id', editTarget.id); setModal(null); setEditTarget(null); refresh(); showToast('Invite cancelled'); }} />`}
     ${modal === 'operator' && html`<${OperatorModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${resetShare && html`<${ResetShareModal} plant=${plant} resetShare=${resetShare} onClose=${() => setResetShare(null)} />`}
-    ${rolesTarget && html`<${UserRolesModal} plant=${plant} user=${rolesTarget} onClose=${() => setRolesTarget(null)} onSaved=${() => setRolesTarget(null)} />`}
+    ${rolesTarget && html`<${UserRolesModal} plant=${plant} user=${rolesTarget} me=${me} onClose=${() => setRolesTarget(null)} onSaved=${() => { setRolesTarget(null); refresh(); }} />`}
   `;
 }
 
@@ -7468,6 +7591,21 @@ const RBAC_MODULE_KEYS = new Set(RBAC_MODULES.map(m => m.key));
 const RBAC_ACTIONS = ['view','create','edit','delete','approve','export'];
 const RBAC_ACTION_LABELS = { view:'View', create:'Create', edit:'Edit', delete:'Delete', approve:'Approve', export:'Export' };
 
+// Which RBAC modules apply to a given plant. Starter / limited plants set
+// plants.enabled_tabs — restrict the access matrix + role editor to those
+// (plus the implicit 'home' tab and any extra_modules), mirroring the nav's
+// enabled_tabs gating in visibleMoreGroups(). Legacy/full plants (no
+// enabled_tabs) keep the full module list unchanged. Display-only: a role's
+// stored permissions for hidden modules are preserved on save.
+function plantRbacModules(plant) {
+  if (Array.isArray(plant?.enabled_tabs) && plant.enabled_tabs.length > 0) {
+    const allow = new Set(['home', ...plant.enabled_tabs,
+      ...(Array.isArray(plant?.extra_modules) ? plant.extra_modules : [])]);
+    return RBAC_MODULES.filter(m => allow.has(m.key));
+  }
+  return RBAC_MODULES;
+}
+
 function RolesTab({ plant, me }) {
   const [roles, setRoles] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
@@ -7540,6 +7678,8 @@ function RolesTab({ plant, me }) {
     return acts ? acts.size : 0;
   };
 
+  const matrixModules = plantRbacModules(plant);
+
   return html`
     <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);padding:10px 14px;margin-bottom:12px">
       <div style="font-size:12px;color:var(--teal-800);line-height:1.55">
@@ -7571,13 +7711,13 @@ function RolesTab({ plant, me }) {
             </tr>
           </thead>
           <tbody>
-            ${Object.keys(RBAC_MODULE_GROUPS).map(gk => html`
+            ${Object.keys(RBAC_MODULE_GROUPS).filter(gk => matrixModules.some(m => m.group === gk)).map(gk => html`
               <tr key=${'g-'+gk}>
                 <td colSpan=${ordered.length + 1} style="background:var(--slate-50);padding:6px 10px;font-weight:700;font-size:10px;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.05em;position:sticky;left:0;z-index:1">
                   ${RBAC_MODULE_GROUPS[gk]}
                 </td>
               </tr>
-              ${RBAC_MODULES.filter(m => m.group === gk).map(m => html`
+              ${matrixModules.filter(m => m.group === gk).map(m => html`
                 <tr key=${m.key} style="border-top:1px solid var(--slate-100)">
                   <td style="position:sticky;left:0;background:white;padding:7px 10px;border-right:1px solid var(--slate-200);font-weight:500">${m.label}</td>
                   ${ordered.map(r => {
@@ -7623,6 +7763,7 @@ function RolesTab({ plant, me }) {
               <div class="list-item-sub">${r.member_count} user${r.member_count === 1 ? '' : 's'} · ${r.permissions.length} permission${r.permissions.length === 1 ? '' : 's'}${r.description ? ' · ' + r.description : ''}</div>
             </div>
             <div style="display:flex;gap:6px">
+              <button class="btn small ghost" title="See the app as this role — safe, doesn't change your own access" onClick=${() => setPreviewRole({ id:r.id, slug:r.slug, display_name:r.display_name, perms: buildPreviewPerms(plant, r) })}>👁 Preview</button>
               <button class="btn small" onClick=${() => setEditTarget(r)}>${r.is_builtin && (r.slug === 'plant_head' || r.slug === 'admin') ? 'View' : 'Edit'}</button>
               ${!r.is_builtin && html`<button class="btn small ghost" style="color:var(--rose-600)" onClick=${() => del(r)} title="Delete role">🗑</button>`}
             </div>
@@ -7726,9 +7867,9 @@ function RoleEditModal({ plant, role, onClose, onSaved }) {
     } catch (e) { setErr(e.message); } finally { setBusy(false); }
   };
 
-  // Group modules for readability
+  // Group modules for readability — scoped to the modules this plant actually has.
   const byGroup = {};
-  for (const m of RBAC_MODULES) {
+  for (const m of plantRbacModules(plant)) {
     (byGroup[m.group] ||= []).push(m);
   }
 
@@ -7800,7 +7941,7 @@ function RoleEditModal({ plant, role, onClose, onSaved }) {
 }
 
 // User row → role assignment modal (opened from People → Team → "Roles" button)
-function UserRolesModal({ plant, user, onClose, onSaved }) {
+function UserRolesModal({ plant, user, me, onClose, onSaved }) {
   const [roles, setRoles] = useState(null);
   const [selected, setSelected] = useState(new Set());
   const [busy, setBusy] = useState(false);
@@ -7815,7 +7956,20 @@ function UserRolesModal({ plant, user, onClose, onSaved }) {
       setSelected(new Set((links || []).map(l => l.role_id)));
     })();
   }, [plant.id, user.id]);
-  const toggle = (id) => { const n = new Set(selected); if (n.has(id)) n.delete(id); else n.add(id); setSelected(n); };
+  // Self-demotion guard: you can't remove your OWN last owner (plant_head/admin)
+  // role — that's the lock-out footgun. Use "Preview as role" to test instead.
+  const isSelf = me && user.id === me.id;
+  const ownerRoleIds = new Set((roles || []).filter(r => r.slug === 'plant_head' || r.slug === 'admin').map(r => r.id));
+  const selectedOwnerCount = [...selected].filter(id => ownerRoleIds.has(id)).length;
+  const lastOwnerLockedId = (id) => isSelf && ownerRoleIds.has(id) && selected.has(id) && selectedOwnerCount <= 1;
+  const toggle = (id) => {
+    if (lastOwnerLockedId(id)) {
+      setErr("You can't remove your own last owner role — you'd lock yourself out. To see what another role can access, use 👁 Preview instead.");
+      return;
+    }
+    setErr('');
+    const n = new Set(selected); if (n.has(id)) n.delete(id); else n.add(id); setSelected(n);
+  };
   const save = async () => {
     setBusy(true); setErr('');
     const { error } = await sb.rpc('assign_user_roles', { p_user_id: user.id, p_role_ids: Array.from(selected) });
@@ -7835,15 +7989,15 @@ function UserRolesModal({ plant, user, onClose, onSaved }) {
           <p style="font-size:13px;color:var(--slate-600);margin-bottom:10px;line-height:1.5">
             Pick one or more roles. The user gets the union of permissions across all selected roles.
           </p>
-          ${roles.map(r => html`
-            <label key=${r.id} style="display:flex;align-items:center;gap:10px;padding:9px 4px;border-bottom:1px solid var(--slate-100);cursor:pointer">
-              <input type="checkbox" checked=${selected.has(r.id)} onChange=${() => toggle(r.id)} />
+          ${roles.map(r => { const locked = lastOwnerLockedId(r.id); return html`
+            <label key=${r.id} style=${'display:flex;align-items:center;gap:10px;padding:9px 4px;border-bottom:1px solid var(--slate-100);cursor:' + (locked ? 'not-allowed' : 'pointer') + ';opacity:' + (locked ? '0.75' : '1')}>
+              <input type="checkbox" checked=${selected.has(r.id)} disabled=${locked} onChange=${() => toggle(r.id)} />
               <div style="flex:1;min-width:0">
-                <div style="font-weight:600">${r.display_name}${r.is_builtin ? html` <span style="font-size:10px;color:var(--slate-400);font-weight:400">· built-in</span>` : ''}</div>
+                <div style="font-weight:600">${r.display_name}${r.is_builtin ? html` <span style="font-size:10px;color:var(--slate-400);font-weight:400">· built-in</span>` : ''}${locked ? html` <span style="font-size:10px;color:var(--amber-700);font-weight:600">· 🔒 your own access</span>` : ''}</div>
                 <div style="font-size:11px;color:var(--slate-500)">${r.description || ''}</div>
               </div>
             </label>
-          `)}
+          `})}
           <div style="display:flex;gap:8px;margin-top:14px">
             <button class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
             <button class="btn" onClick=${save} disabled=${busy} style="flex:2">${busy ? 'Saving…' : 'Save roles'}</button>
@@ -7856,7 +8010,7 @@ function UserRolesModal({ plant, user, onClose, onSaved }) {
 
 function InviteModal({ plant, me, units, onClose, onSaved }) {
   const [form, setForm] = useState({
-    full_name:'', phone:'', email:'', role:'supervisor',
+    full_name:'', phone:'', email:'', role:'supervisor', invited_role_id:null,
     primary_unit_id: units[0]?.id || '',
     // Units this employee can access. Defaults to just the primary unit; the
     // creator can tick more for staff who work across units.
@@ -7865,6 +8019,20 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [createdInvite, setCreatedInvite] = useState(null);
+  const [customRoles, setCustomRoles] = useState([]);
+  const [creatingRole, setCreatingRole] = useState(false);
+  const loadRoles = async () => {
+    try { const { data } = await sb.rpc('list_plant_roles', { p_plant_id: plant.id });
+      setCustomRoles((data || []).filter(r => !r.is_builtin && r.is_active !== false)); } catch (_) {}
+  };
+  useEffect(() => { loadRoles(); }, [plant.id]);
+  // Role dropdown can pick a standard (enum) role, a custom role (custom:<id>),
+  // or "+ Create a new role…" which opens the role builder inline.
+  const onRoleChange = (v) => {
+    if (v === '__new__') { setCreatingRole(true); return; }
+    if (v.indexOf('custom:') === 0) { setForm({ ...form, role: 'operator', invited_role_id: v.slice(7) }); return; }
+    setForm({ ...form, role: v, invited_role_id: null });
+  };
 
   // Toggle a unit in/out of the access set. Removing the current primary
   // re-points primary at the first remaining unit so they never disagree.
@@ -7912,6 +8080,7 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
         phone: '+91' + form.phone,
         email: form.email || null,
         role: form.role,
+        invited_role_id: form.invited_role_id,
         primary_unit_id: primary || null,
         unit_ids: chosen.length ? chosen : null,
         invite_code: code,
@@ -7926,7 +8095,12 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
     const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
     const inviteUrl = baseUrl + '?code=' + createdInvite.invite_code;
     const waMessage = encodeURIComponent(
-      `Hi ${createdInvite.full_name}, you've been invited to join ${plant.name} on Loglinkr as ${roleLabel(createdInvite.role)}.\n\nSign up here: ${inviteUrl}\n\nOr enter code: ${createdInvite.invite_code}`
+      `Hi ${createdInvite.full_name}! You've been invited to *${plant.name}* on Loglinkr as ${roleLabel(createdInvite.role)}.\n\n` +
+      `▶ How to log in:\n` +
+      `1) Open this link: ${inviteUrl}\n` +
+      `2) Sign up with your email + a password — you'll be added to ${plant.name} automatically.\n\n` +
+      `📲 No link? Open *loglinkr.com*, tap "Have an invite code?", and enter your code:  *${createdInvite.invite_code}*\n\n` +
+      `💡 After logging in, tap "Install app" to keep Loglinkr on your home screen — opens like a normal app, no Play Store needed.`
     );
     const waUrl = createdInvite.phone ? 'https://wa.me/' + createdInvite.phone.replace(/\D/g,'') + '?text=' + waMessage : 'https://wa.me/?text=' + waMessage;
 
@@ -7946,7 +8120,7 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
           </div>
 
           <p style="font-size:12px;color:var(--slate-500);margin-bottom:14px;line-height:1.5">
-            They open the link → sign up with email + password → automatically added to your plant. No code typing needed.
+            They open the link → sign up with email + password → automatically added to your plant. No link? They can open <b>loglinkr.com</b> and enter the code above. After login they'll be prompted to <b>install the app</b>.
           </p>
 
           <a href=${waUrl} target="_blank" rel="noopener" class="btn" style="text-decoration:none;display:flex;align-items:center;justify-content:center;gap:8px;background:#25D366">
@@ -7973,14 +8147,18 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
           <div class="field"><label>Phone *</label><input type="tel" required maxLength=${10} value=${form.phone} onChange=${e => setForm({...form, phone: e.target.value.replace(/\D/g,'')})} placeholder="9876543210" /></div>
           <div class="field"><label>Email (optional)</label><input type="email" value=${form.email} onChange=${e => setForm({...form, email: e.target.value})} placeholder="they@email.com" /></div>
           <div class="field"><label>Role *</label>
-            <select required value=${form.role} onChange=${e => setForm({...form, role: e.target.value})}>
-              <option value="supervisor">Supervisor</option>
-              <option value="qa">Quality (QA)</option>
-              <option value="operator">Operator</option>
-              <option value="toolroom">Toolroom</option>
-              <option value="store">Store</option>
-              <option value="driver">Driver</option>
-              <option value="admin">Admin</option>
+            <select required value=${form.invited_role_id ? 'custom:'+form.invited_role_id : form.role} onChange=${e => onRoleChange(e.target.value)}>
+              <optgroup label="Standard roles">
+                <option value="supervisor">Supervisor</option>
+                <option value="qa">Quality (QA)</option>
+                <option value="operator">Operator</option>
+                <option value="toolroom">Toolroom</option>
+                <option value="store">Store</option>
+                <option value="driver">Driver</option>
+                <option value="admin">Admin</option>
+              </optgroup>
+              ${customRoles.length ? html`<optgroup label="Custom roles">${customRoles.map(r => html`<option key=${r.id} value=${'custom:'+r.id}>${r.display_name}</option>`)}</optgroup>` : ''}
+              <option value="__new__">+ Create a new role…</option>
             </select>
           </div>
           ${units.length === 0 ? html`
@@ -8016,6 +8194,15 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
           <button class="btn" disabled=${loading}>${loading ? 'Creating…' : 'Generate invite'}</button>
         </form>
       </div>
+      ${creatingRole && html`<${RoleCreateModal} plant=${plant} onClose=${() => setCreatingRole(false)} onSaved=${async () => {
+        setCreatingRole(false);
+        const prev = new Set(customRoles.map(r => r.id));
+        const { data } = await sb.rpc('list_plant_roles', { p_plant_id: plant.id });
+        const all = (data || []).filter(r => !r.is_builtin && r.is_active !== false);
+        setCustomRoles(all);
+        const fresh = all.find(r => !prev.has(r.id));   // auto-select the role just created
+        if (fresh) setForm(f => ({ ...f, role: 'operator', invited_role_id: fresh.id }));
+      }} />`}
     </div>
   `;
 }
@@ -13113,6 +13300,31 @@ function SelfAttendancePage({ plant, me, reload }) {
 
   const cancelScan = () => { stopCamera(); setPhase('idle'); };
 
+  // Close the shift from off-site — the worker has left the factory and can't
+  // scan the gate QR. No geofence gate; records out_time + hours, captures GPS
+  // best-effort, and stamps the row (mark_method='self_offsite_close') so the
+  // supervisor can see it was closed away from the factory.
+  const closeOffsite = () => {
+    if (!confirm('Close your shift from here?\n\nUse this only if you have genuinely left for the day — your supervisor will see it was closed away from the factory.')) return;
+    setError(''); setBusy(true);
+    const submit = (lat, lng) => sb.rpc('attendance_self_close_offsite', { p_plant_id: plant.id, p_lat: lat, p_lng: lng })
+      .then(({ data, error: err }) => {
+        if (err) throw err;
+        if (!data?.success) { setError(data?.error || 'Failed to close shift'); return; }
+        showToast('✓ ' + (data.message || 'Shift closed'));
+        refresh();
+      })
+      .catch(e => setError(e.message || String(e)))
+      .finally(() => setBusy(false));
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        pos => submit(pos.coords.latitude, pos.coords.longitude),
+        () => submit(null, null),            // GPS best-effort, not a gate
+        { enableHighAccuracy:false, timeout:8000, maximumAge:60000 }
+      );
+    } else submit(null, null);
+  };
+
   // On Duty — off-site work, no gate QR / geofence. Captures GPS (best-effort)
   // + an optional reason. Counts as a present day in payroll.
   // On Duty = real punch IN / OUT from anywhere (off-site), no gate QR/geofence.
@@ -13192,6 +13404,7 @@ function SelfAttendancePage({ plant, me, reload }) {
       `}
       ${punchedIn && html`
         <button class="btn" disabled=${busy} onClick=${() => startScan('out')} style="width:100%;padding:18px;font-size:17px;font-weight:700;background:linear-gradient(135deg,var(--rose-600,#e11d48),var(--rose-500,#f43f5e))">🛡 Punch OUT — scan factory QR</button>
+        <button type="button" class="btn ghost" disabled=${busy} onClick=${closeOffsite} style="width:100%;padding:11px;font-size:13px;font-weight:600;margin-top:8px">📍 Can't reach the gate? Close shift off-site</button>
       `}
     `}
 
@@ -26378,6 +26591,55 @@ function PushNotifSetting({ me, plant }) {
       </div>
     </div>
   `;
+}
+
+// One-time install nudge shown automatically right after login, for users in a
+// browser tab (not the installed app). Appears once per device; reuses the same
+// install flow as the Home banner.
+function PostLoginInstallPrompt() {
+  const isStandalone = () =>
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
+    window.navigator.standalone === true ||
+    (document.referrer || '').indexOf('android-app://') === 0;
+  const isIos = () =>
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const alreadyShown = () => { try { return localStorage.getItem('loglinkr_postlogin_install') === '1'; } catch (_) { return false; } };
+  const [show, setShow] = useState(false);
+  const [iosHelp, setIosHelp] = useState(false);
+  useEffect(() => {
+    if (isStandalone() || alreadyShown()) return;
+    const t = setTimeout(() => { setShow(true); try { localStorage.setItem('loglinkr_postlogin_install', '1'); } catch (_) {} }, 1400);
+    return () => clearTimeout(t);
+  }, []);
+  if (!show) return null;
+  const close = () => setShow(false);
+  const install = async () => {
+    if (isIos()) { setIosHelp(true); return; }
+    if (deferredInstallPrompt) { const ok = await promptInstallApp(); if (ok) close(); return; }
+    window.open('/install', '_blank', 'noopener'); close();
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) close(); }}>
+      <div class="modal" style="max-width:380px;text-align:center">
+        <button class="close-btn" onClick=${close} style="position:absolute;right:12px;top:10px">×</button>
+        <div style="font-size:44px;line-height:1">📲</div>
+        <div style="font-size:18px;font-weight:700;color:var(--slate-800);margin-top:8px">Install Loglinkr on your phone</div>
+        <div style="font-size:13px;color:var(--slate-500);margin:8px 0 16px;line-height:1.5">Opens like a normal app — faster, push alerts, and no browser bar. No Play Store needed.</div>
+        ${iosHelp ? html`
+          <div style="text-align:left;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.55;color:var(--slate-700);margin-bottom:14px">
+            <b>On iPhone / iPad (open in Safari):</b>
+            <ol style="padding-left:18px;margin:6px 0 0;display:flex;flex-direction:column;gap:4px">
+              <li>Tap the <b>Share</b> button (square with an up-arrow).</li>
+              <li>Tap <b>Add to Home Screen</b> → <b>Add</b>.</li>
+            </ol>
+          </div>` : ''}
+        <div style="display:flex;gap:8px">
+          <button class="btn ghost" style="flex:1" onClick=${close}>Maybe later</button>
+          <button class="btn" style="flex:2" onClick=${iosHelp ? close : install}>${iosHelp ? 'Got it' : 'Install app'}</button>
+        </div>
+      </div>
+    </div>`;
 }
 
 // ============= HOME INSTALL BANNER =============
