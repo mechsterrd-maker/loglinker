@@ -8094,8 +8094,13 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
   if (createdInvite) {
     const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
     const inviteUrl = baseUrl + '?code=' + createdInvite.invite_code;
+    // Show the CUSTOM role's name when one was chosen — the base role is just
+    // 'operator' in that case, so roleLabel(role) alone would mislabel the invite.
+    const inviteRoleLabel = createdInvite.invited_role_id
+      ? ((customRoles.find(r => r.id === createdInvite.invited_role_id) || {}).display_name || roleLabel(createdInvite.role))
+      : roleLabel(createdInvite.role);
     const waMessage = encodeURIComponent(
-      `Hi ${createdInvite.full_name}! You've been invited to *${plant.name}* on Loglinkr as ${roleLabel(createdInvite.role)}.\n\n` +
+      `Hi ${createdInvite.full_name}! You've been invited to *${plant.name}* on Loglinkr as ${inviteRoleLabel}.\n\n` +
       `▶ How to log in:\n` +
       `1) Open this link: ${inviteUrl}\n` +
       `2) Sign up with your email + a password — you'll be added to ${plant.name} automatically.\n\n` +
@@ -8252,8 +8257,19 @@ function ResetShareModal({ plant, resetShare, onClose }) {
 function InviteViewModal({ invite, onClose, onCancel }) {
   const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
   const inviteUrl = baseUrl + '?code=' + invite.invite_code;
+  // When the invite carries a custom role, show its name (the base role is just
+  // 'operator' for custom-role invites). Resolved from plant_roles.
+  const [customLabel, setCustomLabel] = useState(null);
+  useEffect(() => {
+    if (!invite.invited_role_id) { setCustomLabel(null); return; }
+    let alive = true;
+    sb.from('plant_roles').select('display_name').eq('id', invite.invited_role_id).maybeSingle()
+      .then(({ data }) => { if (alive && data) setCustomLabel(data.display_name); });
+    return () => { alive = false; };
+  }, [invite.invited_role_id]);
+  const roleText = customLabel || roleLabel(invite.role);
   const waMessage = encodeURIComponent(
-    `Hi ${invite.full_name}, your Loglinkr invite as ${roleLabel(invite.role)}:\n\n${inviteUrl}\n\nOr enter code: ${invite.invite_code}`
+    `Hi ${invite.full_name}, your Loglinkr invite as ${roleText}:\n\n${inviteUrl}\n\nOr enter code: ${invite.invite_code}`
   );
   const waUrl = invite.phone ? 'https://wa.me/' + invite.phone.replace(/\D/g,'') + '?text=' + waMessage : 'https://wa.me/?text=' + waMessage;
 
@@ -8264,7 +8280,7 @@ function InviteViewModal({ invite, onClose, onCancel }) {
           <div class="modal-title">Invite for ${invite.full_name}</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
-        <div class="card-row"><span class="label">Role</span><span class="value">${roleLabel(invite.role)}</span></div>
+        <div class="card-row"><span class="label">Role</span><span class="value">${roleText}</span></div>
         <div class="card-row"><span class="label">Phone</span><span class="value mono">${invite.phone}</span></div>
         <div class="invite-code">${invite.invite_code}</div>
         <div class="field" style="margin-top:14px">
