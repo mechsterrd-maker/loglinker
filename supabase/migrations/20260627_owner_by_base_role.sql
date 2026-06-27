@@ -1,0 +1,4 @@
+-- Owner = the user's BASE role (users.role = plant_head/admin), the
+-- authoritative owner signal. my_permissions() now returns base_role; the client
+-- treats base-role owners (or genuine built-in owner roles) as owners. Fixes a
+-- lock-out where the plant 'admin' slug was held by a custom role. Applied to prod.
