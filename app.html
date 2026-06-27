@@ -7831,6 +7831,8 @@ function RoleEditModal({ plant, role, onClose, onSaved }) {
   const [desc, setDesc] = useState(role.description || '');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  const [suggesting, setSuggesting] = useState(false);
+  const [aiNotes, setAiNotes] = useState('');
   const readOnly = role.is_builtin && (role.slug === 'plant_head' || role.slug === 'admin');
   // Display-name (label) is editable for every role -- code references the
   // immutable slug, not the label, so relabelling a built-in is safe.
@@ -7851,6 +7853,32 @@ function RoleEditModal({ plant, role, onClose, onSaved }) {
       if (on) next.add(k); else next.delete(k);
     }
     setPerms(next);
+  };
+  // Ask Claude to propose a least-privilege matrix from the role name/description.
+  // Suggestion only — it pre-fills the grid; the admin reviews + Saves.
+  const suggestAccess = async () => {
+    if (readOnly) return;
+    if (!displayName.trim()) { setErr('Give the role a name first so AI can suggest access.'); return; }
+    setErr(''); setAiNotes(''); setSuggesting(true);
+    try {
+      const mods = plantRbacModules(plant).map(m => ({ key: m.key, label: m.label, group: m.group }));
+      const { data, error } = await sb.functions.invoke('suggest-role-access', {
+        body: { role_name: displayName, role_description: desc, modules: mods, actions: RBAC_ACTIONS },
+      });
+      if (error) throw error;
+      if (data?.error) throw new Error(data.error);
+      const valid = new Set(mods.map(m => m.key));
+      const next = new Set();
+      for (const p of (data.permissions || [])) {
+        if (!valid.has(p.module_key)) continue;
+        for (const a of (p.actions || [])) if (RBAC_ACTIONS.includes(a)) next.add(p.module_key + '|' + a);
+      }
+      next.add('home|view');
+      setPerms(next);
+      setAiNotes(data.notes || 'Suggested access applied — review and adjust, then Save.');
+    } catch (e) {
+      setErr('AI suggestion failed: ' + (e.message || e));
+    } finally { setSuggesting(false); }
   };
   const save = async () => {
     setErr(''); setBusy(true);
@@ -7897,7 +7925,20 @@ function RoleEditModal({ plant, role, onClose, onSaved }) {
         <div class="field"><label>Display name</label><input type="text" value=${displayName} onInput=${e => setDisplayName(e.target.value)} disabled=${renameLocked} /></div>
         <div class="field"><label>Description</label><input type="text" value=${desc} onInput=${e => setDesc(e.target.value)} /></div>
 
-        <div class="section-h" style="margin-top:14px">Permissions</div>
+        <div class="section-h" style="margin-top:14px;display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <span>Permissions</span>
+          ${!readOnly && html`
+            <button type="button" class="btn small" onClick=${suggestAccess} disabled=${suggesting}
+              style="font-size:11px;padding:5px 10px;background:linear-gradient(135deg,var(--teal-600),var(--teal-700));white-space:nowrap">
+              ${suggesting ? '✨ Thinking…' : '✨ Suggest access (AI)'}
+            </button>
+          `}
+        </div>
+        ${aiNotes && html`
+          <div class="card" style="background:var(--teal-50);border:1px solid var(--teal-200);padding:9px 12px;font-size:12px;color:var(--teal-800);margin-bottom:10px;line-height:1.5">
+            <strong>✨ AI suggestion applied.</strong> ${aiNotes} <span style="color:var(--teal-700)">Review the grid below and adjust, then <strong>Save</strong>.</span>
+          </div>
+        `}
         <div style="overflow-x:auto;border:1px solid var(--slate-200);border-radius:8px">
           <table style="width:100%;border-collapse:collapse;font-size:12px">
             <thead>
