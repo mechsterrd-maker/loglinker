@@ -1533,6 +1533,32 @@ function App() {
     location.reload();
   };
 
+  // Keep MY permissions live without a manual reload: refetch my_permissions
+  // when an admin changes my role assignments (realtime), when a role's
+  // permission grid is edited (realtime), or whenever I return to the app
+  // (pulse). So newly granted / revoked access takes effect instantly.
+  const refreshMyPerms = useCallback(async () => {
+    try {
+      const { data: perms } = await sb.rpc('my_permissions');
+      if (perms) {
+        setMyPerms(perms);
+        try { window.dispatchEvent(new Event('loglinkr-roles-changed')); } catch (_) {}
+      }
+    } catch (_) {}
+  }, []);
+  useEffect(() => {
+    if (!user?.id) return;
+    const onPulse = () => refreshMyPerms();
+    window.addEventListener('loglinkr-pulse', onPulse);
+    let t;
+    const debounced = () => { clearTimeout(t); t = setTimeout(refreshMyPerms, 250); };
+    const ch = sb.channel('my-perms-' + user.id)
+      .on('postgres_changes', { event:'*', schema:'public', table:'user_plant_roles', filter:'user_id=eq.' + user.id }, debounced)
+      .on('postgres_changes', { event:'*', schema:'public', table:'role_permissions' }, debounced)
+      .subscribe();
+    return () => { window.removeEventListener('loglinkr-pulse', onPulse); clearTimeout(t); sb.removeChannel(ch); };
+  }, [user?.id, refreshMyPerms]);
+
   if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
   // A reset link short-circuits everything else, signed in or not.
   if (resetToken) return html`<${ResetPasswordScreen} token=${resetToken} />`;
