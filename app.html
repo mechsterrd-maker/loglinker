@@ -13078,6 +13078,31 @@ function SelfAttendancePage({ plant, me, reload }) {
 
   const cancelScan = () => { stopCamera(); setPhase('idle'); };
 
+  // Close the shift from off-site — the worker has left the factory and can't
+  // scan the gate QR. No geofence gate; records out_time + hours, captures GPS
+  // best-effort, and stamps the row (mark_method='self_offsite_close') so the
+  // supervisor can see it was closed away from the factory.
+  const closeOffsite = () => {
+    if (!confirm('Close your shift from here?\n\nUse this only if you have genuinely left for the day — your supervisor will see it was closed away from the factory.')) return;
+    setError(''); setBusy(true);
+    const submit = (lat, lng) => sb.rpc('attendance_self_close_offsite', { p_plant_id: plant.id, p_lat: lat, p_lng: lng })
+      .then(({ data, error: err }) => {
+        if (err) throw err;
+        if (!data?.success) { setError(data?.error || 'Failed to close shift'); return; }
+        showToast('✓ ' + (data.message || 'Shift closed'));
+        refresh();
+      })
+      .catch(e => setError(e.message || String(e)))
+      .finally(() => setBusy(false));
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        pos => submit(pos.coords.latitude, pos.coords.longitude),
+        () => submit(null, null),            // GPS best-effort, not a gate
+        { enableHighAccuracy:false, timeout:8000, maximumAge:60000 }
+      );
+    } else submit(null, null);
+  };
+
   // On Duty — off-site work, no gate QR / geofence. Captures GPS (best-effort)
   // + an optional reason. Counts as a present day in payroll.
   // On Duty = real punch IN / OUT from anywhere (off-site), no gate QR/geofence.
@@ -13157,6 +13182,7 @@ function SelfAttendancePage({ plant, me, reload }) {
       `}
       ${punchedIn && html`
         <button class="btn" disabled=${busy} onClick=${() => startScan('out')} style="width:100%;padding:18px;font-size:17px;font-weight:700;background:linear-gradient(135deg,var(--rose-600,#e11d48),var(--rose-500,#f43f5e))">🛡 Punch OUT — scan factory QR</button>
+        <button type="button" class="btn ghost" disabled=${busy} onClick=${closeOffsite} style="width:100%;padding:11px;font-size:13px;font-weight:600;margin-top:8px">📍 Can't reach the gate? Close shift off-site</button>
       `}
     `}
 
