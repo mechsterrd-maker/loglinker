@@ -7855,10 +7855,32 @@ function UserRolesModal({ plant, user, onClose, onSaved }) {
 }
 
 function InviteModal({ plant, me, units, onClose, onSaved }) {
-  const [form, setForm] = useState({ full_name:'', phone:'', email:'', role:'supervisor', primary_unit_id: units[0]?.id || '' });
+  const [form, setForm] = useState({
+    full_name:'', phone:'', email:'', role:'supervisor',
+    primary_unit_id: units[0]?.id || '',
+    // Units this employee can access. Defaults to just the primary unit; the
+    // creator can tick more for staff who work across units.
+    unit_ids: units[0] ? [units[0].id] : [],
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [createdInvite, setCreatedInvite] = useState(null);
+
+  // Toggle a unit in/out of the access set. Removing the current primary
+  // re-points primary at the first remaining unit so they never disagree.
+  const toggleUnit = (id) => setForm(f => {
+    const has = f.unit_ids.includes(id);
+    const unit_ids = has ? f.unit_ids.filter(x => x !== id) : [...f.unit_ids, id];
+    let primary_unit_id = f.primary_unit_id;
+    if (has && primary_unit_id === id) primary_unit_id = unit_ids[0] || '';
+    if (!has && !primary_unit_id) primary_unit_id = id;
+    return { ...f, unit_ids, primary_unit_id };
+  });
+  // Mark a unit primary; ensures it's also in the access set.
+  const setPrimary = (id) => setForm(f => ({
+    ...f, primary_unit_id: id,
+    unit_ids: f.unit_ids.includes(id) ? f.unit_ids : [...f.unit_ids, id],
+  }));
 
   const submit = async (e) => {
     e.preventDefault();
@@ -7877,6 +7899,11 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
           return;
         }
       }
+      // Normalise unit selection so primary is always inside the access set.
+      const chosen = Array.from(new Set(form.unit_ids));
+      let primary = form.primary_unit_id;
+      if (!primary && chosen.length) primary = chosen[0];
+      if (primary && !chosen.includes(primary)) chosen.push(primary);
       const code = generateInviteCode();
       const { data, error } = await sb.from('user_invites').insert({
         plant_id: plant.id,
@@ -7885,7 +7912,8 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
         phone: '+91' + form.phone,
         email: form.email || null,
         role: form.role,
-        primary_unit_id: form.primary_unit_id || null,
+        primary_unit_id: primary || null,
+        unit_ids: chosen.length ? chosen : null,
         invite_code: code,
         status: 'pending'
       }).select().single();
@@ -7955,12 +7983,36 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
               <option value="admin">Admin</option>
             </select>
           </div>
-          <div class="field"><label>Primary Unit</label>
-            <select value=${form.primary_unit_id} onChange=${e => setForm({...form, primary_unit_id: e.target.value})}>
-              <option value="">— None —</option>
-              ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
-            </select>
-          </div>
+          ${units.length === 0 ? html`
+            <div class="field"><label>Unit access</label>
+              <div style="font-size:12px;color:var(--slate-500);background:var(--slate-50);padding:8px 10px;border-radius:6px">No units defined for this plant yet. The employee will be added without a unit; add units later and grant access from People → Unit access.</div>
+            </div>
+          ` : html`
+            <div class="field">
+              <label>Unit access ${form.unit_ids.length > 1 ? html`<span style="font-weight:400;color:var(--teal-700);font-size:11px">· ${form.unit_ids.length} units</span>` : ''}</label>
+              <div style="font-size:11px;color:var(--slate-500);margin:-2px 0 8px;line-height:1.5">Tick every unit this person works in. Pick one as <strong>primary</strong> (their default on login). Multi-unit staff can switch between the ticked units.</div>
+              <div style="border:1px solid var(--slate-200);border-radius:8px;overflow:hidden">
+                ${units.map((u, i) => {
+                  const checked = form.unit_ids.includes(u.id);
+                  const isPrimary = form.primary_unit_id === u.id;
+                  return html`
+                    <div key=${u.id} style=${'display:flex;align-items:center;gap:10px;padding:9px 11px;'+(i>0?'border-top:1px solid var(--slate-100);':'')+(checked?'background:var(--teal-50)':'')}>
+                      <label style="display:flex;align-items:center;gap:9px;flex:1;cursor:pointer;min-width:0">
+                        <input type="checkbox" checked=${checked} onChange=${() => toggleUnit(u.id)} />
+                        <span style=${'font-size:13px;'+(checked?'font-weight:600;color:var(--slate-800)':'color:var(--slate-600)')}>${u.name}</span>
+                      </label>
+                      ${checked ? html`
+                        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:11px;color:${isPrimary?'var(--teal-700)':'var(--slate-500)'};font-weight:${isPrimary?'700':'500'}">
+                          <input type="radio" name="primary_unit" checked=${isPrimary} onChange=${() => setPrimary(u.id)} />
+                          Primary
+                        </label>
+                      ` : ''}
+                    </div>
+                  `;
+                })}
+              </div>
+            </div>
+          `}
           <button class="btn" disabled=${loading}>${loading ? 'Creating…' : 'Generate invite'}</button>
         </form>
       </div>
