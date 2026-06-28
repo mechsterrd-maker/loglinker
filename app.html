@@ -492,6 +492,20 @@ const SUPABASE_URL = 'https://wzxowvrvuecybdxymjvi.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind6eG93dnJ2dWVjeWJkeHltanZpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3MjMzMTQsImV4cCI6MjA5MzI5OTMxNH0.GyvHnBtlJTWs8HqMvu0VyRhjme5jbTUWzz9vOAxXhO8';
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+// --- Active-unit store (module-level) ---------------------------------------
+// Mirrors the React activeUnit so any loader or sub-panel can scope its queries
+// to the unit the user is currently working in, WITHOUT prop-threading. RLS
+// already enforces hard per-unit isolation at the database (unit staff cannot
+// read other units at all); this store only narrows a multi-unit manager/owner's
+// view to one unit at a time when they switch. unit_id IS NULL = shared row
+// (visible in every unit, e.g. the few cross-unit parts and the BILLS-OCR group).
+let _activeUnitId = null;
+function setActiveUnitId(id) { _activeUnitId = id || null; }
+function getActiveUnitId() { return _activeUnitId; }
+// Scope a Supabase query to the active unit + shared rows. No-op when no unit
+// is selected (single-unit plants / not yet loaded).
+const unitScope = (q) => _activeUnitId ? q.or(`unit_id.eq.${_activeUnitId},unit_id.is.null`) : q;
+
 // Founder allow-list. ONLY these specific gmails (the platform admin
 // panel's owners) can see AI cost / usage / token numbers anywhere in
 // the app. NOT customer-side admin or plant_head roles. NOT the founder
@@ -1432,6 +1446,7 @@ function App() {
     setAccessibleUnits(data || []);
     const active = (data || []).find(u => u.is_active) || (data || [])[0];
     setActiveUnit(active || null);
+    setActiveUnitId((active || null)?.unit_id || null);
   }, []);
 
   const switchUnit = useCallback(async (unitId) => {
@@ -1521,10 +1536,13 @@ function App() {
       setPlant(null); setMe(null);
       return;
     }
+    // Resolve the accessible/active unit BEFORE rendering the Shell, so the
+    // module-global _activeUnitId is set before any module mounts and runs its
+    // loaders. Otherwise loaders fetch with a null active unit (unitScope becomes
+    // a no-op) and a multi-unit manager sees every unit's data until a refetch.
+    await loadUnits();
     setPlant(plantRow);
     setMe(userRow);
-    // Load accessible units once profile is set
-    await loadUnits();
     // RBAC Phase 1: fetch my permissions. Non-blocking — if the RPC ever fails
     // we fall back to the legacy users.role behavior so the app never bricks.
     try {
@@ -2146,7 +2164,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
 
   const recalcUnread = useCallback(async () => {
     if (!plant?.id) return;
-    const { data: groups } = await sb.from('chat_groups').select('id').contains('members', [user.id]);
+    const { data: groups } = await unitScope(sb.from('chat_groups').select('id').contains('members', [user.id]));
     if (!groups || groups.length === 0) { setUnreadCount(0); return; }
     // Single aggregated fetch instead of N count-queries per group. Use the
     // oldest lastRead across all groups as a server-side lower bound, then
@@ -2585,7 +2603,7 @@ function TabBtn({ icon, label, active, onClick, badge }) {
 }
 
 // ============= HOME =============
-function Home({ plant, me, setTab, go, reload, activeUnit }) {
+function Home({ plant, me, activeUnit, setTab, go, reload }) {
   // Fallback so Home still works if rendered without `go` (e.g. older callers).
   const navTo = go || ((t) => setTab(t));
   const [stats, setStats] = useState({ units: 0, users: 1, machines: 0, dies: 0, shotsToday: 0, openActions: 0, openNcrs: 0, openBreakdowns: 0, lowStock: 0 });
@@ -2595,26 +2613,25 @@ function Home({ plant, me, setTab, go, reload, activeUnit }) {
   const canCreateProject = me?.role === 'plant_head' || me?.role === 'admin';
   const [showNewProject, setShowNewProject] = useState(false);
 
+  // Reload when the active unit changes so the overview always reflects the unit
+  // you're viewing (not a stale or plant-wide snapshot).
   useEffect(() => { loadStats(); }, [activeUnit?.unit_id]);
 
   const loadStats = async () => {
     setLoading(true);
     const today = new Date(); today.setHours(0,0,0,0);
-    // Unit scope: count only the active unit's own + shared rows for tables that
-    // carry a unit_id (machines, dies, shots, breakdowns, stocks). NCRs and
-    // tasks have no unit_id yet, so those counts stay plant-wide.
-    const uid = activeUnit?.unit_id;
-    const scope = (q) => uid ? q.or(`unit_id.eq.${uid},unit_id.is.null`) : q;
+    const uid = activeUnit?.unit_id || null;          // scope unit-specific stats to the active unit
+    const byUnit = (q) => uid ? q.eq('unit_id', uid) : q;
     const [u, us, m, d, s, a, n, b, st] = await Promise.all([
       sb.from('units').select('id', { count:'exact', head:true }),
       sb.from('users').select('id', { count:'exact', head:true }),
-      scope(sb.from('machines').select('id', { count:'exact', head:true })),
-      scope(sb.from('mcp_pdc_dies').select('id', { count:'exact', head:true })),
-      scope(sb.from('mcp_pdc_shots').select('id', { count:'exact', head:true }).gte('recorded_at', today.toISOString())),
-      sb.from('actions').select('id', { count:'exact', head:true }).eq('status', 'open'),
-      sb.from('mcp_quality_ncrs').select('id', { count:'exact', head:true }).neq('status', 'closed').neq('status', 'cancelled'),
-      scope(sb.from('mcp_maintenance_breakdowns').select('id', { count:'exact', head:true }).neq('status', 'resolved').neq('status', 'cancelled')),
-      scope(sb.from('mcp_stocks_items').select('id, current_qty, reorder_level').not('reorder_level', 'is', null)),
+      byUnit(sb.from('machines').select('id', { count:'exact', head:true })),
+      byUnit(sb.from('mcp_pdc_dies').select('id', { count:'exact', head:true })),
+      byUnit(sb.from('mcp_pdc_shots').select('id', { count:'exact', head:true }).gte('recorded_at', today.toISOString())),
+      byUnit(sb.from('actions').select('id', { count:'exact', head:true }).eq('status', 'open')),
+      byUnit(sb.from('mcp_quality_ncrs').select('id', { count:'exact', head:true }).neq('status', 'closed').neq('status', 'cancelled')),
+      byUnit(sb.from('mcp_maintenance_breakdowns').select('id', { count:'exact', head:true }).neq('status', 'resolved').neq('status', 'cancelled')),
+      byUnit(sb.from('mcp_stocks_items').select('id, current_qty, reorder_level').not('reorder_level', 'is', null)),
     ]);
     const lowStockCount = (st.data || []).filter(i => parseFloat(i.current_qty || 0) <= parseFloat(i.reorder_level || 0)).length;
     setStats({
@@ -2820,7 +2837,7 @@ function Production({ plant, me, activeUnit }) {
     const [m, d, s, p, units, sh, us, t, si] = await Promise.all([
       scope(sb.from('machines').select('*, units(name)')).order('code'),
       scope(sb.from('mcp_pdc_dies').select('*, cavities')).order('code'),
-      sb.from('mcp_pdc_shots').select('*, cavities, pieces_good, pieces_rejected, units(name), shifts(name), mcp_pdc_dies(code,part_number,cavities), machines(code), users:operator_user_id(full_name)').order('recorded_at', { ascending:false }).limit(50),
+      scope(sb.from('mcp_pdc_shots').select('*, cavities, pieces_good, pieces_rejected, units(name), shifts(name), mcp_pdc_dies(code,part_number,cavities), machines(code), users:operator_user_id(full_name)')).order('recorded_at', { ascending:false }).limit(50),
       scope(sb.from('mcp_pdc_parts').select('*')).order('part_number'),
       sb.from('units').select('*').order('name'),
       scope(sb.from('shifts').select('*')).order('start_time'),
@@ -5488,12 +5505,12 @@ function PendingTasksPanel({ plant, setTab }) {
   const [busy, setBusy] = useState({});
 
   const refresh = useCallback(async () => {
-    const { data } = await sb.from('actions')
+    const { data } = await unitScope(sb.from('actions')
       .select('id, title, status, due_at, owner_id, department')
       .eq('plant_id', plant.id)
       .not('status', 'in', '(completed,cancelled)')
       .order('due_at', { ascending: true, nullsFirst: false })
-      .limit(50);
+      .limit(50));
     const list = data || [];
     const ownerIds = [...new Set(list.map(t => t.owner_id).filter(Boolean))];
     if (ownerIds.length > 0) {
@@ -5597,6 +5614,14 @@ function PendingTasksPanel({ plant, setTab }) {
 function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAction, setTab }) {
   const [groups, setGroups] = useState([]);
   const [activeGroup, setActiveGroup] = useState(null);
+  // BILLS-OCR is a common group, but each uploaded bill must file into a unit.
+  // Default to the active unit; let the user pick another before uploading.
+  const [billUnits, setBillUnits] = useState([]);
+  const [billUnitId, setBillUnitId] = useState(getActiveUnitId());
+  useEffect(() => { sb.rpc('my_accessible_units').then(({ data }) => {
+    setBillUnits(data || []);
+    if (!getActiveUnitId() && (data || []).length) setBillUnitId((data.find(u => u.is_active) || data[0]).unit_id);
+  }); }, []);
   // Home "Upload Bill" shortcut: route to the OCR-enabled chat group (where
   // ai_logistics_enabled = true) and pop its file picker. If there isn't one,
   // fall back to the chat list with a hint so the user can enable AI on a
@@ -5873,7 +5898,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
 
   const loadGroups = async () => {
     setLoading(true);
-    const { data: groupsData } = await sb.from('chat_groups').select('*').contains('members', [user.id]);
+    const { data: groupsData } = await unitScope(sb.from('chat_groups').select('*').contains('members', [user.id]));
     const groupsList = groupsData || [];
 
     // Get unread count + last message preview for each group
@@ -6049,6 +6074,10 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
       });
       if (error) { alert(error.message); return; }
       if (!queueId) { alert('Already queued'); return; }
+      // File this bill into the chosen unit (default = active unit). The doc
+      // created by the extractor inherits the queue row's unit_id.
+      const _bu = billUnitId || getActiveUnitId();
+      if (_bu) { try { await sb.from('mcp_logistics_extraction_queue').update({ unit_id: _bu }).eq('id', queueId); } catch (_e) {} }
       const { data: { session } } = await sb.auth.getSession();
       if (session) {
         showToast('Extracting…');
@@ -6554,6 +6583,15 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
             <span>${attachment.name}</span>
             <button onClick=${() => { setAttachment(null); setAttachmentProject(''); setAttachmentStage(''); }}>×</button>
           </div>
+          ${attachment.type?.startsWith('image/') && activeGroup?.ai_logistics_enabled && billUnits.length > 1 && html`
+            <div style="padding:8px 12px;background:var(--teal-50);border-top:1px solid var(--teal-100);display:flex;align-items:center;gap:10px;font-size:12px;flex-wrap:wrap">
+              <span style="color:var(--teal-800);font-weight:600">🏭 File this bill into:</span>
+              <select value=${billUnitId || ''} onChange=${e => setBillUnitId(e.target.value)}
+                style="flex:1;padding:6px 8px;border:1px solid var(--teal-200);border-radius:6px;font-size:12px;background:white">
+                ${billUnits.map(u => html`<option key=${u.unit_id} value=${u.unit_id}>${u.name}</option>`)}
+              </select>
+            </div>
+          `}
           ${attachment.type?.startsWith('image/') && activeGroup?.ai_logistics_enabled && myPerms?.rbac_enforced && html`
             <div style="padding:8px 12px;background:var(--teal-50);border-top:1px solid var(--teal-100);display:flex;align-items:center;gap:10px;font-size:12px;flex-wrap:wrap">
               <span style="color:var(--teal-800);font-weight:600">📐 Tag this bill to:</span>
@@ -7081,16 +7119,19 @@ function People({ plant, me, myPerms }) {
   const [resetShare, setResetShare] = useState(null); // { user, token, expires_at } when a reset link is freshly issued
   const [rolesTarget, setRolesTarget] = useState(null); // RBAC Phase 1: opens UserRolesModal for the picked user
   const [userRoles, setUserRoles] = useState({}); // user_id -> [{slug, display_name}] assigned custom roles
+  const [userUnits, setUserUnits] = useState({}); // user_id -> [{name, role}] unit access (for the at-a-glance chips)
+  const [unitsTarget, setUnitsTarget] = useState(null); // opens UnitAccessModal focused on this user
 
   const refresh = async () => {
     setLoading(true);
-    const [u, us, sh, inv, upr, prs] = await Promise.all([
+    const [u, us, sh, inv, upr, prs, uua] = await Promise.all([
       sb.from('units').select('*').order('created_at'),
       sb.from('users').select('*').order('created_at'),
       sb.from('shifts').select('*').order('start_time'),
       sb.from('user_invites').select('*').eq('status', 'pending').order('created_at', { ascending:false }),
       sb.from('user_plant_roles').select('user_id, role_id'),
       sb.from('plant_roles').select('id, slug, display_name').eq('plant_id', plant.id),
+      sb.from('user_unit_access').select('user_id, role, unit:units(name)').eq('plant_id', plant.id),
     ]);
     setUnits(u.data || []);
     setUsers(us.data || []);
@@ -7106,6 +7147,10 @@ function People({ plant, me, myPerms }) {
       if (pr) (rm[row.user_id] = rm[row.user_id] || []).push(pr);
     }
     setUserRoles(rm);
+    // Map each user to the units they can access (for the at-a-glance chips).
+    const um = {};
+    for (const g of (uua.data || [])) { if (g.unit) (um[g.user_id] = um[g.user_id] || []).push({ name: g.unit.name, role: g.role }); }
+    setUserUnits(um);
     setLoading(false);
   };
 
@@ -7196,7 +7241,14 @@ function People({ plant, me, myPerms }) {
                     return assigned.map(r => html`<span key=${r.slug} class=${'badge ' + (owner(r.slug) ? 'teal' : '')}>${r.display_name}</span>`);
                   })()}
                 </div>
-                ${canAssignRoles && html`<button class="btn small ghost" title="Manage the roles assigned to this user" onClick=${() => setRolesTarget(u)}>👥 Roles</button>`}
+                ${u.status !== 'inactive' && html`<div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;max-width:220px">
+                  ${(userUnits[u.id] || []).map(g => html`<span key=${g.name} class="badge" style="font-size:9.5px;background:var(--slate-100);color:var(--slate-600);font-weight:500" title=${'Role in this unit: ' + roleLabel(g.role)}>🏭 ${g.name}</span>`)}
+                  ${(userUnits[u.id] || []).length === 0 ? html`<span style="font-size:10px;color:var(--slate-400)">no unit access yet</span>` : ''}
+                </div>`}
+                <div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end">
+                  ${canAssignRoles && html`<button class="btn small ghost" title="Manage the roles assigned to this user" onClick=${() => setRolesTarget(u)}>👥 Roles</button>`}
+                  ${canManage && u.status !== 'inactive' && html`<button class="btn small ghost" title="View / edit which units this person can access" onClick=${() => setUnitsTarget(u)}>🏭 Units</button>`}
+                </div>
                 ${canReset && html`<button class="btn small ghost" title="Issue a one-tap link they can use to set a new password" onClick=${async () => {
                   const { data, error } = await sb.rpc('issue_password_reset', { p_target_user_id: u.id });
                   if (error || !data?.token) { alert(error?.message || 'Could not generate reset link'); return; }
@@ -7290,6 +7342,7 @@ function People({ plant, me, myPerms }) {
     ${modal === 'operator' && html`<${OperatorModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${resetShare && html`<${ResetShareModal} plant=${plant} resetShare=${resetShare} onClose=${() => setResetShare(null)} />`}
     ${rolesTarget && html`<${UserRolesModal} plant=${plant} user=${rolesTarget} me=${me} onClose=${() => setRolesTarget(null)} onSaved=${() => { setRolesTarget(null); refresh(); }} />`}
+    ${unitsTarget && html`<${UnitAccessModal} plant=${plant} me=${me} focusUserId=${unitsTarget.id} focusName=${unitsTarget.full_name} onClose=${() => { setUnitsTarget(null); refresh(); }} />`}
   `;
 }
 
@@ -9293,12 +9346,12 @@ function DailyDigest({ me, setTab }) {
 
 // ============= MORE (navigator) =============
 // ============= UNIT ACCESS MODAL (manager+) =============
-function UnitAccessModal({ plant, me, onClose }) {
+function UnitAccessModal({ plant, me, focusUserId, focusName, onClose }) {
   const [units, setUnits] = useState([]);
   const [users, setUsers] = useState([]);
   const [grants, setGrants] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [pickUser, setPickUser] = useState('');
+  const [pickUser, setPickUser] = useState(focusUserId || '');
   const [pickUnit, setPickUnit] = useState('');
   const [pickRole, setPickRole] = useState('operator');
   const [error, setError] = useState('');
@@ -9348,7 +9401,7 @@ function UnitAccessModal({ plant, me, onClose }) {
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal" style="max-width:580px">
         <div class="modal-header">
-          <div class="modal-title">🔐 Unit Access Management</div>
+          <div class="modal-title">🔐 Unit Access${focusName ? ' · ' + focusName : ''}</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
@@ -13701,12 +13754,12 @@ function PettyCashModule({ plant, me, activeUnit }) {
     // balance + transactions are then restricted to the books visible in this
     // unit, so one unit never sees another unit's petty cash.
     const u = activeUnit?.unit_id;
-    let booksQ = sb.from('mcp_petty_cash_books').select('*').eq('plant_id', plant.id).eq('active', true).order('created_at');
+    let booksQ = unitScope(sb.from('mcp_petty_cash_books').select('*').eq('plant_id', plant.id).eq('active', true)).order('created_at');
     if (u) booksQ = booksQ.or(`unit_id.eq.${u},unit_id.is.null`);
     const [bks, bal, tx, adv, us] = await Promise.all([
       booksQ,
       sb.from('v_petty_cash_book_balance').select('*').eq('plant_id', plant.id),
-      sb.from('mcp_petty_cash_txns').select('*, book:book_id(name), party:party_user_id(full_name), creator:created_by(full_name)').eq('plant_id', plant.id).order('txn_date', { ascending:false }).order('created_at', { ascending:false }).limit(300),
+      unitScope(sb.from('mcp_petty_cash_txns').select('*, book:book_id(name), party:party_user_id(full_name), creator:created_by(full_name)').eq('plant_id', plant.id).order('txn_date', { ascending:false }).order('created_at', { ascending:false }).limit(300)),
       sb.from('v_petty_cash_outstanding_advances').select('*').eq('plant_id', plant.id),
       sb.from('users').select('id, full_name, role, phone').eq('plant_id', plant.id).order('full_name'),
     ]);
@@ -15306,7 +15359,7 @@ function ProjectTracker({ plant, me, myPerms, go }) {
   const refresh = useCallback(async () => {
     setLoading(true);
     const [p, c, u] = await Promise.all([
-      sb.from('mcp_projects').select('*, customer:customer_id(name), owner:owner_user_id(full_name)').eq('plant_id', plant.id).order('created_at', { ascending:false }),
+      unitScope(sb.from('mcp_projects').select('*, customer:customer_id(name), owner:owner_user_id(full_name)').eq('plant_id', plant.id).order('created_at', { ascending:false })),
       sb.from('mcp_sched_customers').select('id, name').eq('plant_id', plant.id).order('name'),
       sb.from('users').select('id, full_name').eq('plant_id', plant.id).order('full_name'),
     ]);
@@ -18372,7 +18425,7 @@ function ExpenseLedger({ plant, me }) {
     const start = month + '-01';
     const end = new Date(new Date(start).getFullYear(), new Date(start).getMonth()+1, 0).toISOString().slice(0,10);
     const [e, v, p] = await Promise.all([
-      sb.from('mcp_expenses').select('*, vendor:vendor_id(name), project:project_id(name)').eq('plant_id', plant.id).gte('expense_date', start).lte('expense_date', end).order('expense_date', { ascending:false }),
+      unitScope(sb.from('mcp_expenses').select('*, vendor:vendor_id(name), project:project_id(name)').eq('plant_id', plant.id).gte('expense_date', start).lte('expense_date', end).order('expense_date', { ascending:false })),
       sb.from('mcp_logistics_vendors').select('id, name').eq('plant_id', plant.id).order('name'),
       sb.from('mcp_projects').select('id, name').eq('plant_id', plant.id).neq('status','completed').order('name'),
     ]);
@@ -27217,7 +27270,7 @@ function Quality({ plant, me }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    let q = sb.from('mcp_quality_ncrs').select('*, raised_by_user:raised_by(full_name), assigned_to_user:assigned_to(full_name)').order('created_at', { ascending:false });
+    let q = unitScope(sb.from('mcp_quality_ncrs').select('*, raised_by_user:raised_by(full_name), assigned_to_user:assigned_to(full_name)')).order('created_at', { ascending:false });
     if (filter === 'open') q = q.neq('status', 'closed').neq('status', 'cancelled');
     else if (filter === 'closed') q = q.eq('status', 'closed');
     const [{ data: ncrData }, { data: inspData }] = await Promise.all([
@@ -27778,7 +27831,7 @@ function Maintenance({ plant, me }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    let q = sb.from('mcp_maintenance_breakdowns').select('*, machines(code), reported_by_user:reported_by(full_name), attended_by_user:attended_by(full_name)').order('reported_at', { ascending:false });
+    let q = unitScope(sb.from('mcp_maintenance_breakdowns').select('*, machines(code), reported_by_user:reported_by(full_name), attended_by_user:attended_by(full_name)')).order('reported_at', { ascending:false });
     if (filter === 'open') q = q.neq('status', 'resolved').neq('status', 'cancelled');
     else if (filter === 'resolved') q = q.eq('status', 'resolved');
     const [b, m, u] = await Promise.all([
@@ -28913,7 +28966,7 @@ function ActionHub({ plant, me, navAction }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    let q = sb.from('actions').select('*, owner_user:owner_id(full_name, role), assigner:assigned_by(full_name)').order('created_at', { ascending:false });
+    let q = unitScope(sb.from('actions').select('*, owner_user:owner_id(full_name, role), assigner:assigned_by(full_name)')).order('created_at', { ascending:false });
     if (statusFilter === 'open') q = q.in('status', ['open','in_progress']);
     else if (statusFilter === 'done') q = q.eq('status', 'completed');
     // Three independent queries — nesting users → user_unit_access → units in

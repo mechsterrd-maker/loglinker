@@ -391,7 +391,7 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
     const rawExtraction = { ...parsed, flags: flagsList, validation_note: validationNote, _worker_version: WORKER_VERSION, _model: MODEL, _resolved_doc_type: docType, _resolved_vendor_id: resolvedVendorId, _server_arithmetic_issues: issues, _scale_correction: scaleNote };
     stage = "persist";
     const { data: doc, error: docErr } = await supabase.from("mcp_logistics_documents").insert({
-      plant_id: row.plant_id, doc_type: docType, doc_number: parsed.doc_number ?? null, doc_date: parsed.doc_date ?? null, due_date: parsed.due_date ?? null,
+      plant_id: row.plant_id, unit_id: row.unit_id ?? null, doc_type: docType, doc_number: parsed.doc_number ?? null, doc_date: parsed.doc_date ?? null, due_date: parsed.due_date ?? null,
       vendor_id: resolvedVendorId, vendor_name_raw: parsed.vendor_name ?? null, vendor_gstin_raw: parsed.vendor_gstin ?? null,
       taxable_value: parsed.taxable_value ?? null, tax_amount: parsed.tax_amount ?? null, total_value: parsed.total_value ?? null,
       items: parsed.items ?? [], raw_extraction: rawExtraction, validation_note: validationNote,
@@ -434,20 +434,20 @@ Deno.serve(async (req: Request) => {
     const countTowardCap = !body.reextract_doc_id;
     let rows: QueueRow[];
     if (body.reextract_doc_id) {
-      const { data: srcDoc, error: srcErr } = await supabase.from("mcp_logistics_documents").select("id, plant_id, source_message_id, source_image_url").eq("id", body.reextract_doc_id).maybeSingle();
+      const { data: srcDoc, error: srcErr } = await supabase.from("mcp_logistics_documents").select("id, plant_id, unit_id, source_message_id, source_image_url").eq("id", body.reextract_doc_id).maybeSingle();
       if (srcErr) throw srcErr;
       if (!srcDoc) throw new Error("reextract_doc_id not found");
       if (!srcDoc.source_image_url) throw new Error("source doc has no source_image_url");
-      const { data: q, error: qErr } = await supabase.from("mcp_logistics_extraction_queue").insert({ plant_id: srcDoc.plant_id, message_id: null, group_id: null, image_url: srcDoc.source_image_url, status: "pending" }).select("id, plant_id, message_id, group_id, image_url, attempts").single();
+      const { data: q, error: qErr } = await supabase.from("mcp_logistics_extraction_queue").insert({ plant_id: srcDoc.plant_id, unit_id: srcDoc.unit_id ?? null, message_id: null, group_id: null, image_url: srcDoc.source_image_url, status: "pending" }).select("id, plant_id, unit_id, message_id, group_id, image_url, attempts").single();
       if (qErr) throw qErr;
       rows = [q as QueueRow];
     } else if (body.queue_id) {
-      const { data, error } = await supabase.from("mcp_logistics_extraction_queue").select("id, plant_id, message_id, group_id, image_url, attempts").eq("id", body.queue_id).limit(1);
+      const { data, error } = await supabase.from("mcp_logistics_extraction_queue").select("id, plant_id, unit_id, message_id, group_id, image_url, attempts").eq("id", body.queue_id).limit(1);
       if (error) throw error;
       rows = (data ?? []) as QueueRow[];
     } else {
       const limit = Math.min(body.batch_size ?? 5, 10);
-      const { data, error } = await supabase.from("mcp_logistics_extraction_queue").select("id, plant_id, message_id, group_id, image_url, attempts").eq("status", "pending").order("created_at", { ascending: true }).limit(limit);
+      const { data, error } = await supabase.from("mcp_logistics_extraction_queue").select("id, plant_id, unit_id, message_id, group_id, image_url, attempts").eq("status", "pending").order("created_at", { ascending: true }).limit(limit);
       if (error) throw error;
       rows = (data ?? []) as QueueRow[];
     }
