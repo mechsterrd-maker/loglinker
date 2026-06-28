@@ -1,4 +1,4 @@
-// extract-document/index.ts — v26 (model → claude-sonnet-4-6; sonnet-4-20250514 retired)
+// extract-document/index.ts — v27 (graceful duplicate handling: link existing doc, not "failed")
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { Image } from "https://deno.land/x/imagescript@1.2.17/mod.ts";
@@ -8,7 +8,7 @@ const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-sonnet-4-6";
-const WORKER_VERSION = "v26";
+const WORKER_VERSION = "v27";
 // Claude Sonnet 4.6 pricing (USD per token). Update here if the model/pricing changes.
 const PRICE_IN_PER_TOK  = 3 / 1_000_000;
 const PRICE_OUT_PER_TOK = 15 / 1_000_000;
@@ -398,7 +398,25 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
       source_message_id: row.message_id, source_image_url: row.image_url,
       extracted_by_ai: true, extraction_status: "completed", status: "pending",
     }).select("id").single();
-    if (docErr) throw docErr;
+    if (docErr) {
+      // Same bill already filed (idx_docs_unique on plant+type+vendor+number+date) —
+      // link the queue row to the existing doc instead of showing "Extract failed".
+      if ((docErr as { code?: string }).code === "23505") {
+        let dq = supabase.from("mcp_logistics_documents").select("id")
+          .eq("plant_id", row.plant_id).eq("doc_type", docType)
+          .ilike("vendor_name_raw", parsed.vendor_name ?? "").eq("doc_number", parsed.doc_number ?? "");
+        dq = parsed.doc_date ? dq.eq("doc_date", parsed.doc_date) : dq.is("doc_date", null);
+        const { data: existing } = await dq.limit(1).maybeSingle();
+        await logAi(existing?.id ?? null);
+        await supabase.from("mcp_logistics_extraction_queue").update({
+          status: "completed", classification: "document", result_doc_id: existing?.id ?? null,
+          processed_at: new Date().toISOString(), extraction_ms: Date.now() - startedAt, error_message: null, raw_response: null,
+          debug_payload: { worker_version: WORKER_VERSION, model: MODEL, duplicate: true, note: "already filed — linked to existing doc", resolved_doc_type: docType },
+        }).eq("id", row.id);
+        return { ok: true, queue_id: row.id, doc_id: existing?.id ?? null, duplicate: true };
+      }
+      throw docErr;
+    }
     // Count this bill toward the plant's monthly OCR allowance (new uploads only, not re-extracts).
     if (countTowardCap) {
       try { await supabase.rpc("increment_ocr_usage", { p_plant_id: row.plant_id }); } catch (_e) { /* metering must never block a successful extract */ }
