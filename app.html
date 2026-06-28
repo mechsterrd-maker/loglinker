@@ -2585,7 +2585,7 @@ function TabBtn({ icon, label, active, onClick, badge }) {
 }
 
 // ============= HOME =============
-function Home({ plant, me, setTab, go, reload }) {
+function Home({ plant, me, setTab, go, reload, activeUnit }) {
   // Fallback so Home still works if rendered without `go` (e.g. older callers).
   const navTo = go || ((t) => setTab(t));
   const [stats, setStats] = useState({ units: 0, users: 1, machines: 0, dies: 0, shotsToday: 0, openActions: 0, openNcrs: 0, openBreakdowns: 0, lowStock: 0 });
@@ -2595,21 +2595,26 @@ function Home({ plant, me, setTab, go, reload }) {
   const canCreateProject = me?.role === 'plant_head' || me?.role === 'admin';
   const [showNewProject, setShowNewProject] = useState(false);
 
-  useEffect(() => { loadStats(); }, []);
+  useEffect(() => { loadStats(); }, [activeUnit?.unit_id]);
 
   const loadStats = async () => {
     setLoading(true);
     const today = new Date(); today.setHours(0,0,0,0);
+    // Unit scope: count only the active unit's own + shared rows for tables that
+    // carry a unit_id (machines, dies, shots, breakdowns, stocks). NCRs and
+    // tasks have no unit_id yet, so those counts stay plant-wide.
+    const uid = activeUnit?.unit_id;
+    const scope = (q) => uid ? q.or(`unit_id.eq.${uid},unit_id.is.null`) : q;
     const [u, us, m, d, s, a, n, b, st] = await Promise.all([
       sb.from('units').select('id', { count:'exact', head:true }),
       sb.from('users').select('id', { count:'exact', head:true }),
-      sb.from('machines').select('id', { count:'exact', head:true }),
-      sb.from('mcp_pdc_dies').select('id', { count:'exact', head:true }),
-      sb.from('mcp_pdc_shots').select('id', { count:'exact', head:true }).gte('recorded_at', today.toISOString()),
+      scope(sb.from('machines').select('id', { count:'exact', head:true })),
+      scope(sb.from('mcp_pdc_dies').select('id', { count:'exact', head:true })),
+      scope(sb.from('mcp_pdc_shots').select('id', { count:'exact', head:true }).gte('recorded_at', today.toISOString())),
       sb.from('actions').select('id', { count:'exact', head:true }).eq('status', 'open'),
       sb.from('mcp_quality_ncrs').select('id', { count:'exact', head:true }).neq('status', 'closed').neq('status', 'cancelled'),
-      sb.from('mcp_maintenance_breakdowns').select('id', { count:'exact', head:true }).neq('status', 'resolved').neq('status', 'cancelled'),
-      sb.from('mcp_stocks_items').select('id, current_qty, reorder_level').not('reorder_level', 'is', null),
+      scope(sb.from('mcp_maintenance_breakdowns').select('id', { count:'exact', head:true }).neq('status', 'resolved').neq('status', 'cancelled')),
+      scope(sb.from('mcp_stocks_items').select('id, current_qty, reorder_level').not('reorder_level', 'is', null)),
     ]);
     const lowStockCount = (st.data || []).filter(i => parseFloat(i.current_qty || 0) <= parseFloat(i.reorder_level || 0)).length;
     setStats({
@@ -2710,22 +2715,22 @@ function Home({ plant, me, setTab, go, reload }) {
     </div>
     ${showNewProject && html`<${NewProjectModal} plant=${plant} me=${me} onClose=${() => setShowNewProject(false)} onCreated=${(id) => { setShowNewProject(false); navTo('projects'); }} />`}
 
-    <${PettyCashHomeCard} plant=${plant} setTab=${setTab} />
+    <${PettyCashHomeCard} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />
 
     <div class="dashboard-grid">
       <div class="dashboard-col-main">
         <${DailyDigest} me=${me} setTab=${setTab} />
-        ${!fab && html`<${TodaysProductionCard} plant=${plant} setTab=${setTab} />`}
-        ${!fab && html`<${ScheduleStatusCard} plant=${plant} setTab=${setTab} />`}
-        ${!fab && html`<${StagePendingBanner} plant=${plant} me=${me} setTab=${setTab} />`}
+        ${!fab && html`<${TodaysProductionCard} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />`}
+        ${!fab && html`<${ScheduleStatusCard} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />`}
+        ${!fab && html`<${StagePendingBanner} plant=${plant} me=${me} setTab=${setTab} activeUnit=${activeUnit} />`}
       </div>
 
       <div class="dashboard-col-side">
-        <${TopConcernsCard} plant=${plant} setTab=${setTab} />
-        ${!fab && html`<${SupplierChaseBanner} plant=${plant} setTab=${setTab} />`}
-        ${!fab && html`<${MaterialBurnRateCard} plant=${plant} setTab=${setTab} />`}
-        ${!fab && html`<${StageLagCard} plant=${plant} me=${me} setTab=${setTab} />`}
-        <${StockAlerts} plant=${plant} setTab=${setTab} />
+        <${TopConcernsCard} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />
+        ${!fab && html`<${SupplierChaseBanner} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />`}
+        ${!fab && html`<${MaterialBurnRateCard} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />`}
+        ${!fab && html`<${StageLagCard} plant=${plant} me=${me} setTab=${setTab} activeUnit=${activeUnit} />`}
+        <${StockAlerts} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />
 
         ${alerts > 0 && html`
           <div>
@@ -8363,16 +8368,19 @@ function InviteViewModal({ invite, onClose, onCancel }) {
 // ============= INSIGHT CARDS (Home dashboard) =============
 
 // 1. TODAY'S PRODUCTION — good/reject % + 7-day sparkline
-function TodaysProductionCard({ plant, setTab }) {
+function TodaysProductionCard({ plant, setTab, activeUnit }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
 
   const refresh = async () => {
-    const { data: rows } = await sb.from('v_production_7day').select('*').order('prod_date');
+    const u = activeUnit?.unit_id;
+    let q = sb.from('v_production_7day').select('*').order('prod_date');
+    if (u) q = q.or(`unit_id.eq.${u},unit_id.is.null`);
+    const { data: rows } = await q;
     setData(rows || []);
     setLoading(false);
   };
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => { refresh(); }, [activeUnit?.unit_id]);
 
   if (loading) return html`<div class="card"><div class="card-title">📊 Today's Production</div><div class="loader"><div class="spinner"></div></div></div>`;
 
@@ -8434,17 +8442,20 @@ function TodaysProductionCard({ plant, setTab }) {
 }
 
 // 2. SCHEDULE STATUS — current month attainment per customer
-function ScheduleStatusCard({ plant, setTab }) {
+function ScheduleStatusCard({ plant, setTab, activeUnit }) {
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [drilldown, setDrilldown] = useState(false);
 
   const refresh = async () => {
-    const { data: rows } = await sb.from('v_schedule_status_current_month').select('*').order('pct_attainment');
+    const u = activeUnit?.unit_id;
+    let q = sb.from('v_schedule_status_current_month').select('*').order('pct_attainment');
+    if (u) q = q.or(`unit_id.eq.${u},unit_id.is.null`);
+    const { data: rows } = await q;
     setData(rows || []);
     setLoading(false);
   };
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => { refresh(); }, [activeUnit?.unit_id]);
 
   if (loading) return html`<div class="card"><div class="card-title">📅 Schedule Status</div><div class="loader"><div class="spinner"></div></div></div>`;
 
@@ -8539,22 +8550,25 @@ function ScheduleStatusCard({ plant, setTab }) {
 }
 
 // 3. MATERIAL BURN RATE — days of stock left at current consumption
-function MaterialBurnRateCard({ plant, setTab }) {
+function MaterialBurnRateCard({ plant, setTab, activeUnit }) {
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [drilldown, setDrilldown] = useState(false);
 
   const refresh = async () => {
+    const u = activeUnit?.unit_id;
     // Only show items that have recent consumption (otherwise prediction is meaningless)
-    const { data: rows } = await sb.from('v_material_burn_rate')
+    let q = sb.from('v_material_burn_rate')
       .select('*')
       .gt('consumed_7d', 0)
       .order('days_of_stock_left', { ascending: true, nullsFirst: false })
       .limit(20);
+    if (u) q = q.or(`unit_id.eq.${u},unit_id.is.null`);
+    const { data: rows } = await q;
     setData(rows || []);
     setLoading(false);
   };
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => { refresh(); }, [activeUnit?.unit_id]);
 
   if (loading) return html`<div class="card"><div class="card-title">⚙️ Material Burn Rate</div><div class="loader"><div class="spinner"></div></div></div>`;
 
@@ -8644,27 +8658,30 @@ function MaterialBurnRateCard({ plant, setTab }) {
 }
 
 // 4. STAGE TRACKING LAG — what hasn't been logged
-function StageLagCard({ plant, me, setTab }) {
+function StageLagCard({ plant, me, setTab, activeUnit }) {
   const [summary, setSummary] = useState(null);
   const [details, setDetails] = useState([]);
   const [loading, setLoading] = useState(true);
   const [drilldown, setDrilldown] = useState(false);
 
   const refresh = async () => {
+    const u = activeUnit?.unit_id;
+    let detQ = sb.from('mcp_pdc_stage_log')
+      .select('id, log_date, stage, status, is_provisional, mcp_pdc_parts(part_number, name), shifts(name)')
+      .eq('is_provisional', true)
+      .gte('log_date', new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10))
+      .order('log_date', { ascending: false })
+      .limit(50);
+    if (u) detQ = detQ.or(`unit_id.eq.${u},unit_id.is.null`);
     const [sumRes, detRes] = await Promise.all([
       sb.from('v_stage_lag_summary').select('*').maybeSingle(),
-      sb.from('mcp_pdc_stage_log')
-        .select('id, log_date, stage, status, is_provisional, mcp_pdc_parts(part_number, name), shifts(name)')
-        .eq('is_provisional', true)
-        .gte('log_date', new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10))
-        .order('log_date', { ascending: false })
-        .limit(50),
+      detQ,
     ]);
     setSummary(sumRes.data);
     setDetails(detRes.data || []);
     setLoading(false);
   };
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => { refresh(); }, [activeUnit?.unit_id]);
 
   if (loading) return html`<div class="card"><div class="card-title">📋 Stage Tracking</div><div class="loader"><div class="spinner"></div></div></div>`;
 
@@ -8769,7 +8786,7 @@ function DrillDownDrawer({ title, subtitle, items, renderItem, ctaLabel, onCtaCl
   `;
 }
 
-function TopConcernsCard({ plant, setTab }) {
+function TopConcernsCard({ plant, setTab, activeUnit }) {
   const [ncrs, setNcrs] = useState([]);
   const [breakdowns, setBreakdowns] = useState([]);
   const [stockRisks, setStockRisks] = useState([]);
@@ -8777,17 +8794,20 @@ function TopConcernsCard({ plant, setTab }) {
   const [drilldown, setDrilldown] = useState(null);  // 'quality' | 'maintenance' | 'stocks' | null
 
   const refresh = async () => {
+    const u = activeUnit?.unit_id;
+    const scope = (q) => u ? q.or(`unit_id.eq.${u},unit_id.is.null`) : q;
     const [n, b, s] = await Promise.all([
+      // NCRs have no unit_id yet, so quality concerns stay plant-wide.
       sb.from('v_top_ncrs_30d').select('*').order('ncr_count', { ascending: false }).limit(10),
-      sb.from('v_top_breakdowns_30d').select('*').order('total_downtime_hrs', { ascending: false }).limit(10),
-      sb.from('v_material_burn_rate').select('*').in('risk_level', ['out_of_stock','critical','warning']).limit(10),
+      scope(sb.from('v_top_breakdowns_30d').select('*').order('total_downtime_hrs', { ascending: false })).limit(10),
+      scope(sb.from('v_material_burn_rate').select('*').in('risk_level', ['out_of_stock','critical','warning'])).limit(10),
     ]);
     setNcrs(n.data || []);
     setBreakdowns(b.data || []);
     setStockRisks(s.data || []);
     setLoading(false);
   };
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => { refresh(); }, [activeUnit?.unit_id]);
 
   if (loading) return html`<div class="card"><div class="card-title">🚨 Top Concerns</div><div class="loader"><div class="spinner"></div></div></div>`;
 
@@ -8929,23 +8949,30 @@ function TopConcernsCard({ plant, setTab }) {
   `;
 }
 
-function PettyCashHomeCard({ plant, setTab }) {
+function PettyCashHomeCard({ plant, setTab, activeUnit }) {
   const [balances, setBalances] = useState([]);
   const [outstanding, setOutstanding] = useState(0);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     if (!plant?.id) return;
+    const u = activeUnit?.unit_id;
+    // Each unit's own cash. Find this unit's books, then keep only their balances.
+    let booksQ = sb.from('mcp_petty_cash_books').select('id').eq('plant_id', plant.id).eq('active', true);
+    if (u) booksQ = booksQ.or(`unit_id.eq.${u},unit_id.is.null`);
     Promise.all([
+      booksQ,
       sb.from('v_petty_cash_book_balance').select('*').eq('plant_id', plant.id),
       sb.from('v_petty_cash_outstanding_advances').select('outstanding').eq('plant_id', plant.id),
-    ]).then(([b, a]) => {
-      setBalances(b.data || []);
+    ]).then(([bk, b, a]) => {
+      const allow = new Set((bk.data || []).map(x => x.id));
+      const bals = u ? (b.data || []).filter(x => allow.has(x.book_id)) : (b.data || []);
+      setBalances(bals);
       const out = (a.data || []).reduce((s, x) => s + Math.max(0, parseFloat(x.outstanding || 0)), 0);
       setOutstanding(out);
       setLoading(false);
     });
-  }, [plant?.id]);
+  }, [plant?.id, activeUnit?.unit_id]);
 
   if (loading) return null;
 
@@ -8995,15 +9022,17 @@ function PettyCashHomeCard({ plant, setTab }) {
   `;
 }
 
-function SupplierChaseBanner({ plant, setTab }) {
+function SupplierChaseBanner({ plant, setTab, activeUnit }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     if (!plant?.id) return;
-    sb.from('v_raw_material_runway').select('*').eq('plant_id', plant.id).in('severity', ['critical','high'])
-      .then(({ data }) => { setRows(data || []); setLoading(false); });
-  }, [plant?.id]);
+    const u = activeUnit?.unit_id;
+    let q = sb.from('v_raw_material_runway').select('*').eq('plant_id', plant.id).in('severity', ['critical','high']);
+    if (u) q = q.or(`unit_id.eq.${u},unit_id.is.null`);
+    q.then(({ data }) => { setRows(data || []); setLoading(false); });
+  }, [plant?.id, activeUnit?.unit_id]);
 
   if (loading || rows.length === 0) return null;
   const top = rows.slice().sort((a,b) => (a.severity === 'critical' ? -1 : 1) - (b.severity === 'critical' ? -1 : 1)).slice(0, 3);
@@ -9028,20 +9057,23 @@ function SupplierChaseBanner({ plant, setTab }) {
   `;
 }
 
-function StockAlerts({ plant, setTab }) {
+function StockAlerts({ plant, setTab, activeUnit }) {
   const [alerts, setAlerts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [collapsed, setCollapsed] = useState(false);
   const [drillItem, setDrillItem] = useState(null);
 
-  useEffect(() => { load(); }, [plant?.id]);
+  useEffect(() => { load(); }, [plant?.id, activeUnit?.unit_id]);
 
   const load = async () => {
     setLoading(true);
-    const { data } = await sb.from('mcp_stocks_items')
+    const u = activeUnit?.unit_id;
+    let q = sb.from('mcp_stocks_items')
       .select('id, code, name, current_qty, reorder_level, uom, category')
       .not('reorder_level', 'is', null)
       .order('name');
+    if (u) q = q.or(`unit_id.eq.${u},unit_id.is.null`);
+    const { data } = await q;
     const lows = (data || []).filter(i => i.current_qty <= i.reorder_level);
     setAlerts(lows);
     setLoading(false);
@@ -9115,19 +9147,19 @@ function StockAlerts({ plant, setTab }) {
 }
 
 // ============= STAGE PENDING BANNER (blocks supervisors with overdue entries) =============
-function StagePendingBanner({ plant, me, setTab }) {
+function StagePendingBanner({ plant, me, setTab, activeUnit }) {
   const [pending, setPending] = useState([]);
   const [loading, setLoading] = useState(true);
   const [logTarget, setLogTarget] = useState(null);
 
-  useEffect(() => { load(); }, [plant?.id]);
+  useEffect(() => { load(); }, [plant?.id, activeUnit?.unit_id]);
 
   const load = async () => {
     setLoading(true);
-    const { data } = await sb.from('v_my_pending_stage_entries')
-      .select('*')
-      .eq('plant_id', plant.id)
-      .order('log_date');
+    const u = activeUnit?.unit_id;
+    let q = sb.from('v_my_pending_stage_entries').select('*').eq('plant_id', plant.id).order('log_date');
+    if (u) q = q.or(`unit_id.eq.${u},unit_id.is.null`);
+    const { data } = await q;
     setPending(data || []);
     setLoading(false);
   };
