@@ -7076,16 +7076,19 @@ function People({ plant, me, myPerms }) {
   const [resetShare, setResetShare] = useState(null); // { user, token, expires_at } when a reset link is freshly issued
   const [rolesTarget, setRolesTarget] = useState(null); // RBAC Phase 1: opens UserRolesModal for the picked user
   const [userRoles, setUserRoles] = useState({}); // user_id -> [{slug, display_name}] assigned custom roles
+  const [userUnits, setUserUnits] = useState({}); // user_id -> [{name, role}] unit access (for the at-a-glance chips)
+  const [unitsTarget, setUnitsTarget] = useState(null); // opens UnitAccessModal focused on this user
 
   const refresh = async () => {
     setLoading(true);
-    const [u, us, sh, inv, upr, prs] = await Promise.all([
+    const [u, us, sh, inv, upr, prs, uua] = await Promise.all([
       sb.from('units').select('*').order('created_at'),
       sb.from('users').select('*').order('created_at'),
       sb.from('shifts').select('*').order('start_time'),
       sb.from('user_invites').select('*').eq('status', 'pending').order('created_at', { ascending:false }),
       sb.from('user_plant_roles').select('user_id, role_id'),
       sb.from('plant_roles').select('id, slug, display_name').eq('plant_id', plant.id),
+      sb.from('user_unit_access').select('user_id, role, unit:units(name)').eq('plant_id', plant.id),
     ]);
     setUnits(u.data || []);
     setUsers(us.data || []);
@@ -7101,6 +7104,10 @@ function People({ plant, me, myPerms }) {
       if (pr) (rm[row.user_id] = rm[row.user_id] || []).push(pr);
     }
     setUserRoles(rm);
+    // Map each user to the units they can access (for the at-a-glance chips).
+    const um = {};
+    for (const g of (uua.data || [])) { if (g.unit) (um[g.user_id] = um[g.user_id] || []).push({ name: g.unit.name, role: g.role }); }
+    setUserUnits(um);
     setLoading(false);
   };
 
@@ -7191,7 +7198,14 @@ function People({ plant, me, myPerms }) {
                     return assigned.map(r => html`<span key=${r.slug} class=${'badge ' + (owner(r.slug) ? 'teal' : '')}>${r.display_name}</span>`);
                   })()}
                 </div>
-                ${canAssignRoles && html`<button class="btn small ghost" title="Manage the roles assigned to this user" onClick=${() => setRolesTarget(u)}>👥 Roles</button>`}
+                ${u.status !== 'inactive' && html`<div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;max-width:220px">
+                  ${(userUnits[u.id] || []).map(g => html`<span key=${g.name} class="badge" style="font-size:9.5px;background:var(--slate-100);color:var(--slate-600);font-weight:500" title=${'Role in this unit: ' + roleLabel(g.role)}>🏭 ${g.name}</span>`)}
+                  ${(userUnits[u.id] || []).length === 0 ? html`<span style="font-size:10px;color:var(--slate-400)">no unit access yet</span>` : ''}
+                </div>`}
+                <div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end">
+                  ${canAssignRoles && html`<button class="btn small ghost" title="Manage the roles assigned to this user" onClick=${() => setRolesTarget(u)}>👥 Roles</button>`}
+                  ${canManage && u.status !== 'inactive' && html`<button class="btn small ghost" title="View / edit which units this person can access" onClick=${() => setUnitsTarget(u)}>🏭 Units</button>`}
+                </div>
                 ${canReset && html`<button class="btn small ghost" title="Issue a one-tap link they can use to set a new password" onClick=${async () => {
                   const { data, error } = await sb.rpc('issue_password_reset', { p_target_user_id: u.id });
                   if (error || !data?.token) { alert(error?.message || 'Could not generate reset link'); return; }
@@ -7285,6 +7299,7 @@ function People({ plant, me, myPerms }) {
     ${modal === 'operator' && html`<${OperatorModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${resetShare && html`<${ResetShareModal} plant=${plant} resetShare=${resetShare} onClose=${() => setResetShare(null)} />`}
     ${rolesTarget && html`<${UserRolesModal} plant=${plant} user=${rolesTarget} me=${me} onClose=${() => setRolesTarget(null)} onSaved=${() => { setRolesTarget(null); refresh(); }} />`}
+    ${unitsTarget && html`<${UnitAccessModal} plant=${plant} me=${me} focusUserId=${unitsTarget.id} focusName=${unitsTarget.full_name} onClose=${() => { setUnitsTarget(null); refresh(); }} />`}
   `;
 }
 
@@ -9261,12 +9276,12 @@ function DailyDigest({ me, setTab }) {
 
 // ============= MORE (navigator) =============
 // ============= UNIT ACCESS MODAL (manager+) =============
-function UnitAccessModal({ plant, me, onClose }) {
+function UnitAccessModal({ plant, me, focusUserId, focusName, onClose }) {
   const [units, setUnits] = useState([]);
   const [users, setUsers] = useState([]);
   const [grants, setGrants] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [pickUser, setPickUser] = useState('');
+  const [pickUser, setPickUser] = useState(focusUserId || '');
   const [pickUnit, setPickUnit] = useState('');
   const [pickRole, setPickRole] = useState('operator');
   const [error, setError] = useState('');
@@ -9316,7 +9331,7 @@ function UnitAccessModal({ plant, me, onClose }) {
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal" style="max-width:580px">
         <div class="modal-header">
-          <div class="modal-title">🔐 Unit Access Management</div>
+          <div class="modal-title">🔐 Unit Access${focusName ? ' · ' + focusName : ''}</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
