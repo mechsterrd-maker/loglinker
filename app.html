@@ -2585,7 +2585,7 @@ function TabBtn({ icon, label, active, onClick, badge }) {
 }
 
 // ============= HOME =============
-function Home({ plant, me, setTab, go, reload }) {
+function Home({ plant, me, activeUnit, setTab, go, reload }) {
   // Fallback so Home still works if rendered without `go` (e.g. older callers).
   const navTo = go || ((t) => setTab(t));
   const [stats, setStats] = useState({ units: 0, users: 1, machines: 0, dies: 0, shotsToday: 0, openActions: 0, openNcrs: 0, openBreakdowns: 0, lowStock: 0 });
@@ -2595,21 +2595,25 @@ function Home({ plant, me, setTab, go, reload }) {
   const canCreateProject = me?.role === 'plant_head' || me?.role === 'admin';
   const [showNewProject, setShowNewProject] = useState(false);
 
-  useEffect(() => { loadStats(); }, []);
+  // Reload when the active unit changes so the overview always reflects the unit
+  // you're viewing (not a stale or plant-wide snapshot).
+  useEffect(() => { loadStats(); }, [activeUnit?.unit_id]);
 
   const loadStats = async () => {
     setLoading(true);
     const today = new Date(); today.setHours(0,0,0,0);
+    const uid = activeUnit?.unit_id || null;          // scope unit-specific stats to the active unit
+    const byUnit = (q) => uid ? q.eq('unit_id', uid) : q;
     const [u, us, m, d, s, a, n, b, st] = await Promise.all([
       sb.from('units').select('id', { count:'exact', head:true }),
       sb.from('users').select('id', { count:'exact', head:true }),
-      sb.from('machines').select('id', { count:'exact', head:true }),
-      sb.from('mcp_pdc_dies').select('id', { count:'exact', head:true }),
-      sb.from('mcp_pdc_shots').select('id', { count:'exact', head:true }).gte('recorded_at', today.toISOString()),
+      byUnit(sb.from('machines').select('id', { count:'exact', head:true })),
+      byUnit(sb.from('mcp_pdc_dies').select('id', { count:'exact', head:true })),
+      byUnit(sb.from('mcp_pdc_shots').select('id', { count:'exact', head:true }).gte('recorded_at', today.toISOString())),
       sb.from('actions').select('id', { count:'exact', head:true }).eq('status', 'open'),
       sb.from('mcp_quality_ncrs').select('id', { count:'exact', head:true }).neq('status', 'closed').neq('status', 'cancelled'),
       sb.from('mcp_maintenance_breakdowns').select('id', { count:'exact', head:true }).neq('status', 'resolved').neq('status', 'cancelled'),
-      sb.from('mcp_stocks_items').select('id, current_qty, reorder_level').not('reorder_level', 'is', null),
+      byUnit(sb.from('mcp_stocks_items').select('id, current_qty, reorder_level').not('reorder_level', 'is', null)),
     ]);
     const lowStockCount = (st.data || []).filter(i => parseFloat(i.current_qty || 0) <= parseFloat(i.reorder_level || 0)).length;
     setStats({
