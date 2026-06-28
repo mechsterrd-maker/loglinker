@@ -1,0 +1,9 @@
+-- Retire All Hands; add one-click broadcast to all unit groups.
+-- _post_group_message(plant,group,sender,body): shared dedup+insert+push helper.
+-- post_to_all_hands(plant,sender,body,unit_id): unit group → All Hands (legacy
+--   plants) → broadcast to every per-unit group (so retiring All Hands loses nothing).
+-- broadcast_to_units(plant,body): posts '📢 '||body to every per-unit group;
+--   gated to plant_head/admin or users with access to all plant units.
+-- post_daily_supplier_chase_alerts: material-shortage alerts now pass v_row.unit_id.
+-- Krishnas 'All Hands' group retired: type→custom, unit_ids/members emptied (hidden;
+--   history preserved). Full bodies applied live via apply_migration.

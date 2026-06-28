@@ -5696,6 +5696,21 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
   const [notifPerm, setNotifPerm] = useState(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
   const [taskFromMsg, setTaskFromMsg] = useState(null);
   const [groupModal, setGroupModal] = useState(false);
+  const [broadcastOpen, setBroadcastOpen] = useState(false);
+  const [bcText, setBcText] = useState('');
+  const [bcBusy, setBcBusy] = useState(false);
+  // All-unit people can broadcast one message to every unit group at once.
+  const canBroadcast = ['plant_head','admin','manager'].includes(me?.role);
+  const sendBroadcast = async () => {
+    if (!bcText.trim()) return;
+    setBcBusy(true);
+    const { data, error } = await sb.rpc('broadcast_to_units', { p_plant_id: plant.id, p_body: bcText.trim() });
+    setBcBusy(false);
+    if (error || !data?.success) { showToast(error?.message || data?.error || 'Broadcast failed'); return; }
+    setBcText(''); setBroadcastOpen(false);
+    showToast('📢 Sent to all ' + (data.groups || 0) + ' unit groups');
+    loadGroups();
+  };
   const [msgMenu, setMsgMenu] = useState(null);
   const [editMsgTarget, setEditMsgTarget] = useState(null);
   const [forwardMsgTarget, setForwardMsgTarget] = useState(null);
@@ -6703,7 +6718,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
   }
 
   return html`
-    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start"><div><h1>Chat</h1><div class="sub">Plant communication</div></div><button class="btn small" onClick=${() => setGroupModal(true)} style="margin-top:6px">+ New Group</button></div>
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start"><div><h1>Chat</h1><div class="sub">Plant communication</div></div><div style="display:flex;gap:8px;margin-top:6px">${canBroadcast && html`<button class="btn small" onClick=${() => setBroadcastOpen(true)} style="background:var(--teal-600);color:white" title="Send one message to every unit group">📢 Broadcast</button>`}<button class="btn small" onClick=${() => setGroupModal(true)}>+ New Group</button></div></div>
     <${PendingTasksPanel} plant=${plant} setTab=${setTab} />
     ${notifPerm === 'default' && html`
       <div class="setup-banner" style="margin-bottom:14px">
@@ -6750,6 +6765,15 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
 
     ${taskFromMsg && html`<${AssignTaskFromMsgModal} plant=${plant} me=${me} message=${taskFromMsg} group=${activeGroup} onClose=${() => setTaskFromMsg(null)} onSaved=${() => setTaskFromMsg(null)} />`}
     ${groupModal && html`<${GroupCreateModal} plant=${plant} me=${me} user=${user} onClose=${() => setGroupModal(false)} onSaved=${() => { setGroupModal(false); loadGroups(); }} />`}
+    ${broadcastOpen && html`
+      <div class="modal-backdrop" onClick=${() => setBroadcastOpen(false)}>
+        <div class="modal" onClick=${e => e.stopPropagation()} style="max-width:440px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><h3 style="margin:0">📢 Broadcast to all units</h3><button class="close-btn" onClick=${() => setBroadcastOpen(false)}>×</button></div>
+          <p style="font-size:12px;color:var(--slate-500);margin:0 0 10px">Posts one message to every unit group at once. Use for plant-wide announcements.</p>
+          <textarea rows="4" value=${bcText} onInput=${e => setBcText(e.target.value)} placeholder="Type your announcement…" style="width:100%"></textarea>
+          <button class="btn" style="width:100%;margin-top:12px;background:var(--teal-600)" disabled=${bcBusy || !bcText.trim()} onClick=${sendBroadcast}>${bcBusy ? 'Sending…' : '📢 Send to all units'}</button>
+        </div>
+      </div>`}
   `;
 }
 
