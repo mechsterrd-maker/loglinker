@@ -2280,7 +2280,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'expenses'}><${ExpenseLedger} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'machine_prod'}><${MachineProductionModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${pageTab === 'petty_cash'}><${PettyCashModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'petty_cash'}><${PettyCashModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
       <${Page} active=${denied}><${AccessDenied} moduleKey=${tab} /></${Page}>
 
@@ -2810,22 +2810,18 @@ function Production({ plant, me, activeUnit }) {
     // Unit scope: when an activeUnit is set, parts + stock items belonging to
     // other units are hidden. Rows with unit_id=NULL ("shared") stay visible.
     const u = activeUnit?.unit_id;
-    let partsQ = sb.from('mcp_pdc_parts').select('*').order('part_number');
-    let stockQ = sb.from('mcp_stocks_items').select('id, code, name, current_qty, uom, unit_id').order('code');
-    if (u) {
-      partsQ = partsQ.or(`unit_id.eq.${u},unit_id.is.null`);
-      stockQ = stockQ.or(`unit_id.eq.${u},unit_id.is.null`);
-    }
+    // Unit-scope helper: a unit's own rows + shared (unit_id NULL) rows.
+    const scope = (q) => u ? q.or(`unit_id.eq.${u},unit_id.is.null`) : q;
     const [m, d, s, p, units, sh, us, t, si] = await Promise.all([
-      sb.from('machines').select('*, units(name)').order('code'),
-      sb.from('mcp_pdc_dies').select('*, cavities').order('code'),
+      scope(sb.from('machines').select('*, units(name)')).order('code'),
+      scope(sb.from('mcp_pdc_dies').select('*, cavities')).order('code'),
       sb.from('mcp_pdc_shots').select('*, cavities, pieces_good, pieces_rejected, units(name), shifts(name), mcp_pdc_dies(code,part_number,cavities), machines(code), users:operator_user_id(full_name)').order('recorded_at', { ascending:false }).limit(50),
-      partsQ,
+      scope(sb.from('mcp_pdc_parts').select('*')).order('part_number'),
       sb.from('units').select('*').order('name'),
-      sb.from('shifts').select('*').order('start_time'),
+      scope(sb.from('shifts').select('*')).order('start_time'),
       sb.from('users').select('*').order('full_name'),
-      sb.from('tools_master').select('*').eq('is_active', true).order('code'),
-      stockQ,
+      scope(sb.from('tools_master').select('*').eq('is_active', true)).order('code'),
+      scope(sb.from('mcp_stocks_items').select('id, code, name, current_qty, uom, unit_id')).order('code'),
     ]);
     setMachines(m.data || []);
     setDies(d.data || []);
@@ -3130,7 +3126,7 @@ function Production({ plant, me, activeUnit }) {
 // ============= TOOL MODAL =============
 // Add/edit a tool: insert/drill/tap/end-mill etc.
 // Optional stock link, life specs, applicable machines/parts.
-function ToolModal({ plant, me, machines, stockItems, parts, editTarget, onClose, onSaved }) {
+function ToolModal({ plant, me, machines, stockItems, parts, activeUnit, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget || {
     code:'', name:'', kind:'insert', make:'', grade:'', geometry:'',
     life_unit:'pieces', life_value:1000, corners_per_insert:1,
@@ -3163,6 +3159,7 @@ function ToolModal({ plant, me, machines, stockItems, parts, editTarget, onClose
         applicable_parts: form.applicable_parts || [],
         notes: form.notes || null,
         is_active: form.is_active !== false,
+        unit_id: editTarget ? (editTarget.unit_id ?? null) : (activeUnit?.unit_id || null),
       };
       const { error: err } = editTarget
         ? await sb.from('tools_master').update(payload).eq('id', editTarget.id)
@@ -4967,7 +4964,7 @@ function MachineBulkAddModal({ plant, units, users, onClose, onSaved }) {
 }
 
 // ============= DIE MODAL =============
-function DieModal({ plant, me, parts, editTarget, onClose, onSaved }) {
+function DieModal({ plant, me, parts, activeUnit, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget || { code:'', part_number:'', customer_name:'', cavities:1, max_strokes:300000, corepin_count:0, ejector_pin_count:0, status:'active', default_part_id:'' });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -5006,6 +5003,7 @@ function DieModal({ plant, me, parts, editTarget, onClose, onSaved }) {
         ejector_pin_count: parseInt(form.ejector_pin_count) || 0,
         status: form.status,
         default_part_id: form.default_part_id || null,
+        unit_id: editTarget ? (editTarget.unit_id ?? null) : (activeUnit?.unit_id || null),
       };
       const { error } = editTarget
         ? await sb.from('mcp_pdc_dies').update(payload).eq('id', editTarget.id)
@@ -6780,14 +6778,14 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
     const [un, op, sh, us, pa, ma, di, to, si, rt, ve, cu, uprLinks, uprRoles] = await Promise.all([
       sb.from('units').select('*').eq('plant_id', plant.id).order('name'),
       sb.from('users').select('*').eq('plant_id', plant.id).eq('role','operator').order('full_name'),
-      sb.from('shifts').select('*').eq('plant_id', plant.id).order('start_time'),
+      scope(sb.from('shifts').select('*').eq('plant_id', plant.id)).order('start_time'),
       sb.from('users').select('*').eq('plant_id', plant.id).neq('role','operator').order('full_name'),
       scope(sb.from('mcp_pdc_parts').select('*').eq('plant_id', plant.id)).order('part_number'),
       scope(sb.from('machines').select('*, units(name)').eq('plant_id', plant.id)).order('code'),
-      sb.from('mcp_pdc_dies').select('*').eq('plant_id', plant.id).order('code'),
-      sb.from('tools_master').select('*').eq('plant_id', plant.id).order('code'),
+      scope(sb.from('mcp_pdc_dies').select('*').eq('plant_id', plant.id)).order('code'),
+      scope(sb.from('tools_master').select('*').eq('plant_id', plant.id)).order('code'),
       scope(sb.from('mcp_stocks_items').select('*').eq('plant_id', plant.id)).order('code'),
-      sb.from('mcp_pdc_rejection_types').select('*').eq('plant_id', plant.id).order('stage,ord'),
+      scope(sb.from('mcp_pdc_rejection_types').select('*').eq('plant_id', plant.id)).order('stage,ord'),
       sb.from('mcp_logistics_vendors').select('*').eq('plant_id', plant.id).order('name'),
       sb.from('mcp_sched_customers').select('*').eq('plant_id', plant.id).order('name'),
       sb.from('user_plant_roles').select('user_id, role_id'),
@@ -7053,11 +7051,11 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
 
     ${modal === 'unit'       && html`<${UnitModal} plant=${plant} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'operator'   && html`<${OperatorModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
-    ${modal === 'shift'      && html`<${ShiftModal} plant=${plant} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'shift'      && html`<${ShiftModal} plant=${plant} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'part'       && html`<${PartModal} plant=${plant} me=${me} dies=${dies} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'machine'    && html`<${MachineModal} plant=${plant} units=${units} users=${[...users, ...operators]} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
-    ${modal === 'die'        && html`<${DieModal} plant=${plant} me=${me} parts=${parts} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
-    ${modal === 'tool'       && html`<${ToolModal} plant=${plant} me=${me} machines=${machines} stockItems=${stockItems} parts=${parts} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'die'        && html`<${DieModal} plant=${plant} me=${me} parts=${parts} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'tool'       && html`<${ToolModal} plant=${plant} me=${me} machines=${machines} stockItems=${stockItems} parts=${parts} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'stock_item' && html`<${ItemModal} plant=${plant} me=${me} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'customer'   && html`<${CustomerModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'vendor'     && html`<${VendorEditModal} plant=${plant} me=${me} vendor=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
@@ -7498,7 +7496,7 @@ function UnitModal({ plant, editTarget, onClose, onSaved }) {
   `;
 }
 
-function ShiftModal({ plant, editTarget, onClose, onSaved }) {
+function ShiftModal({ plant, activeUnit, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget ? {...editTarget, start_time: editTarget.start_time.slice(0,5), end_time: editTarget.end_time.slice(0,5)} : { name:'', start_time:'06:00', end_time:'14:00', is_active:true });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -7507,7 +7505,8 @@ function ShiftModal({ plant, editTarget, onClose, onSaved }) {
     e.preventDefault();
     setError(''); setLoading(true);
     try {
-      const payload = { plant_id: plant.id, name: form.name, start_time: form.start_time, end_time: form.end_time, is_active: form.is_active };
+      const payload = { plant_id: plant.id, name: form.name, start_time: form.start_time, end_time: form.end_time, is_active: form.is_active,
+        unit_id: editTarget ? (editTarget.unit_id ?? null) : (activeUnit?.unit_id || null) };
       const { error } = editTarget
         ? await sb.from('shifts').update(payload).eq('id', editTarget.id)
         : await sb.from('shifts').insert(payload);
@@ -13650,7 +13649,7 @@ function AttendanceSetupPage({ plant, me, reload }) {
 // =================================================================
 // PETTY CASH — expenses · advances · recollection
 // =================================================================
-function PettyCashModule({ plant, me }) {
+function PettyCashModule({ plant, me, activeUnit }) {
   const [books, setBooks] = useState([]);
   const [balances, setBalances] = useState([]);
   const [txns, setTxns] = useState([]);
@@ -13666,20 +13665,31 @@ function PettyCashModule({ plant, me }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    // Each unit keeps its own cash. Books are unit-specific (NULL = shared); the
+    // balance + transactions are then restricted to the books visible in this
+    // unit, so one unit never sees another unit's petty cash.
+    const u = activeUnit?.unit_id;
+    let booksQ = sb.from('mcp_petty_cash_books').select('*').eq('plant_id', plant.id).eq('active', true).order('created_at');
+    if (u) booksQ = booksQ.or(`unit_id.eq.${u},unit_id.is.null`);
     const [bks, bal, tx, adv, us] = await Promise.all([
-      sb.from('mcp_petty_cash_books').select('*').eq('plant_id', plant.id).eq('active', true).order('created_at'),
+      booksQ,
       sb.from('v_petty_cash_book_balance').select('*').eq('plant_id', plant.id),
       sb.from('mcp_petty_cash_txns').select('*, book:book_id(name), party:party_user_id(full_name), creator:created_by(full_name)').eq('plant_id', plant.id).order('txn_date', { ascending:false }).order('created_at', { ascending:false }).limit(300),
       sb.from('v_petty_cash_outstanding_advances').select('*').eq('plant_id', plant.id),
       sb.from('users').select('id, full_name, role, phone').eq('plant_id', plant.id).order('full_name'),
     ]);
-    setBooks(bks.data || []);
-    setBalances(bal.data || []);
-    setTxns(tx.data || []);
+    const books = bks.data || [];
+    const allow = new Set(books.map(b => b.id));
+    // book_id-keyed rows get filtered to this unit's books; advances is a
+    // per-person plant aggregate (no book key) so it stays plant-wide.
+    const scopeBook = (rows) => u ? (rows || []).filter(r => allow.has(r.book_id)) : (rows || []);
+    setBooks(books);
+    setBalances(scopeBook(bal.data));
+    setTxns(scopeBook(tx.data));
     setAdvances(adv.data || []);
     setUsers(us.data || []);
     setLoading(false);
-  }, [plant.id]);
+  }, [plant.id, activeUnit?.unit_id]);
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
 
@@ -13733,7 +13743,7 @@ function PettyCashModule({ plant, me }) {
         <div style="font-size:13px;margin-bottom:10px">No petty cash book yet. Create one to start recording expenses + advances.</div>
         <button class="btn" onClick=${() => setCreateBookOpen(true)}>+ Create cash book</button>
       </div></div>
-      ${createBookOpen && html`<${PettyCashBookModal} plant=${plant} me=${me} users=${users} onClose=${() => setCreateBookOpen(false)} onSaved=${() => { setCreateBookOpen(false); refresh(); }} />`}
+      ${createBookOpen && html`<${PettyCashBookModal} plant=${plant} me=${me} users=${users} activeUnit=${activeUnit} onClose=${() => setCreateBookOpen(false)} onSaved=${() => { setCreateBookOpen(false); refresh(); }} />`}
     `;
   }
 
@@ -13922,7 +13932,7 @@ function PettyCashModule({ plant, me }) {
       })}
     `}
 
-    ${createBookOpen && html`<${PettyCashBookModal} plant=${plant} me=${me} users=${users} onClose=${() => setCreateBookOpen(false)} onSaved=${() => { setCreateBookOpen(false); refresh(); }} />`}
+    ${createBookOpen && html`<${PettyCashBookModal} plant=${plant} me=${me} users=${users} activeUnit=${activeUnit} onClose=${() => setCreateBookOpen(false)} onSaved=${() => { setCreateBookOpen(false); refresh(); }} />`}
     ${createTxnOpen && html`<${PettyCashTxnModal} plant=${plant} me=${me} books=${books} users=${users} initial=${createTxnOpen} advances=${advances} onClose=${() => setCreateTxnOpen(null)} onSaved=${() => { setCreateTxnOpen(null); refresh(); }} />`}
   `;
 }
@@ -14752,7 +14762,7 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
   `;
 }
 
-function PettyCashBookModal({ plant, me, users, onClose, onSaved }) {
+function PettyCashBookModal({ plant, me, users, activeUnit, onClose, onSaved }) {
   const [form, setForm] = useState({
     name: 'Plant Office Cash',
     custodian_user_id: me.id,
@@ -14768,6 +14778,7 @@ function PettyCashBookModal({ plant, me, users, onClose, onSaved }) {
     try {
       const { error } = await sb.from('mcp_petty_cash_books').insert({
         plant_id: plant.id,
+        unit_id: activeUnit?.unit_id || null,
         name: form.name.trim(),
         custodian_user_id: form.custodian_user_id || null,
         opening_balance: parseFloat(form.opening_balance || 0),
