@@ -506,6 +506,18 @@ function getActiveUnitId() { return _activeUnitId; }
 // is selected (single-unit plants / not yet loaded).
 const unitScope = (q) => _activeUnitId ? q.or(`unit_id.eq.${_activeUnitId},unit_id.is.null`) : q;
 
+// People who can work in the active unit (set via list_unit_members RPC; includes
+// all-unit roles like plant_head/admin/MD). Used to scope people-pickers so a
+// manager in Unit 1 doesn't see Unit-2-only staff. null = unknown → don't filter.
+let _unitMemberIds = null;
+function setUnitMemberIds(ids) { _unitMemberIds = ids ? new Set(ids) : null; }
+// Keep only users who can work in the active unit. No-op when no active unit or
+// membership not yet loaded. Accepts user objects ({id}/{user_id}) or bare ids.
+function filterUnitMembers(list) {
+  if (!_activeUnitId || !_unitMemberIds) return list || [];
+  return (list || []).filter(u => _unitMemberIds.has(typeof u === 'string' ? u : (u.id ?? u.user_id)));
+}
+
 // Founder allow-list. ONLY these specific gmails (the platform admin
 // panel's owners) can see AI cost / usage / token numbers anywhere in
 // the app. NOT customer-side admin or plant_head roles. NOT the founder
@@ -1447,6 +1459,13 @@ function App() {
     const active = (data || []).find(u => u.is_active) || (data || [])[0];
     setActiveUnit(active || null);
     setActiveUnitId((active || null)?.unit_id || null);
+    // Load the active unit's members so people-pickers can be scoped to it.
+    if (active?.unit_id) {
+      const { data: mem } = await sb.rpc('list_unit_members', { p_unit_id: active.unit_id });
+      setUnitMemberIds((mem || []).map(m => m.id));
+    } else {
+      setUnitMemberIds(null);
+    }
   }, []);
 
   const switchUnit = useCallback(async (unitId) => {
@@ -2851,7 +2870,7 @@ function Production({ plant, me, activeUnit }) {
     setParts(p.data || []);
     setUnits(units.data || []);
     setShifts(sh.data || []);
-    setUsers(us.data || []);
+    setUsers(filterUnitMembers(us.data || []));  // operator picker = active-unit members
     setTools(t.data || []);
     setStockItems(si.data || []);
     setLoading(false);
@@ -13796,7 +13815,7 @@ function PettyCashModule({ plant, me, activeUnit }) {
     setBalances(scopeBook(bal.data));
     setTxns(scopeBook(tx.data));
     setAdvances(adv.data || []);
-    setUsers(us.data || []);
+    setUsers(filterUnitMembers(us.data || []));  // custodian picker = active-unit members only
     setLoading(false);
   }, [plant.id, activeUnit?.unit_id]);
   useEffect(() => { refresh(); }, [refresh]);
@@ -27738,7 +27757,7 @@ function NcrModal({ plant, me, editTarget, onClose, onSaved }) {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    sb.from('users').select('*').then(({ data }) => setUsers(data || []));
+    sb.from('users').select('*').then(({ data }) => setUsers(filterUnitMembers(data || [])));  // NCR assignee = active-unit members
   }, []);
 
   const submit = async (e) => {
@@ -27865,7 +27884,7 @@ function Maintenance({ plant, me }) {
     ]);
     setBreakdowns(b.data || []);
     setMachines(m.data || []);
-    setUsers(u.data || []);
+    setUsers(filterUnitMembers(u.data || []));  // breakdown assignee = active-unit members
     setLoading(false);
   }, [filter]);
 
