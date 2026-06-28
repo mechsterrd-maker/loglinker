@@ -492,6 +492,20 @@ const SUPABASE_URL = 'https://wzxowvrvuecybdxymjvi.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind6eG93dnJ2dWVjeWJkeHltanZpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3MjMzMTQsImV4cCI6MjA5MzI5OTMxNH0.GyvHnBtlJTWs8HqMvu0VyRhjme5jbTUWzz9vOAxXhO8';
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+// --- Active-unit store (module-level) ---------------------------------------
+// Mirrors the React activeUnit so any loader or sub-panel can scope its queries
+// to the unit the user is currently working in, WITHOUT prop-threading. RLS
+// already enforces hard per-unit isolation at the database (unit staff cannot
+// read other units at all); this store only narrows a multi-unit manager/owner's
+// view to one unit at a time when they switch. unit_id IS NULL = shared row
+// (visible in every unit, e.g. the few cross-unit parts and the BILLS-OCR group).
+let _activeUnitId = null;
+function setActiveUnitId(id) { _activeUnitId = id || null; }
+function getActiveUnitId() { return _activeUnitId; }
+// Scope a Supabase query to the active unit + shared rows. No-op when no unit
+// is selected (single-unit plants / not yet loaded).
+const unitScope = (q) => _activeUnitId ? q.or(`unit_id.eq.${_activeUnitId},unit_id.is.null`) : q;
+
 // Founder allow-list. ONLY these specific gmails (the platform admin
 // panel's owners) can see AI cost / usage / token numbers anywhere in
 // the app. NOT customer-side admin or plant_head roles. NOT the founder
@@ -1432,6 +1446,7 @@ function App() {
     setAccessibleUnits(data || []);
     const active = (data || []).find(u => u.is_active) || (data || [])[0];
     setActiveUnit(active || null);
+    setActiveUnitId((active || null)?.unit_id || null);
   }, []);
 
   const switchUnit = useCallback(async (unitId) => {
@@ -2146,7 +2161,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
 
   const recalcUnread = useCallback(async () => {
     if (!plant?.id) return;
-    const { data: groups } = await sb.from('chat_groups').select('id').contains('members', [user.id]);
+    const { data: groups } = await unitScope(sb.from('chat_groups').select('id').contains('members', [user.id]));
     if (!groups || groups.length === 0) { setUnreadCount(0); return; }
     // Single aggregated fetch instead of N count-queries per group. Use the
     // oldest lastRead across all groups as a server-side lower bound, then
@@ -2610,9 +2625,9 @@ function Home({ plant, me, activeUnit, setTab, go, reload }) {
       byUnit(sb.from('machines').select('id', { count:'exact', head:true })),
       byUnit(sb.from('mcp_pdc_dies').select('id', { count:'exact', head:true })),
       byUnit(sb.from('mcp_pdc_shots').select('id', { count:'exact', head:true }).gte('recorded_at', today.toISOString())),
-      sb.from('actions').select('id', { count:'exact', head:true }).eq('status', 'open'),
-      sb.from('mcp_quality_ncrs').select('id', { count:'exact', head:true }).neq('status', 'closed').neq('status', 'cancelled'),
-      sb.from('mcp_maintenance_breakdowns').select('id', { count:'exact', head:true }).neq('status', 'resolved').neq('status', 'cancelled'),
+      byUnit(sb.from('actions').select('id', { count:'exact', head:true }).eq('status', 'open')),
+      byUnit(sb.from('mcp_quality_ncrs').select('id', { count:'exact', head:true }).neq('status', 'closed').neq('status', 'cancelled')),
+      byUnit(sb.from('mcp_maintenance_breakdowns').select('id', { count:'exact', head:true }).neq('status', 'resolved').neq('status', 'cancelled')),
       byUnit(sb.from('mcp_stocks_items').select('id, current_qty, reorder_level').not('reorder_level', 'is', null)),
     ]);
     const lowStockCount = (st.data || []).filter(i => parseFloat(i.current_qty || 0) <= parseFloat(i.reorder_level || 0)).length;
@@ -5487,12 +5502,12 @@ function PendingTasksPanel({ plant, setTab }) {
   const [busy, setBusy] = useState({});
 
   const refresh = useCallback(async () => {
-    const { data } = await sb.from('actions')
+    const { data } = await unitScope(sb.from('actions')
       .select('id, title, status, due_at, owner_id, department')
       .eq('plant_id', plant.id)
       .not('status', 'in', '(completed,cancelled)')
       .order('due_at', { ascending: true, nullsFirst: false })
-      .limit(50);
+      .limit(50));
     const list = data || [];
     const ownerIds = [...new Set(list.map(t => t.owner_id).filter(Boolean))];
     if (ownerIds.length > 0) {
@@ -5596,6 +5611,14 @@ function PendingTasksPanel({ plant, setTab }) {
 function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAction, setTab }) {
   const [groups, setGroups] = useState([]);
   const [activeGroup, setActiveGroup] = useState(null);
+  // BILLS-OCR is a common group, but each uploaded bill must file into a unit.
+  // Default to the active unit; let the user pick another before uploading.
+  const [billUnits, setBillUnits] = useState([]);
+  const [billUnitId, setBillUnitId] = useState(getActiveUnitId());
+  useEffect(() => { sb.rpc('my_accessible_units').then(({ data }) => {
+    setBillUnits(data || []);
+    if (!getActiveUnitId() && (data || []).length) setBillUnitId((data.find(u => u.is_active) || data[0]).unit_id);
+  }); }, []);
   // Home "Upload Bill" shortcut: route to the OCR-enabled chat group (where
   // ai_logistics_enabled = true) and pop its file picker. If there isn't one,
   // fall back to the chat list with a hint so the user can enable AI on a
@@ -5872,7 +5895,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
 
   const loadGroups = async () => {
     setLoading(true);
-    const { data: groupsData } = await sb.from('chat_groups').select('*').contains('members', [user.id]);
+    const { data: groupsData } = await unitScope(sb.from('chat_groups').select('*').contains('members', [user.id]));
     const groupsList = groupsData || [];
 
     // Get unread count + last message preview for each group
@@ -6048,6 +6071,10 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
       });
       if (error) { alert(error.message); return; }
       if (!queueId) { alert('Already queued'); return; }
+      // File this bill into the chosen unit (default = active unit). The doc
+      // created by the extractor inherits the queue row's unit_id.
+      const _bu = billUnitId || getActiveUnitId();
+      if (_bu) { try { await sb.from('mcp_logistics_extraction_queue').update({ unit_id: _bu }).eq('id', queueId); } catch (_e) {} }
       const { data: { session } } = await sb.auth.getSession();
       if (session) {
         showToast('Extracting…');
@@ -6553,6 +6580,15 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
             <span>${attachment.name}</span>
             <button onClick=${() => { setAttachment(null); setAttachmentProject(''); setAttachmentStage(''); }}>×</button>
           </div>
+          ${attachment.type?.startsWith('image/') && activeGroup?.ai_logistics_enabled && billUnits.length > 1 && html`
+            <div style="padding:8px 12px;background:var(--teal-50);border-top:1px solid var(--teal-100);display:flex;align-items:center;gap:10px;font-size:12px;flex-wrap:wrap">
+              <span style="color:var(--teal-800);font-weight:600">🏭 File this bill into:</span>
+              <select value=${billUnitId || ''} onChange=${e => setBillUnitId(e.target.value)}
+                style="flex:1;padding:6px 8px;border:1px solid var(--teal-200);border-radius:6px;font-size:12px;background:white">
+                ${billUnits.map(u => html`<option key=${u.unit_id} value=${u.unit_id}>${u.name}</option>`)}
+              </select>
+            </div>
+          `}
           ${attachment.type?.startsWith('image/') && activeGroup?.ai_logistics_enabled && myPerms?.rbac_enforced && html`
             <div style="padding:8px 12px;background:var(--teal-50);border-top:1px solid var(--teal-100);display:flex;align-items:center;gap:10px;font-size:12px;flex-wrap:wrap">
               <span style="color:var(--teal-800);font-weight:600">📐 Tag this bill to:</span>
@@ -13688,12 +13724,12 @@ function PettyCashModule({ plant, me, activeUnit }) {
     // balance + transactions are then restricted to the books visible in this
     // unit, so one unit never sees another unit's petty cash.
     const u = activeUnit?.unit_id;
-    let booksQ = sb.from('mcp_petty_cash_books').select('*').eq('plant_id', plant.id).eq('active', true).order('created_at');
+    let booksQ = unitScope(sb.from('mcp_petty_cash_books').select('*').eq('plant_id', plant.id).eq('active', true)).order('created_at');
     if (u) booksQ = booksQ.or(`unit_id.eq.${u},unit_id.is.null`);
     const [bks, bal, tx, adv, us] = await Promise.all([
       booksQ,
       sb.from('v_petty_cash_book_balance').select('*').eq('plant_id', plant.id),
-      sb.from('mcp_petty_cash_txns').select('*, book:book_id(name), party:party_user_id(full_name), creator:created_by(full_name)').eq('plant_id', plant.id).order('txn_date', { ascending:false }).order('created_at', { ascending:false }).limit(300),
+      unitScope(sb.from('mcp_petty_cash_txns').select('*, book:book_id(name), party:party_user_id(full_name), creator:created_by(full_name)').eq('plant_id', plant.id).order('txn_date', { ascending:false }).order('created_at', { ascending:false }).limit(300)),
       sb.from('v_petty_cash_outstanding_advances').select('*').eq('plant_id', plant.id),
       sb.from('users').select('id, full_name, role, phone').eq('plant_id', plant.id).order('full_name'),
     ]);
@@ -15293,7 +15329,7 @@ function ProjectTracker({ plant, me, myPerms, go }) {
   const refresh = useCallback(async () => {
     setLoading(true);
     const [p, c, u] = await Promise.all([
-      sb.from('mcp_projects').select('*, customer:customer_id(name), owner:owner_user_id(full_name)').eq('plant_id', plant.id).order('created_at', { ascending:false }),
+      unitScope(sb.from('mcp_projects').select('*, customer:customer_id(name), owner:owner_user_id(full_name)').eq('plant_id', plant.id).order('created_at', { ascending:false })),
       sb.from('mcp_sched_customers').select('id, name').eq('plant_id', plant.id).order('name'),
       sb.from('users').select('id, full_name').eq('plant_id', plant.id).order('full_name'),
     ]);
@@ -18359,7 +18395,7 @@ function ExpenseLedger({ plant, me }) {
     const start = month + '-01';
     const end = new Date(new Date(start).getFullYear(), new Date(start).getMonth()+1, 0).toISOString().slice(0,10);
     const [e, v, p] = await Promise.all([
-      sb.from('mcp_expenses').select('*, vendor:vendor_id(name), project:project_id(name)').eq('plant_id', plant.id).gte('expense_date', start).lte('expense_date', end).order('expense_date', { ascending:false }),
+      unitScope(sb.from('mcp_expenses').select('*, vendor:vendor_id(name), project:project_id(name)').eq('plant_id', plant.id).gte('expense_date', start).lte('expense_date', end).order('expense_date', { ascending:false })),
       sb.from('mcp_logistics_vendors').select('id, name').eq('plant_id', plant.id).order('name'),
       sb.from('mcp_projects').select('id, name').eq('plant_id', plant.id).neq('status','completed').order('name'),
     ]);
@@ -27204,7 +27240,7 @@ function Quality({ plant, me }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    let q = sb.from('mcp_quality_ncrs').select('*, raised_by_user:raised_by(full_name), assigned_to_user:assigned_to(full_name)').order('created_at', { ascending:false });
+    let q = unitScope(sb.from('mcp_quality_ncrs').select('*, raised_by_user:raised_by(full_name), assigned_to_user:assigned_to(full_name)')).order('created_at', { ascending:false });
     if (filter === 'open') q = q.neq('status', 'closed').neq('status', 'cancelled');
     else if (filter === 'closed') q = q.eq('status', 'closed');
     const [{ data: ncrData }, { data: inspData }] = await Promise.all([
@@ -27765,7 +27801,7 @@ function Maintenance({ plant, me }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    let q = sb.from('mcp_maintenance_breakdowns').select('*, machines(code), reported_by_user:reported_by(full_name), attended_by_user:attended_by(full_name)').order('reported_at', { ascending:false });
+    let q = unitScope(sb.from('mcp_maintenance_breakdowns').select('*, machines(code), reported_by_user:reported_by(full_name), attended_by_user:attended_by(full_name)')).order('reported_at', { ascending:false });
     if (filter === 'open') q = q.neq('status', 'resolved').neq('status', 'cancelled');
     else if (filter === 'resolved') q = q.eq('status', 'resolved');
     const [b, m, u] = await Promise.all([
@@ -28900,7 +28936,7 @@ function ActionHub({ plant, me, navAction }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    let q = sb.from('actions').select('*, owner_user:owner_id(full_name, role), assigner:assigned_by(full_name)').order('created_at', { ascending:false });
+    let q = unitScope(sb.from('actions').select('*, owner_user:owner_id(full_name, role), assigner:assigned_by(full_name)')).order('created_at', { ascending:false });
     if (statusFilter === 'open') q = q.in('status', ['open','in_progress']);
     else if (statusFilter === 'done') q = q.eq('status', 'completed');
     // Three independent queries — nesting users → user_unit_access → units in
