@@ -506,6 +506,11 @@ function getActiveUnitId() { return _activeUnitId; }
 // is selected (single-unit plants / not yet loaded).
 const unitScope = (q) => _activeUnitId ? q.or(`unit_id.eq.${_activeUnitId},unit_id.is.null`) : q;
 
+// Chat groups use a unit_ids[] array (a group can belong to several units, e.g.
+// the cross-unit "Unit 1 & 2"). Show a group if it's common (unit_ids NULL) or
+// the active unit is one of its units. No-op when no active unit.
+const unitGroupScope = (q) => _activeUnitId ? q.or(`unit_ids.is.null,unit_ids.cs.{${_activeUnitId}}`) : q;
+
 // People who can work in the active unit (set via list_unit_members RPC; includes
 // all-unit roles like plant_head/admin/MD). Used to scope people-pickers so a
 // manager in Unit 1 doesn't see Unit-2-only staff. null = unknown → don't filter.
@@ -2183,7 +2188,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
 
   const recalcUnread = useCallback(async () => {
     if (!plant?.id) return;
-    const { data: groups } = await unitScope(sb.from('chat_groups').select('id').contains('members', [user.id]));
+    const { data: groups } = await unitGroupScope(sb.from('chat_groups').select('id').contains('members', [user.id]));
     if (!groups || groups.length === 0) { setUnreadCount(0); return; }
     // Single aggregated fetch instead of N count-queries per group. Use the
     // oldest lastRead across all groups as a server-side lower bound, then
@@ -5917,7 +5922,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
 
   const loadGroups = async () => {
     setLoading(true);
-    const { data: groupsData } = await unitScope(sb.from('chat_groups').select('*').contains('members', [user.id]));
+    const { data: groupsData } = await unitGroupScope(sb.from('chat_groups').select('*').contains('members', [user.id]));
     const groupsList = groupsData || [];
 
     // Get unread count + last message preview for each group
@@ -29859,7 +29864,8 @@ function GroupCreateModal({ plant, me, user, onClose, onSaved }) {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    sb.from('users').select('*').order('full_name').then(({ data }) => setUsers(data || []));
+    // New group is scoped to the active unit → only that unit's staff can be added.
+    sb.from('users').select('*').order('full_name').then(({ data }) => setUsers(filterUnitMembers(data || [])));
   }, []);
 
   const toggle = (id) => {
@@ -29878,6 +29884,9 @@ function GroupCreateModal({ plant, me, user, onClose, onSaved }) {
         type: 'custom',
         members: form.selected,
         created_by: me.id,
+        // New groups belong to the active unit by default (so they don't become
+        // common/visible-everywhere). Cross-unit/common groups are seeded server-side.
+        unit_ids: getActiveUnitId() ? [getActiveUnitId()] : null,
       });
       if (error) throw error;
       showToast('Group created');
@@ -33109,7 +33118,15 @@ function GroupSettingsModal({ plant, me, user, group, onClose, onChanged }) {
   const load = async () => {
     const ids = group.members || [];
     const all = await sb.from('users').select('id, full_name, role').eq('status', 'active');
-    setAllUsers(all.data || []);
+    // Unit/cross-unit groups: only that unit's staff (+ all-unit admins) can be
+    // added. Common groups (no unit_ids) allow everyone.
+    let pool = all.data || [];
+    if (group.unit_ids && group.unit_ids.length) {
+      const lists = await Promise.all(group.unit_ids.map(uid => sb.rpc('list_unit_members', { p_unit_id: uid })));
+      const allowed = new Set(lists.flatMap(r => (r.data || []).map(m => m.id)));
+      pool = pool.filter(u => allowed.has(u.id));
+    }
+    setAllUsers(pool);
     if (ids.length === 0) { setMembers([]); return; }
     const m = await sb.from('users').select('id, full_name, role').in('id', ids);
     setMembers(m.data || []);
