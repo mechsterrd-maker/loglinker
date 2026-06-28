@@ -1,4 +1,4 @@
-// extract-document/index.ts — v25 (prompt caching: static instructions cached at 0.1× input)
+// extract-document/index.ts — v26 (model → claude-sonnet-4-6; sonnet-4-20250514 retired)
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { Image } from "https://deno.land/x/imagescript@1.2.17/mod.ts";
@@ -7,9 +7,9 @@ import { SYSTEM_PROMPT, buildContext } from "./prompt.ts";
 const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
-const MODEL = "claude-sonnet-4-20250514";
-const WORKER_VERSION = "v25";
-// Claude Sonnet 4 pricing (USD per token). Update here if the model/pricing changes.
+const MODEL = "claude-sonnet-4-6";
+const WORKER_VERSION = "v26";
+// Claude Sonnet 4.6 pricing (USD per token). Update here if the model/pricing changes.
 const PRICE_IN_PER_TOK  = 3 / 1_000_000;
 const PRICE_OUT_PER_TOK = 15 / 1_000_000;
 // Prompt-cache multipliers: writing the cache costs 1.25× input, reading it 0.1×.
@@ -18,7 +18,7 @@ const CACHE_READ_MULT  = 0.10;
 const VENDOR_CONTEXT_LIMIT = 60;
 const ITEM_CONTEXT_LIMIT   = 80;
 
-interface QueueRow { id: string; plant_id: string; message_id: string | null; group_id: string | null; image_url: string; attempts: number; }
+interface QueueRow { id: string; plant_id: string; unit_id?: string | null; message_id: string | null; group_id: string | null; image_url: string; attempts: number; }
 interface ExtractionPayload {
   is_document: boolean; classification: "document" | "non_document";
   seller_name?: string | null; seller_gstin?: string | null;
