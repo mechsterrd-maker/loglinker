@@ -23213,15 +23213,19 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
   // CADNEXA_SHARED_FILE { file }; CNX_AUTH unlocks the balloon tool. We also push
   // proactively on an interval in case CadNexa is still booting when we open it.
   const CNX_CAPS = { view3d:true, drawing2d:true, balloonTool:true, faiReport:true, bom:true, estimator:true, rfq:true };
-  const openBalloonWithFile = (f) => {
+  const openBalloonWithFile = (f, fileUrl, fileName) => {
     if (!f) return;
     balloonFileRef.current = f;
-    const qs = new URLSearchParams({
+    const params = {
       cxauto: 'balloon', tool: 'autoBalloon',
       plant: plant?.name || '', plant_id: plant?.id || '',
       user: me?.full_name || '', email: me?.email || '',
       returnTo: location.origin, projectId: p.id, projectCode: p.project_code || '',
-    });
+    };
+    // Hedge: also pass the public URL so CadNexa can auto-fetch it if its balloon
+    // tool reads a fileUrl param (postMessage bridge below is the primary path).
+    if (fileUrl) { params.fileUrl = fileUrl; params.fileName = fileName || f.name || ''; }
+    const qs = new URLSearchParams(params);
     const win = window.open('https://cadnexa.com/app.html?' + qs.toString(), '_blank');
     balloonWinRef.current = win;
     if (!win) { alert('Pop-up blocked — allow pop-ups for loglinkr to open the CadNexa balloon tool.'); return; }
@@ -23236,7 +23240,7 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
     setLoadingCad(true);
     try {
       const f = await npdUrlToFile(doc.file_url, doc.title, doc.content_type);
-      openBalloonWithFile(f);
+      openBalloonWithFile(f, doc.file_url, doc.title);
     } catch (e) { alert('Could not load the drawing: ' + e.message); }
     finally { setLoadingCad(false); }
   };
@@ -23262,9 +23266,9 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
     if (!file) return;
     setUploading('drawing');
     try {
-      await uploadTo(file, 'customer_drawing');
+      const publicUrl = await uploadTo(file, 'customer_drawing');
       onReload();
-      openBalloonWithFile(file);  // open cadnexa.com auto-balloon with the just-uploaded drawing
+      openBalloonWithFile(file, publicUrl, file.name);  // open cadnexa.com auto-balloon with the just-uploaded drawing
     } catch (e) { alert('Upload failed: ' + e.message); }
     finally { setUploading(''); }
   };
