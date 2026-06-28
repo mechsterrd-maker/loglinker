@@ -23194,6 +23194,8 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
   const modelRef = useRef(null);
   const resultRef = useRef(null);
   const faiRef = useRef(null);
+  const balloonFileRef = useRef(null);  // drawing held for the cadnexa.com auto-balloon popup bridge
+  const balloonWinRef = useRef(null);   // handle to the opened cadnexa.com window
   const [uploading, setUploading] = useState('');     // 'drawing' | 'model' | 'balloon_drawing' | 'fai_report' | ''
   const [loadingCad, setLoadingCad] = useState(false);
   const [cad, setCad] = useState(null);               // { file, mode:'3d' } | null
@@ -23205,16 +23207,37 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
   const balloonDocs  = docs.filter(d => d.kind === 'balloon_drawing');
   const faiDocs      = docs.filter(d => d.kind === 'fai_report');
 
-  // Load the stored 2D drawing straight into the EMBEDDED CadNexa auto-balloon
-  // tool via the postMessage file bridge (same mechanism as the 3D viewer). The
-  // old external-tab handoff only passed a fileUrl query param that CadNexa never
-  // fetched, so the drawing never loaded.
+  // Open CadNexa's auto-balloon tool on cadnexa.com (new tab) and push the drawing
+  // into it via the postMessage file bridge so it auto-loads. CadNexa asks the
+  // opener for the file (CADNEXA_REQUEST_SHARED_FILE) and we answer with
+  // CADNEXA_SHARED_FILE { file }; CNX_AUTH unlocks the balloon tool. We also push
+  // proactively on an interval in case CadNexa is still booting when we open it.
+  const CNX_CAPS = { view3d:true, drawing2d:true, balloonTool:true, faiReport:true, bom:true, estimator:true, rfq:true };
+  const openBalloonWithFile = (f) => {
+    if (!f) return;
+    balloonFileRef.current = f;
+    const qs = new URLSearchParams({
+      cxauto: 'balloon', tool: 'autoBalloon',
+      plant: plant?.name || '', plant_id: plant?.id || '',
+      user: me?.full_name || '', email: me?.email || '',
+      returnTo: location.origin, projectId: p.id, projectCode: p.project_code || '',
+    });
+    const win = window.open('https://cadnexa.com/app.html?' + qs.toString(), '_blank');
+    balloonWinRef.current = win;
+    if (!win) { alert('Pop-up blocked — allow pop-ups for loglinkr to open the CadNexa balloon tool.'); return; }
+    let n = 0;
+    const h = setInterval(() => {
+      n++; if (n > 20 || !balloonWinRef.current || balloonWinRef.current.closed) { clearInterval(h); return; }
+      try { win.postMessage({ type: 'CADNEXA_SHARED_FILE', file: f }, '*'); } catch(_){}
+      try { win.postMessage({ type: 'CNX_AUTH', capabilities: CNX_CAPS, effectivePlan: 'bundle', isDemoMode:false, isAnonymous:false }, '*'); } catch(_){}
+    }, 500);
+  };
   const openBalloon = async (doc) => {
     setLoadingCad(true);
     try {
       const f = await npdUrlToFile(doc.file_url, doc.title, doc.content_type);
-      setCad({ file: f, mode: 'balloon' });
-    } catch (e) { alert('Could not load into CadNexa: ' + e.message); }
+      openBalloonWithFile(f);
+    } catch (e) { alert('Could not load the drawing: ' + e.message); }
     finally { setLoadingCad(false); }
   };
 
@@ -23241,7 +23264,7 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
     try {
       await uploadTo(file, 'customer_drawing');
       onReload();
-      setCad({ file, mode: 'balloon' });  // load the just-uploaded drawing into the embedded balloon tool
+      openBalloonWithFile(file);  // open cadnexa.com auto-balloon with the just-uploaded drawing
     } catch (e) { alert('Upload failed: ' + e.message); }
     finally { setUploading(''); }
   };
@@ -23265,7 +23288,17 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
   useEffect(() => {
     const onMsg = async (e) => {
       const d = e && e.data;
-      if (!d || d.type !== 'CNX_RESULT') return;
+      if (!d) return;
+      // Serve the held drawing + auth to the cadnexa.com auto-balloon popup.
+      if (d.type === 'CADNEXA_REQUEST_SHARED_FILE') {
+        if (balloonFileRef.current) { try { (e.source || balloonWinRef.current)?.postMessage({ type: 'CADNEXA_SHARED_FILE', file: balloonFileRef.current }, '*'); } catch(_){} }
+        return;
+      }
+      if (d.type === 'CNX_REQUEST_AUTH') {
+        try { (e.source || balloonWinRef.current)?.postMessage({ type: 'CNX_AUTH', capabilities: CNX_CAPS, effectivePlan: 'bundle', isDemoMode:false, isAnonymous:false }, '*'); } catch(_){}
+        return;
+      }
+      if (d.type !== 'CNX_RESULT') return;
       if (d.projectId && d.projectId !== p.id) return;
       const kind = d.kind === 'fai_report' ? 'fai_report' : 'balloon_drawing';
       try {
