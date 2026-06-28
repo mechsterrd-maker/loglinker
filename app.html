@@ -23352,6 +23352,20 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
 
   if (cad) return html`<${CadNexaHandoff} plant=${plant} me=${me} file=${cad.file} mode=${cad.mode} onClose=${() => setCad(null)} />`;
 
+  // Supabase serves user-uploaded .html as text/plain (a stored-XSS guard), so an
+  // HTML FAI report opened via its storage URL shows raw source. Fetch it and open
+  // from a same-origin blob so it renders properly.
+  const isHtmlDoc = (d) => /html/i.test(d.content_type || '') || /\.html?($|\?)/i.test(d.file_url || '');
+  const openHtmlBlob = async (url) => {
+    try {
+      const r = await fetch(url); const t = await r.text();
+      const u = URL.createObjectURL(new Blob([t], { type: 'text/html' }));
+      window.open(u, '_blank');
+      setTimeout(() => URL.revokeObjectURL(u), 60000);
+    } catch (_e) { window.open(url, '_blank'); }
+  };
+  const openDocLink = (doc) => (e) => { if (isHtmlDoc(doc)) { e.preventDefault(); openHtmlBlob(doc.file_url); } };
+
   const drawingRow = (doc) => html`
     <div key=${doc.id} style="display:flex;align-items:center;gap:6px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:7px;margin-top:6px">
       <span style="font-size:16px">📐</span>
@@ -23372,7 +23386,7 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
     <div key=${doc.id} style="display:flex;align-items:center;gap:6px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:7px;margin-top:6px">
       <span style="font-size:16px">${NPD_DOC_KIND_BY_KEY[doc.kind]?.emoji || '📄'}</span>
       <div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${doc.title}</div><div style="font-size:10px;color:var(--slate-400)">${NPD_DOC_KIND_BY_KEY[doc.kind]?.label || doc.kind}</div></div>
-      <a href=${doc.file_url} target="_blank" rel="noopener" style="font-size:11px;color:var(--slate-500);text-decoration:none">↗ open</a>
+      <a href=${doc.file_url} target="_blank" rel="noopener" onClick=${openDocLink(doc)} style="font-size:11px;color:var(--slate-500);text-decoration:none">↗ open</a>
     </div>
   `;
 
