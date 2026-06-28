@@ -265,7 +265,7 @@ body{
 .chat-name{font-weight:600;font-size:14px;margin-bottom:2px}
 .chat-preview{color:var(--slate-500);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-.chat-thread{display:flex;flex-direction:column;position:fixed;top:60px;left:0;right:0;bottom:calc(76px + var(--safe-bottom));background:#fafaf9;z-index:30}
+.chat-thread{display:flex;flex-direction:column;position:fixed;top:var(--nav-h,60px);left:0;right:0;bottom:calc(76px + var(--safe-bottom));background:#fafaf9;z-index:30}
 .thread-header{background:white;border-bottom:1px solid var(--slate-200);padding:10px 14px;display:flex;align-items:center;gap:10px;flex-shrink:0}
 .thread-back{background:none;border:none;color:var(--slate-700);cursor:pointer;font-size:18px;padding:6px}
 .thread-messages{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:6px}
@@ -419,7 +419,7 @@ body{
 }
 
 @media (min-width: 768px){
-  .chat-thread{height:calc(100vh - 80px)}
+  .chat-thread{height:calc(100vh - var(--nav-h,80px))}
 }
 
 /* Dashboard 2-column layout (desktop) */
@@ -2172,6 +2172,23 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   // navAction.ts rather than a mount-time read. { tab, sub, ts }.
   const [navAction, setNavAction] = useState(null);
   const go = (tabKey, sub) => { setTab(tabKey); setNavAction(sub ? { tab: tabKey, sub, ts: Date.now() } : null); };
+
+  // Keep --nav-h synced to the visible top-nav height. The desktop nav wraps its
+  // tabs (so its height varies); the fixed chat panel reads --nav-h for its top
+  // offset so the group header is never clipped under the nav.
+  useEffect(() => {
+    const measure = () => {
+      const desk = document.querySelector('.topnav-desktop');
+      const el = (desk && getComputedStyle(desk).display !== 'none') ? desk : document.querySelector('.topbar');
+      const h = el ? Math.round(el.getBoundingClientRect().height) : 60;
+      document.documentElement.style.setProperty('--nav-h', h + 'px');
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    let ro;
+    try { ro = new ResizeObserver(measure); document.querySelectorAll('.topnav-desktop, .topbar').forEach(n => ro.observe(n)); } catch (_e) {}
+    return () => { window.removeEventListener('resize', measure); ro && ro.disconnect(); };
+  }, []);
 
   // Load the slug -> display_name map once so role labels (People, profile,
   // dropdowns, invites) reflect any renamed roles. Bump a version after it
