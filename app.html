@@ -7509,15 +7509,25 @@ function OperatorModal({ plant, units, editTarget, onClose, onSaved }) {
 }
 
 function UnitModal({ plant, editTarget, onClose, onSaved }) {
-  const [form, setForm] = useState(editTarget || { name:'', address:'' });
+  const [form, setForm] = useState(editTarget
+    ? { ...editTarget, process_stages: Array.isArray(editTarget.process_stages) ? editTarget.process_stages : [] }
+    : { name:'', address:'', process_stages: [] });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  const toggleStage = (k) => setForm(f => {
+    const cur = f.process_stages || [];
+    return { ...f, process_stages: cur.includes(k) ? cur.filter(x => x !== k) : [...cur, k] };
+  });
 
   const submit = async (e) => {
     e.preventDefault();
     setError(''); setLoading(true);
     try {
-      const payload = { plant_id: plant.id, name: form.name, address: form.address || null };
+      const stages = (form.process_stages || []).filter(Boolean);
+      const payload = { plant_id: plant.id, name: form.name, address: form.address || null,
+        // Empty = auto (derive from this unit's machines when logging production).
+        process_stages: stages.length ? stages : null };
       const { error } = editTarget
         ? await sb.from('units').update(payload).eq('id', editTarget.id)
         : await sb.from('units').insert(payload);
@@ -7546,6 +7556,21 @@ function UnitModal({ plant, editTarget, onClose, onSaved }) {
         <form onSubmit=${submit}>
           <div class="field"><label>Unit Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} placeholder="Unit 1" /></div>
           <div class="field"><label>Address</label><input type="text" value=${form.address || ''} onChange=${e => setForm({...form, address: e.target.value})} placeholder="Optional" /></div>
+          <div class="field">
+            <label>Processes this unit runs <span style="font-weight:400;color:var(--slate-500);font-size:11px">— shown when logging production here</span></label>
+            <div style="font-size:11px;color:var(--slate-500);margin:-2px 0 8px;line-height:1.5">Tick the stages this unit actually does. Leave all unticked to <strong>auto-detect</strong> from the unit's machines.</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;max-height:240px;overflow-y:auto;border:1px solid var(--slate-200);border-radius:8px;padding:8px">
+              ${Object.entries(LOG_TEMPLATES).filter(([k]) => k !== 'other').map(([k, t]) => {
+                const on = (form.process_stages || []).includes(k);
+                return html`
+                  <label key=${k} style=${'display:flex;align-items:center;gap:7px;padding:5px 7px;border-radius:6px;cursor:pointer;font-size:12.5px;'+(on?'background:var(--teal-50);font-weight:600;color:var(--slate-800)':'color:var(--slate-600)')}>
+                    <input type="checkbox" checked=${on} onChange=${() => toggleStage(k)} />
+                    ${t.label}
+                  </label>
+                `;
+              })}
+            </div>
+          </div>
           <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (editTarget ? 'Update' : 'Add')}</button>
           ${editTarget && html`<button class="btn danger" type="button" style="margin-top:8px" onClick=${remove}>Delete</button>`}
         </form>
@@ -32313,7 +32338,19 @@ const LOG_TEMPLATES = {
 };
 
 function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, shifts, users, defaultDate, onClose, onSaved }) {
-  const STAGE_OPTIONS = Object.entries(LOG_TEMPLATES).map(([v, t]) => ({ v, l: t.label }));
+  // Per-unit process list. Each unit is its own factory, so it only shows the
+  // stages it actually runs:
+  //   1. units.process_stages (explicit list set by the owner), else
+  //   2. the distinct categories of the unit's own machines, else
+  //   3. the full catalog (unit not set up yet — don't dead-end).
+  const _activeUnit = (units || []).find(u => u.id === _activeUnitId) || (units && units[0]) || null;
+  const _configured = Array.isArray(_activeUnit?.process_stages) ? _activeUnit.process_stages.filter(k => LOG_TEMPLATES[k]) : [];
+  const _fromMachines = Array.from(new Set((machines || []).map(m => m.category).filter(k => LOG_TEMPLATES[k])));
+  const _stageKeys = _configured.length ? _configured : (_fromMachines.length ? _fromMachines : Object.keys(LOG_TEMPLATES));
+  // Keep catalog order; always allow "Other" as a fallback.
+  const _allowed = new Set([..._stageKeys, 'other']);
+  const STAGE_OPTIONS = Object.entries(LOG_TEMPLATES).filter(([v]) => _allowed.has(v)).map(([v, t]) => ({ v, l: t.label }));
+  const _defaultStage = STAGE_OPTIONS[0]?.v || 'other';
 
   // If filling pendingEntry, prefill from it; else default
   const isReconcile = !!pendingEntry?.id;
@@ -32336,7 +32373,7 @@ function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, 
     shift_id: shifts[0]?.id || '',
     unit_id: units[0]?.id || '',
     part_id: parts[0]?.id || '',
-    stage: 'pdc',
+    stage: _defaultStage,
     qty_good: '',
     qty_rejected: '',
     reject_reason: '',
