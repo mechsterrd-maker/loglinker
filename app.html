@@ -2248,7 +2248,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'performance'}><${PerformanceDashboards} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'chat'}><${Chat} plant=${plant} me=${me} myPerms=${myPerms} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} navAction=${navAction} setTab=${setTab} /></${Page}>
       <${Page} active=${pageTab === 'people'}><${People} plant=${plant} me=${me} myPerms=${myPerms} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
-      <${Page} active=${pageTab === 'masters'}><${MastersHub} plant=${plant} me=${me} myPerms=${myPerms} setTab=${setTab} /></${Page}>
+      <${Page} active=${pageTab === 'masters'}><${MastersHub} plant=${plant} me=${me} myPerms=${myPerms} setTab=${setTab} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${pageTab === 'calibration'}><${CalibrationModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'training'}><${TrainingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -4664,10 +4664,12 @@ function MachineDetail({ plant, me, machine, units, users, dies, parts, onClose 
   `;
 }
 
-function MachineModal({ plant, units, users, editTarget, onClose, onSaved }) {
+function MachineModal({ plant, units, users, activeUnit, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget || {
     code:'', display_name:'', make:'', model:'', category:'pdc',
-    tonnage:'', unit_id: units[0]?.id || '', status:'idle',
+    // New machines default to the unit you're currently in, so they don't
+    // accidentally land in another unit (machines are unit-specific).
+    tonnage:'', unit_id: activeUnit?.unit_id || units[0]?.id || '', status:'idle',
     default_supervisor_id: '',
     attributes: {}
   });
@@ -4699,6 +4701,7 @@ function MachineModal({ plant, units, users, editTarget, onClose, onSaved }) {
         attributes: form.attributes || {},
         default_supervisor_id: form.default_supervisor_id || null,
         display_name: form.display_name || null,
+        unit_id: form.unit_id || null,
       };
       const { error } = editTarget
         ? await sb.from('machines').update(payload).eq('id', editTarget.id)
@@ -4804,6 +4807,14 @@ function MachineModal({ plant, units, users, editTarget, onClose, onSaved }) {
             <div class="field"><label>Make</label><input type="text" value=${form.make || ''} onChange=${e => setForm({...form, make: e.target.value})} placeholder="Toshiba / Mazak / BFW" /></div>
             <div class="field"><label>Model</label><input type="text" value=${form.model || ''} onChange=${e => setForm({...form, model: e.target.value})} placeholder="DC-250J" /></div>
           </div>
+          ${(units && units.length > 0) && html`
+            <div class="field"><label>Unit *<span style="font-size:11px;color:var(--slate-500);font-weight:400"> — machines are specific to a unit</span></label>
+              <select required value=${form.unit_id || ''} onChange=${e => setForm({...form, unit_id: e.target.value})}>
+                <option value="">— Select unit —</option>
+                ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
+              </select>
+            </div>
+          `}
           ${attrFields.length > 0 && html`
             <div style="background:var(--slate-50);padding:10px 12px;border-radius:8px;margin:10px 0">
               <div style="font-size:11px;color:var(--slate-500);font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">${cat.toUpperCase()} attributes</div>
@@ -6721,7 +6732,7 @@ const MASTERS_TREE = [
   },
 ];
 
-function MastersHub({ plant, me, myPerms, setTab }) {
+function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
   const isAdminLike = me?.role === 'admin' || me?.role === 'plant_head';
   const canSeeRoles = isAdminLike && myPerms?.rbac_enforced;
   const leafGate = (leaf) => leaf.adminOnly ? canSeeRoles : true;
@@ -6759,16 +6770,23 @@ function MastersHub({ plant, me, myPerms, setTab }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    // Unit scope: machines, parts and stock items are unit-specific. When a unit
+    // is active, hide other units' rows; rows with unit_id = NULL are "shared"
+    // (the few parts/materials common across units) and stay visible. Tables
+    // without a unit_id column (dies, tools, rejection types, shifts) remain
+    // plant-wide. Mirrors the Production / Stocks modules.
+    const u = activeUnit?.unit_id;
+    const scope = (q) => u ? q.or(`unit_id.eq.${u},unit_id.is.null`) : q;
     const [un, op, sh, us, pa, ma, di, to, si, rt, ve, cu, uprLinks, uprRoles] = await Promise.all([
       sb.from('units').select('*').eq('plant_id', plant.id).order('name'),
       sb.from('users').select('*').eq('plant_id', plant.id).eq('role','operator').order('full_name'),
       sb.from('shifts').select('*').eq('plant_id', plant.id).order('start_time'),
       sb.from('users').select('*').eq('plant_id', plant.id).neq('role','operator').order('full_name'),
-      sb.from('mcp_pdc_parts').select('*').eq('plant_id', plant.id).order('part_number'),
-      sb.from('machines').select('*, units(name)').eq('plant_id', plant.id).order('code'),
+      scope(sb.from('mcp_pdc_parts').select('*').eq('plant_id', plant.id)).order('part_number'),
+      scope(sb.from('machines').select('*, units(name)').eq('plant_id', plant.id)).order('code'),
       sb.from('mcp_pdc_dies').select('*').eq('plant_id', plant.id).order('code'),
       sb.from('tools_master').select('*').eq('plant_id', plant.id).order('code'),
-      sb.from('mcp_stocks_items').select('*').eq('plant_id', plant.id).order('code'),
+      scope(sb.from('mcp_stocks_items').select('*').eq('plant_id', plant.id)).order('code'),
       sb.from('mcp_pdc_rejection_types').select('*').eq('plant_id', plant.id).order('stage,ord'),
       sb.from('mcp_logistics_vendors').select('*').eq('plant_id', plant.id).order('name'),
       sb.from('mcp_sched_customers').select('*').eq('plant_id', plant.id).order('name'),
@@ -6783,7 +6801,7 @@ function MastersHub({ plant, me, myPerms, setTab }) {
     setParts(pa.data||[]); setMachines(ma.data||[]); setDies(di.data||[]); setTools(to.data||[]);
     setStockItems(si.data||[]); setRejectionTypes(rt.data||[]); setVendors(ve.data||[]); setCustomers(cu.data||[]);
     setLoading(false);
-  }, [plant.id]);
+  }, [plant.id, activeUnit?.unit_id]);
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
 
@@ -7036,11 +7054,11 @@ function MastersHub({ plant, me, myPerms, setTab }) {
     ${modal === 'unit'       && html`<${UnitModal} plant=${plant} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'operator'   && html`<${OperatorModal} plant=${plant} units=${units} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'shift'      && html`<${ShiftModal} plant=${plant} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
-    ${modal === 'part'       && html`<${PartModal} plant=${plant} me=${me} dies=${dies} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
-    ${modal === 'machine'    && html`<${MachineModal} plant=${plant} units=${units} users=${[...users, ...operators]} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'part'       && html`<${PartModal} plant=${plant} me=${me} dies=${dies} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'machine'    && html`<${MachineModal} plant=${plant} units=${units} users=${[...users, ...operators]} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'die'        && html`<${DieModal} plant=${plant} me=${me} parts=${parts} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'tool'       && html`<${ToolModal} plant=${plant} me=${me} machines=${machines} stockItems=${stockItems} parts=${parts} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
-    ${modal === 'stock_item' && html`<${ItemModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'stock_item' && html`<${ItemModal} plant=${plant} me=${me} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'customer'   && html`<${CustomerModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'vendor'     && html`<${VendorEditModal} plant=${plant} me=${me} vendor=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'invite'     && html`<${InviteModal} plant=${plant} me=${me} units=${units} onClose=${closeModal} onSaved=${saveModal} />`}
