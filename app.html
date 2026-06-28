@@ -3308,7 +3308,7 @@ function ToolAssignmentModal({ plant, tool, parts, onClose, onSaved }) {
   useEffect(() => {
     (async () => {
       const [rsRes, exRes] = await Promise.all([
-        sb.from('v_part_route_steps').select('*').order('part_id').order('op_seq'),
+        unitScope(sb.from('v_part_route_steps').select('*').order('part_id').order('op_seq')),
         sb.from('part_op_tools').select('route_step_id, qty_per_change').eq('tool_id', tool.id),
       ]);
       setRouteSteps(rsRes.data || []);
@@ -3453,7 +3453,7 @@ function ToolForecastView({ plant, setModal, setEditTarget }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const { data, error } = await sb.from('v_tool_demand_30d').select('*').order('shortage_qty', { ascending: false, nullsFirst: false });
+    const { data, error } = await unitScope(sb.from('v_tool_demand_30d').select('*').order('shortage_qty', { ascending: false, nullsFirst: false }));
     if (!error) setForecast(data || []);
     setLoading(false);
   }, []);
@@ -8850,8 +8850,7 @@ function TopConcernsCard({ plant, setTab, activeUnit }) {
     const u = activeUnit?.unit_id;
     const scope = (q) => u ? q.or(`unit_id.eq.${u},unit_id.is.null`) : q;
     const [n, b, s] = await Promise.all([
-      // NCRs have no unit_id yet, so quality concerns stay plant-wide.
-      sb.from('v_top_ncrs_30d').select('*').order('ncr_count', { ascending: false }).limit(10),
+      scope(sb.from('v_top_ncrs_30d').select('*').order('ncr_count', { ascending: false })).limit(10),
       scope(sb.from('v_top_breakdowns_30d').select('*').order('total_downtime_hrs', { ascending: false })).limit(10),
       scope(sb.from('v_material_burn_rate').select('*').in('risk_level', ['out_of_stock','critical','warning'])).limit(10),
     ]);
@@ -15117,7 +15116,7 @@ function MachineProductionModule({ plant, me }) {
   const refresh = useCallback(async () => {
     setLoading(true);
     const [s, m, r, sh] = await Promise.all([
-      sb.from('v_machine_runtime_summary').select('*').eq('plant_id', plant.id).order('availability_pct', { ascending:true, nullsFirst:false }),
+      unitScope(sb.from('v_machine_runtime_summary').select('*').eq('plant_id', plant.id).order('availability_pct', { ascending:true, nullsFirst:false })),
       sb.from('machines').select('*').eq('plant_id', plant.id).order('code'),
       sb.from('mcp_pdc_machine_idle_log').select('*, machine:machine_id(code, display_name), creator:created_by(full_name)').eq('plant_id', plant.id).order('log_date', { ascending:false }).order('created_at', { ascending:false }).limit(200),
       sb.from('shifts').select('*').eq('plant_id', plant.id).order('name'),
@@ -19738,7 +19737,7 @@ function SubContractingModule({ plant, me }) {
   const refresh = useCallback(async () => {
     setLoading(true);
     const [openL, closedL, vL] = await Promise.all([
-      sb.from('v_jobwork_open_lines').select('*').eq('plant_id', plant.id).order('sent_date', { ascending:true }).limit(500),
+      unitScope(sb.from('v_jobwork_open_lines').select('*').eq('plant_id', plant.id).order('sent_date', { ascending:true }).limit(500)),
       sb.from('mcp_logistics_jobwork_lines').select('*, vendor:vendor_id(name), part:part_id(part_number, name)').eq('plant_id', plant.id).eq('status', 'closed').order('closed_at', { ascending:false }).limit(100),
       sb.from('mcp_logistics_vendors').select('id, name, gstin, is_jobwork_vendor').eq('plant_id', plant.id).order('name'),
     ]);
@@ -22137,7 +22136,7 @@ function TpmModule({ plant, me }) {
 
   const refresh = async () => {
     setLoading(true);
-    const { data } = await sb.from('v_tpm_today').select('*').eq('plant_id', plant.id);
+    const { data } = await unitScope(sb.from('v_tpm_today').select('*').eq('plant_id', plant.id));
     setStatusList((data || []).sort((a, b) => (a.machine_name || '').localeCompare(b.machine_name || '')));
     setLoading(false);
   };
@@ -25474,7 +25473,7 @@ function StageLogBatchVoiceModal({ plant, me, parts, machines, units, shifts, us
   // Load route steps once — we need them to resolve op_seq/op_name to a
   // specific route_step_id for the RPC payload.
   useEffect(() => {
-    sb.from('v_part_route_steps').select('*').order('part_id').order('op_seq').then(({ data }) => setRouteSteps(data || []));
+    unitScope(sb.from('v_part_route_steps').select('*').order('part_id').order('op_seq')).then(({ data }) => setRouteSteps(data || []));
   }, []);
 
   const invokeFn = async (path, init) => {
@@ -29918,8 +29917,8 @@ function Documents({ plant, me, activeUnit }) {
     const [d, v, jw, r, iu, o] = await Promise.all([
       docsQ,
       sb.from('mcp_logistics_vendors').select('*').eq('plant_id', plant.id).order('name'),
-      sb.from('v_vendor_jobwork_stock').select('*').eq('plant_id', plant.id).order('vendor_name'),
-      sb.from('v_returnables_open').select('*').eq('plant_id', plant.id).limit(500),
+      unitScope(sb.from('v_vendor_jobwork_stock').select('*').eq('plant_id', plant.id).order('vendor_name')),
+      unitScope(sb.from('v_returnables_open').select('*').eq('plant_id', plant.id).limit(500)),
       sb.from('interunit_transfers').select('*, from_unit:from_unit_id(name), to_unit:to_unit_id(name), out_doc:out_doc_id(doc_number, doc_date), in_doc:in_doc_id(doc_number, doc_date)').eq('plant_id', plant.id).order('created_at', { ascending: false }).limit(200),
       sb.rpc('ocr_usage_state', { p_plant_id: plant.id }),
     ]);
@@ -31446,7 +31445,7 @@ function StageLog({ plant, me, parts, machines, dies, units, shifts, users }) {
       .order('part_id').order('stage');
     if (filterPart !== 'all') q = q.eq('part_id', filterPart);
     if (filterStatus !== 'all') q = q.eq('status', filterStatus);
-    const { data: s } = await sb.from('v_daily_production_summary').select('*').eq('log_date', filterDate);
+    const { data: s } = await unitScope(sb.from('v_daily_production_summary').select('*').eq('log_date', filterDate));
     const { data } = await q;
     setLogs(data || []);
     setSummary(s || []);
@@ -31605,7 +31604,7 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
     (async () => {
       const [tRes, rsRes] = await Promise.all([
         sb.from('tools_master').select('*').eq('is_active', true).order('code'),
-        sb.from('v_part_route_steps').select('*').order('part_id').order('op_seq'),
+        unitScope(sb.from('v_part_route_steps').select('*').order('part_id').order('op_seq')),
       ]);
       setTools(tRes.data || []);
       setRouteSteps(rsRes.data || []);
@@ -33510,7 +33509,7 @@ function TracePage({ plant, me, activeUnit }) {
 
   const runTrace = async () => {
     setLoading(true);
-    let q = sb.from('v_trace_events').select('*').eq('plant_id', plant.id);
+    let q = unitScope(sb.from('v_trace_events').select('*').eq('plant_id', plant.id));
 
     if (anchor === 'date') {
       const d = new Date(date);
@@ -33743,7 +33742,7 @@ function MovementsView({ plant, me }) {
   // Load (date+direction+status only — counterparty/item filtered client-side)
   const load = useCallback(async () => {
     setLoading(true);
-    let q = sb.from('v_movements').select('*').eq('plant_id', plant.id);
+    let q = unitScope(sb.from('v_movements').select('*').eq('plant_id', plant.id));
     if (direction !== 'both') q = q.eq('direction', direction);
     if (dateFrom) q = q.gte('movement_date', dateFrom);
     if (dateTo) q = q.lte('movement_date', dateTo);
@@ -34093,7 +34092,7 @@ function PlanVsSupplyView({ plant, me }) {
   const refresh = useCallback(async () => {
     setLoading(true);
     const [pvsRes, mRes] = await Promise.all([
-      sb.from('v_plan_vs_supply').select('*').order('effective_due_date', { ascending: true, nullsFirst: false }),
+      unitScope(sb.from('v_plan_vs_supply').select('*').order('effective_due_date', { ascending: true, nullsFirst: false })),
       sb.from('machines').select('id, code, category, status', { count: 'exact', head: false }),
     ]);
     if (!pvsRes.error) setRows(pvsRes.data || []);
@@ -39362,7 +39361,7 @@ async function genToolAssignmentMatrix(plant) {
 }
 
 async function genPlanVsSupply(plant) {
-  const { data: rows } = await sb.from('v_plan_vs_supply').select('*').order('effective_due_date');
+  const { data: rows } = await unitScope(sb.from('v_plan_vs_supply').select('*').order('effective_due_date'));
   const trs = (rows || []).map(r => `<tr>
     <td>${esc(r.customer_name || '-')}</td>
     <td><b>${esc(r.part_number || r.part_name_raw || '-')}</b></td>
