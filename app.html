@@ -2290,7 +2290,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       </div>
       ${profileOpen && html`<${ProfileModal} me=${me} user=${user} plant=${plant} activeUnit=${activeUnit} logout=${logout} onClose=${() => setProfileOpen(false)} onSaved=${() => { setProfileOpen(false); reload && reload(); }} />`}
 
-      <${Page} active=${pageTab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} /></${Page}>
+      <${Page} active=${pageTab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} myPerms=${myPerms} /></${Page}>
       <${Page} active=${pageTab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'attendance'}><${AttendanceModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'self_attendance'}><${SelfAttendancePage} plant=${plant} me=${me} reload=${reload} /></${Page}>
@@ -2644,9 +2644,14 @@ function TabBtn({ icon, label, active, onClick, badge }) {
 }
 
 // ============= HOME =============
-function Home({ plant, me, activeUnit, setTab, go, reload }) {
+function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
   // Fallback so Home still works if rendered without `go` (e.g. older callers).
   const navTo = go || ((t) => setTab(t));
+  // RBAC: hide Home shortcuts/cards for modules this role can't view, so the
+  // role matrix is honoured on the dashboard too (owners/zero-role bypass).
+  // Respects Preview-as-role (myPerms is the effective/preview perms).
+  const _hg = moduleAccessGuard(myPerms);
+  const canSee = (k) => !_hg.enforce || !RBAC_MODULE_KEYS.has(k) || _hg.canView(k);
   const [stats, setStats] = useState({ units: 0, users: 1, machines: 0, dies: 0, shotsToday: 0, openActions: 0, openNcrs: 0, openBreakdowns: 0, lowStock: 0 });
   const [loading, setLoading] = useState(true);
   const fab = isFab(plant);
@@ -2758,7 +2763,7 @@ function Home({ plant, me, activeUnit, setTab, go, reload }) {
           const fabDefault = ['projects','new_dc','new_po','upload_bill','actions','chat'];
           const nonFabDefault = ['production','quality','maintenance','tpm','documents','chat','stocks','masters'];
           const override = Array.isArray(plant?.quick_entry_tiles) && plant.quick_entry_tiles.length > 0 ? plant.quick_entry_tiles : null;
-          const keys = override || (fab ? fabDefault : nonFabDefault);
+          const keys = (override || (fab ? fabDefault : nonFabDefault)).filter(canSee);
           return keys.map(k => CATALOG[k]).filter(Boolean).map((b, i) => html`
           <button key=${b.tab + (b.sub||'') + i} onClick=${() => navTo(b.tab, b.sub)}
             style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:10px 4px;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:8px;cursor:pointer;font-family:inherit;transition:all 0.1s"
@@ -2773,7 +2778,7 @@ function Home({ plant, me, activeUnit, setTab, go, reload }) {
     </div>
     ${showNewProject && html`<${NewProjectModal} plant=${plant} me=${me} onClose=${() => setShowNewProject(false)} onCreated=${(id) => { setShowNewProject(false); navTo('projects'); }} />`}
 
-    <${PettyCashHomeCard} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />
+    ${canSee('petty_cash') && html`<${PettyCashHomeCard} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />`}
 
     <div class="dashboard-grid">
       <div class="dashboard-col-main">
