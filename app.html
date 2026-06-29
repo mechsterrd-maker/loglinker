@@ -39163,6 +39163,92 @@ const rpFmtDate = (s) => s ? new Date(s).toLocaleDateString('en-IN', { dateStyle
 // One report generator can render any view I built (NCR log, CAPA register,
 // approved supplier list, etc.). Catalog entries set `view: 'v_iatf_xxx'`
 // and the switch routes them all here. Schema-agnostic: columns auto-inferred.
+// ── Lightweight SVG chart engine (no library; renders in the opened report
+// window + prints). Types: bar, line, donut, pareto. Returns an HTML string. ──
+function chartSVG(type, data, opts) {
+  opts = opts || {};
+  data = (data || []).filter(d => d && isFinite(d.value));
+  if (!data.length) return '';
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+  const W = opts.width || 680, H = opts.height || 240, pad = 38, teal = '#0d9488', grid = '#e2e8f0';
+  const inr = n => (typeof n === 'number' ? n.toLocaleString('en-IN') : n);
+  const title = opts.title ? '<div style="font-size:12px;font-weight:600;color:#334155;margin:14px 0 6px">📊 ' + esc(opts.title) + '</div>' : '';
+
+  if (type === 'donut') {
+    const total = data.reduce((s, d) => s + Math.max(0, d.value), 0) || 1;
+    const cx = 110, cy = 110, r = 82, rin = 48;
+    const cols = ['#0d9488','#0ea5e9','#f59e0b','#ef4444','#8b5cf6','#10b981','#64748b','#ec4899'];
+    let a0 = -Math.PI/2, segs = '', leg = '';
+    data.slice(0, 8).forEach((d, i) => {
+      const frac = Math.max(0, d.value)/total, a1 = a0 + frac*2*Math.PI, c = cols[i%cols.length];
+      const x0 = cx+r*Math.cos(a0), y0 = cy+r*Math.sin(a0), x1 = cx+r*Math.cos(a1), y1 = cy+r*Math.sin(a1);
+      const xi0 = cx+rin*Math.cos(a1), yi0 = cy+rin*Math.sin(a1), xi1 = cx+rin*Math.cos(a0), yi1 = cy+rin*Math.sin(a0);
+      const lg = frac > 0.5 ? 1 : 0;
+      segs += '<path d="M'+x0+' '+y0+' A'+r+' '+r+' 0 '+lg+' 1 '+x1+' '+y1+' L'+xi0+' '+yi0+' A'+rin+' '+rin+' 0 '+lg+' 0 '+xi1+' '+yi1+' Z" fill="'+c+'"/>';
+      leg += '<div style="display:flex;align-items:center;gap:6px;font-size:11px;color:#334155;margin:2px 0"><span style="width:10px;height:10px;border-radius:2px;background:'+c+'"></span>'+esc(d.label)+' · <b>'+inr(d.value)+'</b> ('+Math.round(frac*100)+'%)</div>';
+      a0 = a1;
+    });
+    return '<div style="margin:8px 0 18px">'+title+'<div style="display:flex;align-items:center;gap:24px;flex-wrap:wrap"><svg width="230" height="220" viewBox="0 0 220 220">'+segs+'</svg><div>'+leg+'</div></div></div>';
+  }
+
+  let rows = data.slice(0, type === 'line' ? 60 : 16);
+  if (type === 'pareto') rows = [...rows].sort((a, b) => b.value - a.value);
+  const max = Math.max(...rows.map(d => d.value), 1);
+  const x0 = pad, y0 = 10, plotW = W - pad*2, plotH = H - y0 - 30;
+  let grids = '';
+  for (let g = 0; g <= 4; g++) { const yy = y0 + plotH*(g/4), val = Math.round(max*(1-g/4));
+    grids += '<line x1="'+x0+'" y1="'+yy+'" x2="'+(x0+plotW)+'" y2="'+yy+'" stroke="'+grid+'"/><text x="'+(x0-6)+'" y="'+(yy+3)+'" text-anchor="end" font-size="9" fill="#94a3b8">'+inr(val)+'</text>'; }
+  let svg;
+  if (type === 'line') {
+    const step = rows.length > 1 ? plotW/(rows.length-1) : 0;
+    const pts = rows.map((d, i) => (x0+i*step)+','+(y0+plotH*(1-d.value/max))).join(' ');
+    const dots = rows.map((d, i) => '<circle cx="'+(x0+i*step)+'" cy="'+(y0+plotH*(1-d.value/max))+'" r="2.5" fill="'+teal+'"/>').join('');
+    let xl = ''; [0, Math.floor(rows.length/2), rows.length-1].forEach(i => { if (rows[i]) xl += '<text x="'+(x0+i*step)+'" y="'+(y0+plotH+14)+'" text-anchor="middle" font-size="9" fill="#64748b">'+esc(String(rows[i].label)).slice(0,12)+'</text>'; });
+    svg = grids+'<polygon points="'+x0+','+(y0+plotH)+' '+pts+' '+(x0+(rows.length-1)*step)+','+(y0+plotH)+'" fill="'+teal+'" opacity="0.08"/><polyline points="'+pts+'" fill="none" stroke="'+teal+'" stroke-width="2"/>'+dots+xl;
+  } else {
+    const bw = plotW/rows.length, gap = Math.min(10, bw*0.25);
+    const bars = rows.map((d, i) => { const h = plotH*(d.value/max), bx = x0+i*bw+gap/2, by = y0+plotH-h;
+      return '<rect x="'+bx+'" y="'+by+'" width="'+(bw-gap)+'" height="'+Math.max(0,h)+'" rx="2" fill="'+teal+'"/><text x="'+(bx+(bw-gap)/2)+'" y="'+(by-3)+'" text-anchor="middle" font-size="8" fill="#475569">'+inr(d.value)+'</text><text x="'+(bx+(bw-gap)/2)+'" y="'+(y0+plotH+12)+'" text-anchor="middle" font-size="8" fill="#64748b">'+esc(String(d.label)).slice(0,9)+'</text>'; }).join('');
+    let cum = '';
+    if (type === 'pareto') { const tot = rows.reduce((s, d) => s+d.value, 0)||1; let acc = 0;
+      const cp = rows.map((d, i) => { acc += d.value; return (x0+i*bw+bw/2)+','+(y0+plotH*(1-acc/tot)); }).join(' ');
+      cum = '<polyline points="'+cp+'" fill="none" stroke="#f59e0b" stroke-width="2"/>'; }
+    svg = grids+bars+cum;
+  }
+  return '<div style="margin:8px 0 18px">'+title+'<svg width="100%" viewBox="0 0 '+W+' '+H+'" style="max-width:'+W+'px;overflow:visible">'+svg+'</svg>'+(type==='pareto'?'<div style="font-size:10px;color:#94a3b8">Bars = value · orange line = cumulative %</div>':'')+'</div>';
+}
+
+function chartTypeFor(viewName) {
+  const v = (viewName || '').toLowerCase();
+  if (/pareto/.test(v)) return 'pareto';
+  if (/trend|_yield|forecast|copq|cycle_time|over_time|monthly/.test(v)) return 'line';
+  if (/disposition|_mix|_split|abc_analysis/.test(v)) return 'donut';
+  return 'bar';
+}
+
+// Pick a label + value column from a report's rows and render a chart. Returns
+// '' (→ table only) when there's no sensible numeric series.
+function autoChartHtml(viewName, rows, cols) {
+  try {
+    if (!rows.length) return '';
+    const isNum = c => rows.some(r => typeof r[c] === 'number');
+    const numCols = cols.filter(c => isNum(c) && !/_id$|^year$|month_num|plant_id/i.test(c));
+    if (!numCols.length) return '';
+    const labelCol = cols.find(c => /name|code|part|machine|customer|vendor|item|month|date|cause|type|category|bucket|dept|reason|status|instrument/i.test(c) && !numCols.includes(c))
+                  || cols.find(c => !numCols.includes(c)) || cols[0];
+    const valCol = numCols.find(c => /count|qty|total|sum|amount|cost|ppm|pct|percent|days|hours|hrs|value|downtime|spend|revenue|score|avg|rate|util|availab/i.test(c)) || numCols[0];
+    const type = chartTypeFor(viewName);
+    let pts = rows.map(r => ({ label: String(r[labelCol] ?? '—'), value: Number(r[valCol]) || 0 })).filter(p => isFinite(p.value));
+    if (!pts.length) return '';
+    if (type !== 'line') {
+      const m = {}; pts.forEach(p => { m[p.label] = (m[p.label] || 0) + p.value; });
+      pts = Object.entries(m).map(([label, value]) => ({ label, value })).sort((a, b) => b.value - a.value).slice(0, 16);
+    }
+    const lbl = c => c.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+    return chartSVG(type, pts, { title: lbl(valCol) + ' by ' + lbl(labelCol) });
+  } catch (_e) { return ''; }
+}
+
 async function genIatfView(plant, viewName, title, clauses, dateFrom, dateTo) {
   let q = sb.from(viewName).select('*').eq('plant_id', plant.id);
 
@@ -39236,6 +39322,7 @@ async function genIatfView(plant, viewName, title, clauses, dateFrom, dateTo) {
   if (rows.length === 0) {
     body += '<div class="empty">No records yet — operational activity will populate this report automatically.</div>';
   } else {
+    body += autoChartHtml(viewName, rows, cols);
     body += '<table class="data"><thead><tr>';
     for (const c of cols) body += '<th>' + labelFor(c) + '</th>';
     body += '</tr></thead><tbody>';
