@@ -1767,6 +1767,7 @@ const MORE_GROUPS = [
     icon: '🛡',
     sub: 'Compliance · audit-ready records',
     items: [
+      { key:'quality_rejections',  icon:'🔬', label:'Daily Rejection & Analytics', sub:'Inhouse / supplier / customer rejection log · Pareto · PPM · COPQ · Rework' },
       { key:'customer_complaints', icon:'📞', label:'Customer Complaints',       sub:'Closure workflow · 8D · email reference · customer signoff' },
       { key:'pfmea',               icon:'⚠️', label:'PFMEA Register',     iatf:true, sub:'Process FMEAs, RPN review (IATF 8.3)' },
       { key:'quality_objectives',  icon:'🎯', label:'Quality Objectives', iatf:true, sub:'KPI targets per function (IATF 6.2)' },
@@ -2331,6 +2332,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'mom'}><${MomModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'voice_notes'}><${VoiceNotesModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
+      <${Page} active=${pageTab === 'quality_rejections'}><${QualityAnalyticsModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} /></${Page}>
       <${Page} active=${pageTab === 'doc_formats'}><${DocFormatsModule} plant=${plant} me=${me} /></${Page}>
@@ -3590,7 +3592,7 @@ function PartModal({ plant, me, dies, activeUnit, editTarget, onClose, onSaved }
     part_number: '', revision: 'A', name: '', description: '',
     part_type: 'finished', status: 'active',
     customer: '', drawing_url: '', weight_kg: '', uom: 'nos',
-    default_die_id: '', notes: ''
+    default_die_id: '', cost_per_piece: '', notes: ''
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -3612,6 +3614,7 @@ function PartModal({ plant, me, dies, activeUnit, editTarget, onClose, onSaved }
         weight_kg: form.weight_kg ? parseFloat(form.weight_kg) : null,
         uom: form.uom,
         default_die_id: form.default_die_id || null,
+        cost_per_piece: form.cost_per_piece === '' ? null : parseFloat(form.cost_per_piece),
         notes: form.notes || null,
       };
       if (!editTarget) {
@@ -3671,6 +3674,7 @@ function PartModal({ plant, me, dies, activeUnit, editTarget, onClose, onSaved }
               </select>
             </div>
           </div>
+          <div class="field"><label>Cost / piece (₹)</label><input type="number" step="0.01" value=${form.cost_per_piece || ''} onChange=${e => setForm({...form, cost_per_piece: e.target.value})} placeholder="for COPQ — scrap & rework costing" /></div>
           <div class="field"><label>Default Die</label>
             <select value=${form.default_die_id || ''} onChange=${e => setForm({...form, default_die_id: e.target.value})}>
               <option value="">— None —</option>
@@ -7743,6 +7747,7 @@ const RBAC_MODULES = [
   { key:'jobwork', label:'Sub-Contracting', group:'commercial' },
   { key:'supplier_chase', label:'Supplier Chase', group:'commercial' },
   { key:'customer_complaints', label:'Customer Complaints', group:'quality' },
+  { key:'quality_rejections', label:'Daily Rejection & Analytics', group:'quality' },
   { key:'self_attendance', label:'Punch IN / My Attendance', group:'workforce' },
   { key:'attendance', label:'Attendance Register', group:'workforce' },
   { key:'attendance_setup', label:'Attendance / Payroll Setup', group:'workforce' },
@@ -13135,6 +13140,330 @@ function computeQuoteBreakup(matCost, processTotal, qty, ld) {
   pct('Overhead', ld.overhead_pct);
   pct('Profit', ld.profit_pct);
   return { prime, lines, final: r };
+}
+
+// ============= QUALITY: DAILY REJECTION & ANALYTICS =============
+// One detailed daily rejection entry feeds Pareto, PPM trends, COPQ and Rework
+// dashboards — replaces the customer's manual quality Excel. Unit-scoped.
+const QR_PPM_DENOM = 1000000;
+function qrMonthKey(d) { return (d || '').slice(0, 7); }
+
+function QualityAnalyticsModule({ plant, me, activeUnit }) {
+  const [view, setView] = useState('log');     // log | pareto | ppm | copq | rework
+  const [rows, setRows] = useState([]);
+  const [parts, setParts] = useState([]);
+  const [rtypes, setRtypes] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [ppmBase, setPpmBase] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [modal, setModal] = useState(null);     // 'entry' | 'ppm'
+  const [editTarget, setEditTarget] = useState(null);
+  const [month, setMonth] = useState(new Date().toISOString().slice(0, 7));
+  const [ppmCat, setPpmCat] = useState('inhouse');
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [rj, pa, rt, us, pb] = await Promise.all([
+      unitScope(sb.from('mcp_quality_rejections').select('*').eq('plant_id', plant.id)).order('rej_date', { ascending:false }).limit(3000),
+      unitScope(sb.from('mcp_pdc_parts').select('id, part_number, name, cost_per_piece').eq('plant_id', plant.id)).order('part_number'),
+      sb.from('mcp_pdc_rejection_types').select('id, code, label, stage').eq('plant_id', plant.id).eq('active', true).order('ord'),
+      sb.from('users').select('id, full_name').eq('plant_id', plant.id).order('full_name'),
+      unitScope(sb.from('mcp_quality_ppm_base').select('*').eq('plant_id', plant.id)),
+    ]);
+    setRows(rj.data || []); setParts(pa.data || []); setRtypes(rt.data || []); setUsers(us.data || []); setPpmBase(pb.data || []);
+    setLoading(false);
+  }, [plant.id, _activeUnitId]);
+  useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
+
+  const partCost = (id) => { const p = parts.find(x => x.id === id); return p ? Number(p.cost_per_piece || 0) : 0; };
+  const monthRows = rows.filter(r => qrMonthKey(r.rej_date) === month);
+  const del = async (id) => { if (!confirm('Delete this rejection entry?')) return; await sb.from('mcp_quality_rejections').delete().eq('id', id); refresh(); };
+
+  // ---- Pareto (reason-wise, current month) ----
+  const pareto = (() => {
+    const by = {};
+    for (const r of monthRows) by[r.reason || '—'] = (by[r.reason || '—'] || 0) + Number(r.total_qty || 0);
+    const arr = Object.entries(by).map(([reason, qty]) => ({ reason, qty })).sort((a, b) => b.qty - a.qty);
+    const tot = arr.reduce((s, x) => s + x.qty, 0) || 1;
+    let cum = 0; arr.forEach(p => { cum += p.qty; p.cum = cum; p.cumPct = cum / tot * 100; });
+    return { arr, tot };
+  })();
+
+  // ---- PPM trend (last 12 months for the chosen category) ----
+  const ppmSeries = (() => {
+    const out = [];
+    const now = new Date(month + '-01');
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const mk = d.toISOString().slice(0, 7);
+      const scrap = rows.filter(r => qrMonthKey(r.rej_date) === mk && (r.category || 'inhouse') === ppmCat)
+        .reduce((s, r) => s + Number(r.scrap_qty || r.total_qty || 0), 0);
+      const base = ppmBase.find(b => qrMonthKey(b.month) === mk && (b.category || 'inhouse') === ppmCat);
+      const rec = base ? Number(base.received_qty || 0) : 0;
+      const ppm = rec > 0 ? Math.round(scrap / rec * QR_PPM_DENOM) : null;
+      out.push({ mk, label: d.toLocaleDateString('en-IN', { month:'short' }), scrap, rec, ppm });
+    }
+    return out;
+  })();
+
+  // ---- COPQ (current month) ----
+  const copq = (() => {
+    let scrapCost = 0, reworkCost = 0; const byPart = {};
+    for (const r of monthRows) {
+      const cost = Number(r.cost_per_piece || partCost(r.part_id) || 0);
+      const sc = Number(r.scrap_qty || 0) * cost;
+      const rc = Number(r.rework_qty || 0) * cost * 0.25;   // rework ≈ 25% of part value
+      scrapCost += sc; reworkCost += rc;
+      const k = r.part_name || (parts.find(p => p.id === r.part_id) || {}).part_number || '—';
+      byPart[k] = (byPart[k] || 0) + sc + rc;
+    }
+    const top = Object.entries(byPart).map(([part, cost]) => ({ part, cost })).sort((a, b) => b.cost - a.cost).slice(0, 12);
+    return { scrapCost, reworkCost, total: scrapCost + reworkCost, top };
+  })();
+
+  // ---- Rework (current month) ----
+  const reworkRows = monthRows.filter(r => Number(r.rework_qty || 0) > 0);
+  const reworkTotal = reworkRows.reduce((s, r) => s + Number(r.rework_qty || 0), 0);
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  const tabs = [['log','📋 Log'],['pareto','📊 Pareto'],['ppm','📈 PPM'],['copq','💸 COPQ'],['rework','🔧 Rework']];
+  const openAdd = () => { setEditTarget(null); setModal('entry'); };
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start">
+      <div><h1>🔬 Daily Rejection & Analytics</h1><div class="sub">Inhouse / supplier / customer rejection · Pareto · PPM · COPQ · Rework</div></div>
+      <button class="btn small" onClick=${openAdd} style="white-space:nowrap">+ Log rejection</button>
+    </div>
+
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;align-items:center">
+      ${tabs.map(([k, l]) => html`<button key=${k} class=${'btn small ' + (view===k?'':'ghost')} onClick=${() => setView(k)} style="font-size:12px">${l}</button>`)}
+      <div style="flex:1"></div>
+      <${MonthField} value=${month} onChange=${setMonth} />
+    </div>
+
+    ${view === 'log' && html`
+      <div class="section-h">Rejection entries · ${monthRows.length}</div>
+      ${monthRows.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">✅</div>No rejections logged for this month</div></div>` :
+        html`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead><tr style="background:var(--slate-50);text-align:left">
+            ${['Date','Part','Reason','Stage','Total','Rework','Scrap','Supplier','Insp.',''].map(h => html`<th style="padding:7px 8px;font-weight:600;color:var(--slate-600);white-space:nowrap">${h}</th>`)}
+          </tr></thead><tbody>
+          ${monthRows.map(r => html`<tr key=${r.id} style="border-top:1px solid var(--slate-100)">
+            <td style="padding:6px 8px;white-space:nowrap">${(r.rej_date||'').slice(0,10)}</td>
+            <td style="padding:6px 8px">${r.part_name || (parts.find(p=>p.id===r.part_id)||{}).part_number || '—'}</td>
+            <td style="padding:6px 8px">${r.reason}</td>
+            <td style="padding:6px 8px;color:var(--slate-500)">${r.found_stage || '—'}</td>
+            <td style="padding:6px 8px;font-weight:600">${fmtNum(r.total_qty)}</td>
+            <td style="padding:6px 8px;color:var(--amber-700)">${fmtNum(r.rework_qty)}</td>
+            <td style="padding:6px 8px;color:var(--rose-600)">${fmtNum(r.scrap_qty)}</td>
+            <td style="padding:6px 8px;color:var(--slate-500)">${r.supplier_name || (r.category==='supplier'?'—':'')}</td>
+            <td style="padding:6px 8px;color:var(--slate-500)">${r.inspector_name || ''}</td>
+            <td style="padding:6px 8px;white-space:nowrap">
+              <button class="btn small ghost" style="padding:2px 6px;font-size:10px" onClick=${() => { setEditTarget(r); setModal('entry'); }}>Edit</button>
+              <button class="btn small ghost" style="padding:2px 6px;font-size:10px;color:var(--rose-600)" onClick=${() => del(r.id)}>✕</button>
+            </td>
+          </tr>`)}
+        </tbody></table></div>`}
+    `}
+
+    ${view === 'pareto' && html`
+      <div class="card">
+        <div class="card-title">Rejection Pareto · ${month} · total ${fmtNum(pareto.tot)} pcs</div>
+        ${pareto.arr.length === 0 ? html`<div class="empty" style="padding:16px">No data</div>` : (() => {
+          const top = pareto.arr.slice(0, 12);
+          const max = top[0]?.qty || 1;
+          return html`<div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
+            ${top.map((p, i) => html`<div key=${p.reason}>
+              <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:2px">
+                <span style="color:var(--slate-700);font-weight:500">${i+1}. ${p.reason}</span>
+                <span style="color:var(--slate-500)">${fmtNum(p.qty)} · ${p.cumPct.toFixed(0)}% cum</span>
+              </div>
+              <div style="height:16px;background:var(--slate-100);border-radius:4px;overflow:hidden">
+                <div style=${'height:100%;width:'+(p.qty/max*100)+'%;background:linear-gradient(90deg,var(--rose-500),var(--rose-400));border-radius:4px'}></div>
+              </div>
+            </div>`)}
+            <div style="font-size:11px;color:var(--slate-500);margin-top:6px">Top reasons driving rejection — fix the top 2–3 to cut the bulk (80/20).</div>
+          </div>`;
+        })()}
+      </div>
+    `}
+
+    ${view === 'ppm' && html`
+      <div style="display:flex;gap:6px;margin-bottom:10px">
+        ${[['inhouse','Inhouse'],['supplier','Supplier'],['customer','Customer']].map(([k,l]) => html`<button key=${k} class=${'btn small '+(ppmCat===k?'':'ghost')} style="font-size:11px" onClick=${() => setPpmCat(k)}>${l}</button>`)}
+        <div style="flex:1"></div>
+        <button class="btn small ghost" style="font-size:11px" onClick=${() => { setEditTarget(null); setModal('ppm'); }}>+ Received qty</button>
+      </div>
+      <div class="card">
+        <div class="card-title">${ppmCat[0].toUpperCase()+ppmCat.slice(1)} PPM · 12-month trend</div>
+        ${(() => {
+          const vals = ppmSeries.map(s => s.ppm).filter(v => v != null);
+          const maxPpm = Math.max(1, ...vals);
+          return html`
+            <div style="display:flex;gap:4px;align-items:flex-end;height:120px;margin:14px 0 4px">
+              ${ppmSeries.map(s => {
+                const h = s.ppm != null ? Math.max(3, s.ppm / maxPpm * 100) : 0;
+                const isCur = s.mk === month;
+                return html`<div key=${s.mk} style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;justify-content:flex-end;height:100%">
+                  <div style="font-size:9px;color:var(--slate-500)">${s.ppm != null ? fmtNum(s.ppm) : ''}</div>
+                  <div title=${'Scrap '+s.scrap+' / Recd '+s.rec} style=${'width:100%;max-width:26px;height:'+h+'px;background:'+(isCur?'var(--teal-600)':'var(--teal-400)')+';border-radius:3px 3px 0 0'}></div>
+                  <div style="font-size:9px;color:var(--slate-500)">${s.label}</div>
+                </div>`;
+              })}
+            </div>
+            <div style="font-size:11px;color:var(--slate-500)">PPM = scrap ÷ received × 1,000,000. Enter monthly <b>received qty</b> (+ Received qty) so PPM can compute.</div>
+          `;
+        })()}
+      </div>
+    `}
+
+    ${view === 'copq' && html`
+      <div class="dashboard-grid">
+        <div class="dashboard-col-main">
+          <div class="card"><div class="card-title">Cost of Poor Quality · ${month}</div>
+            <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:8px">
+              <div><div style="font-size:11px;color:var(--slate-500)">SCRAP COST</div><div style="font-size:22px;font-weight:700;color:var(--rose-600)">₹${fmtNum(copq.scrapCost.toFixed(0))}</div></div>
+              <div><div style="font-size:11px;color:var(--slate-500)">REWORK COST</div><div style="font-size:22px;font-weight:700;color:var(--amber-700)">₹${fmtNum(copq.reworkCost.toFixed(0))}</div></div>
+              <div style="margin-left:auto;text-align:right"><div style="font-size:11px;color:var(--slate-500)">TOTAL COPQ</div><div style="font-size:24px;font-weight:800;color:var(--slate-800)">₹${fmtNum(copq.total.toFixed(0))}</div></div>
+            </div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:8px">Uses each part's <b>cost/piece</b> (set in Masters → Parts). Scrap = qty×cost; rework ≈ 25% of part value.</div>
+          </div>
+        </div>
+        <div class="dashboard-col-side">
+          <div class="card"><div class="card-title">Top cost parts</div>
+            ${copq.top.length === 0 ? html`<div class="empty" style="padding:14px;font-size:12px">No cost data — set part cost/piece</div>` :
+              copq.top.map(p => html`<div key=${p.part} style="display:flex;justify-content:space-between;font-size:12px;padding:5px 0;border-bottom:1px solid var(--slate-100)"><span>${p.part}</span><span style="font-weight:600">₹${fmtNum(p.cost.toFixed(0))}</span></div>`)}
+          </div>
+        </div>
+      </div>
+    `}
+
+    ${view === 'rework' && html`
+      <div class="card" style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;align-items:center">
+        <div class="card-title" style="margin:0">Rework · ${month}</div>
+        <div style="font-size:22px;font-weight:700;color:var(--amber-700)">${fmtNum(reworkTotal)}<span style="font-size:12px;color:var(--slate-500);font-weight:400"> pcs</span></div>
+      </div></div>
+      ${reworkRows.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🔧</div>No rework this month</div></div>` :
+        html`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead><tr style="background:var(--slate-50);text-align:left">${['Date','Part','Reason','Rework qty','Inspector'].map(h => html`<th style="padding:7px 8px;font-weight:600;color:var(--slate-600)">${h}</th>`)}</tr></thead>
+          <tbody>${reworkRows.map(r => html`<tr key=${r.id} style="border-top:1px solid var(--slate-100)">
+            <td style="padding:6px 8px">${(r.rej_date||'').slice(0,10)}</td>
+            <td style="padding:6px 8px">${r.part_name || (parts.find(p=>p.id===r.part_id)||{}).part_number || '—'}</td>
+            <td style="padding:6px 8px">${r.reason}</td>
+            <td style="padding:6px 8px;font-weight:600;color:var(--amber-700)">${fmtNum(r.rework_qty)}</td>
+            <td style="padding:6px 8px;color:var(--slate-500)">${r.inspector_name || ''}</td>
+          </tr>`)}</tbody></table></div>`}
+    `}
+
+    ${modal === 'entry' && html`<${RejectionEntryModal} plant=${plant} me=${me} activeUnit=${activeUnit} parts=${parts} rtypes=${rtypes} users=${users} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'ppm' && html`<${PpmBaseModal} plant=${plant} activeUnit=${activeUnit} defaultCat=${ppmCat} defaultMonth=${month} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
+  `;
+}
+
+function RejectionEntryModal({ plant, me, activeUnit, parts, rtypes, users, editTarget, onClose, onSaved }) {
+  const [f, setF] = useState(editTarget || {
+    rej_date: new Date().toISOString().slice(0,10), category:'inhouse', part_id:'', part_name:'', model:'',
+    reason:'', found_stage:'', total_qty:'', rework_qty:'', suspected_qty:'', scrap_qty:'',
+    supplier_name:'', supplier_debit:false, issue_details:'', inspector_user_id:'', inspector_name:'', cavity:'', cost_per_piece:'', remarks:'',
+  });
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+  const onPart = (id) => { const p = parts.find(x => x.id === id); setF(s => ({ ...s, part_id:id, part_name: p?(p.part_number+' · '+(p.name||'')):s.part_name, cost_per_piece: s.cost_per_piece || (p?.cost_per_piece ?? '') })); };
+  const stages = ['Incoming','In-process','Pre assy rejection','Final inspection','Pre-dispatch','Customer end'];
+  const save = async () => {
+    setErr('');
+    if (!f.reason || !(f.part_id || f.part_name)) { setErr('Pick a part and a reason'); return; }
+    setBusy(true);
+    try {
+      const num = (x) => x === '' || x == null ? 0 : Number(x);
+      const payload = {
+        plant_id: plant.id, unit_id: activeUnit?.unit_id || _activeUnitId || null,
+        rej_date: f.rej_date, category: f.category, part_id: f.part_id || null, part_name: f.part_name || null, model: f.model || null,
+        reason: f.reason, found_stage: f.found_stage || null,
+        total_qty: num(f.total_qty), rework_qty: num(f.rework_qty), suspected_qty: num(f.suspected_qty), scrap_qty: num(f.scrap_qty),
+        supplier_name: f.supplier_name || null, supplier_debit: !!f.supplier_debit, issue_details: f.issue_details || null,
+        inspector_user_id: f.inspector_user_id || null, inspector_name: f.inspector_name || (users.find(u=>u.id===f.inspector_user_id)||{}).full_name || null,
+        cavity: f.cavity || null, cost_per_piece: f.cost_per_piece === '' ? null : Number(f.cost_per_piece), remarks: f.remarks || null,
+      };
+      if (editTarget) { const { error } = await sb.from('mcp_quality_rejections').update(payload).eq('id', editTarget.id); if (error) throw error; }
+      else { payload.created_by = me.id; const { error } = await sb.from('mcp_quality_rejections').insert(payload); if (error) throw error; }
+      showToast(editTarget ? 'Rejection updated' : 'Rejection logged'); onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+  const reasonOpts = Array.from(new Set(rtypes.map(r => r.label).filter(Boolean)));
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:620px;max-height:92vh;overflow-y:auto">
+        <div class="modal-header"><div class="modal-title">${editTarget ? 'Edit' : '+ Log'} rejection</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field-row">
+          <div class="field"><label>Date *</label><input type="date" value=${f.rej_date} onChange=${e => set('rej_date', e.target.value)} /></div>
+          <div class="field"><label>Type</label><select value=${f.category} onChange=${e => set('category', e.target.value)}><option value="inhouse">Inhouse</option><option value="supplier">Supplier</option><option value="customer">Customer</option></select></div>
+        </div>
+        <div class="field"><label>Part *</label>
+          <select value=${f.part_id} onChange=${e => onPart(e.target.value)}><option value="">— Pick part —</option>${parts.map(p => html`<option key=${p.id} value=${p.id}>${p.part_number} · ${p.name || ''}</option>`)}</select>
+          ${!f.part_id && html`<input type="text" value=${f.part_name} onInput=${e => set('part_name', e.target.value)} placeholder="…or type part name" style="margin-top:6px" />`}
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Reason *</label><input list="qr-reasons" value=${f.reason} onInput=${e => set('reason', e.target.value)} placeholder="Blow hole / Thread damage…" /><datalist id="qr-reasons">${reasonOpts.map(r => html`<option key=${r} value=${r}></option>`)}</datalist></div>
+          <div class="field"><label>Found at (stage)</label><input list="qr-stages" value=${f.found_stage} onInput=${e => set('found_stage', e.target.value)} placeholder="Pre assy / Final…" /><datalist id="qr-stages">${stages.map(s => html`<option key=${s} value=${s}></option>`)}</datalist></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Total rej qty *</label><input type="number" value=${f.total_qty} onInput=${e => set('total_qty', e.target.value)} placeholder="0" /></div>
+          <div class="field"><label>Rework</label><input type="number" value=${f.rework_qty} onInput=${e => set('rework_qty', e.target.value)} placeholder="0" /></div>
+          <div class="field"><label>Scrap</label><input type="number" value=${f.scrap_qty} onInput=${e => set('scrap_qty', e.target.value)} placeholder="0" /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Suspected</label><input type="number" value=${f.suspected_qty} onInput=${e => set('suspected_qty', e.target.value)} placeholder="0" /></div>
+          <div class="field"><label>Cavity</label><input type="text" value=${f.cavity} onInput=${e => set('cavity', e.target.value)} placeholder="1 / 2 / 3" /></div>
+          <div class="field"><label>Cost/piece (₹)</label><input type="number" value=${f.cost_per_piece} onInput=${e => set('cost_per_piece', e.target.value)} placeholder="auto" /></div>
+        </div>
+        ${f.category === 'supplier' && html`<div class="field-row">
+          <div class="field"><label>Supplier</label><input type="text" value=${f.supplier_name} onInput=${e => set('supplier_name', e.target.value)} /></div>
+          <div class="field" style="flex:0 0 auto;align-self:flex-end"><label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" checked=${f.supplier_debit} onChange=${e => set('supplier_debit', e.target.checked)} />Debited</label></div>
+        </div>`}
+        <div class="field"><label>Inspector</label><select value=${f.inspector_user_id} onChange=${e => set('inspector_user_id', e.target.value)}><option value="">— Pick —</option>${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}</select></div>
+        <div class="field"><label>Issue details / remarks</label><textarea rows="2" value=${f.remarks} onInput=${e => set('remarks', e.target.value)}></textarea></div>
+        <button class="btn" disabled=${busy} onClick=${save} style="width:100%">${busy ? 'Saving…' : (editTarget ? 'Update' : 'Log rejection')}</button>
+      </div>
+    </div>
+  `;
+}
+
+function PpmBaseModal({ plant, activeUnit, defaultCat, defaultMonth, onClose, onSaved }) {
+  const [month, setMonth] = useState(defaultMonth || new Date().toISOString().slice(0,7));
+  const [cat, setCat] = useState(defaultCat || 'inhouse');
+  const [qty, setQty] = useState('');
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const save = async () => {
+    setErr(''); if (!qty) { setErr('Enter received qty'); return; }
+    setBusy(true);
+    try {
+      const { error } = await sb.from('mcp_quality_ppm_base').upsert({
+        plant_id: plant.id, unit_id: activeUnit?.unit_id || _activeUnitId || null,
+        month: month + '-01', category: cat, received_qty: Number(qty),
+      }, { onConflict: 'plant_id,unit_id,month,category' });
+      if (error) throw error;
+      showToast('Received qty saved'); onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:420px">
+        <div class="modal-header"><div class="modal-title">Monthly received qty (PPM base)</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field-row">
+          <div class="field"><label>Month</label><${MonthField} value=${month} onChange=${setMonth} /></div>
+          <div class="field"><label>Type</label><select value=${cat} onChange=${e => setCat(e.target.value)}><option value="inhouse">Inhouse</option><option value="supplier">Supplier</option><option value="customer">Customer</option></select></div>
+        </div>
+        <div class="field"><label>Received / produced qty</label><input type="number" value=${qty} onInput=${e => setQty(e.target.value)} placeholder="e.g. 270000" /></div>
+        <p style="font-size:11px;color:var(--slate-500)">PPM = scrap ÷ this qty × 1,000,000. Set it per month so the trend can compute.</p>
+        <button class="btn" disabled=${busy} onClick=${save} style="width:100%">${busy ? 'Saving…' : 'Save'}</button>
+      </div>
+    </div>
+  `;
 }
 
 function QuotationModule({ plant, me }) {
