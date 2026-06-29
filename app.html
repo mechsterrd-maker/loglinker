@@ -9441,9 +9441,10 @@ function UnitAccessModal({ plant, me, focusUserId, focusName, onClose }) {
   const [grants, setGrants] = useState([]);
   const [loading, setLoading] = useState(true);
   const [pickUser, setPickUser] = useState(focusUserId || '');
-  const [pickUnit, setPickUnit] = useState('');
+  const [pickUnits, setPickUnits] = useState([]);
   const [pickRole, setPickRole] = useState('operator');
   const [error, setError] = useState('');
+  const toggleUnit = (id) => setPickUnits(p => p.includes(id) ? p.filter(x => x !== id) : [...p, id]);
 
   const load = async () => {
     setLoading(true);
@@ -9461,11 +9462,16 @@ function UnitAccessModal({ plant, me, focusUserId, focusName, onClose }) {
 
   const grant = async () => {
     setError('');
-    if (!pickUser || !pickUnit) { setError('Pick user + unit'); return; }
-    const { data, error: err } = await sb.rpc('grant_unit_access', { p_user_id: pickUser, p_unit_id: pickUnit, p_role: pickRole });
-    if (err || !data?.success) { setError(err?.message || data?.error || 'Failed'); return; }
-    showToast('Access granted');
-    setPickUser(''); setPickUnit(''); setPickRole('operator');
+    if (!pickUser || pickUnits.length === 0) { setError('Pick a user + at least one unit'); return; }
+    // Grant the chosen role on every selected unit in one go.
+    let ok = 0, failMsg = '';
+    for (const uid of pickUnits) {
+      const { data, error: err } = await sb.rpc('grant_unit_access', { p_user_id: pickUser, p_unit_id: uid, p_role: pickRole });
+      if (err || !data?.success) failMsg = err?.message || data?.error || 'Failed'; else ok++;
+    }
+    if (ok > 0) showToast(`Access granted · ${ok} unit${ok > 1 ? 's' : ''}`);
+    if (failMsg) setError(failMsg);
+    setPickUser(focusUserId || ''); setPickUnits([]); setPickRole('operator');
     load();
   };
 
@@ -9497,18 +9503,29 @@ function UnitAccessModal({ plant, me, focusUserId, focusName, onClose }) {
 
         <div class="card" style="background:var(--teal-50);padding:10px 12px;margin-bottom:12px;border-left:3px solid var(--teal-500)">
           <div style="font-size:11px;font-weight:700;color:var(--teal-700);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">+ GRANT ACCESS</div>
-          <div class="field-row" style="margin-bottom:6px">
-            <div class="field" style="margin:0"><label style="font-size:11px">User</label>
-              <select value=${pickUser} onChange=${e => setPickUser(e.target.value)} style="font-size:12px">
-                <option value="">— Pick user —</option>
-                ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
-              </select>
-            </div>
-            <div class="field" style="margin:0"><label style="font-size:11px">Unit</label>
-              <select value=${pickUnit} onChange=${e => setPickUnit(e.target.value)} style="font-size:12px">
-                <option value="">— Pick unit —</option>
-                ${units.map(u => html`<option key=${u.id} value=${u.id}>${u.name}</option>`)}
-              </select>
+          <div class="field" style="margin:0 0 8px"><label style="font-size:11px">User</label>
+            <select value=${pickUser} onChange=${e => setPickUser(e.target.value)} style="font-size:12px">
+              <option value="">— Pick user —</option>
+              ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
+            </select>
+          </div>
+          <div class="field" style="margin:0 0 8px"><label style="font-size:11px">Units <span style="font-weight:400;color:var(--slate-500)">— tick one or more${pickUnits.length ? ' · ' + pickUnits.length + ' selected' : ''}</span></label>
+            <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:2px">
+              ${units.map(u => {
+                const on = pickUnits.includes(u.id);
+                return html`
+                  <button type="button" key=${u.id} onClick=${() => toggleUnit(u.id)}
+                    style=${'font-size:12px;padding:6px 11px;border-radius:999px;cursor:pointer;border:1px solid '+(on?'var(--teal-500)':'var(--slate-300)')+';background:'+(on?'var(--teal-600)':'white')+';color:'+(on?'white':'var(--slate-700)')+';font-weight:'+(on?'600':'500')}>
+                    ${on ? '✓ ' : ''}${u.name}
+                  </button>
+                `;
+              })}
+              ${units.length > 1 && html`
+                <button type="button" onClick=${() => setPickUnits(pickUnits.length === units.length ? [] : units.map(u => u.id))}
+                  style="font-size:11px;padding:6px 11px;border-radius:999px;cursor:pointer;border:1px dashed var(--slate-400);background:white;color:var(--slate-600)">
+                  ${pickUnits.length === units.length ? 'Clear all' : 'All units'}
+                </button>
+              `}
             </div>
           </div>
           <div class="field-row" style="margin-bottom:0">
