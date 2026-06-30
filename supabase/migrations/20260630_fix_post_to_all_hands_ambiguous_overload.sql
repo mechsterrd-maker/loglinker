@@ -1,0 +1,20 @@
+-- Fix: 9 AM "pending task" + "pending-by-department" digests crashed daily since
+-- 2026-06-29.
+--
+-- The 20260628 unit-group routing migration ran:
+--   CREATE OR REPLACE FUNCTION post_to_all_hands(uuid,uuid,text, uuid DEFAULT NULL)
+-- intending to REPLACE the old 3-arg post_to_all_hands(uuid,uuid,text). But adding
+-- a parameter changes the signature, so CREATE OR REPLACE created a SECOND function
+-- instead of replacing the first. Both then coexisted:
+--   post_to_all_hands(uuid,uuid,text)
+--   post_to_all_hands(uuid,uuid,text,uuid DEFAULT NULL)
+-- Any 3-arg call now matches BOTH (the 4-arg one via its default) and Postgres
+-- refuses: "function post_to_all_hands(uuid, unknown, text) is not unique".
+--
+-- Escalation jobs were updated to pass the entity unit_id (4 args) so they kept
+-- working; only the plant-wide 3-arg callers — post_daily_task_reminders() and
+-- post_pending_tasks_by_department() — broke.
+--
+-- The 4-arg version (p_unit_id DEFAULT NULL → All Hands) is the intended single
+-- implementation. Drop the stale 3-arg overload so 3-arg calls resolve to it.
+DROP FUNCTION IF EXISTS public.post_to_all_hands(uuid, uuid, text);
