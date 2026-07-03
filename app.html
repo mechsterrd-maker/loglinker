@@ -36660,6 +36660,8 @@ const REPORT_CATALOG = [
     desc:'All machine breakdowns with reported/attended/resolved times.', icon:'🔧' },
   { id:'mtbf_mttr', title:'MTBF / MTTR per Machine', dept:'maintenance', clauses:['8.5.1.5','9.1'], frequency:'monthly',
     desc:'Mean Time Between Failures and Mean Time To Repair per machine.', icon:'📊' },
+  { id:'tpm_checksheet', title:'TPM Daily Checksheet', dept:'maintenance', clauses:['8.5.1.5'], frequency:'monthly',
+    desc:'Autonomous-maintenance daily check done-sheet: per-machine ✓/⚠/– completion grid + issues raised to maintenance (with close status). Audit-ready.', icon:'🛠' },
 
   // SCHEDULES
   { id:'schedule_attainment', title:'Customer Schedule Attainment', dept:'schedules', clauses:['8.2','9.1.2'], frequency:'monthly',
@@ -39010,6 +39012,7 @@ function ReportConfig({ plant, me, report, onClose }) {
         case 'ncr_8d':                 html_content = await genNcr8D(plantWithDoc, pickedItem); break;
         case 'breakdown_register':     html_content = await genBreakdownRegister(plantWithDoc, dateFrom, dateTo); break;
         case 'mtbf_mttr':              html_content = await genMtbfMttr(plantWithDoc, dateFrom, dateTo); break;
+        case 'tpm_checksheet':         html_content = await genTpmChecksheet(plantWithDoc, dateFrom, dateTo); break;
         case 'schedule_attainment':    html_content = await genScheduleAttainment(plantWithDoc, monthPick); break;
         case 'otd_report':             html_content = await genOtd(plantWithDoc, monthPick); break;
         case 'stock_movement':         html_content = await genStockMovement(plantWithDoc, dateFrom, dateTo); break;
@@ -39056,7 +39059,7 @@ function ReportConfig({ plant, me, report, onClose }) {
   };
 
   // Decide which inputs to show
-  const needsDateRange = ['reject_analysis','stage_summary','ncr_register','breakdown_register','mtbf_mttr','stock_movement','vendor_grn','document_index'].includes(report.id);
+  const needsDateRange = ['reject_analysis','stage_summary','ncr_register','breakdown_register','mtbf_mttr','tpm_checksheet','stock_movement','vendor_grn','document_index'].includes(report.id);
   const needsSingleDate = report.id === 'daily_production';
   const needsMonth = ['schedule_attainment','otd_report'].includes(report.id);
   const needsItemPick = report.id === 'material_traceability';
@@ -39654,6 +39657,77 @@ async function genBreakdownRegister(plant, from, to) {
 
   return reportShell(plant, 'Breakdown Register', `${rpFmtDate(from)} to ${rpFmtDate(to)}`, body,
     { 'Period': `${rpFmtDate(from)} → ${rpFmtDate(to)}`, 'Total Downtime': totalDowntime.toFixed(1) + ' hours' });
+}
+
+// 6b. TPM DAILY CHECKSHEET (autonomous maintenance done-sheet · IATF 8.5.1.5)
+async function genTpmChecksheet(plant, from, to) {
+  const [machRes, runRes, resRes] = await Promise.all([
+    sb.from('machines').select('id, code, display_name').eq('plant_id', plant.id).order('code'),
+    sb.from('mcp_tpm_runs').select('machine_id, check_date, has_issues, issue_count, operator:operator_id(full_name)').eq('plant_id', plant.id).gte('check_date', from).lte('check_date', to),
+    sb.from('mcp_tpm_results').select('item_label, note, critical, followup_breakdown_id, run:run_id(check_date, machine_id)').eq('plant_id', plant.id).eq('status', 'issue'),
+  ]);
+  const machines = machRes.data || [];
+  const runs = runRes.data || [];
+  const issues = (resRes.data || []).filter(r => r.run && r.run.check_date >= from && r.run.check_date <= to);
+
+  // close status of the maintenance jobs each issue raised
+  const bdIds = [...new Set(issues.map(i => i.followup_breakdown_id).filter(Boolean))];
+  let bdMap = {};
+  if (bdIds.length) {
+    const { data: bds } = await sb.from('mcp_maintenance_breakdowns').select('id, status, resolved_at').in('id', bdIds);
+    bdMap = Object.fromEntries((bds || []).map(b => [b.id, b]));
+  }
+  const machName = Object.fromEntries(machines.map(m => [m.id, m.display_name || m.code]));
+
+  // day columns (capped for print width)
+  const days = []; { const end = new Date(to + 'T00:00:00'); let d = new Date(from + 'T00:00:00');
+    while (d <= end && days.length < 40) { days.push(d.toISOString().slice(0, 10)); d.setDate(d.getDate() + 1); } }
+  const runByMD = {}; runs.forEach(r => { runByMD[r.machine_id + '|' + r.check_date] = r; });
+
+  const checksDone = runs.length;
+  const issuesFound = issues.length;
+  const issuesClosed = issues.filter(i => bdMap[i.followup_breakdown_id]?.status === 'resolved').length;
+  const expected = machines.length * days.length;
+  const compliance = expected > 0 ? Math.round(checksDone / expected * 100) : 0;
+
+  const dayHead = days.map(dt => '<th style="font-size:8px;padding:2px 3px">' + dt.slice(8) + '</th>').join('');
+  const gridRows = machines.map(m => {
+    const cells = days.map(dt => {
+      const r = runByMD[m.id + '|' + dt];
+      if (!r) return '<td style="text-align:center;color:#cbd5e1">–</td>';
+      return r.has_issues ? '<td style="text-align:center;color:#c92a2a;font-weight:700">⚠</td>'
+                          : '<td style="text-align:center;color:#2e7d32;font-weight:700">✓</td>';
+    }).join('');
+    return '<tr><td style="white-space:nowrap"><b>' + esc(m.display_name || m.code) + '</b></td>' + cells + '</tr>';
+  }).join('');
+
+  const issRows = issues.slice().sort((a, b) => (a.run.check_date < b.run.check_date ? 1 : -1)).map(i => {
+    const bd = bdMap[i.followup_breakdown_id];
+    const st = bd ? (bd.status === 'resolved'
+        ? '<span class="badge green">Closed' + (bd.resolved_at ? ' ' + rpFmtDate(bd.resolved_at) : '') + '</span>'
+        : '<span class="badge rose">' + esc(bd.status) + '</span>')
+      : '<span class="badge amber">raised</span>';
+    return '<tr><td>' + rpFmtDate(i.run.check_date) + '</td><td><b>' + esc(machName[i.run.machine_id] || '—') + '</b></td><td>' + esc(i.item_label) + (i.critical ? ' <span class="badge rose">critical</span>' : '') + '</td><td>' + esc(i.note || '—') + '</td><td>' + st + '</td></tr>';
+  }).join('');
+
+  const chart = chartSVG('bar', machines.map(m => ({ label: m.display_name || m.code, value: days.reduce((s, dt) => s + (runByMD[m.id + '|' + dt] ? 1 : 0), 0) })).filter(p => p.value > 0), { title: 'Checks completed per machine' });
+
+  const body = `
+    <div class="stat-grid" style="grid-template-columns:repeat(5,1fr)">
+      <div class="stat-box"><div class="stat-num">${machines.length}</div><div class="stat-lbl">Machines</div></div>
+      <div class="stat-box"><div class="stat-num">${checksDone}</div><div class="stat-lbl">Checks done</div></div>
+      <div class="stat-box"><div class="stat-num">${compliance}%</div><div class="stat-lbl">Completion</div></div>
+      <div class="stat-box"><div class="stat-num">${issuesFound}</div><div class="stat-lbl">Issues found</div></div>
+      <div class="stat-box"><div class="stat-num">${issuesClosed}/${issuesFound}</div><div class="stat-lbl">Issues closed</div></div>
+    </div>
+    ${chart}
+    <h2 class="section">Daily completion &nbsp;<span style="font-size:11px;color:#64748b">✓ done · ⚠ issue raised · – not done</span></h2>
+    ${machines.length ? '<div style="overflow-x:auto"><table class="data" style="font-size:10px"><thead><tr><th style="text-align:left">Machine</th>' + dayHead + '</tr></thead><tbody>' + gridRows + '</tbody></table></div>' : '<div class="empty">No machines configured for this plant.</div>'}
+    <h2 class="section">Issues found → maintenance</h2>
+    ${issRows ? '<table class="data"><thead><tr><th>Date</th><th>Machine</th><th>Check item</th><th>Note</th><th>Maintenance status</th></tr></thead><tbody>' + issRows + '</tbody></table>' : '<div class="empty">No issues flagged in this period 🎉</div>'}`;
+
+  return reportShell(plant, 'TPM Daily Checksheet', rpFmtDate(from) + ' to ' + rpFmtDate(to), body,
+    { 'IATF Clause': '8.5.1.5', 'Period': rpFmtDate(from) + ' → ' + rpFmtDate(to), 'Completion': compliance + '%', 'Issues': issuesFound + ' (' + issuesClosed + ' closed)' });
 }
 
 // 7. MTBF / MTTR
