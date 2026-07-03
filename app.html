@@ -4565,8 +4565,9 @@ function MachineDetail({ plant, me, machine, units, users, dies, parts, onClose 
     const pmTaskIds = (pmTasks || []).map(t => t.id);
     const pmTaskMap = Object.fromEntries((pmTasks || []).map(t => [t.id, t]));
 
-    const [brk, tc, idle, shots, pm] = await Promise.all([
+    const [brk, tpm, tc, idle, shots, pm] = await Promise.all([
       sb.from('mcp_maintenance_breakdowns').select('id, description, reported_at, attended_at, resolved_at, downtime_minutes, status, resolution_notes, attended:attended_by(full_name), reporter:reported_by(full_name)').eq('machine_id', machine.id).gte('reported_at', periodStartIso).order('reported_at', { ascending: false }),
+      sb.from('mcp_tpm_runs').select('id, check_date, has_issues, issue_count, operator:operator_id(full_name)').eq('machine_id', machine.id).gte('check_date', periodStartDate).order('check_date', { ascending: false }),
       sb.from('tool_change_events').select('id, changed_at, change_reason, pieces_done, minutes_used, notes, tool:tool_id(code, name), users:changed_by(full_name)').eq('machine_id', machine.id).gte('changed_at', periodStartIso).order('changed_at', { ascending: false }),
       sb.from('mcp_pdc_machine_idle_log').select('id, log_date, idle_hours, reason, notes, shifts:shift_id(name)').eq('machine_id', machine.id).gte('log_date', periodStartDate).order('log_date', { ascending: false }),
       sb.from('mcp_pdc_shots').select('id, recorded_at, shots_good, shots_rejected, pieces_good, pieces_rejected, cavities, mcp_pdc_dies(code), mcp_pdc_parts(part_number)').eq('machine_id', machine.id).gte('recorded_at', periodStartIso).order('recorded_at', { ascending: false }),
@@ -4581,6 +4582,12 @@ function MachineDetail({ plant, me, machine, units, users, dies, parts, onClose 
       title: 'Breakdown · ' + b.status, body: b.description,
       sub: 'reported by ' + (b.reporter?.full_name || '?') + (b.attended?.full_name ? ' · attended by ' + b.attended.full_name : '') + (b.downtime_minutes ? ' · ' + b.downtime_minutes + 'min downtime' : ''),
       notes: b.resolution_notes, id: b.id,
+    }));
+    (tpm.data || []).forEach(t => merged.push({
+      kind: 'tpm', icon: '🛠', color: t.has_issues ? 'rose' : 'emerald', at: t.check_date + 'T08:00:00',
+      title: 'TPM daily check' + (t.has_issues ? ' · ' + (t.issue_count || 0) + ' issue' + ((t.issue_count || 0) === 1 ? '' : 's') + ' → raised to maintenance' : ' · all OK'),
+      body: t.has_issues ? 'Oil / coolant / leaks / guards — problem(s) flagged' : 'Oil, coolant, leaks, guards — all clear',
+      sub: 'by ' + (t.operator?.full_name || '?'),
     }));
     (tc.data || []).forEach(t => merged.push({
       kind: 'tool_change', icon: '🛠️', color: 'amber', at: t.changed_at,
@@ -4683,6 +4690,7 @@ function MachineDetail({ plant, me, machine, units, users, dies, parts, onClose 
         <select value=${filterType} onChange=${e => setFilterType(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
           <option value="all">All events · ${events.length}</option>
           <option value="breakdown">🔧 Breakdowns</option>
+          <option value="tpm">🛠 TPM checks</option>
           <option value="pm">⚙️ PM</option>
           <option value="tool_change">🛠️ Tool changes</option>
           <option value="idle">⏸️ Idle</option>
