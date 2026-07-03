@@ -2167,6 +2167,29 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   const initials = (me.full_name || user.email).split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
   const [unreadCount, setUnreadCount] = useState(0);
   const [profileOpen, setProfileOpen] = useState(false);
+  // Drill-down from a generated report: report windows postMessage LOGLINKR_OPEN
+  // and we open the item's full live record (machine history card) in an overlay.
+  const [histMachine, setHistMachine] = useState(null);
+  const [histLoading, setHistLoading] = useState(false);
+  useEffect(() => {
+    const onMsg = async (e) => {
+      const d = e && e.data;
+      if (!d || d.type !== 'LOGLINKR_OPEN' || !d.id) return;
+      let machineId = null;
+      if (d.entity === 'machine') machineId = d.id;
+      else if (d.entity === 'breakdown') {
+        const { data: b } = await sb.from('mcp_maintenance_breakdowns').select('machine_id').eq('id', d.id).maybeSingle();
+        machineId = b?.machine_id || null;
+      }
+      if (!machineId) return;
+      setHistLoading(true);
+      const { data: m } = await sb.from('machines').select('*').eq('id', machineId).maybeSingle();
+      setHistLoading(false);
+      if (m) setHistMachine(m);
+    };
+    window.addEventListener('message', onMsg);
+    return () => window.removeEventListener('message', onMsg);
+  }, []);
   // navAction: a one-shot deep-link signal so Home shortcuts can land a user on
   // a specific sub-screen (e.g. Make Documents → New PO), not just a tab. Pages
   // stay mounted (hidden via CSS), so target components react via useEffect on
@@ -2290,6 +2313,12 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
         </div>
       </div>
       ${profileOpen && html`<${ProfileModal} me=${me} user=${user} plant=${plant} activeUnit=${activeUnit} logout=${logout} onClose=${() => setProfileOpen(false)} onSaved=${() => { setProfileOpen(false); reload && reload(); }} />`}
+      ${histLoading && html`<div class="modal-backdrop active" style="z-index:9999"><div class="loader"><div class="spinner"></div></div></div>`}
+      ${histMachine && html`<div class="modal-backdrop active" style="align-items:flex-start;overflow-y:auto;z-index:9998" onClick=${e => { if (e.target === e.currentTarget) setHistMachine(null); }}>
+        <div style="background:#fafaf9;max-width:920px;width:100%;margin:16px auto;border-radius:12px;padding:16px 18px 28px">
+          <${MachineDetail} plant=${plant} me=${me} machine=${histMachine} units=${[]} users=${[]} dies=${[]} parts=${[]} onClose=${() => setHistMachine(null)} />
+        </div>
+      </div>`}
 
       <${Page} active=${pageTab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} myPerms=${myPerms} /></${Page}>
       <${Page} active=${pageTab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -39633,7 +39662,7 @@ async function genBreakdownRegister(plant, from, to) {
 
   const rows = (bds || []).map(b => {
     const dur = b.resolved_at ? ((new Date(b.resolved_at) - new Date(b.reported_at)) / 3600000).toFixed(1) + ' hrs' : 'open';
-    return `<tr>
+    return `<tr style="cursor:pointer" title="Open machine history" onclick="window.opener&&window.opener.postMessage({type:'LOGLINKR_OPEN',entity:'machine',id:'${b.machine_id}'},'*');window.opener&&window.opener.focus()">
       <td>${rpFmtDateTime(b.reported_at)}</td>
       <td><b>${esc(b.machines?.code || '—')}</b></td>
       <td>${esc(b.description || '')}</td>
@@ -39707,7 +39736,7 @@ async function genTpmChecksheet(plant, from, to) {
         ? '<span class="badge green">Closed' + (bd.resolved_at ? ' ' + rpFmtDate(bd.resolved_at) : '') + '</span>'
         : '<span class="badge rose">' + esc(bd.status) + '</span>')
       : '<span class="badge amber">raised</span>';
-    return '<tr><td>' + rpFmtDate(i.run.check_date) + '</td><td><b>' + esc(machName[i.run.machine_id] || '—') + '</b></td><td>' + esc(i.item_label) + (i.critical ? ' <span class="badge rose">critical</span>' : '') + '</td><td>' + esc(i.note || '—') + '</td><td>' + st + '</td></tr>';
+    return '<tr style="cursor:pointer" title="Open machine history" onclick="window.opener&&window.opener.postMessage({type:\'LOGLINKR_OPEN\',entity:\'machine\',id:\'' + i.run.machine_id + '\'},\'*\');window.opener&&window.opener.focus()"><td>' + rpFmtDate(i.run.check_date) + '</td><td><b>' + esc(machName[i.run.machine_id] || '—') + '</b></td><td>' + esc(i.item_label) + (i.critical ? ' <span class="badge rose">critical</span>' : '') + '</td><td>' + esc(i.note || '—') + '</td><td>' + st + ' <span style="color:#0d9488">↗</span></td></tr>';
   }).join('');
 
   const chart = chartSVG('bar', machines.map(m => ({ label: m.display_name || m.code, value: days.reduce((s, dt) => s + (runByMD[m.id + '|' + dt] ? 1 : 0), 0) })).filter(p => p.value > 0), { title: 'Checks completed per machine' });
@@ -39723,7 +39752,7 @@ async function genTpmChecksheet(plant, from, to) {
     ${chart}
     <h2 class="section">Daily completion &nbsp;<span style="font-size:11px;color:#64748b">✓ done · ⚠ issue raised · – not done</span></h2>
     ${machines.length ? '<div style="overflow-x:auto"><table class="data" style="font-size:10px"><thead><tr><th style="text-align:left">Machine</th>' + dayHead + '</tr></thead><tbody>' + gridRows + '</tbody></table></div>' : '<div class="empty">No machines configured for this plant.</div>'}
-    <h2 class="section">Issues found → maintenance</h2>
+    <h2 class="section">Issues found → maintenance &nbsp;<span style="font-size:11px;color:#64748b;font-weight:400">(click a row ↗ to open that machine's full live history)</span></h2>
     ${issRows ? '<table class="data"><thead><tr><th>Date</th><th>Machine</th><th>Check item</th><th>Note</th><th>Maintenance status</th></tr></thead><tbody>' + issRows + '</tbody></table>' : '<div class="empty">No issues flagged in this period 🎉</div>'}`;
 
   return reportShell(plant, 'TPM Daily Checksheet', rpFmtDate(from) + ' to ' + rpFmtDate(to), body,
