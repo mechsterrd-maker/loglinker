@@ -506,6 +506,17 @@ function getActiveUnitId() { return _activeUnitId; }
 // is selected (single-unit plants / not yet loaded).
 const unitScope = (q) => _activeUnitId ? q.or(`unit_id.eq.${_activeUnitId},unit_id.is.null`) : q;
 
+// Tasks (actions) are personal: you always see a task assigned to you (owner),
+// escalated to you, or that you assigned — even if it lives in another unit
+// (cross-unit assignment). So the active-unit filter must OR in ownership.
+// Matches the DB's broadened unit_iso policy on actions. Pass the current
+// user's id; falls back to plain unit scope if it's missing.
+const taskScope = (q, meId) => {
+  if (!_activeUnitId) return q;
+  if (!meId) return unitScope(q);
+  return q.or(`unit_id.eq.${_activeUnitId},unit_id.is.null,owner_id.eq.${meId},escalated_to_id.eq.${meId},assigned_by.eq.${meId}`);
+};
+
 // Chat groups use a unit_ids[] array (a group can belong to several units, e.g.
 // the cross-unit "Unit 1 & 2"). Show a group if it's common (unit_ids NULL) or
 // the active unit is one of its units. No-op when no active unit.
@@ -5586,18 +5597,18 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, edi
 // Plant-wide pending tasks, collapsible header that shows counts. Each row
 // has inline Done / Start / Snooze quick actions; the link icon jumps to the
 // Actions tab. Subscribes to the actions table so updates appear instantly.
-function PendingTasksPanel({ plant, setTab }) {
+function PendingTasksPanel({ plant, me, setTab }) {
   const [open, setOpen] = useState(false);
   const [tasks, setTasks] = useState([]);
   const [busy, setBusy] = useState({});
 
   const refresh = useCallback(async () => {
-    const { data } = await unitScope(sb.from('actions')
+    const { data } = await taskScope(sb.from('actions')
       .select('id, title, status, due_at, owner_id, department')
       .eq('plant_id', plant.id)
-      .not('status', 'in', '(completed,cancelled)')
+      .not('status', 'in', '(completed,cancelled)'), me?.id)
       .order('due_at', { ascending: true, nullsFirst: false })
-      .limit(50));
+      .limit(50);
     const list = data || [];
     const ownerIds = [...new Set(list.map(t => t.owner_id).filter(Boolean))];
     if (ownerIds.length > 0) {
@@ -6782,7 +6793,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
 
   return html`
     <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start"><div><h1>Chat</h1><div class="sub">Plant communication</div></div><div style="display:flex;gap:8px;margin-top:6px">${canBroadcast && html`<button class="btn small" onClick=${() => setBroadcastOpen(true)} style="background:var(--teal-600);color:white" title="Send one message to every unit group">📢 Broadcast</button>`}<button class="btn small" onClick=${() => setGroupModal(true)}>+ New Group</button></div></div>
-    <${PendingTasksPanel} plant=${plant} setTab=${setTab} />
+    <${PendingTasksPanel} plant=${plant} me=${me} setTab=${setTab} />
     ${notifPerm === 'default' && html`
       <div class="setup-banner" style="margin-bottom:14px">
         <div class="setup-banner-title">🔔 Enable notifications</div>
@@ -29564,7 +29575,7 @@ function ActionHub({ plant, me, navAction }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    let q = unitScope(sb.from('actions').select('*, owner_user:owner_id(full_name, role), assigner:assigned_by(full_name)')).order('created_at', { ascending:false });
+    let q = taskScope(sb.from('actions').select('*, owner_user:owner_id(full_name, role), assigner:assigned_by(full_name)'), me?.id).order('created_at', { ascending:false });
     if (statusFilter === 'open') q = q.in('status', ['open','in_progress']);
     else if (statusFilter === 'done') q = q.eq('status', 'completed');
     // Three independent queries — nesting users → user_unit_access → units in
