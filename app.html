@@ -31884,13 +31884,24 @@ function ProductionFlow({ plant, parts }) {
     sortedStages.forEach((stage, idx) => {
       let cumGood = 0, cumRej = 0, periodGood = 0, periodRej = 0, lastDate = null;
       if (stage === 'pdc') {
+        const shotDates = new Set();
         shots.filter(s => s.part_id === partId).forEach(s => {
           const g = s.pieces_good ?? (s.shots_good||0) * (s.cavities||1);
           const rj = s.pieces_rejected ?? (s.shots_rejected||0) * (s.cavities||1);
           cumGood += g; cumRej += rj;
           const dateStr = s.recorded_at?.slice(0,10);
+          if (dateStr) shotDates.add(dateStr);
           if (dateStr && dateStr >= periodStartStr) { periodGood += g; periodRej += rj; }
           if (!lastDate || (dateStr && dateStr > lastDate)) lastDate = dateStr;
+        });
+        // Also count PDC entries logged via the stage log — the "Log pending
+        // entry" reconcile path writes PDC counts here, not to shots. Skip
+        // dates already covered by shots so we never double-count.
+        logs.filter(l => l.part_id === partId && l.stage === 'pdc' && !shotDates.has(l.log_date)).forEach(l => {
+          const g = parseFloat(l.qty_good||0); const rj = parseFloat(l.qty_rejected||0);
+          cumGood += g; cumRej += rj;
+          if (l.log_date >= periodStartStr) { periodGood += g; periodRej += rj; }
+          if (!lastDate || (l.log_date && l.log_date > lastDate)) lastDate = l.log_date;
         });
       } else {
         logs.filter(l => l.part_id === partId && l.stage === stage).forEach(l => {
