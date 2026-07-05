@@ -434,6 +434,42 @@ body{
 @media (min-width: 1200px){
   .stats-4-wide{grid-template-columns:repeat(4,1fr) !important}
 }
+
+/* ================= FLO ASSISTANT ================= */
+.flo-fab{position:fixed;right:18px;bottom:calc(20px + var(--safe-bottom));z-index:900;width:54px;height:54px;border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;color:#fff;background:linear-gradient(135deg,var(--teal-500),var(--teal-700));box-shadow:0 8px 24px rgba(13,148,136,0.4);transition:transform .15s}
+.flo-fab:hover{transform:scale(1.08)}
+@media (max-width:768px){.flo-fab{bottom:calc(76px + var(--safe-bottom))}}
+.flo-panel{position:fixed;right:0;top:0;bottom:0;z-index:1500;width:min(420px,100vw);background:#fff;box-shadow:-12px 0 40px rgba(15,23,42,0.18);display:flex;flex-direction:column;animation:floIn .2s ease}
+@keyframes floIn{from{transform:translateX(40px);opacity:0}to{transform:translateX(0);opacity:1}}
+.flo-head{display:flex;align-items:center;gap:10px;padding:14px 16px;background:linear-gradient(135deg,var(--teal-600),var(--teal-900));color:#fff}
+.flo-head .flo-title{font-family:'Bricolage Grotesque',sans-serif;font-weight:700;font-size:17px}
+.flo-head .flo-sub{font-size:11px;opacity:.75}
+.flo-body{flex:1;overflow-y:auto;padding:14px;background:var(--slate-50);display:flex;flex-direction:column;gap:10px}
+.flo-msg{max-width:88%;padding:9px 12px;border-radius:14px;font-size:13.5px;line-height:1.5;word-wrap:break-word}
+.flo-msg.user{align-self:flex-end;background:var(--teal-600);color:#fff;border-bottom-right-radius:4px;white-space:pre-wrap}
+.flo-msg.bot{align-self:flex-start;background:#fff;border:1px solid var(--slate-200);border-bottom-left-radius:4px;box-shadow:0 1px 2px rgba(15,23,42,0.04)}
+.flo-msg.bot table{border-collapse:collapse;margin:6px 0;font-size:12.5px;width:100%}
+.flo-msg.bot th,.flo-msg.bot td{border:1px solid var(--slate-200);padding:4px 8px;text-align:left}
+.flo-msg.bot th{background:var(--slate-100);font-weight:600}
+.flo-msg.bot code{background:var(--slate-100);border-radius:4px;padding:1px 5px;font-family:'Geist Mono',monospace;font-size:12px}
+.flo-msg.bot ul{margin:4px 0 4px 18px}
+.flo-msg.err{background:var(--rose-50);border-color:var(--rose-200);color:var(--rose-700)}
+.flo-think{align-self:flex-start;display:flex;align-items:center;gap:8px;color:var(--slate-500);font-size:12.5px;padding:6px 2px}
+.flo-dots{display:inline-flex;gap:3px}
+.flo-dots span{width:6px;height:6px;border-radius:50%;background:var(--teal-500);animation:floBlink 1.2s infinite}
+.flo-dots span:nth-child(2){animation-delay:.2s}.flo-dots span:nth-child(3){animation-delay:.4s}
+@keyframes floBlink{0%,80%,100%{opacity:.25}40%{opacity:1}}
+.flo-chips{display:flex;flex-wrap:wrap;gap:8px;padding:4px 0}
+.flo-chip{border:1px solid var(--teal-200);background:var(--teal-50);color:var(--teal-700);font-size:12px;padding:6px 12px;border-radius:999px;cursor:pointer}
+.flo-chip:hover{background:var(--teal-100)}
+.flo-input{display:flex;gap:8px;padding:12px;border-top:1px solid var(--slate-200);background:#fff;padding-bottom:calc(12px + var(--safe-bottom))}
+.flo-input textarea{flex:1;resize:none;border:1px solid var(--slate-300);border-radius:12px;padding:9px 12px;font-size:14px;font-family:inherit;max-height:110px;outline:none}
+.flo-input textarea:focus{border-color:var(--teal-500)}
+.flo-icon-btn{width:40px;height:40px;border-radius:12px;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:17px;flex-shrink:0}
+.flo-send{background:var(--teal-600);color:#fff}
+.flo-send:disabled{opacity:.4;cursor:default}
+.flo-mic{background:var(--slate-100);color:var(--slate-600)}
+.flo-mic.rec{background:var(--rose-500);color:#fff;animation:floBlink 1s infinite}
 </style>
 </head>
 <body>
@@ -2174,6 +2210,160 @@ function ProfileModal({ me, user, plant, activeUnit, logout, onClose, onSaved })
   `;
 }
 
+// ============= FLO — AI PLANT COPILOT =============
+// Floating assistant (JARVIS-style): asks the 'assistant' edge function, which
+// runs a Claude tool loop over the user's own RLS-scoped data. Replies render
+// markdown-lite; navigate actions switch app tabs; mic uses webkitSpeechRecognition.
+const floEsc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+function floMd(text) {
+  const inline = (s) => floEsc(s)
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>');
+  const lines = String(text || '').split('\n');
+  let html_out = '', i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    // markdown table block
+    if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|[\s\-:|]+\|\s*$/.test(lines[i + 1])) {
+      const heads = line.split('|').slice(1, -1).map(c => inline(c.trim()));
+      i += 2;
+      let rows = '';
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) {
+        rows += '<tr>' + lines[i].split('|').slice(1, -1).map(c => '<td>' + inline(c.trim()) + '</td>').join('') + '</tr>';
+        i++;
+      }
+      html_out += '<table><thead><tr>' + heads.map(h => '<th>' + h + '</th>').join('') + '</tr></thead><tbody>' + rows + '</tbody></table>';
+      continue;
+    }
+    // bullet list block
+    if (/^\s*[-•]\s+/.test(line)) {
+      let items = '';
+      while (i < lines.length && /^\s*[-•]\s+/.test(lines[i])) {
+        items += '<li>' + inline(lines[i].replace(/^\s*[-•]\s+/, '')) + '</li>';
+        i++;
+      }
+      html_out += '<ul>' + items + '</ul>';
+      continue;
+    }
+    if (/^\s*#{1,4}\s+/.test(line)) { html_out += '<div style="font-weight:700;margin:6px 0 2px">' + inline(line.replace(/^\s*#{1,4}\s+/, '')) + '</div>'; i++; continue; }
+    html_out += inline(line) + (i < lines.length - 1 ? '<br>' : '');
+    i++;
+  }
+  return html_out;
+}
+
+const FLO_THINKING = ['Checking the data…', 'Crunching the numbers…', 'Looking that up…', 'Asking the database…', 'On it…'];
+const FLO_CHIPS = ["What's pending today?", "Today's production summary", 'Any open breakdowns?', "Who's absent today?", 'Yesterday’s rejections'];
+
+function AssistantPanel({ plant, me, setTab, onClose }) {
+  const [msgs, setMsgs] = useState([]);
+  const [input, setInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [thinkIdx, setThinkIdx] = useState(0);
+  const [rec, setRec] = useState(false);
+  const bodyRef = useRef(null);
+  const recogRef = useRef(null);
+
+  useEffect(() => {
+    if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
+  }, [msgs, busy]);
+  useEffect(() => {
+    if (!busy) return;
+    const t = setInterval(() => setThinkIdx(x => x + 1), 2200);
+    return () => clearInterval(t);
+  }, [busy]);
+
+  const send = async (text) => {
+    const q = (text ?? input).trim();
+    if (!q || busy) return;
+    setInput('');
+    const nextMsgs = [...msgs.filter(m => !m.err), { role: 'user', content: q }];
+    setMsgs([...msgs, { role: 'user', content: q }]);
+    setBusy(true);
+    try {
+      const session = (await sb.auth.getSession()).data.session;
+      const res = await fetch(SUPABASE_URL + '/functions/v1/assistant', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + (session?.access_token || ''),
+          'apikey': SUPABASE_ANON_KEY,
+        },
+        body: JSON.stringify({ messages: nextMsgs.slice(-12) }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || data.error) throw new Error(data?.error || ('HTTP ' + res.status));
+      setMsgs(m => [...m, { role: 'assistant', content: data.reply || '…' }]);
+      for (const a of (data.actions || [])) {
+        if (a.type === 'navigate' && a.tab) { setTab(a.tab); showToast('Opened ' + a.tab); }
+      }
+    } catch (e) {
+      setMsgs(m => [...m, { role: 'assistant', content: 'Something went wrong: ' + e.message, err: true }]);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleMic = () => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { showToast('Voice input not supported on this browser'); return; }
+    if (rec) { recogRef.current?.stop(); return; }
+    const r = new SR();
+    recogRef.current = r;
+    r.lang = 'en-IN'; r.interimResults = true; r.continuous = false;
+    r.onresult = (e) => {
+      const t = Array.from(e.results).map(x => x[0].transcript).join('');
+      setInput(t);
+    };
+    r.onend = () => setRec(false);
+    r.onerror = () => setRec(false);
+    setRec(true);
+    r.start();
+  };
+
+  const onKey = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  };
+
+  return html`
+    <div class="flo-panel">
+      <div class="flo-head">
+        <div style="width:36px;height:36px;border-radius:10px;background:rgba(255,255,255,0.15);display:flex;align-items:center;justify-content:center;font-size:19px">✨</div>
+        <div style="flex:1">
+          <div class="flo-title">FLO</div>
+          <div class="flo-sub">${plant.name} · your plant copilot</div>
+        </div>
+        <button class="flo-icon-btn" style="background:rgba(255,255,255,0.12);color:#fff" onClick=${onClose}>✕</button>
+      </div>
+      <div class="flo-body" ref=${bodyRef}>
+        ${msgs.length === 0 && html`
+          <div class="flo-msg bot">
+            Hi ${(me.full_name || '').split(' ')[0]} 👋 I'm <strong>FLO</strong> — ask me anything about your plant: production, tasks, breakdowns, quality, stocks, bills, attendance. I can also assign tasks and open sections for you.
+          </div>
+          <div class="flo-chips">
+            ${FLO_CHIPS.map(c => html`<button class="flo-chip" onClick=${() => send(c)}>${c}</button>`)}
+          </div>
+        `}
+        ${msgs.map(m => m.role === 'user'
+          ? html`<div class="flo-msg user">${m.content}</div>`
+          : html`<div class="flo-msg bot ${m.err ? 'err' : ''}" dangerouslySetInnerHTML=${{ __html: floMd(m.content) }}></div>`)}
+        ${busy && html`
+          <div class="flo-think">
+            <span class="flo-dots"><span></span><span></span><span></span></span>
+            ${FLO_THINKING[thinkIdx % FLO_THINKING.length]}
+          </div>
+        `}
+      </div>
+      <div class="flo-input">
+        <button class="flo-icon-btn flo-mic ${rec ? 'rec' : ''}" title="Voice input" onClick=${toggleMic}>🎙</button>
+        <textarea rows="1" placeholder="Ask FLO…" value=${input}
+          onInput=${e => setInput(e.target.value)} onKeyDown=${onKey}></textarea>
+        <button class="flo-icon-btn flo-send" disabled=${busy || !input.trim()} onClick=${() => send()}>➤</button>
+      </div>
+    </div>
+  `;
+}
+
 function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessibleUnits, activeUnit, switchUnit }) {
   const initials = (me.full_name || user.email).split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
   const [unreadCount, setUnreadCount] = useState(0);
@@ -2182,6 +2372,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   // and we open the item's full live record (machine history card) in an overlay.
   const [histMachine, setHistMachine] = useState(null);
   const [histLoading, setHistLoading] = useState(false);
+  const [floOpen, setFloOpen] = useState(false);
   useEffect(() => {
     const onMsg = async (e) => {
       const d = e && e.data;
@@ -2330,6 +2521,8 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
           <${MachineDetail} plant=${plant} me=${me} machine=${histMachine} units=${[]} users=${[]} dies=${[]} parts=${[]} onClose=${() => setHistMachine(null)} />
         </div>
       </div>`}
+      ${!floOpen && html`<button class="flo-fab" title="Ask FLO — your plant copilot" onClick=${() => setFloOpen(true)}>✨</button>`}
+      ${floOpen && html`<${AssistantPanel} plant=${plant} me=${me} setTab=${setTab} onClose=${() => setFloOpen(false)} />`}
 
       <${Page} active=${pageTab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} myPerms=${myPerms} /></${Page}>
       <${Page} active=${pageTab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
