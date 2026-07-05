@@ -470,6 +470,23 @@ body{
 .flo-send:disabled{opacity:.4;cursor:default}
 .flo-mic{background:var(--slate-100);color:var(--slate-600)}
 .flo-mic.rec{background:var(--rose-500);color:#fff;animation:floBlink 1s infinite}
+/* Genie voice conversation overlay */
+.flo-voice{position:absolute;top:64px;left:0;right:0;bottom:0;z-index:5;background:linear-gradient(180deg,rgba(15,23,42,0.96),rgba(19,78,74,0.97));display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:24px;text-align:center}
+.flo-orb{width:110px;height:110px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#5eead4,#0d9488 60%,#134e4a);box-shadow:0 0 60px rgba(20,184,166,0.55);cursor:pointer;transition:transform .2s}
+.flo-orb.listening{animation:floOrbPulse 1.6s ease-in-out infinite}
+.flo-orb.thinking{animation:floOrbSpin 1.1s linear infinite;box-shadow:0 0 60px rgba(251,191,36,0.5);background:radial-gradient(circle at 35% 30%,#fde68a,#d97706 60%,#78350f)}
+.flo-orb.speaking{animation:floOrbTalk .5s ease-in-out infinite alternate}
+@keyframes floOrbPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.12)}}
+@keyframes floOrbSpin{from{transform:rotate(0) scale(.96)}to{transform:rotate(360deg) scale(.96)}}
+@keyframes floOrbTalk{from{transform:scale(1)}to{transform:scale(1.09)}}
+.flo-voice-status{color:#ccfbf1;font-size:15px;font-weight:600;font-family:'Bricolage Grotesque',sans-serif}
+.flo-voice-interim{color:rgba(255,255,255,0.85);font-size:14px;min-height:42px;max-width:320px;line-height:1.5}
+.flo-voice-reply{color:rgba(204,251,241,0.95);font-size:13.5px;max-width:330px;line-height:1.5;max-height:130px;overflow-y:auto}
+.flo-lang-row{display:flex;gap:8px}
+.flo-lang{border:1px solid rgba(255,255,255,0.25);background:rgba(255,255,255,0.08);color:#fff;font-size:12.5px;padding:6px 14px;border-radius:999px;cursor:pointer}
+.flo-lang.on{background:#fff;color:var(--teal-900);font-weight:700}
+.flo-voice-end{margin-top:6px;border:none;border-radius:999px;background:var(--rose-500);color:#fff;padding:10px 22px;font-size:13.5px;font-weight:600;cursor:pointer}
+.flo-voice-hint{color:rgba(255,255,255,0.5);font-size:11.5px}
 </style>
 </head>
 <body>
@@ -2255,14 +2272,30 @@ function floMd(text) {
 const FLO_THINKING = ['Checking the data…', 'Crunching the numbers…', 'Looking that up…', 'Asking the database…', 'On it…'];
 const FLO_CHIPS = ["What's pending today?", "Today's production summary", 'Any open breakdowns?', "Who's absent today?", 'Yesterday’s rejections'];
 
+const FLO_LANGS = [
+  { code: 'en-IN', label: 'English' },
+  { code: 'ta-IN', label: 'தமிழ்' },
+  { code: 'hi-IN', label: 'हिंदी' },
+];
+
 function AssistantPanel({ plant, me, setTab, onClose }) {
   const [msgs, setMsgs] = useState([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [thinkIdx, setThinkIdx] = useState(0);
-  const [rec, setRec] = useState(false);
+  // Genie voice conversation: tap once → continuous listen → think → speak → listen…
+  const [voiceMode, setVoiceMode] = useState(false);
+  const [voiceState, setVoiceState] = useState('listening'); // listening | thinking | speaking
+  const [voiceLang, setVoiceLang] = useState(localStorage.getItem('flo_lang') || 'en-IN');
+  const [interim, setInterim] = useState('');
+  const [lastReply, setLastReply] = useState('');
   const bodyRef = useRef(null);
   const recogRef = useRef(null);
+  const voiceModeRef = useRef(false);
+  const voiceLangRef = useRef(voiceLang);
+  const msgsRef = useRef([]);
+  useEffect(() => { msgsRef.current = msgs; }, [msgs]);
+  useEffect(() => { voiceLangRef.current = voiceLang; localStorage.setItem('flo_lang', voiceLang); }, [voiceLang]);
 
   useEffect(() => {
     if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
@@ -2272,13 +2305,15 @@ function AssistantPanel({ plant, me, setTab, onClose }) {
     const t = setInterval(() => setThinkIdx(x => x + 1), 2200);
     return () => clearInterval(t);
   }, [busy]);
+  // Leaving the panel or voice mode: stop everything cleanly.
+  useEffect(() => () => { try { recogRef.current?.abort(); } catch {} try { window.speechSynthesis?.cancel(); } catch {} }, []);
 
-  const send = async (text) => {
+  const send = async (text, viaVoice = false) => {
     const q = (text ?? input).trim();
-    if (!q || busy) return;
+    if (!q || busy) return null;
     setInput('');
-    const nextMsgs = [...msgs.filter(m => !m.err), { role: 'user', content: q }];
-    setMsgs([...msgs, { role: 'user', content: q }]);
+    const nextMsgs = [...msgsRef.current.filter(m => !m.err), { role: 'user', content: q }];
+    setMsgs(m => [...m, { role: 'user', content: q }]);
     setBusy(true);
     try {
       const session = (await sb.auth.getSession()).data.session;
@@ -2289,7 +2324,7 @@ function AssistantPanel({ plant, me, setTab, onClose }) {
           'Authorization': 'Bearer ' + (session?.access_token || ''),
           'apikey': SUPABASE_ANON_KEY,
         },
-        body: JSON.stringify({ messages: nextMsgs.slice(-12) }),
+        body: JSON.stringify({ messages: nextMsgs.slice(-12), voice: viaVoice }),
       });
       const data = await res.json().catch(() => null);
       if (!res.ok || !data || data.error) throw new Error(data?.error || ('HTTP ' + res.status));
@@ -2297,28 +2332,104 @@ function AssistantPanel({ plant, me, setTab, onClose }) {
       for (const a of (data.actions || [])) {
         if (a.type === 'navigate' && a.tab) { setTab(a.tab); showToast('Opened ' + a.tab); }
       }
+      return data.reply || '';
     } catch (e) {
       setMsgs(m => [...m, { role: 'assistant', content: 'Something went wrong: ' + e.message, err: true }]);
+      return null;
     } finally {
       setBusy(false);
     }
   };
 
-  const toggleMic = () => {
+  // ---- Genie voice loop ----
+  const speak = (text) => new Promise((resolve) => {
+    try {
+      const clean = String(text || '')
+        .replace(/[*#|`_>]/g, ' ')
+        .replace(/[✅⚠️\u{1F300}-\u{1FAFF}]/gu, ' ')
+        .replace(/\s+/g, ' ').trim();
+      if (!clean || !window.speechSynthesis) return resolve();
+      const u = new SpeechSynthesisUtterance(clean);
+      const isTamil = /[஀-௿]/.test(clean);
+      const isHindi = /[ऀ-ॿ]/.test(clean);
+      u.lang = isTamil ? 'ta-IN' : isHindi ? 'hi-IN' : 'en-IN';
+      const pick = () => {
+        const vs = window.speechSynthesis.getVoices() || [];
+        return vs.find(v => v.lang === u.lang) || vs.find(v => v.lang && v.lang.startsWith(u.lang.slice(0, 2))) || null;
+      };
+      const v = pick();
+      if (v) u.voice = v;
+      u.rate = 1.03;
+      u.onend = resolve; u.onerror = resolve;
+      setVoiceState('speaking');
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(u);
+      // Safety: some browsers never fire onend if the tab loses focus.
+      setTimeout(resolve, Math.min(30000, 2500 + clean.length * 90));
+    } catch { resolve(); }
+  });
+
+  const listenOnce = () => {
+    if (!voiceModeRef.current) return;
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { showToast('Voice input not supported on this browser'); return; }
-    if (rec) { recogRef.current?.stop(); return; }
+    if (!SR) { showToast('Voice input not supported on this browser'); setVoiceMode(false); return; }
     const r = new SR();
     recogRef.current = r;
-    r.lang = 'en-IN'; r.interimResults = true; r.continuous = false;
+    r.lang = voiceLangRef.current;
+    r.interimResults = true;
+    r.continuous = false;
+    let finalTxt = '';
+    let done = false;
     r.onresult = (e) => {
-      const t = Array.from(e.results).map(x => x[0].transcript).join('');
-      setInput(t);
+      let f = '', it = '';
+      for (const res of e.results) { if (res.isFinal) f += res[0].transcript; else it += res[0].transcript; }
+      finalTxt = f;
+      setInterim(f || it);
     };
-    r.onend = () => setRec(false);
-    r.onerror = () => setRec(false);
-    setRec(true);
-    r.start();
+    const finish = async () => {
+      if (done || !voiceModeRef.current) return;
+      done = true;
+      const q = (finalTxt || '').trim();
+      setInterim('');
+      if (!q) { setTimeout(listenOnce, 250); return; } // silence — keep listening
+      setVoiceState('thinking');
+      const reply = await send(q, true);
+      if (!voiceModeRef.current) return;
+      if (reply) { setLastReply(reply); await speak(reply); }
+      if (!voiceModeRef.current) return;
+      setVoiceState('listening');
+      setTimeout(listenOnce, 150);
+    };
+    r.onend = finish;
+    r.onerror = (e) => {
+      if (e && (e.error === 'not-allowed' || e.error === 'service-not-allowed')) {
+        showToast('Microphone permission needed'); setVoiceMode(false); done = true;
+      }
+    };
+    setVoiceState('listening');
+    try { r.start(); } catch { /* already started */ }
+  };
+
+  const startVoice = () => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { showToast('Voice input not supported on this browser'); return; }
+    try { window.speechSynthesis?.getVoices(); } catch {}
+    voiceModeRef.current = true;
+    setLastReply('');
+    setVoiceMode(true);
+    listenOnce();
+  };
+  const stopVoice = () => {
+    voiceModeRef.current = false;
+    setVoiceMode(false);
+    setInterim('');
+    try { recogRef.current?.abort(); } catch {}
+    try { window.speechSynthesis?.cancel(); } catch {}
+  };
+  const switchLang = (code) => {
+    setVoiceLang(code);
+    voiceLangRef.current = code;
+    try { recogRef.current?.abort(); } catch {} // onend fires → restarts with new lang
   };
 
   const onKey = (e) => {
@@ -2355,11 +2466,28 @@ function AssistantPanel({ plant, me, setTab, onClose }) {
         `}
       </div>
       <div class="flo-input">
-        <button class="flo-icon-btn flo-mic ${rec ? 'rec' : ''}" title="Voice input" onClick=${toggleMic}>🎙</button>
+        <button class="flo-icon-btn flo-mic" title="Talk to FLO" onClick=${startVoice}>🎙</button>
         <textarea rows="1" placeholder="Ask FLO…" value=${input}
           onInput=${e => setInput(e.target.value)} onKeyDown=${onKey}></textarea>
         <button class="flo-icon-btn flo-send" disabled=${busy || !input.trim()} onClick=${() => send()}>➤</button>
       </div>
+      ${voiceMode && html`
+        <div class="flo-voice">
+          <div class="flo-orb ${voiceState}" onClick=${() => { if (voiceState === 'speaking') { try { window.speechSynthesis.cancel(); } catch {} } }}></div>
+          <div class="flo-voice-status">
+            ${voiceState === 'listening' ? (voiceLang === 'ta-IN' ? 'கேட்கிறேன்… பேசுங்க' : voiceLang === 'hi-IN' ? 'सुन रहा हूँ… बोलिए' : 'Listening… just talk')
+              : voiceState === 'thinking' ? (voiceLang === 'ta-IN' ? 'யோசிக்கிறேன்…' : 'Thinking…')
+              : (voiceLang === 'ta-IN' ? 'சொல்கிறேன்…' : 'Speaking…')}
+          </div>
+          <div class="flo-voice-interim">${interim}</div>
+          ${voiceState === 'speaking' && lastReply && html`<div class="flo-voice-reply">${lastReply}</div>`}
+          <div class="flo-lang-row">
+            ${FLO_LANGS.map(l => html`<button class="flo-lang ${voiceLang === l.code ? 'on' : ''}" onClick=${() => switchLang(l.code)}>${l.label}</button>`)}
+          </div>
+          <button class="flo-voice-end" onClick=${stopVoice}>✕ End conversation</button>
+          <div class="flo-voice-hint">${voiceState === 'speaking' ? 'tap the orb to interrupt' : 'full conversation stays in the chat behind'}</div>
+        </div>
+      `}
     </div>
   `;
 }

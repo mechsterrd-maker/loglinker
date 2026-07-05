@@ -13,7 +13,7 @@ const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-opus-4-8";
 const MAX_ROUNDS = 8;
-const VERSION = "flo-v1";
+const VERSION = "flo-v2";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -63,7 +63,7 @@ const TOOLS = [
   },
 ];
 
-function buildSystem(ctx: { name: string; role: string; plant: string; unit: string; units: string; today: string }) {
+function buildSystem(ctx: { name: string; role: string; plant: string; unit: string; units: string; today: string; voice: boolean }) {
   return `You are FLO, Loglinkr's built-in plant copilot — a sharp, friendly assistant living inside a factory-operations app used by Indian fabrication and die-casting plants. Think JARVIS for the shop floor: fast, factual, zero fluff.
 
 ## Who you're talking to
@@ -79,7 +79,15 @@ Today is ${ctx.today} (IST). The database stores timestamps in UTC — for "toda
 - When the request is ambiguous (which unit? which part? which person?), ask one short clarifying question instead of guessing.
 - You may create tasks and open app sections with your tools. Confirm what you did in one line ("✅ Task assigned to Naresh, due 6 Jul").
 - Politely refuse things outside the plant/app (general web questions, code, other companies' data).
-- Reply in the user's language if they write in Tamil/Hindi/etc.; otherwise English.
+- LANGUAGE: mirror the user. Many users speak Tanglish — Tamil-English mix, often Tamil words in English letters ("innaiku production evlo?", "reject athigama irukka?") — understand it naturally and reply in the same mix. Pure Tamil → reply in Tamil (தமிழ்). Hindi/Hinglish → reply likewise. English → English. Keep technical terms (part codes, machine codes, numbers) as-is.${ctx.voice ? `
+
+## VOICE CONVERSATION MODE (active now)
+You are in a live spoken conversation — your reply will be read aloud by text-to-speech.
+- Reply like a human colleague speaking: 1–3 short sentences, warm and natural.
+- NO markdown, NO tables, NO bullet lists, NO emoji, NO symbols like | or #.
+- Speak numbers naturally ("about twelve thousand five hundred" style is not needed — plain "12,500" is fine, but round long decimals).
+- If the answer would need a big table, give the headline figure and offer: "want me to show the full list on screen?" (then use navigate or wait for them to ask in text).
+- Keep the conversation flowing — it's okay to end with a short natural follow-up question when useful.` : ""}
 
 ## Schema cheat-sheet (key tables; verify columns via information_schema when unsure)
 - users(id, full_name, role, department, designation, primary_unit_id, active_unit_id, status) · units(id, name) · shifts(id, name) · departments(name)
@@ -158,6 +166,7 @@ Deno.serve(async (req) => {
     const body = await req.json().catch(() => ({}));
     const history: Array<{ role: string; content: string }> = Array.isArray(body.messages) ? body.messages : [];
     if (!history.length) return json({ error: "messages required" }, 400);
+    const voiceMode = body.voice === true;
 
     // Context (all via the user's own RLS)
     const { data: me } = await db.from("users")
@@ -178,6 +187,7 @@ Deno.serve(async (req) => {
       unit: unitName,
       units: (units || []).map((u: { name: string }) => u.name).join(", ") || "—",
       today,
+      voice: voiceMode,
     });
 
     // Conversation: client sends plain-text turns; tool blocks live only server-side within this request.
