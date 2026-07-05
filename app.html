@@ -2369,67 +2369,113 @@ function AssistantPanel({ plant, me, setTab, onClose }) {
     } catch { resolve(); }
   });
 
-  const listenOnce = () => {
-    if (!voiceModeRef.current) return;
+  // Your turn ends only after this much continuous silence — so pausing to
+  // think mid-sentence doesn't cut you off.
+  const FLO_PAUSE_MS = 2500;
+  const bufferRef = useRef('');          // everything you've said this turn
+  const lastHeardRef = useRef(0);        // last time the mic heard anything
+  const phaseRef = useRef('idle');       // idle | listening | processing
+  const wakeRef = useRef(null);          // screen wake lock
+
+  const acquireWakeLock = async () => {
+    try {
+      if (navigator.wakeLock && !wakeRef.current) {
+        wakeRef.current = await navigator.wakeLock.request('screen');
+        wakeRef.current.addEventListener?.('release', () => { wakeRef.current = null; });
+      }
+    } catch { /* unsupported / denied — screen may still auto-lock */ }
+  };
+  const releaseWakeLock = () => { try { wakeRef.current?.release(); } catch {} wakeRef.current = null; };
+  useEffect(() => {
+    // Wake locks are auto-released when the tab is hidden; re-acquire on return.
+    const onVis = () => { if (document.visibilityState === 'visible' && voiceModeRef.current) acquireWakeLock(); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => { document.removeEventListener('visibilitychange', onVis); releaseWakeLock(); };
+  }, []);
+
+  // The recognizer auto-ends after short silences; restart it seamlessly and
+  // keep accumulating into bufferRef so nothing you said is lost.
+  const startRecognizer = () => {
+    if (!voiceModeRef.current || phaseRef.current !== 'listening') return;
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) { showToast('Voice input not supported on this browser'); setVoiceMode(false); return; }
     const r = new SR();
     recogRef.current = r;
     r.lang = voiceLangRef.current;
     r.interimResults = true;
-    r.continuous = false;
-    let finalTxt = '';
-    let done = false;
+    r.continuous = true;
     r.onresult = (e) => {
-      let f = '', it = '';
-      for (const res of e.results) { if (res.isFinal) f += res[0].transcript; else it += res[0].transcript; }
-      finalTxt = f;
-      setInterim(f || it);
+      let interimTxt = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const res = e.results[i];
+        if (res.isFinal) bufferRef.current = (bufferRef.current + ' ' + res[0].transcript).trim();
+        else interimTxt += res[0].transcript;
+      }
+      lastHeardRef.current = Date.now();
+      setInterim((bufferRef.current + ' ' + interimTxt).trim());
     };
-    const finish = async () => {
-      if (done || !voiceModeRef.current) return;
-      done = true;
-      const q = (finalTxt || '').trim();
+    r.onend = () => { if (voiceModeRef.current && phaseRef.current === 'listening') setTimeout(startRecognizer, 120); };
+    r.onerror = (e) => {
+      if (e && (e.error === 'not-allowed' || e.error === 'service-not-allowed')) {
+        showToast('Microphone permission needed'); stopVoice();
+      }
+    };
+    try { r.start(); } catch { /* already running */ }
+  };
+
+  // Silence watcher: commits your turn once you've been quiet for FLO_PAUSE_MS.
+  useEffect(() => {
+    if (!voiceMode) return;
+    const t = setInterval(async () => {
+      if (phaseRef.current !== 'listening') return;
+      const buf = bufferRef.current.trim();
+      if (!buf) return;
+      if (Date.now() - lastHeardRef.current < FLO_PAUSE_MS) return;
+      phaseRef.current = 'processing';
+      try { recogRef.current?.abort(); } catch {}
+      bufferRef.current = '';
       setInterim('');
-      if (!q) { setTimeout(listenOnce, 250); return; } // silence — keep listening
       setVoiceState('thinking');
-      const reply = await send(q, true);
+      const reply = await send(buf, true);
       if (!voiceModeRef.current) return;
       if (reply) { setLastReply(reply); await speak(reply); }
       if (!voiceModeRef.current) return;
+      phaseRef.current = 'listening';
+      lastHeardRef.current = Date.now();
       setVoiceState('listening');
-      setTimeout(listenOnce, 150);
-    };
-    r.onend = finish;
-    r.onerror = (e) => {
-      if (e && (e.error === 'not-allowed' || e.error === 'service-not-allowed')) {
-        showToast('Microphone permission needed'); setVoiceMode(false); done = true;
-      }
-    };
-    setVoiceState('listening');
-    try { r.start(); } catch { /* already started */ }
-  };
+      startRecognizer();
+    }, 250);
+    return () => clearInterval(t);
+  }, [voiceMode]);
 
   const startVoice = () => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) { showToast('Voice input not supported on this browser'); return; }
     try { window.speechSynthesis?.getVoices(); } catch {}
     voiceModeRef.current = true;
+    phaseRef.current = 'listening';
+    bufferRef.current = '';
+    lastHeardRef.current = Date.now();
     setLastReply('');
+    setVoiceState('listening');
     setVoiceMode(true);
-    listenOnce();
+    acquireWakeLock();
+    startRecognizer();
   };
   const stopVoice = () => {
     voiceModeRef.current = false;
+    phaseRef.current = 'idle';
+    bufferRef.current = '';
     setVoiceMode(false);
     setInterim('');
+    releaseWakeLock();
     try { recogRef.current?.abort(); } catch {}
     try { window.speechSynthesis?.cancel(); } catch {}
   };
   const switchLang = (code) => {
     setVoiceLang(code);
     voiceLangRef.current = code;
-    try { recogRef.current?.abort(); } catch {} // onend fires → restarts with new lang
+    try { recogRef.current?.abort(); } catch {} // onend restarts with the new lang
   };
 
   const onKey = (e) => {
@@ -2485,7 +2531,7 @@ function AssistantPanel({ plant, me, setTab, onClose }) {
             ${FLO_LANGS.map(l => html`<button class="flo-lang ${voiceLang === l.code ? 'on' : ''}" onClick=${() => switchLang(l.code)}>${l.label}</button>`)}
           </div>
           <button class="flo-voice-end" onClick=${stopVoice}>✕ End conversation</button>
-          <div class="flo-voice-hint">${voiceState === 'speaking' ? 'tap the orb to interrupt' : 'full conversation stays in the chat behind'}</div>
+          <div class="flo-voice-hint">${voiceState === 'speaking' ? 'tap the orb to interrupt' : 'take your time — I wait till you finish speaking'}</div>
         </div>
       `}
     </div>
