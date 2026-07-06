@@ -3415,7 +3415,12 @@ function Production({ plant, me, activeUnit }) {
     `}
 
     ${view === 'parts' && html`
-      <div class="section-h">Parts · ${parts.length}<button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('part'); }}>+ Add Part</button></div>
+      <div class="section-h">Parts · ${parts.length}
+        <span style="margin-left:auto;display:flex;gap:6px">
+          <button class="btn small ghost" onClick=${() => setModal('import_sched_parts')}>📥 From schedules</button>
+          <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('part'); }}>+ Add Part</button>
+        </span>
+      </div>
       ${parts.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🔩</div>No parts yet. Add your first part — then add its route and BOM.</div></div>` :
         parts.map(p => html`
           <div class="list-item" key=${p.id} onClick=${() => setActivePart(p)}>
@@ -3589,6 +3594,7 @@ function Production({ plant, me, activeUnit }) {
     `}
 
     ${modal === 'part' && html`<${PartModal} plant=${plant} me=${me} dies=${dies} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'import_sched_parts' && html`<${ImportPartsFromSchedulesModal} plant=${plant} me=${me} activeUnit=${activeUnit} parts=${parts} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'machine' && html`<${MachineModal} plant=${plant} units=${units} users=${users} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'machine_bulk' && html`<${MachineBulkAddModal} plant=${plant} units=${units} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'die' && html`<${DieModal} plant=${plant} me=${me} parts=${parts} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
@@ -3994,6 +4000,175 @@ function ToolForecastView({ plant, setModal, setEditTarget }) {
 }
 
 // ============= MACHINE MODAL =============
+// ============= IMPORT PARTS FROM SCHEDULES =============
+// Seeds the part master from schedule lines: every distinct (customer ×
+// part name) seen in uploaded schedules that isn't already in the master
+// becomes an editable candidate row. Importing creates the part, links all
+// matching schedule lines (part_id), and records a customer alias so future
+// schedule uploads auto-match.
+function ImportPartsFromSchedulesModal({ plant, me, activeUnit, parts, onClose, onSaved }) {
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);       // candidate groups
+  const [skipped, setSkipped] = useState(0);  // already in master / linked
+  const [importing, setImporting] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => { (async () => {
+    try {
+      const [{ data: lines, error: e1 }, { data: aliases, error: e2 }] = await Promise.all([
+        sb.from('mcp_sched_lines')
+          .select('id, part_name_raw, customer_part_number, uom, planned_qty, part_id, mcp_sched_schedules!inner(customer_id, mcp_sched_customers(name))')
+          .eq('plant_id', plant.id),
+        sb.from('customer_part_aliases').select('customer_id, external_name_normalized').eq('plant_id', plant.id),
+      ]);
+      if (e1) throw e1; if (e2) throw e2;
+
+      const aliasSet = new Set((aliases || []).map(a => a.customer_id + '|' + a.external_name_normalized));
+      const partNames = new Set((parts || []).map(p => (p.name || '').trim().toLowerCase()));
+      const partNumbers = new Set((parts || []).flatMap(p => [p.part_number, p.customer_part_number].filter(Boolean).map(x => String(x).trim().toLowerCase())));
+
+      const groups = {};
+      let skip = 0;
+      for (const l of (lines || [])) {
+        const raw = (l.part_name_raw || '').trim();
+        if (!raw) continue;
+        const custId = l.mcp_sched_schedules?.customer_id || '';
+        const key = custId + '|' + raw.toLowerCase();
+        if (!groups[key]) {
+          groups[key] = {
+            key, customer_id: custId,
+            customer_name: l.mcp_sched_schedules?.mcp_sched_customers?.name || '?',
+            raw_name: raw, cpn: '', uom: l.uom || 'nos',
+            line_ids: [], total_qty: 0, linked: false,
+          };
+        }
+        const g = groups[key];
+        g.line_ids.push(l.id);
+        g.total_qty += Number(l.planned_qty) || 0;
+        if (!g.cpn && l.customer_part_number) g.cpn = String(l.customer_part_number).trim();
+        if (l.part_id) g.linked = true;
+      }
+
+      const candidates = [];
+      for (const g of Object.values(groups)) {
+        const nameL = g.raw_name.toLowerCase();
+        const already = g.linked
+          || aliasSet.has(g.customer_id + '|' + nameL)
+          || partNames.has(nameL)
+          || (g.cpn && partNumbers.has(g.cpn.toLowerCase()));
+        if (already) { skip++; continue; }
+        candidates.push({
+          ...g, checked: true,
+          part_number: (g.cpn || g.raw_name.toUpperCase().replace(/[^A-Z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24)),
+          name: g.raw_name,
+        });
+      }
+      candidates.sort((a, b) => a.customer_name.localeCompare(b.customer_name) || a.name.localeCompare(b.name));
+      setRows(candidates);
+      setSkipped(skip);
+    } catch (err) { setError(err.message); }
+    finally { setLoading(false); }
+  })(); }, []);
+
+  const patchRow = (i, patch) => setRows(prev => prev.map((r, x) => x === i ? { ...r, ...patch } : r));
+  const selCount = rows.filter(r => r.checked).length;
+
+  const runImport = async () => {
+    setImporting(true); setError('');
+    let created = 0, failed = 0;
+    try {
+      // Guard against duplicate part numbers inside the selection itself
+      const nums = rows.filter(r => r.checked).map(r => r.part_number.trim().toUpperCase());
+      if (new Set(nums).size !== nums.length) throw new Error('Two selected rows have the same part number — make them unique first.');
+
+      for (const r of rows) {
+        if (!r.checked) continue;
+        try {
+          const payload = {
+            plant_id: plant.id,
+            part_number: r.part_number.trim().toUpperCase(),
+            revision: 'A',
+            name: r.name.trim(),
+            part_type: 'finished',
+            status: 'active',
+            customer: r.customer_name !== '?' ? r.customer_name : null,
+            customer_part_number: r.cpn || null,
+            uom: r.uom || 'nos',
+            notes: 'Imported from schedules',
+            created_by: me.id,
+          };
+          if (activeUnit?.unit_id) payload.unit_id = activeUnit.unit_id;
+          const { data: part, error: pe } = await sb.from('mcp_pdc_parts').insert(payload).select('id, part_number').single();
+          if (pe) throw pe;
+          // Link every schedule line of this (customer × raw name) to the new part
+          await sb.from('mcp_sched_lines').update({ part_id: part.id }).in('id', r.line_ids);
+          // Alias so the next schedule upload auto-matches this customer name
+          if (r.customer_id) {
+            await sb.from('customer_part_aliases').insert({
+              plant_id: plant.id,
+              customer_id: r.customer_id,
+              external_name: r.raw_name,
+              external_name_normalized: r.raw_name.toLowerCase(),
+              internal_part_id: part.id,
+              internal_part_number: part.part_number,
+              confidence: 'manual',
+              created_by: me.id,
+            }).then(() => {}, () => {}); // alias is best-effort (unique constraint)
+          }
+          created++;
+        } catch (err) {
+          failed++;
+          patchRow(rows.indexOf(r), { failed: err.message });
+        }
+      }
+      showToast(created + ' part' + (created === 1 ? '' : 's') + ' created & linked' + (failed ? ' · ' + failed + ' failed' : ''));
+      if (failed === 0) onSaved();
+      else setRows(prev => prev.filter(r => r.checked && r.failed)); // keep failures visible
+    } catch (err) { setError(err.message); }
+    finally { setImporting(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:680px">
+        <div class="modal-header">
+          <div class="modal-title">📥 Import parts from schedules</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        ${loading ? html`<div class="empty" style="padding:24px">Scanning schedule lines…</div>` : html`
+          <div style="font-size:12.5px;color:var(--slate-600);margin-bottom:10px">
+            Found <strong>${rows.length}</strong> part${rows.length === 1 ? '' : 's'} in your schedules that ${rows.length === 1 ? "isn't" : "aren't"} in the part master yet${skipped > 0 ? html` · <span style="color:var(--slate-400)">${skipped} already in master / linked — skipped</span>` : ''}.
+            Edit part numbers/names if needed, untick any you don't want, then import. Schedule lines get linked and future uploads auto-match.
+          </div>
+          ${rows.length === 0 ? html`<div class="empty" style="padding:20px">🎉 Every part in your schedules is already in the master.</div>` : html`
+            <div style="max-height:46vh;overflow-y:auto;display:flex;flex-direction:column;gap:8px">
+              ${rows.map((r, i) => html`
+                <div key=${r.key} style="border:1px solid ${r.failed ? 'var(--rose-200)' : 'var(--slate-200)'};border-radius:10px;padding:10px;display:flex;gap:10px;align-items:flex-start;background:${r.checked ? '#fff' : 'var(--slate-50)'}">
+                  <input type="checkbox" checked=${r.checked} onChange=${e => patchRow(i, { checked: e.target.checked })} style="margin-top:8px" />
+                  <div style="flex:1;min-width:0">
+                    <div class="field-row" style="margin-bottom:6px">
+                      <div class="field" style="margin:0"><label style="font-size:10px">Part number</label>
+                        <input type="text" value=${r.part_number} onChange=${e => patchRow(i, { part_number: e.target.value })} style="font-size:12.5px" /></div>
+                      <div class="field" style="margin:0"><label style="font-size:10px">Name</label>
+                        <input type="text" value=${r.name} onChange=${e => patchRow(i, { name: e.target.value })} style="font-size:12.5px" /></div>
+                    </div>
+                    <div style="font-size:11px;color:var(--slate-500)">${r.customer_name} · ${r.line_ids.length} schedule line${r.line_ids.length === 1 ? '' : 's'} · ${fmtNum(r.total_qty)} ${r.uom}${r.cpn ? ' · CPN ' + r.cpn : ''}</div>
+                    ${r.failed && html`<div style="font-size:11px;color:var(--rose-600);margin-top:4px">✕ ${r.failed}</div>`}
+                  </div>
+                </div>
+              `)}
+            </div>
+            <button class="btn" style="margin-top:12px" disabled=${importing || selCount === 0} onClick=${runImport}>
+              ${importing ? 'Importing…' : ('Import ' + selCount + ' part' + (selCount === 1 ? '' : 's') + ' & link schedules')}
+            </button>
+          `}
+        `}
+      </div>
+    </div>
+  `;
+}
+
 function PartModal({ plant, me, dies, activeUnit, editTarget, onClose, onSaved }) {
   const [form, setForm] = useState(editTarget || {
     part_number: '', revision: 'A', name: '', description: '',
