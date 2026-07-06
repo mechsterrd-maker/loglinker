@@ -12901,7 +12901,21 @@ function SupplierChaseModule({ plant, me }) {
   const [alertLog, setAlertLog] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('shortage'); // shortage | all
-  const [tab, setTab] = useState('runway'); // runway | log
+  const [tab, setTab] = useState('runway'); // runway | plan | log
+  // Monthly procurement plan (whole schedule month, not just 14d runway)
+  const [planMonth, setPlanMonth] = useState(() => new Date().toISOString().slice(0, 7));
+  const [plan, setPlan] = useState(null);
+  const [planLoading, setPlanLoading] = useState(false);
+
+  useEffect(() => {
+    if (tab !== 'plan') return;
+    (async () => {
+      setPlanLoading(true);
+      const { data, error } = await sb.rpc('rm_procurement_plan', { p_month: planMonth + '-01' });
+      if (!error) setPlan(data);
+      setPlanLoading(false);
+    })();
+  }, [tab, planMonth]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -12960,8 +12974,84 @@ function SupplierChaseModule({ plant, me }) {
 
     <div class="auth-tabs" style="margin-bottom:12px">
       <button class=${'auth-tab' + (tab==='runway'?' active':'')} onClick=${() => setTab('runway')}>Live Runway</button>
+      <button class=${'auth-tab' + (tab==='plan'?' active':'')} onClick=${() => setTab('plan')}>📋 Monthly Plan</button>
       <button class=${'auth-tab' + (tab==='log'?' active':'')} onClick=${() => setTab('log')}>Alert History · ${alertLog.length}</button>
     </div>
+
+    ${tab === 'plan' && html`
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap">
+        <input type="month" value=${planMonth} onChange=${e => setPlanMonth(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-300);border-radius:8px;font-size:13px" />
+        <div style="font-size:11.5px;color:var(--slate-500)">Raw material needed for this month's schedules (BOM-expanded, minus already-supplied) vs stock + incoming POs.</div>
+      </div>
+      ${planLoading ? html`<div class="loader"><div class="spinner"></div></div>` : !plan ? '' : html`
+        ${(() => {
+          const items = plan.items || [];
+          const buy = items.filter(i => (i.to_procure || 0) > 0);
+          const spend = buy.reduce((s, i) => s + (i.to_procure || 0) * (i.unit_cost || 0), 0);
+          const copyPlan = () => {
+            const monthLabel = new Date(planMonth + '-01').toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+            const byVendor = {};
+            for (const i of buy) {
+              const v = i.vendor_name || 'No vendor mapped';
+              (byVendor[v] = byVendor[v] || { phone: i.vendor_phone, lines: [] }).lines.push(i);
+            }
+            let txt = '🛒 RM Procurement Plan — ' + monthLabel + ' · ' + plant.name + '\n';
+            for (const [v, g] of Object.entries(byVendor)) {
+              txt += '\n*' + v + '*' + (g.phone ? ' (' + g.phone + ')' : '') + '\n';
+              for (const i of g.lines) {
+                txt += '• ' + (i.code ? i.code + ' ' : '') + i.name + ' — ' + fmtNum(Math.ceil(i.to_procure)) + ' ' + (i.uom || '') +
+                  (i.unit_cost ? ' (≈₹' + fmtNum(Math.round(i.to_procure * i.unit_cost)) + ')' : '') +
+                  (i.earliest_need ? ' · need by ' + i.earliest_need : '') + '\n';
+              }
+            }
+            txt += '\nTotal est: ₹' + fmtNum(Math.round(spend));
+            navigator.clipboard.writeText(txt).then(() => showToast('Order list copied — paste in WhatsApp/PO'), () => showToast('Copy failed'));
+          };
+          return html`
+            <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:12px">
+              <div class=${'stat ' + (buy.length ? 'rose' : 'teal')}><div class="stat-num">${buy.length}</div><div class="stat-label">Items to procure</div></div>
+              <div class="stat teal"><div class="stat-num" style="font-size:17px">₹${fmtNum(Math.round(spend))}</div><div class="stat-label">Est. spend</div></div>
+              <div class=${'stat ' + ((plan.missing_bom || []).length ? 'amber' : 'teal')}><div class="stat-num">${(plan.missing_bom || []).length}</div><div class="stat-label">Parts w/o BOM</div></div>
+            </div>
+            ${buy.length > 0 && html`<button class="btn small" style="margin-bottom:10px" onClick=${copyPlan}>📋 Copy order list (by vendor)</button>`}
+            ${items.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📦</div><div style="font-size:13px">No raw-material demand found for this month. Check that schedule lines are linked to parts and parts have a BOM.</div></div></div>` :
+              items.map(i => html`
+                <div class="card" key=${i.stock_item_id} style="margin-bottom:6px;padding:10px 12px;border-left:3px solid ${(i.to_procure || 0) > 0 ? 'var(--rose-500)' : 'var(--emerald-500)'}">
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap">
+                    <div style="flex:1;min-width:200px">
+                      <div style="font-size:13px;font-weight:600">${i.code ? html`<span style="font-family:monospace;color:var(--slate-500);font-size:12px">${i.code}</span> · ` : ''}${i.name}</div>
+                      <div style="font-size:11px;color:var(--slate-500);margin-top:3px">
+                        Required <strong style="color:var(--slate-700)">${fmtNum(i.required_qty)} ${i.uom || ''}</strong>
+                        · on-hand <strong style="color:${(i.current_qty || 0) < 0 ? 'var(--rose-600)' : 'var(--slate-700)'}">${fmtNum(i.current_qty)}</strong>${(i.current_qty || 0) < 0 ? ' ⚠︎' : ''}
+                        ${(i.incoming_qty || 0) > 0 ? html` · 📥 ${fmtNum(i.incoming_qty)} incoming` : ''}
+                        ${i.earliest_need ? html` · first need ${i.earliest_need}` : ''}
+                      </div>
+                      ${i.parts?.length > 0 && html`<div style="font-size:10.5px;color:var(--slate-400);margin-top:3px">for: ${i.parts.slice(0, 6).join(', ')}${i.parts.length > 6 ? ' +' + (i.parts.length - 6) + ' more' : ''}</div>`}
+                      ${i.vendor_name && html`<div style="font-size:11px;color:var(--slate-600);margin-top:4px">🛒 ${i.vendor_name}${i.vendor_phone ? ' · ' + i.vendor_phone : ''}</div>`}
+                    </div>
+                    <div style="text-align:right">
+                      <div style="font-size:15px;font-weight:800;color:${(i.to_procure || 0) > 0 ? 'var(--rose-600)' : 'var(--emerald-600)'}">${(i.to_procure || 0) > 0 ? fmtNum(Math.ceil(i.to_procure)) + ' ' + (i.uom || '') : '✓ covered'}</div>
+                      ${(i.to_procure || 0) > 0 && i.unit_cost ? html`<div style="font-size:11px;color:var(--slate-500)">≈₹${fmtNum(Math.round(i.to_procure * i.unit_cost))}</div>` : ''}
+                    </div>
+                  </div>
+                </div>
+              `)}
+            ${(plan.missing_bom || []).length > 0 && html`
+              <div class="card" style="background:var(--amber-50);border-color:var(--amber-200);margin-top:10px;padding:10px 12px">
+                <div style="font-size:12px;font-weight:700;color:var(--amber-700);margin-bottom:6px">⚠️ ${plan.missing_bom.length} scheduled part${plan.missing_bom.length === 1 ? '' : 's'} ha${plan.missing_bom.length === 1 ? 's' : 've'} no raw-material BOM — their material need is NOT counted above</div>
+                ${plan.missing_bom.slice(0, 10).map(m => html`<div style="font-size:11.5px;color:var(--amber-800)">• ${m.part_number} · ${m.name} — ${fmtNum(m.qty)} pcs scheduled</div>`)}
+                <div style="font-size:11px;color:var(--amber-700);margin-top:6px">Add BOM in Production → Masters → Parts → (part) → BOM.</div>
+              </div>
+            `}
+            ${plan.unlinked_lines?.count > 0 && html`
+              <div class="card" style="background:var(--amber-50);border-color:var(--amber-200);margin-top:8px;padding:10px 12px">
+                <div style="font-size:12px;color:var(--amber-800)">⚠️ <strong>${plan.unlinked_lines.count}</strong> schedule line${plan.unlinked_lines.count === 1 ? '' : 's'} (${fmtNum(plan.unlinked_lines.qty)} pcs) aren't linked to a part yet, so they're invisible to this plan. Use <strong>Production → Masters → Parts → 📥 From schedules</strong> to link them.</div>
+              </div>
+            `}
+          `;
+        })()}
+      `}
+    `}
 
     ${tab === 'runway' && html`
       <div style="display:flex;gap:6px;margin-bottom:10px">
