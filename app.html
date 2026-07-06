@@ -36291,7 +36291,9 @@ function ScheduleAddModal({ plant, me, customers, parts, onClose, onSaved }) {
   const [lines, setLines] = useState([
     { part_name_raw:'', customer_part_number:'', delivery_date:'', planned_qty:'', uom:'nos' }
   ]);
-  const [file, setFile] = useState(null);
+  // A schedule often doesn't fit in one photo — allow several images of the
+  // same document; the extractor merges them and dedupes overlapping rows.
+  const [files, setFiles] = useState([]);
   const [extracting, setExtracting] = useState(false);
   const [extracted, setExtracted] = useState(null);
   const [pasteText, setPasteText] = useState('');
@@ -36465,23 +36467,28 @@ function ScheduleAddModal({ plant, me, customers, parts, onClose, onSaved }) {
   };
 
   const onPickFile = (e) => {
-    const f = e.target.files?.[0];
-    if (!f) return;
-    setFile(f); setExtracted(null); setError('');
+    const picked = Array.from(e.target.files || []);
+    if (!picked.length) return;
+    setFiles(prev => [...prev, ...picked].slice(0, 6));
+    setExtracted(null); setError('');
+    e.target.value = ''; // allow re-picking / adding more
   };
+  const removeFile = (idx) => { setFiles(prev => prev.filter((_, i) => i !== idx)); setExtracted(null); };
 
   const runExtraction = async () => {
-    if (!file) return;
+    if (!files.length) return;
     setExtracting(true); setError('');
     try {
-      const reader = new FileReader();
-      const dataUrl = await new Promise((resolve, reject) => {
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      });
-      const base64 = dataUrl.split(',')[1];
-      const mediaType = file.type || 'image/jpeg';
+      const images = [];
+      for (const f of files) {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(f);
+        });
+        images.push({ base64: dataUrl.split(',')[1], media_type: f.type || 'image/jpeg' });
+      }
 
       const { data: { session } } = await sb.auth.getSession();
       const resp = await fetch(SUPABASE_URL + '/functions/v1/extract-schedule', {
@@ -36490,7 +36497,7 @@ function ScheduleAddModal({ plant, me, customers, parts, onClose, onSaved }) {
           'Content-Type': 'application/json',
           'Authorization': 'Bearer ' + (session?.access_token || SUPABASE_ANON_KEY),
         },
-        body: JSON.stringify({ image_base64: base64, media_type: mediaType }),
+        body: JSON.stringify({ images }),
       });
       const result = await resp.json();
       if (!resp.ok || !result.success) throw new Error(result.error || 'Extraction failed');
@@ -36642,11 +36649,19 @@ function ScheduleAddModal({ plant, me, customers, parts, onClose, onSaved }) {
 
         ${mode === 'upload' && html`
           <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:14px">
-            <div style="font-size:13px;color:var(--slate-700);margin-bottom:10px">Upload customer's schedule (PDF/image/Excel screenshot). AI vision will read each (part × date × qty) cell and pre-fill below.</div>
-            <input type="file" accept="image/*,application/pdf" onChange=${onPickFile} style="font-size:13px" />
-            ${file && html`
-              <div style="margin-top:10px;font-size:12px;color:var(--slate-600)">📎 ${file.name} · ${(file.size/1024).toFixed(0)} KB</div>
-              <button class="btn small" style="margin-top:10px" onClick=${runExtraction} disabled=${extracting}>${extracting ? 'Reading carefully (15-30s)…' : '🔍 Extract with AI'}</button>
+            <div style="font-size:13px;color:var(--slate-700);margin-bottom:10px">Upload customer's schedule (PDF/image/Excel screenshot). Big schedule that doesn't fit in one photo? <strong>Add multiple photos of the same schedule</strong> — overlapping rows are merged automatically, nothing gets counted twice.</div>
+            <input type="file" accept="image/*,application/pdf" multiple onChange=${onPickFile} style="font-size:13px" />
+            ${files.length > 0 && html`
+              <div style="margin-top:10px;display:flex;flex-direction:column;gap:4px">
+                ${files.map((f, i) => html`
+                  <div key=${i} style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--slate-600);background:white;border:1px solid var(--slate-200);border-radius:8px;padding:5px 10px">
+                    <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">📎 ${i + 1}. ${f.name} · ${(f.size/1024).toFixed(0)} KB</span>
+                    <span style="cursor:pointer;color:var(--rose-500);font-weight:700" onClick=${() => removeFile(i)}>✕</span>
+                  </div>
+                `)}
+              </div>
+              <div style="margin-top:6px;font-size:11px;color:var(--slate-500)">＋ pick again to add more photos (max 6)</div>
+              <button class="btn small" style="margin-top:10px" onClick=${runExtraction} disabled=${extracting}>${extracting ? ('Reading ' + files.length + ' photo' + (files.length > 1 ? 's' : '') + ' carefully (20-45s)…') : ('🔍 Extract with AI' + (files.length > 1 ? ' — ' + files.length + ' photos, one schedule' : ''))}</button>
             `}
             ${extracted && html`
               <div style="margin-top:10px;padding:10px;background:white;border-radius:8px;font-size:12px">
@@ -36656,6 +36671,7 @@ function ScheduleAddModal({ plant, me, customers, parts, onClose, onSaved }) {
                 <div>Format detected: ${extracted.format_detected || '?'}</div>
                 <div>Lines: ${extracted.lines?.length || 0} (${extracted.extraction_summary?.total_parts || '?'} parts)</div>
                 <div>Total qty: ${fmtNum(extracted.extraction_summary?.total_qty || 0)}</div>
+                ${extracted.notes && html`<div style="margin-top:4px;color:var(--amber-700)">📝 ${extracted.notes}</div>`}
                 <div style="font-size:11px;color:var(--slate-500);margin-top:6px">Switch to ✏️ Manual to verify before saving.</div>
               </div>
             `}
