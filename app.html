@@ -40846,24 +40846,147 @@ async function genToolAssignmentMatrix(plant) {
     { Total_assignments: assignments?.length || 0 });
 }
 
+// Plan vs Supply as the customer sees it: one matrix per customer (parts ×
+// delivery days, mirroring their schedule sheet), each cell colored by supply
+// status, topped with a plant-level dashboard and a recovery worklist.
 async function genPlanVsSupply(plant, month) {
-  const { data: all } = await unitScope(sb.from('v_plan_vs_supply').select('*').order('effective_due_date'));
-  // Month filter: keep lines due in the picked month (dateless lines stay visible)
-  const rows = (all || []).filter(r => !month || !r.effective_due_date || String(r.effective_due_date).slice(0, 7) === month);
-  const trs = (rows || []).map(r => `<tr>
-    <td>${esc(r.customer_name || '-')}</td>
-    <td><b>${esc(r.part_number || r.part_name_raw || '-')}</b></td>
-    <td>W${r.week_no || '-'}</td>
-    <td>${r.effective_due_date || '-'}</td>
-    <td style="text-align:right">${r.planned_qty || 0}</td>
-    <td style="text-align:right">${r.supplied_qty || 0}</td>
-    <td style="text-align:right;color:${r.gap_qty > 0 ? '#be123c' : '#047857'}">${r.gap_qty || 0}</td>
-    <td>${r.pct_supplied || 0}%</td>
-    <td>${esc(r.status || '-')}</td>
-  </tr>`).join('');
-  return reportShell(plant, 'Plan vs Supply', plant.name + (month ? ' · ' + month : ''),
-    trs ? `<table class="data"><thead><tr><th>Customer</th><th>Part</th><th>Week</th><th>Due</th><th>Planned</th><th>Supplied</th><th>Gap</th><th>%</th><th>Status</th></tr></thead><tbody>${trs}</tbody></table>` : '<div class="empty">No active schedule lines' + (month ? ' due in ' + month : '') + '</div>',
-    { Lines: rows?.length || 0, Month: month || 'all' });
+  // Query lines directly (not v_plan_vs_supply): the view week-buckets dates
+  // (Jul 2 → "week of Jun 29"), which breaks both the month filter and the
+  // day-by-day matrix. Real delivery_date + summed supplies per line instead.
+  const { data: lines } = await unitScope(sb.from('mcp_sched_lines')
+    .select('id, planned_qty, delivery_date, part_name_raw, uom, part:part_id(part_number, name), schedule:schedule_id(schedule_month, status, customer:customer_id(name)), supplies:mcp_sched_supplies(supplied_qty)')
+    .order('delivery_date')
+    .limit(2000));
+  const rows = (lines || []).filter(l => {
+    if (l.schedule?.status === 'cancelled') return false;
+    const key = l.delivery_date ? String(l.delivery_date).slice(0, 7) : String(l.schedule?.schedule_month || '').slice(0, 7);
+    return !month || key === month;
+  }).map(l => ({
+    customer_name: l.schedule?.customer?.name || '—',
+    part_number: l.part?.part_number || l.part_name_raw || '?',
+    part_name: l.part?.name || l.part_name_raw || '',
+    effective_due_date: l.delivery_date || '',
+    planned_qty: l.planned_qty,
+    supplied_qty: (l.supplies || []).reduce((s, x) => s + (parseFloat(x.supplied_qty) || 0), 0),
+  }));
+  const today = new Date().toISOString().slice(0, 10);
+  const monthLabel = month ? new Date(month + '-01').toLocaleDateString('en-IN', { month: 'long', year: 'numeric' }) : 'All months';
+  const num = v => parseFloat(v || 0) || 0;
+  const inr = n => Math.round(n).toLocaleString('en-IN');
+
+  if (!rows.length) {
+    return reportShell(plant, 'Plan vs Supply — Month Matrix', plant.name + ' · ' + monthLabel,
+      '<div class="empty">No active schedule lines' + (month ? ' due in ' + monthLabel : '') + '</div>', { Month: month || 'all' });
+  }
+
+  // customer → part → per-date cells
+  const customers = new Map();
+  let tPlan = 0, tSup = 0;
+  for (const r of rows) {
+    const cust = r.customer_name || '—';
+    if (!customers.has(cust)) customers.set(cust, { name: cust, parts: new Map(), plan: 0, sup: 0, dates: new Set() });
+    const c = customers.get(cust);
+    const pk = r.part_number || r.part_name_raw || '?';
+    if (!c.parts.has(pk)) c.parts.set(pk, { part: pk, pname: r.part_name || r.part_name_raw || '', cells: new Map(), plan: 0, sup: 0 });
+    const p = c.parts.get(pk);
+    const d = r.effective_due_date || '';
+    const plan = num(r.planned_qty), sup = Math.min(num(r.supplied_qty), num(r.planned_qty));
+    const cell = p.cells.get(d) || { plan: 0, sup: 0 };
+    cell.plan += plan; cell.sup += sup;
+    p.cells.set(d, cell);
+    if (d) c.dates.add(d);
+    p.plan += plan; p.sup += sup;
+    c.plan += plan; c.sup += sup;
+    tPlan += plan; tSup += sup;
+  }
+  const att = (s, p) => p > 0 ? Math.round(s / p * 100) : 100;
+  const tGap = Math.max(tPlan - tSup, 0);
+
+  // remaining calendar days for recovery-rate math
+  const m0 = month ? new Date(month + '-01') : new Date();
+  const mEnd = new Date(m0.getFullYear(), m0.getMonth() + 1, 0);
+  const daysLeft = Math.max(1, Math.ceil((mEnd - new Date(today)) / 86400000) + 1);
+
+  const partVerdict = (p) => {
+    const gap = Math.max(p.plan - p.sup, 0);
+    if (gap === 0) return { label: '✅ Complete', color: '#047857', gap, rate: 0 };
+    let overdueGap = 0;
+    for (const [d, c] of p.cells.entries()) if (d && d < today) overdueGap += Math.max(c.plan - c.sup, 0);
+    const rate = Math.ceil(gap / daysLeft);
+    if (overdueGap <= 0) return { label: '🟢 On track', color: '#047857', gap, rate };
+    return { label: '🔴 Behind', color: '#be123c', gap, rate };
+  };
+
+  // ---------- dashboard ----------
+  const custArr = [...customers.values()].sort((a, b) => att(a.sup, a.plan) - att(b.sup, b.plan));
+  const behindParts = [];
+  for (const c of custArr) for (const p of c.parts.values()) { const v = partVerdict(p); if (v.gap > 0) behindParts.push({ cust: c.name, p, v }); }
+  behindParts.sort((a, b) => b.v.gap - a.v.gap);
+
+  let body = `<div class="stat-grid" style="grid-template-columns:repeat(5,1fr)">
+    <div class="stat-box"><div class="stat-num">${inr(tPlan)}</div><div class="stat-lbl">Planned pcs</div></div>
+    <div class="stat-box"><div class="stat-num">${inr(tSup)}</div><div class="stat-lbl">Supplied pcs</div></div>
+    <div class="stat-box" style="border-left-color:${att(tSup, tPlan) >= 90 ? '#059669' : att(tSup, tPlan) >= 70 ? '#d97706' : '#e11d48'}"><div class="stat-num">${att(tSup, tPlan)}%</div><div class="stat-lbl">Attainment</div></div>
+    <div class="stat-box" style="border-left-color:${tGap > 0 ? '#e11d48' : '#059669'}"><div class="stat-num">${inr(tGap)}</div><div class="stat-lbl">Yet to supply</div></div>
+    <div class="stat-box"><div class="stat-num">${customers.size} / ${behindParts.length}</div><div class="stat-lbl">Customers / parts behind</div></div>
+  </div>`;
+
+  body += chartSVG('bar', custArr.map(c => ({ label: c.name, value: att(c.sup, c.plan) })), { title: 'Attainment % by customer' });
+
+  // recovery worklist: what to run, how fast, to finish the month
+  if (behindParts.length) {
+    body += `<div class="section"><h2>🎯 Recovery worklist — ${behindParts.length} part${behindParts.length === 1 ? '' : 's'} pending (${daysLeft} day${daysLeft === 1 ? '' : 's'} left in month)</h2>
+    <table class="data"><thead><tr><th>Part</th><th>Customer</th><th style="text-align:right">Planned</th><th style="text-align:right">Supplied</th><th style="text-align:right">Pending</th><th style="text-align:right">Need / day</th><th>Status</th></tr></thead><tbody>` +
+    behindParts.slice(0, 20).map(({ cust, p, v }) => `<tr>
+      <td><b>${esc(p.part)}</b>${p.pname && p.pname !== p.part ? ' · ' + esc(p.pname) : ''}</td>
+      <td>${esc(cust)}</td>
+      <td style="text-align:right">${inr(p.plan)}</td>
+      <td style="text-align:right">${inr(p.sup)}</td>
+      <td style="text-align:right;font-weight:700;color:#be123c">${inr(v.gap)}</td>
+      <td style="text-align:right;font-weight:600">${inr(v.rate)}</td>
+      <td style="color:${v.color};font-weight:600">${v.label}</td>
+    </tr>`).join('') + `</tbody></table>${behindParts.length > 20 ? '<div style="font-size:10px;color:#64748b;margin-top:4px">+ ' + (behindParts.length - 20) + ' more with smaller pending qty</div>' : ''}</div>`;
+  }
+
+  // ---------- one matrix per customer ----------
+  const cellTd = (cell, d) => {
+    if (!cell || cell.plan <= 0) return '<td style="text-align:center;color:#cbd5e1">·</td>';
+    const done = cell.sup >= cell.plan, part = cell.sup > 0 && !done, missed = cell.sup <= 0 && d && d < today;
+    const bg = done ? '#ecfdf5' : part ? '#fffbeb' : missed ? '#fff1f2' : '#fff';
+    const col = done ? '#047857' : part ? '#b45309' : missed ? '#be123c' : '#0f172a';
+    const txt = done ? inr(cell.plan) : cell.sup > 0 ? inr(cell.sup) + '<span style="color:#94a3b8">/</span>' + inr(cell.plan) : inr(cell.plan);
+    return `<td style="text-align:center;background:${bg};color:${col};font-weight:600;white-space:nowrap">${txt}</td>`;
+  };
+
+  for (const c of [...customers.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+    const dates = [...c.dates].sort();
+    const parts = [...c.parts.values()].sort((a, b) => (Math.max(b.plan - b.sup, 0)) - (Math.max(a.plan - a.sup, 0)));
+    const cAtt = att(c.sup, c.plan);
+    body += `<div class="section" style="page-break-inside:avoid"><h2>🏭 ${esc(c.name)}
+      <span style="font-weight:400;font-size:11px;color:#64748b"> — planned ${inr(c.plan)} · supplied ${inr(c.sup)} · </span>
+      <span class="badge ${cAtt >= 90 ? 'green' : cAtt >= 70 ? 'amber' : 'rose'}">${cAtt}% attained</span></h2>
+      <table class="data" style="font-size:9.5px"><thead><tr>
+        <th style="min-width:130px">Part</th>
+        ${dates.map(d => `<th style="text-align:center">${parseInt(d.slice(8, 10), 10)}</th>`).join('')}
+        <th style="text-align:right">Total</th><th style="text-align:right">Supplied</th><th style="text-align:right">Pending</th><th>Status</th>
+      </tr></thead><tbody>` +
+      parts.map(p => {
+        const v = partVerdict(p);
+        return `<tr>
+          <td><b>${esc(p.part)}</b>${p.pname && p.pname !== p.part ? '<br><span style="color:#64748b">' + esc(p.pname) + '</span>' : ''}</td>
+          ${dates.map(d => cellTd(p.cells.get(d), d)).join('')}
+          <td style="text-align:right;font-weight:700">${inr(p.plan)}</td>
+          <td style="text-align:right">${inr(p.sup)}</td>
+          <td style="text-align:right;font-weight:700;color:${v.gap > 0 ? '#be123c' : '#047857'}">${v.gap > 0 ? inr(v.gap) : '—'}</td>
+          <td style="color:${v.color};font-weight:600;white-space:nowrap">${v.label}</td>
+        </tr>`;
+      }).join('') + `</tbody></table>
+      <div style="font-size:9px;color:#64748b;margin-top:4px">cell = qty due that day · <span style="color:#047857">green = supplied</span> · <span style="color:#b45309">amber = partial (supplied/planned)</span> · <span style="color:#be123c">red = overdue, nothing supplied</span> · plain = upcoming</div>
+    </div>`;
+  }
+
+  return reportShell(plant, 'Plan vs Supply — Month Matrix', plant.name + ' · ' + monthLabel, body,
+    { Month: monthLabel, Attainment: att(tSup, tPlan) + '%', 'Pending pcs': inr(tGap), Customers: customers.size });
 }
 
 async function genPartAttainmentRollup(plant, month) {
