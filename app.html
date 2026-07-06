@@ -39765,8 +39765,8 @@ function ReportConfig({ plant, me, report, onClose }) {
         case 'tool_change_frequency':    html_content = await genToolChangeFrequency(plantWithDoc, dateFrom, dateTo); break;
         case 'tool_demand_forecast':     html_content = await genToolDemandForecast(plantWithDoc); break;
         case 'tool_assignment_matrix':   html_content = await genToolAssignmentMatrix(plantWithDoc); break;
-        case 'plan_vs_supply':           html_content = await genPlanVsSupply(plantWithDoc); break;
-        case 'part_attainment_rollup':   html_content = await genPartAttainmentRollup(plantWithDoc); break;
+        case 'plan_vs_supply':           html_content = await genPlanVsSupply(plantWithDoc, monthPick); break;
+        case 'part_attainment_rollup':   html_content = await genPartAttainmentRollup(plantWithDoc, monthPick); break;
         case 'ai_audit_history':         html_content = await genAiAuditHistory(plantWithDoc, dateFrom, dateTo); break;
         case 'interunit_transfers':      html_content = await genInterunitTransfers(plantWithDoc, dateFrom, dateTo); break;
         case 'entity_activity_timeline': html_content = await genEntityActivityTimeline(plantWithDoc, entityType, pickedItem); break;
@@ -39796,14 +39796,16 @@ function ReportConfig({ plant, me, report, onClose }) {
     }
   };
 
-  // Decide which inputs to show
-  const needsDateRange = ['reject_analysis','stage_summary','ncr_register','breakdown_register','mtbf_mttr','tpm_checksheet','stock_movement','vendor_grn','document_index'].includes(report.id);
+  // Decide which inputs to show. Every bespoke (non-view) report MUST appear in
+  // exactly one of these lists — otherwise it gets no input UI and canGenerate
+  // stays false forever (the "button never enables" bug).
+  const needsDateRange = ['reject_analysis','stage_summary','ncr_register','breakdown_register','mtbf_mttr','tpm_checksheet','stock_movement','vendor_grn','document_index','tool_life_consumption','tool_change_frequency','ai_audit_history','interunit_transfers','per_unit_dashboard','shift_segment_log','operator_performance'].includes(report.id);
   const needsSingleDate = report.id === 'daily_production';
-  const needsMonth = ['schedule_attainment','otd_report'].includes(report.id);
+  const needsMonth = ['schedule_attainment','otd_report','plan_vs_supply','part_attainment_rollup'].includes(report.id);
   const needsItemPick = report.id === 'material_traceability';
   const needsNcrPick = report.id === 'ncr_8d';
-  const needsEntityPick = report.id === 'audit_trail';
-  const needsNoInput = report.id === 'team_snapshot' || !!report.view; // generic IATF view reports take no input
+  const needsEntityPick = report.id === 'audit_trail' || report.id === 'entity_activity_timeline';
+  const needsNoInput = ['team_snapshot','tool_demand_forecast','tool_assignment_matrix'].includes(report.id) || !!report.view; // generic IATF view reports take no input
 
   const canGenerate = (
     (needsDateRange && dateFrom && dateTo) ||
@@ -40844,8 +40846,10 @@ async function genToolAssignmentMatrix(plant) {
     { Total_assignments: assignments?.length || 0 });
 }
 
-async function genPlanVsSupply(plant) {
-  const { data: rows } = await unitScope(sb.from('v_plan_vs_supply').select('*').order('effective_due_date'));
+async function genPlanVsSupply(plant, month) {
+  const { data: all } = await unitScope(sb.from('v_plan_vs_supply').select('*').order('effective_due_date'));
+  // Month filter: keep lines due in the picked month (dateless lines stay visible)
+  const rows = (all || []).filter(r => !month || !r.effective_due_date || String(r.effective_due_date).slice(0, 7) === month);
   const trs = (rows || []).map(r => `<tr>
     <td>${esc(r.customer_name || '-')}</td>
     <td><b>${esc(r.part_number || r.part_name_raw || '-')}</b></td>
@@ -40857,13 +40861,14 @@ async function genPlanVsSupply(plant) {
     <td>${r.pct_supplied || 0}%</td>
     <td>${esc(r.status || '-')}</td>
   </tr>`).join('');
-  return reportShell(plant, 'Plan vs Supply', plant.name,
-    trs ? `<table class="data"><thead><tr><th>Customer</th><th>Part</th><th>Week</th><th>Due</th><th>Planned</th><th>Supplied</th><th>Gap</th><th>%</th><th>Status</th></tr></thead><tbody>${trs}</tbody></table>` : '<div class="empty">No active schedule lines</div>',
-    { Lines: rows?.length || 0 });
+  return reportShell(plant, 'Plan vs Supply', plant.name + (month ? ' · ' + month : ''),
+    trs ? `<table class="data"><thead><tr><th>Customer</th><th>Part</th><th>Week</th><th>Due</th><th>Planned</th><th>Supplied</th><th>Gap</th><th>%</th><th>Status</th></tr></thead><tbody>${trs}</tbody></table>` : '<div class="empty">No active schedule lines' + (month ? ' due in ' + month : '') + '</div>',
+    { Lines: rows?.length || 0, Month: month || 'all' });
 }
 
-async function genPartAttainmentRollup(plant) {
-  const { data: rows } = await sb.from('v_plan_vs_supply').select('*');
+async function genPartAttainmentRollup(plant, month) {
+  const { data: allRows } = await sb.from('v_plan_vs_supply').select('*');
+  const rows = (allRows || []).filter(r => !month || !r.effective_due_date || String(r.effective_due_date).slice(0, 7) === month);
   const byPart = new Map();
   for (const r of rows || []) {
     const k = r.part_number || r.part_name_raw || '?';
