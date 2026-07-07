@@ -29572,6 +29572,9 @@ function StockImportModal({ plant, me, activeUnit, existingItems, onClose, onSav
   const [error, setError] = useState('');
   const [fileName, setFileName] = useState('');
   const [aiInfo, setAiInfo] = useState(null); // { confidence, notes, summary }
+  const [updateExisting, setUpdateExisting] = useState(true); // re-organize category/sub-category of items that already exist
+
+  const existingById = {}; (existingItems || []).forEach(i => { existingById[String(i.code || '').trim().toLowerCase()] = i; });
 
   const existingCodes = new Set((existingItems || []).map(i => String(i.code || '').trim().toLowerCase()));
 
@@ -29613,7 +29616,8 @@ function StockImportModal({ plant, me, activeUnit, existingItems, onClose, onSav
         if (seen.has(cl)) status = 'dup'; else if (existingCodes.has(cl)) status = 'exists';
         seen.add(cl);
         return {
-          code: it.code, name: it.name, category: it.category || 'general', uom: it.uom || 'nos',
+          code: it.code, name: it.name, category: it.category || 'general',
+          subcategory: it.subcategory || null, uom: it.uom || 'nos',
           opening_qty: parseFloat(it.opening_qty) || 0,
           reorder_level: it.reorder_level != null ? parseFloat(it.reorder_level) : null,
           unit_cost: it.unit_cost != null ? parseFloat(it.unit_cost) : null,
@@ -29632,24 +29636,42 @@ function StockImportModal({ plant, me, activeUnit, existingItems, onClose, onSav
   const existRows = (rows || []).filter(r => r.status === 'exists');
 
   const doImport = async () => {
-    if (!newRows.length) { setError('Nothing new to import.'); return; }
+    if (!newRows.length && !(updateExisting && existRows.length)) { setError('Nothing new to import.'); return; }
     setImporting(true); setError('');
     try {
-      const items = newRows.map(r => ({
-        plant_id: plant.id, code: r.code, name: r.name, category: r.category, uom: r.uom,
-        reorder_level: r.reorder_level, unit_cost: r.unit_cost, current_qty: 0, opening_qty: r.opening_qty,
-        ...(activeUnit?.unit_id ? { unit_id: activeUnit.unit_id } : {}),
-      }));
-      const { data: created, error: iErr } = await sb.from('mcp_stocks_items').insert(items).select('id, code');
-      if (iErr) throw iErr;
-      const idByCode = {}; (created || []).forEach(c => { idByCode[String(c.code).toLowerCase()] = c.id; });
-      const txns = newRows.map(r => ({
-        plant_id: plant.id, item_id: idByCode[r.code.toLowerCase()], txn_type: 'opening',
-        qty: r.opening_qty, reference: 'Opening balance (Excel import)', notes: 'Bulk stock import · ' + (me?.full_name || ''),
-        performed_by: me?.id || null,
-      })).filter(t => t.item_id);
-      if (txns.length) { const { error: tErr } = await sb.from('mcp_stocks_transactions').insert(txns); if (tErr) throw tErr; }
-      showToast('✅ ' + newRows.length + ' item' + (newRows.length === 1 ? '' : 's') + ' imported' + (existRows.length ? ' · ' + existRows.length + ' already existed' : ''));
+      let createdCount = 0, updatedCount = 0;
+      if (newRows.length) {
+        const items = newRows.map(r => ({
+          plant_id: plant.id, code: r.code, name: r.name, category: r.category, subcategory: r.subcategory, uom: r.uom,
+          reorder_level: r.reorder_level, unit_cost: r.unit_cost, current_qty: 0, opening_qty: r.opening_qty,
+          ...(activeUnit?.unit_id ? { unit_id: activeUnit.unit_id } : {}),
+        }));
+        const { data: created, error: iErr } = await sb.from('mcp_stocks_items').insert(items).select('id, code');
+        if (iErr) throw iErr;
+        createdCount = (created || []).length;
+        const idByCode = {}; (created || []).forEach(c => { idByCode[String(c.code).toLowerCase()] = c.id; });
+        const txns = newRows.map(r => ({
+          plant_id: plant.id, item_id: idByCode[r.code.toLowerCase()], txn_type: 'opening',
+          qty: r.opening_qty, reference: 'Opening balance (Excel import)', notes: 'Bulk stock import · ' + (me?.full_name || ''),
+          performed_by: me?.id || null,
+        })).filter(t => t.item_id);
+        if (txns.length) { const { error: tErr } = await sb.from('mcp_stocks_transactions').insert(txns); if (tErr) throw tErr; }
+      }
+      // Re-organize existing items: apply the AI's category / sub-category so
+      // previously-imported "common" items get grouped. Never touches quantities.
+      if (updateExisting && existRows.length) {
+        for (const r of existRows) {
+          const cur = existingById[String(r.code).toLowerCase()];
+          if (!cur) continue;
+          const patch = {};
+          if (r.subcategory && r.subcategory !== cur.subcategory) patch.subcategory = r.subcategory;
+          if (r.category && r.category !== cur.category) patch.category = r.category;
+          if (!Object.keys(patch).length) continue;
+          const { error: uErr } = await sb.from('mcp_stocks_items').update(patch).eq('id', cur.id);
+          if (!uErr) updatedCount++;
+        }
+      }
+      showToast('✅ ' + createdCount + ' imported' + (updatedCount ? ' · ' + updatedCount + ' re-organized' : '') + (existRows.length && !updateExisting ? ' · ' + existRows.length + ' skipped' : ''));
       onSaved();
     } catch (e) { setError('Import failed: ' + (e.message || e)); }
     finally { setImporting(false); }
@@ -29695,15 +29717,17 @@ function StockImportModal({ plant, me, activeUnit, existingItems, onClose, onSav
             <table style="width:100%;border-collapse:collapse;font-size:11.5px">
               <thead><tr style="background:var(--slate-50);position:sticky;top:0">
                 <th style="text-align:left;padding:6px 8px">Code</th><th style="text-align:left;padding:6px 8px">Name</th>
-                <th style="text-align:left;padding:6px 8px">Cat</th><th style="text-align:right;padding:6px 8px">Opening</th>
+                <th style="text-align:left;padding:6px 8px">Category</th><th style="text-align:left;padding:6px 8px">Sub-category</th>
+                <th style="text-align:right;padding:6px 8px">Opening</th>
                 <th style="text-align:right;padding:6px 8px">Cost</th><th style="padding:6px 8px"></th>
               </tr></thead>
               <tbody>
                 ${rows.map((r, i) => html`
                   <tr key=${i} style="border-top:0.5px solid var(--slate-100);${r.status !== 'new' ? 'opacity:.55' : ''}">
                     <td style="padding:5px 8px;font-family:'Geist Mono',monospace">${r.code}</td>
-                    <td style="padding:5px 8px;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.name}</td>
+                    <td style="padding:5px 8px;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.name}</td>
                     <td style="padding:5px 8px;color:var(--slate-500)">${r.category.replace('_', ' ')}</td>
+                    <td style="padding:5px 8px">${r.subcategory ? html`<span class="badge slate" style="font-size:9px">${r.subcategory}</span>` : html`<span style="color:var(--slate-400)">—</span>`}</td>
                     <td style="padding:5px 8px;text-align:right">${fmtNum(r.opening_qty)} ${r.uom}</td>
                     <td style="padding:5px 8px;text-align:right">${r.unit_cost != null ? '₹' + r.unit_cost : '—'}</td>
                     <td style="padding:5px 8px;text-align:center">${statusBadge(r.status)}</td>
@@ -29712,10 +29736,16 @@ function StockImportModal({ plant, me, activeUnit, existingItems, onClose, onSav
               </tbody>
             </table>
           </div>
+          ${existRows.length ? html`
+            <label style="display:flex;align-items:flex-start;gap:8px;margin-top:10px;font-size:12px;color:var(--slate-700);cursor:pointer">
+              <input type="checkbox" checked=${updateExisting} onChange=${e => setUpdateExisting(e.target.checked)} style="margin-top:2px" />
+              <span>Also re-organize the <strong>${existRows.length}</strong> item${existRows.length === 1 ? '' : 's'} that already exist — apply the AI's category &amp; sub-category so they get grouped. <span style="color:var(--slate-500)">Quantities are never changed.</span></span>
+            </label>
+          ` : ''}
           ${error && html`<div class="alert error" style="margin-top:10px">${error}</div>`}
           <div style="display:flex;gap:8px;margin-top:12px">
             <button class="btn ghost" style="flex:1" onClick=${() => { setRows(null); setError(''); }}>← Choose another file</button>
-            <button class="btn" style="flex:2" disabled=${importing || !newRows.length} onClick=${doImport}>${importing ? 'Importing…' : '📦 Import ' + newRows.length + ' item' + (newRows.length === 1 ? '' : 's')}</button>
+            <button class="btn" style="flex:2" disabled=${importing || (!newRows.length && !(updateExisting && existRows.length))} onClick=${doImport}>${importing ? 'Working…' : (newRows.length ? '📦 Import ' + newRows.length + ' item' + (newRows.length === 1 ? '' : 's') : '') + (newRows.length && updateExisting && existRows.length ? ' + ' : '') + (updateExisting && existRows.length ? '🗂 Organize ' + existRows.length : '')}</button>
           </div>
         `}
       </div>
@@ -29730,6 +29760,7 @@ function Stocks({ plant, me, activeUnit }) {
   const [view, setView] = useState('home'); // home | items | transactions
   const [layout, setLayout] = useState('list');
   const [categoryFilter, setCategoryFilter] = useState('all');
+  const [subcategoryFilter, setSubcategoryFilter] = useState('all');
   const [search, setSearch] = useState('');
   const [txnSearch, setTxnSearch] = useState('');
   const [txnTypeFilter, setTxnTypeFilter] = useState('all');
@@ -29776,13 +29807,26 @@ function Stocks({ plant, me, activeUnit }) {
   const lowStockCount = items.filter(i => i.reorder_level && i.current_qty <= i.reorder_level).length;
   const totalValue = items.reduce((sum, i) => sum + (parseFloat(i.current_qty || 0) * parseFloat(i.unit_cost || 0)), 0);
 
-  // Filter by category + search
+  // Filter by category (+ sub-category) + search
   let filteredItems = items;
   if (categoryFilter !== 'all') filteredItems = filteredItems.filter(i => (i.category || 'general') === categoryFilter);
+  if (categoryFilter !== 'all' && subcategoryFilter !== 'all') {
+    filteredItems = filteredItems.filter(i => (subcategoryFilter === '—' ? !i.subcategory : i.subcategory === subcategoryFilter));
+  }
   if (search.trim()) {
     const q = search.toLowerCase();
-    filteredItems = filteredItems.filter(i => (i.code + ' ' + i.name).toLowerCase().includes(q));
+    filteredItems = filteredItems.filter(i => (i.code + ' ' + i.name + ' ' + (i.subcategory || '')).toLowerCase().includes(q));
   }
+
+  // Sub-categories available within the currently selected category (with counts)
+  const subcatCounts = {};
+  if (categoryFilter !== 'all') {
+    for (const i of items.filter(i => (i.category || 'general') === categoryFilter)) {
+      const s = (i.subcategory || '').trim() || '—';
+      subcatCounts[s] = (subcatCounts[s] || 0) + 1;
+    }
+  }
+  const subcatKeys = Object.keys(subcatCounts).sort((a,b) => (a === '—') - (b === '—') || a.localeCompare(b));
 
   // Group by category for category view
   const byCategory = {};
@@ -29817,7 +29861,7 @@ function Stocks({ plant, me, activeUnit }) {
         <div class="list-item-row">
           <div class="list-item-main">
             <div class="list-item-title">${i.code} · ${i.name}</div>
-            <div class="list-item-sub">${lbl(i.category || 'general')}${i.reorder_level ? ' · reorder at ' + i.reorder_level + ' ' + i.uom : ''}${i.unit_cost ? ' · ₹' + i.unit_cost + '/' + i.uom : ''}</div>
+            <div class="list-item-sub">${lbl(i.category || 'general')}${i.subcategory ? ' › ' + i.subcategory : ''}${i.reorder_level ? ' · reorder at ' + i.reorder_level + ' ' + i.uom : ''}${i.unit_cost ? ' · ₹' + i.unit_cost + '/' + i.uom : ''}</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
             <span class=${'badge ' + (isLow ? 'rose' : 'emerald')}>${fmtNum(i.current_qty)} ${i.uom}</span>
@@ -29947,12 +29991,20 @@ function Stocks({ plant, me, activeUnit }) {
       </div>
 
       ${layout === 'list' && html`
-        <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
-          <button class=${'auth-tab' + (categoryFilter === 'all' ? ' active' : '')} onClick=${() => setCategoryFilter('all')}>All · ${items.length}</button>
+        <div class="auth-tabs" style="margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
+          <button class=${'auth-tab' + (categoryFilter === 'all' ? ' active' : '')} onClick=${() => { setCategoryFilter('all'); setSubcategoryFilter('all'); }}>All · ${items.length}</button>
           ${Object.keys(categoryLabels).map(c => categoryCounts[c] > 0 && html`
-            <button key=${c} class=${'auth-tab' + (categoryFilter === c ? ' active' : '')} onClick=${() => setCategoryFilter(c)}>${lbl(c)} · ${categoryCounts[c]}</button>
+            <button key=${c} class=${'auth-tab' + (categoryFilter === c ? ' active' : '')} onClick=${() => { setCategoryFilter(c); setSubcategoryFilter('all'); }}>${lbl(c)} · ${categoryCounts[c]}</button>
           `)}
         </div>
+        ${categoryFilter !== 'all' && subcatKeys.length > 1 && html`
+          <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;gap:6px">
+            <button class=${'auth-tab small' + (subcategoryFilter === 'all' ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => setSubcategoryFilter('all')}>All</button>
+            ${subcatKeys.map(s => html`
+              <button key=${s} class=${'auth-tab small' + (subcategoryFilter === s ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => setSubcategoryFilter(s)}>${s === '—' ? 'Ungrouped' : s} · ${subcatCounts[s]}</button>
+            `)}
+          </div>
+        `}
       `}
 
       <div class="section-h">Items · ${filteredItems.length}<span style="display:flex;gap:6px">
@@ -29963,17 +30015,29 @@ function Stocks({ plant, me, activeUnit }) {
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
         filteredItems.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📦</div>${items.length === 0 ? 'No items yet' : 'No items match this filter'}</div></div>` :
         layout === 'by_category' ? html`
-          ${Object.entries(byCategory).sort((a,b) => b[1].length - a[1].length).map(([cat, list]) => html`
+          ${Object.entries(byCategory).sort((a,b) => b[1].length - a[1].length).map(([cat, list]) => {
+            // Sub-group each category by sub-category. Items with no sub-category
+            // fall into an "Ungrouped" bucket sorted last.
+            const bySub = {};
+            for (const i of list) { const s = (i.subcategory || '').trim() || '—'; (bySub[s] = bySub[s] || []).push(i); }
+            const subEntries = Object.entries(bySub).sort((a,b) => (a[0] === '—') - (b[0] === '—') || a[0].localeCompare(b[0]));
+            const hasSub = subEntries.some(([s]) => s !== '—');
+            return html`
             <details key=${cat} open style="margin-bottom:8px">
               <summary style="cursor:pointer;padding:10px 12px;background:var(--slate-100);border-radius:10px;font-weight:600;font-size:14px;display:flex;justify-content:space-between;align-items:center">
                 <span>📦 ${lbl(cat)}</span>
                 <span style="background:var(--teal-600);color:white;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px">${list.length}</span>
               </summary>
               <div style="margin-top:6px">
-                ${list.map(i => html`<${ItemRow} i=${i} />`)}
+                ${hasSub ? subEntries.map(([sub, sList]) => html`
+                  <div key=${sub} style="margin:6px 0 6px 8px;border-left:2px solid var(--slate-200);padding-left:8px">
+                    <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:.03em;margin:4px 0 2px">${sub === '—' ? 'Ungrouped' : sub} · ${sList.length}</div>
+                    ${sList.map(i => html`<${ItemRow} i=${i} />`)}
+                  </div>
+                `) : list.map(i => html`<${ItemRow} i=${i} />`)}
               </div>
             </details>
-          `)}
+          `;})}
         ` : html`
           ${filteredItems.map(i => html`<${ItemRow} i=${i} />`)}
         `
@@ -30078,7 +30142,7 @@ function Stocks({ plant, me, activeUnit }) {
     `}
     `}
 
-    ${modal === 'item' && html`<${ItemModal} plant=${plant} me=${me} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
+    ${modal === 'item' && html`<${ItemModal} plant=${plant} me=${me} activeUnit=${activeUnit} editTarget=${editTarget} allItems=${items} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'txn' && html`<${TxnModal} plant=${plant} me=${me} item=${editTarget} isAdmin=${isAdmin} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'receive_picker' && html`<${ReceiveFromDocPicker} plant=${plant} me=${me} pendingReceptions=${pendingReceptions} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'stock_import' && html`<${StockImportModal} plant=${plant} me=${me} activeUnit=${activeUnit} existingItems=${items} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
@@ -30088,10 +30152,12 @@ function Stocks({ plant, me, activeUnit }) {
   `;
 }
 
-function ItemModal({ plant, me, activeUnit, editTarget, onClose, onSaved }) {
+function ItemModal({ plant, me, activeUnit, editTarget, allItems, onClose, onSaved }) {
   const isEdit = !!editTarget;
+  // Existing sub-categories in the same category → offered as a datalist so
+  // people reuse the same wording instead of inventing near-duplicates.
   const alreadyOpened = isEdit && !!editTarget.opening_recorded_at;
-  const [form, setForm] = useState(editTarget || { code:'', name:'', category:'general', uom:'nos', reorder_level:'', unit_cost:'', opening_qty: 0 });
+  const [form, setForm] = useState(editTarget || { code:'', name:'', category:'general', subcategory:'', uom:'nos', reorder_level:'', unit_cost:'', opening_qty: 0 });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -30103,6 +30169,7 @@ function ItemModal({ plant, me, activeUnit, editTarget, onClose, onSaved }) {
         plant_id: plant.id,
         code: form.code, name: form.name,
         category: form.category || 'general',
+        subcategory: (form.subcategory || '').trim() || null,
         uom: form.uom,
         reorder_level: form.reorder_level ? parseFloat(form.reorder_level) : null,
         unit_cost: form.unit_cost ? parseFloat(form.unit_cost) : null,
@@ -30151,16 +30218,24 @@ function ItemModal({ plant, me, activeUnit, editTarget, onClose, onSaved }) {
             </div>
           </div>
           <div class="field"><label>Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} placeholder="Aluminum ADC-12 ingots" /></div>
-          <div class="field"><label>Category</label>
-            <select value=${form.category} onChange=${e => setForm({...form, category: e.target.value})}>
-              <option value="raw_material">Raw Material</option>
-              <option value="die_spares">Die Spares</option>
-              <option value="consumables">Consumables</option>
-              <option value="tools">Tools</option>
-              <option value="packing">Packing</option>
-              <option value="bought_out">Bought-out</option>
-              <option value="general">General</option>
-            </select>
+          <div class="field-row">
+            <div class="field"><label>Category</label>
+              <select value=${form.category} onChange=${e => setForm({...form, category: e.target.value})}>
+                <option value="raw_material">Raw Material</option>
+                <option value="die_spares">Die Spares</option>
+                <option value="consumables">Consumables</option>
+                <option value="tools">Tools</option>
+                <option value="packing">Packing</option>
+                <option value="bought_out">Bought-out</option>
+                <option value="general">General</option>
+              </select>
+            </div>
+            <div class="field"><label>Sub-category</label>
+              <input type="text" list="subcat-options" value=${form.subcategory || ''} onChange=${e => setForm({...form, subcategory: e.target.value})} placeholder="e.g. Grinding Machines" />
+              <datalist id="subcat-options">
+                ${[...new Set((allItems || []).filter(i => i.category === form.category && i.subcategory).map(i => i.subcategory))].sort().map(sc => html`<option value=${sc}></option>`)}
+              </datalist>
+            </div>
           </div>
           <div class="field-row">
             ${!isEdit ? html`
