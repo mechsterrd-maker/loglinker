@@ -34,7 +34,8 @@ RULES:
 - quantity = the on-hand / available quantity (columns named Qty, Qty avl, QTY, Stock, Balance, Nos, etc.). If truly absent, use 1.
 - unit_cost = the per-unit price if present. From messy text like "RATE - 3750 + TAX 675 = 4425" take the final total (4425); if only a base rate is given, use that. Null if none.
 - code = an existing item code / SKU / part no / internal number from the sheet if one clearly identifies the item; otherwise GENERATE a short uppercase code from the name (e.g. "AG4 Grinding machine" -> "AG4-GRINDER", max 24 chars, unique within your output).
-- category = infer one of: raw_material, consumables, tools, packing, die_spares, bought_out, general. (Power tools / machines / drills / grinders / welders -> tools.)
+- category = the TOP-LEVEL group, one of: raw_material, consumables, tools, packing, die_spares, bought_out, general. (Power tools / machines / drills / grinders / welders -> tools.)
+- subcategory = the SPECIFIC type/group WITHIN the category, so items align neatly. Use the sheet name / section heading as a strong hint — companies group items by sheet or sub-heading and THAT grouping is usually the subcategory. Examples: a grinder under "tools" -> "Grinding Machines"; a welder -> "Welding Machines"; a drill -> "Drilling Machines"; a cut-off/plasma/bandsaw -> "Cutting Machines"; folding/shearing/rolling -> "Sheet Metal Machines"; an MS bar under "raw_material" -> "MS Steel". Title Case, concise (1-3 words). Group similar items under the SAME subcategory wording so they cluster. Null only if genuinely ungroupable.
 - uom = the unit (nos, pcs, kg, ltr, set, etc.); default "nos" for countable tools/parts.
 - name = a clean human item name (include key spec/model if it distinguishes the item, e.g. "AG5 Grinding Machine (DW831)").
 - notes = optional short extra (location / spec) — keep brief or null.
@@ -42,7 +43,7 @@ RULES:
 Return ONLY valid JSON (no markdown, no prose):
 {
   "items": [
-    {"code":"AG4-GRINDER","name":"AG4 Grinding Machine","category":"tools","uom":"nos","opening_qty":2,"unit_cost":4425,"notes":null}
+    {"code":"AG4-GRINDER","name":"AG4 Grinding Machine","category":"tools","subcategory":"Grinding Machines","uom":"nos","opening_qty":2,"unit_cost":4425,"notes":null}
   ],
   "summary": {"total_items": 0, "total_qty": 0, "source": "which sheet(s) drove the list"},
   "confidence": "high|medium|low",
@@ -116,6 +117,7 @@ Deno.serve(async (req) => {
         code: key,
         name: String(it.name || key).trim(),
         category: ["raw_material", "consumables", "tools", "packing", "die_spares", "bought_out", "general"].includes(String(it.category)) ? it.category : "general",
+        subcategory: it.subcategory ? String(it.subcategory).trim().slice(0, 60) : null,
         uom: String(it.uom || "nos").trim() || "nos",
         opening_qty: num(it.opening_qty) ?? 1,
         unit_cost: num(it.unit_cost),
