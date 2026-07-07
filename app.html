@@ -29562,6 +29562,202 @@ function SparePurchaseRequestModal({ plant, me, users, parentAction, machineId, 
 }
 
 // ============= STOCKS =============
+// Bulk-create stock items + opening balances from an Excel/CSV sheet. SheetJS
+// is lazy-loaded from CDN only when needed. Replicates the single-item create:
+// insert item (current_qty 0) + an 'opening' transaction per row.
+function StockImportModal({ plant, me, activeUnit, existingItems, onClose, onSaved }) {
+  const [rows, setRows] = useState(null);
+  const [parsing, setParsing] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [error, setError] = useState('');
+  const [fileName, setFileName] = useState('');
+
+  const existingCodes = new Set((existingItems || []).map(i => String(i.code || '').trim().toLowerCase()));
+  const norm = s => String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9]/g, '');
+  const HEADER_MAP = {
+    code: ['code', 'itemcode', 'sku', 'stockcode', 'materialcode', 'partcode', 'itemno', 'material', 'partno'],
+    name: ['name', 'itemname', 'description', 'particulars', 'item', 'materialdescription', 'itemdescription', 'productname'],
+    category: ['category', 'type', 'group', 'stocktype', 'itemtype'],
+    uom: ['uom', 'unit', 'units', 'unitofmeasure', 'uqc'],
+    opening_qty: ['openingqty', 'opening', 'openingstock', 'openingbalance', 'qty', 'quantity', 'stock', 'onhand', 'balance', 'currentstock', 'closingstock', 'stockqty', 'availableqty'],
+    reorder_level: ['reorder', 'reorderlevel', 'minlevel', 'minimum', 'minstock', 'rol', 'minqty'],
+    unit_cost: ['unitcost', 'cost', 'rate', 'price', 'costperunit', 'unitrate', 'value', 'costperpiece'],
+  };
+  const mapCategory = (v) => {
+    const n = norm(v);
+    if (!n) return 'general';
+    if (n.includes('raw')) return 'raw_material';
+    if (n.includes('tool')) return 'tools';
+    if (n.includes('consum')) return 'consumables';
+    if (n.includes('pack')) return 'packing';
+    if (n.includes('spare')) return 'die_spares';
+    if (n.includes('bought')) return 'bought_out';
+    return 'general';
+  };
+  const cleanNum = (v) => { const n = parseFloat(String(v == null ? '' : v).replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : null; };
+
+  const loadXLSX = () => import('https://esm.sh/xlsx@0.18.5');
+
+  const downloadTemplate = async () => {
+    setError('');
+    try {
+      const XLSX = await loadXLSX();
+      const data = [
+        ['Code', 'Name', 'Category', 'UOM', 'Opening Qty', 'Reorder Level', 'Unit Cost'],
+        ['ADC-12', 'Aluminium ADC-12', 'Raw Material', 'kg', 7000, 1000, 365],
+        ['SCM-14', 'SCM-14 Steel', 'Raw Material', 'kg', 3000, 1000, 380],
+        ['TOOL-DRILL-8', '8mm Drill Bit', 'Tools', 'nos', 50, 10, 120],
+        ['CON-COOLANT', 'Cutting Coolant', 'Consumables', 'ltr', 200, 50, 90],
+      ];
+      const ws = XLSX.utils.aoa_to_sheet(data);
+      ws['!cols'] = [{ wch: 16 }, { wch: 26 }, { wch: 14 }, { wch: 8 }, { wch: 12 }, { wch: 14 }, { wch: 12 }];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Stock');
+      XLSX.writeFile(wb, 'loglinkr-stock-template.xlsx');
+    } catch (e) { setError('Template download failed: ' + (e.message || e)); }
+  };
+
+  const onFile = async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setFileName(f.name); setError(''); setParsing(true); setRows(null);
+    try {
+      const XLSX = await loadXLSX();
+      const buf = await f.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: false, defval: '' });
+      if (!aoa.length) throw new Error('The sheet is empty.');
+      // Detect the header row within the first ~12 rows (there may be a title row).
+      let colMap = null;
+      for (let i = 0; i < Math.min(aoa.length, 12); i++) {
+        const cells = (aoa[i] || []).map(norm);
+        const m = {};
+        for (const [key, aliases] of Object.entries(HEADER_MAP)) {
+          const idx = cells.findIndex(c => aliases.includes(c));
+          if (idx >= 0 && m[key] == null) m[key] = idx;
+        }
+        if (m.code != null && (m.name != null || Object.keys(m).length >= 3)) { colMap = { _row: i, ...m }; break; }
+      }
+      if (!colMap) throw new Error('Could not find a "Code" column. Use the template headers: Code, Name, Category, UOM, Opening Qty, Reorder Level, Unit Cost.');
+      const seen = new Set();
+      const parsed = [];
+      for (let i = colMap._row + 1; i < aoa.length; i++) {
+        const r = aoa[i] || [];
+        const code = String(r[colMap.code] ?? '').trim();
+        if (!code) continue;
+        const cl = code.toLowerCase();
+        let status = 'new';
+        if (seen.has(cl)) status = 'dup';
+        else if (existingCodes.has(cl)) status = 'exists';
+        seen.add(cl);
+        const name = colMap.name != null ? String(r[colMap.name] ?? '').trim() : '';
+        parsed.push({
+          code, name: name || code,
+          category: colMap.category != null ? mapCategory(r[colMap.category]) : 'general',
+          uom: (colMap.uom != null ? String(r[colMap.uom] ?? '').trim() : '') || 'nos',
+          opening_qty: colMap.opening_qty != null ? (cleanNum(r[colMap.opening_qty]) || 0) : 0,
+          reorder_level: colMap.reorder_level != null ? cleanNum(r[colMap.reorder_level]) : null,
+          unit_cost: colMap.unit_cost != null ? cleanNum(r[colMap.unit_cost]) : null,
+          status,
+        });
+      }
+      if (!parsed.length) throw new Error('No data rows found under the headers.');
+      setRows(parsed);
+    } catch (e2) { setError(e2.message || String(e2)); }
+    finally { setParsing(false); if (e.target) e.target.value = ''; }
+  };
+
+  const newRows = (rows || []).filter(r => r.status === 'new');
+  const dupRows = (rows || []).filter(r => r.status === 'dup');
+  const existRows = (rows || []).filter(r => r.status === 'exists');
+
+  const doImport = async () => {
+    if (!newRows.length) { setError('Nothing new to import.'); return; }
+    setImporting(true); setError('');
+    try {
+      const items = newRows.map(r => ({
+        plant_id: plant.id, code: r.code, name: r.name, category: r.category, uom: r.uom,
+        reorder_level: r.reorder_level, unit_cost: r.unit_cost, current_qty: 0, opening_qty: r.opening_qty,
+        ...(activeUnit?.unit_id ? { unit_id: activeUnit.unit_id } : {}),
+      }));
+      const { data: created, error: iErr } = await sb.from('mcp_stocks_items').insert(items).select('id, code');
+      if (iErr) throw iErr;
+      const idByCode = {}; (created || []).forEach(c => { idByCode[String(c.code).toLowerCase()] = c.id; });
+      const txns = newRows.map(r => ({
+        plant_id: plant.id, item_id: idByCode[r.code.toLowerCase()], txn_type: 'opening',
+        qty: r.opening_qty, reference: 'Opening balance (Excel import)', notes: 'Bulk stock import · ' + (me?.full_name || ''),
+        performed_by: me?.id || null,
+      })).filter(t => t.item_id);
+      if (txns.length) { const { error: tErr } = await sb.from('mcp_stocks_transactions').insert(txns); if (tErr) throw tErr; }
+      showToast('✅ ' + newRows.length + ' item' + (newRows.length === 1 ? '' : 's') + ' imported' + (existRows.length ? ' · ' + existRows.length + ' already existed' : ''));
+      onSaved();
+    } catch (e) { setError('Import failed: ' + (e.message || e)); }
+    finally { setImporting(false); }
+  };
+
+  const statusBadge = (s) => s === 'new' ? html`<span class="badge emerald" style="font-size:9px">new</span>`
+    : s === 'exists' ? html`<span class="badge amber" style="font-size:9px">exists</span>`
+    : html`<span class="badge rose" style="font-size:9px">dup</span>`;
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:620px">
+        <div class="modal-header">
+          <div class="modal-title">📄 Import stock from Excel</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+
+        ${!rows ? html`
+          <div class="card" style="background:var(--slate-50);margin-bottom:12px">
+            <div style="font-size:13px;color:var(--slate-700);margin-bottom:8px">Upload your stock sheet (<strong>.xlsx / .xls / .csv</strong>). Expected columns — extra columns are ignored, order doesn't matter:</div>
+            <div style="font-size:11px;color:var(--slate-600);font-family:'Geist Mono',monospace;background:white;border:1px solid var(--slate-200);border-radius:6px;padding:8px">Code · Name · Category · UOM · Opening Qty · Reorder Level · Unit Cost</div>
+            <button class="btn small ghost" style="margin-top:10px" onClick=${downloadTemplate}>⬇ Download template (.xlsx)</button>
+          </div>
+          <label class="btn" style="width:100%;cursor:pointer;text-align:center">
+            ${parsing ? 'Reading ' + fileName + '…' : '📂 Choose Excel / CSV file'}
+            <input type="file" accept=".xlsx,.xls,.csv" style="display:none" onChange=${onFile} disabled=${parsing} />
+          </label>
+          ${error && html`<div class="alert error" style="margin-top:10px">${error}</div>`}
+        ` : html`
+          <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px">
+            <div class="stat teal" style="padding:8px"><div class="stat-num" style="font-size:16px">${newRows.length}</div><div class="stat-label" style="font-size:10px">New</div></div>
+            <div class="stat ${existRows.length ? 'amber' : ''}" style="padding:8px"><div class="stat-num" style="font-size:16px">${existRows.length}</div><div class="stat-label" style="font-size:10px">Already exist</div></div>
+            <div class="stat ${dupRows.length ? 'rose' : ''}" style="padding:8px"><div class="stat-num" style="font-size:16px">${dupRows.length}</div><div class="stat-label" style="font-size:10px">Duplicate in file</div></div>
+          </div>
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:6px">📎 ${fileName} · only <strong>new</strong> rows are imported. Existing codes and in-file duplicates are skipped.</div>
+          <div style="max-height:40vh;overflow-y:auto;border:1px solid var(--slate-200);border-radius:8px">
+            <table style="width:100%;border-collapse:collapse;font-size:11.5px">
+              <thead><tr style="background:var(--slate-50);position:sticky;top:0">
+                <th style="text-align:left;padding:6px 8px">Code</th><th style="text-align:left;padding:6px 8px">Name</th>
+                <th style="text-align:left;padding:6px 8px">Cat</th><th style="text-align:right;padding:6px 8px">Opening</th>
+                <th style="text-align:right;padding:6px 8px">Cost</th><th style="padding:6px 8px"></th>
+              </tr></thead>
+              <tbody>
+                ${rows.map((r, i) => html`
+                  <tr key=${i} style="border-top:0.5px solid var(--slate-100);${r.status !== 'new' ? 'opacity:.55' : ''}">
+                    <td style="padding:5px 8px;font-family:'Geist Mono',monospace">${r.code}</td>
+                    <td style="padding:5px 8px;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.name}</td>
+                    <td style="padding:5px 8px;color:var(--slate-500)">${r.category.replace('_', ' ')}</td>
+                    <td style="padding:5px 8px;text-align:right">${fmtNum(r.opening_qty)} ${r.uom}</td>
+                    <td style="padding:5px 8px;text-align:right">${r.unit_cost != null ? '₹' + r.unit_cost : '—'}</td>
+                    <td style="padding:5px 8px;text-align:center">${statusBadge(r.status)}</td>
+                  </tr>
+                `)}
+              </tbody>
+            </table>
+          </div>
+          ${error && html`<div class="alert error" style="margin-top:10px">${error}</div>`}
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <button class="btn ghost" style="flex:1" onClick=${() => { setRows(null); setError(''); }}>← Choose another file</button>
+            <button class="btn" style="flex:2" disabled=${importing || !newRows.length} onClick=${doImport}>${importing ? 'Importing…' : '📦 Import ' + newRows.length + ' item' + (newRows.length === 1 ? '' : 's')}</button>
+          </div>
+        `}
+      </div>
+    </div>
+  `;
+}
+
 function Stocks({ plant, me, activeUnit }) {
   const [items, setItems] = useState([]);
   const [transactions, setTransactions] = useState([]);
@@ -29713,6 +29909,11 @@ function Stocks({ plant, me, activeUnit }) {
               <div style="font-size:24px">➕</div>
               <div style="font-size:13px;font-weight:700;margin-top:4px;color:var(--slate-800)">New Item + Opening</div>
               <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Generic item (raw, consumable, etc.)</div>
+            </button>
+            <button class="card" style="text-align:left;padding:14px;cursor:pointer;background:var(--amber-50);border-color:var(--amber-300)" onClick=${() => setModal('stock_import')}>
+              <div style="font-size:24px">📄</div>
+              <div style="font-size:13px;font-weight:700;margin-top:4px;color:var(--amber-800)">Import from Excel</div>
+              <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Bulk-create items + opening from a sheet</div>
             </button>
             <button class="card" style="text-align:left;padding:14px;cursor:pointer;background:var(--teal-50);border-color:var(--teal-300)" onClick=${() => setModal('pick_part_for_stock')}>
               <div style="font-size:24px">🧩</div>
@@ -29915,6 +30116,7 @@ function Stocks({ plant, me, activeUnit }) {
     ${modal === 'item' && html`<${ItemModal} plant=${plant} me=${me} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'txn' && html`<${TxnModal} plant=${plant} me=${me} item=${editTarget} isAdmin=${isAdmin} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'receive_picker' && html`<${ReceiveFromDocPicker} plant=${plant} me=${me} pendingReceptions=${pendingReceptions} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
+    ${modal === 'stock_import' && html`<${StockImportModal} plant=${plant} me=${me} activeUnit=${activeUnit} existingItems=${items} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'pick_part_for_stock' && html`<${PickPartForStockModal} plant=${plant} stockItems=${items} onPick=${(p) => { setEditTarget(p); setModal('track_stock'); }} onClose=${() => setModal(null)} />`}
     ${modal === 'track_stock' && editTarget && html`<${TrackStockForPartModal} plant=${plant} me=${me} part=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="stock_issue" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
