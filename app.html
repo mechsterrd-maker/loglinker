@@ -3267,6 +3267,102 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
 }
 
 // ============= PRODUCTION =============
+// Opening stock for castings — seeds how many pieces of each part already exist
+// at a given stage, WITHOUT consuming raw material or counting as production.
+// Writes to mcp_pdc_part_opening (a table with no BOM/inspection triggers).
+function OpeningStock({ plant, me, parts, activeUnit }) {
+  const [draft, setDraft] = useState({}); // part_id -> { stage, qty, id }
+  const [q, setQ] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  const STAGE_OPTS = FLOW_STAGE_ORDER;
+  const stageLabel = (s) => ({ pdc:'PDC (casting)', shot_blast:'Shot blast', heat_treat:'Heat treat' }[s] || s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()));
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await unitScope(sb.from('mcp_pdc_part_opening').select('*'));
+    const d = {};
+    (data || []).forEach(o => { d[o.part_id] = { stage: o.stage, qty: String(o.qty), id: o.id }; });
+    setDraft(d);
+    setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const setRow = (partId, patch) => setDraft(prev => ({ ...prev, [partId]: { stage: 'pdc', qty: '', ...(prev[partId] || {}), ...patch } }));
+
+  const setCount = Object.values(draft).filter(d => parseFloat(d.qty) > 0).length;
+  const filtered = parts.filter(p => !q || (p.part_number + ' ' + (p.name || '')).toLowerCase().includes(q.toLowerCase()));
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const ups = [], del = [];
+      for (const p of parts) {
+        const d = draft[p.id];
+        if (!d) continue;
+        const qty = parseFloat(d.qty);
+        if (qty > 0) {
+          ups.push({ plant_id: plant.id, part_id: p.id, stage: d.stage || 'pdc', qty,
+            unit_id: activeUnit?.unit_id || null, created_by: me.id, notes: 'Opening stock', updated_at: new Date().toISOString() });
+        } else if (d.id) {
+          del.push(d.id); // cleared an existing opening → remove it
+        }
+      }
+      if (!ups.length && !del.length) { showToast('Enter at least one quantity'); setSaving(false); return; }
+      if (del.length) { const { error } = await sb.from('mcp_pdc_part_opening').delete().in('id', del); if (error) throw error; }
+      if (ups.length) {
+        const { error } = await sb.from('mcp_pdc_part_opening').upsert(ups, { onConflict: 'plant_id,part_id,stage,unit_id' });
+        if (error) throw error;
+      }
+      showToast(ups.length + ' opening ' + (ups.length === 1 ? 'entry' : 'entries') + ' saved' + (del.length ? ' · ' + del.length + ' removed' : ''));
+      refresh();
+    } catch (e) { showToast('Save failed: ' + (e.message || e)); }
+    finally { setSaving(false); }
+  };
+
+  return html`
+    <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:12px">
+      <div style="font-size:13px;color:var(--slate-700)">
+        Seed the castings you <strong>already have on hand</strong> before you started logging production. This is a one-time count —
+        it shows as on-hand in the Overview and is available to dispatch, but it <strong>never consumes raw material</strong> and is <strong>not counted as production</strong>.
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+      <input type="text" placeholder="Search parts…" value=${q} onInput=${e => setQ(e.target.value)} style="flex:1;padding:8px 12px;border:1px solid var(--slate-300);border-radius:8px;font-size:13px" />
+      <span style="font-size:12px;color:var(--slate-500);white-space:nowrap">${setCount} set</span>
+    </div>
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` : html`
+      <div style="border:1px solid var(--slate-200);border-radius:10px;overflow:hidden;background:white">
+        <div style="display:grid;grid-template-columns:1fr 130px 110px;gap:8px;padding:8px 12px;background:var(--slate-50);font-size:10px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:.04em">
+          <span>Part (casting)</span><span>Stage on hand</span><span style="text-align:right">Qty (pcs)</span>
+        </div>
+        ${filtered.length === 0 ? html`<div class="empty" style="padding:16px;font-size:13px">No parts match.</div>` :
+          filtered.map(p => {
+            const d = draft[p.id] || { stage: 'pdc', qty: '' };
+            const has = parseFloat(d.qty) > 0;
+            return html`
+              <div key=${p.id} style="display:grid;grid-template-columns:1fr 130px 110px;gap:8px;padding:8px 12px;align-items:center;border-top:0.5px solid var(--slate-100);${has ? 'background:var(--teal-50)' : ''}">
+                <div style="min-width:0">
+                  <div style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.part_number}</div>
+                  ${p.name && p.name !== p.part_number ? html`<div style="font-size:11px;color:var(--slate-500);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.name}</div>` : ''}
+                </div>
+                <select value=${d.stage} onChange=${e => setRow(p.id, { stage: e.target.value })} style="padding:6px 8px;font-size:12px;border:1px solid var(--slate-300);border-radius:6px">
+                  ${STAGE_OPTS.map(s => html`<option key=${s} value=${s}>${stageLabel(s)}</option>`)}
+                </select>
+                <input type="number" min="0" step="any" value=${d.qty} placeholder="0" onInput=${e => setRow(p.id, { qty: e.target.value })}
+                  style="padding:6px 8px;font-size:13px;border:1px solid ${has ? 'var(--teal-400)' : 'var(--slate-300)'};border-radius:6px;text-align:right" />
+              </div>
+            `;
+          })}
+      </div>
+      <div style="position:sticky;bottom:0;padding:12px 0;background:linear-gradient(transparent,#fafaf9 30%)">
+        <button class="btn" style="width:100%" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : '💾 Save opening stock' + (setCount ? ' · ' + setCount + ' part' + (setCount === 1 ? '' : 's') : '')}</button>
+      </div>
+    `}
+  `;
+}
+
 function Production({ plant, me, activeUnit }) {
   const [view, setView] = useState('overview');
   const [machines, setMachines] = useState([]);
@@ -3360,6 +3456,7 @@ function Production({ plant, me, activeUnit }) {
         { key:'entry',    label:'📥 Entry',     items:[
             { key:'stages', label:'📋 Stage Log' },
             { key:'shots',  label:'Shots' },
+            { key:'opening', label:'📦 Opening Stock' },
         ]},
         { key:'masters',  label:'🔧 Masters',   items:[
             { key:'parts',    label:'Parts' },
@@ -3390,6 +3487,7 @@ function Production({ plant, me, activeUnit }) {
     })()}
 
     ${view === 'flow' && html`<${ProductionFlow} plant=${plant} parts=${parts} />`}
+    ${view === 'opening' && html`<${OpeningStock} plant=${plant} me=${me} parts=${parts} activeUnit=${activeUnit} />`}
     ${view === 'stages' && html`<${StageLog} plant=${plant} me=${me} parts=${parts} machines=${machines} dies=${dies} units=${units} shifts=${shifts} users=${users} />`}
 
     ${view === 'overview' && html`
@@ -32529,6 +32627,7 @@ const FLOW_STAGE_ORDER = ['pdc','trimming','deflashing','shot_blast','cnc','vmc'
 function ProductionFlow({ plant, parts }) {
   const [shots, setShots] = useState([]);
   const [logs, setLogs] = useState([]);
+  const [opening, setOpening] = useState([]); // seeded existing castings (not production)
   const [routes, setRoutes] = useState({}); // part_id → ordered stage list
   const [loading, setLoading] = useState(true);
   // Filters
@@ -32539,11 +32638,12 @@ function ProductionFlow({ plant, parts }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [s, l, r, rs] = await Promise.all([
+    const [s, l, r, rs, op] = await Promise.all([
       sb.from('mcp_pdc_shots').select('part_id, pieces_good, pieces_rejected, shots_good, shots_rejected, cavities, recorded_at').eq('plant_id', plant.id),
       sb.from('mcp_pdc_stage_log').select('part_id, stage, qty_good, qty_rejected, log_date, status').eq('plant_id', plant.id),
       sb.from('mcp_pdc_routes').select('id, part_id').eq('plant_id', plant.id).eq('is_active', true),
       sb.from('mcp_pdc_route_steps').select('route_id, seq, op_type, op_name').order('seq'),
+      unitScope(sb.from('mcp_pdc_part_opening').select('part_id, stage, qty')),
     ]);
     // Build route map: part_id → ordered list of normalized stage names
     const stepsByRoute = {};
@@ -32557,6 +32657,7 @@ function ProductionFlow({ plant, parts }) {
     }
     setShots(s.data || []);
     setLogs(l.data || []);
+    setOpening(op.data || []);
     setRoutes(rMap);
     setLoading(false);
   }, [plant.id]);
@@ -32568,6 +32669,7 @@ function ProductionFlow({ plant, parts }) {
     const ch = sb.channel('flow-' + plant.id)
       .on('postgres_changes', { event:'*', schema:'public', table:'mcp_pdc_stage_log', filter:'plant_id=eq.' + plant.id }, () => refresh())
       .on('postgres_changes', { event:'*', schema:'public', table:'mcp_pdc_shots', filter:'plant_id=eq.' + plant.id }, () => refresh())
+      .on('postgres_changes', { event:'*', schema:'public', table:'mcp_pdc_part_opening', filter:'plant_id=eq.' + plant.id }, () => refresh())
       .subscribe();
     return () => sb.removeChannel(ch);
   }, [plant.id, refresh]);
@@ -32583,6 +32685,15 @@ function ProductionFlow({ plant, parts }) {
   const partsWithActivity = new Set();
   shots.forEach(s => s.part_id && partsWithActivity.add(s.part_id));
   logs.forEach(l => l.part_id && partsWithActivity.add(l.part_id));
+  // Opening castings: on-hand good seeded per (part, stage). Included in
+  // cum-good / WIP below, but never in period production. Surface opening-only
+  // parts too.
+  const openingMap = {};
+  opening.forEach(o => {
+    if (!o.part_id) return;
+    partsWithActivity.add(o.part_id);
+    (openingMap[o.part_id] = openingMap[o.part_id] || {})[o.stage] = (openingMap[o.part_id][o.stage] || 0) + parseFloat(o.qty || 0);
+  });
 
   for (const partId of partsWithActivity) {
     const part = partsMap[partId];
@@ -32592,6 +32703,7 @@ function ProductionFlow({ plant, parts }) {
     const stagesSeen = new Set();
     if (shots.some(s => s.part_id === partId)) stagesSeen.add('pdc');
     logs.forEach(l => { if (l.part_id === partId && l.stage) stagesSeen.add(l.stage); });
+    Object.keys(openingMap[partId] || {}).forEach(s => stagesSeen.add(s));
 
     // Order them by route if defined, else by FLOW_STAGE_ORDER
     const routeOrder = routes[partId] || [];
@@ -32638,6 +32750,10 @@ function ProductionFlow({ plant, parts }) {
           if (!lastDate || (l.log_date && l.log_date > lastDate)) lastDate = l.log_date;
         });
       }
+      // Opening stock: adds to on-hand good at this stage (flows to WIP as input
+      // to the next stage) — but NOT to period_good, since it isn't production.
+      const openQty = (openingMap[partId] && openingMap[partId][stage]) || 0;
+      if (openQty > 0) cumGood += openQty;
       const cumTotal = cumGood + cumRej;
       const cumRejPct = cumTotal > 0 ? (cumRej / cumTotal * 100) : 0;
       const periodTotal = periodGood + periodRej;
@@ -32655,7 +32771,7 @@ function ProductionFlow({ plant, parts }) {
         stage, stage_idx: idx, input, processed: cumTotal,
         cum_good: cumGood, cum_rej: cumRej, cum_rej_pct: cumRejPct,
         period_good: periodGood, period_rej: periodRej, period_rej_pct: periodRejPct,
-        wip, last_date: lastDate,
+        wip, last_date: lastDate, opening_qty: openQty,
       });
       prevGood = cumGood;
     });
@@ -32752,7 +32868,7 @@ function ProductionFlow({ plant, parts }) {
                   <td style="padding:6px 9px;text-align:right;font-family:monospace;color:var(--emerald-700)">${fmtNum(r.period_good)}</td>
                   <td style="padding:6px 9px;text-align:right;font-family:monospace;color:${r.period_rej > 0 ? 'var(--rose-600)' : 'var(--slate-400)'}">${fmtNum(r.period_rej)}</td>
                   <td style="padding:6px 9px;text-align:right;font-family:monospace;color:${rejHigh ? 'var(--rose-700)' : 'var(--slate-600)'};font-weight:${rejHigh ? '600' : '400'}">${r.period_rej_pct.toFixed(1)}%</td>
-                  <td style="padding:6px 9px;text-align:right;font-family:monospace;color:var(--slate-700)">${fmtNum(r.cum_good)}</td>
+                  <td style="padding:6px 9px;text-align:right;font-family:monospace;color:var(--slate-700)">${fmtNum(r.cum_good)}${r.opening_qty > 0 ? html`<div style="font-size:9px;color:var(--teal-600);font-weight:600" title="Includes opening stock (existing castings, not produced)">incl. ${fmtNum(r.opening_qty)} opening</div>` : ''}</td>
                   <td style="padding:6px 9px;text-align:right;color:var(--slate-500)">${r.last_date || '—'}</td>
                 </tr>
               `;
