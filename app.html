@@ -2666,10 +2666,12 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
 
       <div class="topbar">
         <div class="topbar-left">
-          <div class="topbar-logo">L</div>
+          ${plant.logo_url
+            ? html`<img class="topbar-logo" src=${plant.logo_url} style="object-fit:cover;background:#fff" alt="${plant.name}" />`
+            : html`<div class="topbar-logo">${(plant.name || 'L').trim().charAt(0).toUpperCase()}</div>`}
           <div>
-            <div class="topbar-title">Loglinkr</div>
-            <div style="font-size:11px;color:var(--slate-500);margin-top:-2px">${plant.name}${activeUnit ? ' · ' + activeUnit.unit_name : ''}</div>
+            <div class="topbar-title">${plant.name || 'Loglinkr'}</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:-2px">${activeUnit ? activeUnit.unit_name + ' · ' : ''}<span style="opacity:.75">Loglinkr</span></div>
           </div>
         </div>
         <div class="topbar-right" style="display:flex;align-items:center;gap:8px">
@@ -2885,11 +2887,13 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
 
   return html`
     <div class="topnav-desktop">
-      <div class="brand" onClick=${() => setTab('home')}>
-        <div class="brand-mark">L</div>
+      <div class="brand" onClick=${() => setTab('home')} title=${plant.name}>
+        ${plant.logo_url
+          ? html`<img class="brand-mark" src=${plant.logo_url} style="object-fit:cover;background:#fff" alt="${plant.name}" />`
+          : html`<div class="brand-mark">${(plant.name || 'L').trim().charAt(0).toUpperCase()}</div>`}
         <div class="brand-text">
-          <div class="brand-name">Loglinkr</div>
-          <div class="brand-plant">${plant.name}</div>
+          <div class="brand-name">${plant.name || 'Loglinkr'}</div>
+          <div class="brand-plant">powered by Loglinkr</div>
         </div>
       </div>
       <div class="nav-tabs">
@@ -10213,6 +10217,57 @@ function UnitAccessModal({ plant, me, focusUserId, focusName, onClose }) {
 }
 
 // ============= MORE =============
+// Company branding: upload/replace the plant logo (admin only). Reuses the
+// public chat-attachments bucket; reloads so the header picks up the change.
+function PlantLogoRow({ plant }) {
+  const [url, setUrl] = useState(plant.logo_url || '');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const pick = async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (!f.type.startsWith('image/')) { setErr('Pick an image (PNG or JPG).'); return; }
+    if (f.size > 3 * 1024 * 1024) { setErr('Logo over 3 MB — pick a smaller one.'); return; }
+    setErr(''); setBusy(true);
+    try {
+      const ext = (f.name.split('.').pop() || 'png').toLowerCase();
+      const path = 'plant-logos/' + plant.id + '-' + Date.now() + '.' + ext;
+      const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, f, { upsert: true, contentType: f.type });
+      if (upErr) throw upErr;
+      const pub = sb.storage.from('chat-attachments').getPublicUrl(path).data.publicUrl;
+      const { error } = await sb.from('plants').update({ logo_url: pub }).eq('id', plant.id);
+      if (error) throw error;
+      setUrl(pub);
+      showToast('✓ Company logo updated');
+      setTimeout(() => location.reload(), 600);
+    } catch (e2) { setErr('Upload failed: ' + (e2.message || e2)); }
+    finally { setBusy(false); }
+  };
+  const remove = async () => {
+    if (!confirm('Remove company logo? The header will fall back to the company initial.')) return;
+    setBusy(true);
+    const { error } = await sb.from('plants').update({ logo_url: null }).eq('id', plant.id);
+    setBusy(false);
+    if (error) { setErr(error.message); return; }
+    setUrl(''); showToast('Logo removed');
+    setTimeout(() => location.reload(), 500);
+  };
+  return html`
+    <div class="card-row" style="border-top:1px solid var(--slate-100);padding-top:10px;margin-top:4px;align-items:center">
+      <span class="label">Company logo</span>
+      <div style="display:flex;align-items:center;gap:10px">
+        ${url
+          ? html`<img src=${url} style="width:38px;height:38px;border-radius:8px;object-fit:cover;border:1px solid var(--slate-200)" />`
+          : html`<div style="width:38px;height:38px;border-radius:8px;background:linear-gradient(135deg,var(--teal-500),var(--teal-700));display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700">${(plant.name || 'L').trim().charAt(0).toUpperCase()}</div>`}
+        <label class="btn small ghost" style="cursor:pointer;margin:0">${busy ? '…' : (url ? 'Change' : 'Upload')}<input type="file" accept="image/*" style="display:none" onChange=${pick} disabled=${busy} /></label>
+        ${url && html`<button class="btn small ghost" style="color:var(--rose-600)" onClick=${remove} disabled=${busy}>Remove</button>`}
+      </div>
+    </div>
+    ${err && html`<div style="font-size:11px;color:var(--rose-600);padding:2px 12px 6px">${err}</div>`}
+    <div style="font-size:11px;color:var(--slate-500);padding:0 12px 8px">Shown in the app header for everyone in this plant. A square PNG/JPG looks best.</div>
+  `;
+}
+
 function More({ plant, me, myPerms, user, logout, setTab, activeUnit, accessibleUnits, tab }) {
   const [unitAccessOpen, setUnitAccessOpen] = useState(false);
   const [openGroups, setOpenGroups] = useState(() => {
@@ -10348,6 +10403,7 @@ function More({ plant, me, myPerms, user, logout, setTab, activeUnit, accessible
           </label>
         </div>
       `}
+      ${(me.role === 'admin' || me.role === 'plant_head') && html`<${PlantLogoRow} plant=${plant} />`}
     </div>
 
     <div class="section-h">Units</div>
