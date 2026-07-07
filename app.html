@@ -29571,99 +29571,58 @@ function StockImportModal({ plant, me, activeUnit, existingItems, onClose, onSav
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState('');
   const [fileName, setFileName] = useState('');
+  const [aiInfo, setAiInfo] = useState(null); // { confidence, notes, summary }
 
   const existingCodes = new Set((existingItems || []).map(i => String(i.code || '').trim().toLowerCase()));
-  const norm = s => String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9]/g, '');
-  const HEADER_MAP = {
-    code: ['code', 'itemcode', 'sku', 'stockcode', 'materialcode', 'partcode', 'itemno', 'material', 'partno'],
-    name: ['name', 'itemname', 'description', 'particulars', 'item', 'materialdescription', 'itemdescription', 'productname'],
-    category: ['category', 'type', 'group', 'stocktype', 'itemtype'],
-    uom: ['uom', 'unit', 'units', 'unitofmeasure', 'uqc'],
-    opening_qty: ['openingqty', 'opening', 'openingstock', 'openingbalance', 'qty', 'quantity', 'stock', 'onhand', 'balance', 'currentstock', 'closingstock', 'stockqty', 'availableqty'],
-    reorder_level: ['reorder', 'reorderlevel', 'minlevel', 'minimum', 'minstock', 'rol', 'minqty'],
-    unit_cost: ['unitcost', 'cost', 'rate', 'price', 'costperunit', 'unitrate', 'value', 'costperpiece'],
-  };
-  const mapCategory = (v) => {
-    const n = norm(v);
-    if (!n) return 'general';
-    if (n.includes('raw')) return 'raw_material';
-    if (n.includes('tool')) return 'tools';
-    if (n.includes('consum')) return 'consumables';
-    if (n.includes('pack')) return 'packing';
-    if (n.includes('spare')) return 'die_spares';
-    if (n.includes('bought')) return 'bought_out';
-    return 'general';
-  };
-  const cleanNum = (v) => { const n = parseFloat(String(v == null ? '' : v).replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : null; };
 
-  const loadXLSX = () => import('https://esm.sh/xlsx@0.18.5');
-
-  const downloadTemplate = async () => {
-    setError('');
-    try {
-      const XLSX = await loadXLSX();
-      const data = [
-        ['Code', 'Name', 'Category', 'UOM', 'Opening Qty', 'Reorder Level', 'Unit Cost'],
-        ['ADC-12', 'Aluminium ADC-12', 'Raw Material', 'kg', 7000, 1000, 365],
-        ['SCM-14', 'SCM-14 Steel', 'Raw Material', 'kg', 3000, 1000, 380],
-        ['TOOL-DRILL-8', '8mm Drill Bit', 'Tools', 'nos', 50, 10, 120],
-        ['CON-COOLANT', 'Cutting Coolant', 'Consumables', 'ltr', 200, 50, 90],
-      ];
-      const ws = XLSX.utils.aoa_to_sheet(data);
-      ws['!cols'] = [{ wch: 16 }, { wch: 26 }, { wch: 14 }, { wch: 8 }, { wch: 12 }, { wch: 14 }, { wch: 12 }];
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, 'Stock');
-      XLSX.writeFile(wb, 'loglinkr-stock-template.xlsx');
-    } catch (e) { setError('Template download failed: ' + (e.message || e)); }
-  };
-
+  // Upload ANY layout → the analyze-stock-sheet edge function (Claude) reads the
+  // whole workbook and returns a clean, deduped stock list. No fixed template.
   const onFile = async (e) => {
     const f = e.target.files?.[0];
     if (!f) return;
-    setFileName(f.name); setError(''); setParsing(true); setRows(null);
+    setFileName(f.name); setError(''); setParsing(true); setRows(null); setAiInfo(null);
     try {
-      const XLSX = await loadXLSX();
+      const XLSX = await import('https://esm.sh/xlsx@0.18.5');
       const buf = await f.arrayBuffer();
       const wb = XLSX.read(buf, { type: 'array' });
-      const ws = wb.Sheets[wb.SheetNames[0]];
-      const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: false, defval: '' });
-      if (!aoa.length) throw new Error('The sheet is empty.');
-      // Detect the header row within the first ~12 rows (there may be a title row).
-      let colMap = null;
-      for (let i = 0; i < Math.min(aoa.length, 12); i++) {
-        const cells = (aoa[i] || []).map(norm);
-        const m = {};
-        for (const [key, aliases] of Object.entries(HEADER_MAP)) {
-          const idx = cells.findIndex(c => aliases.includes(c));
-          if (idx >= 0 && m[key] == null) m[key] = idx;
-        }
-        if (m.code != null && (m.name != null || Object.keys(m).length >= 3)) { colMap = { _row: i, ...m }; break; }
-      }
-      if (!colMap) throw new Error('Could not find a "Code" column. Use the template headers: Code, Name, Category, UOM, Opening Qty, Reorder Level, Unit Cost.');
+      const sheets = wb.SheetNames.map(name => {
+        const ws = wb.Sheets[name];
+        const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: false, defval: '' });
+        const outRows = aoa.map(r => {
+          const cells = (r || []).map(c => (c == null ? '' : String(c).trim()));
+          while (cells.length && cells[cells.length - 1] === '') cells.pop();
+          return cells;
+        }).filter(r => r.some(c => c !== ''));
+        return { name, rows: outRows };
+      }).filter(s => s.rows.length);
+      if (!sheets.length) throw new Error('The file has no data.');
+
+      const session = (await sb.auth.getSession()).data.session;
+      const resp = await fetch(SUPABASE_URL + '/functions/v1/analyze-stock-sheet', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (session?.access_token || ''), 'apikey': SUPABASE_ANON_KEY },
+        body: JSON.stringify({ filename: f.name, sheets }),
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data || !data.success) throw new Error(data?.error || ('HTTP ' + resp.status));
+
       const seen = new Set();
-      const parsed = [];
-      for (let i = colMap._row + 1; i < aoa.length; i++) {
-        const r = aoa[i] || [];
-        const code = String(r[colMap.code] ?? '').trim();
-        if (!code) continue;
-        const cl = code.toLowerCase();
+      const parsed = (data.items || []).map(it => {
+        const cl = String(it.code || '').toLowerCase();
         let status = 'new';
-        if (seen.has(cl)) status = 'dup';
-        else if (existingCodes.has(cl)) status = 'exists';
+        if (seen.has(cl)) status = 'dup'; else if (existingCodes.has(cl)) status = 'exists';
         seen.add(cl);
-        const name = colMap.name != null ? String(r[colMap.name] ?? '').trim() : '';
-        parsed.push({
-          code, name: name || code,
-          category: colMap.category != null ? mapCategory(r[colMap.category]) : 'general',
-          uom: (colMap.uom != null ? String(r[colMap.uom] ?? '').trim() : '') || 'nos',
-          opening_qty: colMap.opening_qty != null ? (cleanNum(r[colMap.opening_qty]) || 0) : 0,
-          reorder_level: colMap.reorder_level != null ? cleanNum(r[colMap.reorder_level]) : null,
-          unit_cost: colMap.unit_cost != null ? cleanNum(r[colMap.unit_cost]) : null,
-          status,
-        });
-      }
-      if (!parsed.length) throw new Error('No data rows found under the headers.');
+        return {
+          code: it.code, name: it.name, category: it.category || 'general', uom: it.uom || 'nos',
+          opening_qty: parseFloat(it.opening_qty) || 0,
+          reorder_level: it.reorder_level != null ? parseFloat(it.reorder_level) : null,
+          unit_cost: it.unit_cost != null ? parseFloat(it.unit_cost) : null,
+          ai_notes: it.notes || null, status,
+        };
+      });
+      if (!parsed.length) throw new Error('No stock items were found in the file.');
       setRows(parsed);
+      setAiInfo({ confidence: data.confidence, notes: data.notes, summary: data.summary });
     } catch (e2) { setError(e2.message || String(e2)); }
     finally { setParsing(false); if (e.target) e.target.value = ''; }
   };
@@ -29704,22 +29663,28 @@ function StockImportModal({ plant, me, activeUnit, existingItems, onClose, onSav
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal" style="max-width:620px">
         <div class="modal-header">
-          <div class="modal-title">📄 Import stock from Excel</div>
+          <div class="modal-title">📄 Import stock — AI reads your sheet</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
 
         ${!rows ? html`
-          <div class="card" style="background:var(--slate-50);margin-bottom:12px">
-            <div style="font-size:13px;color:var(--slate-700);margin-bottom:8px">Upload your stock sheet (<strong>.xlsx / .xls / .csv</strong>). Expected columns — extra columns are ignored, order doesn't matter:</div>
-            <div style="font-size:11px;color:var(--slate-600);font-family:'Geist Mono',monospace;background:white;border:1px solid var(--slate-200);border-radius:6px;padding:8px">Code · Name · Category · UOM · Opening Qty · Reorder Level · Unit Cost</div>
-            <button class="btn small ghost" style="margin-top:10px" onClick=${downloadTemplate}>⬇ Download template (.xlsx)</button>
+          <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:12px">
+            <div style="font-size:13px;color:var(--slate-700)">Upload your stock sheet in <strong>whatever format you already have it</strong> (.xlsx / .xls / .csv). No template needed — the AI reads the whole workbook, understands your layout (title rows, multiple sheets, merged/stacked cells, embedded prices) and extracts a clean stock list for you to review.</div>
           </div>
           <label class="btn" style="width:100%;cursor:pointer;text-align:center">
-            ${parsing ? 'Reading ' + fileName + '…' : '📂 Choose Excel / CSV file'}
+            ${parsing ? '🤖 Reading ' + fileName + '… (up to a minute)' : '📂 Choose Excel / CSV file'}
             <input type="file" accept=".xlsx,.xls,.csv" style="display:none" onChange=${onFile} disabled=${parsing} />
           </label>
+          ${parsing && html`<div style="font-size:11px;color:var(--slate-500);text-align:center;margin-top:8px">Analysing your sheet — big multi-sheet files can take 30–60s.</div>`}
           ${error && html`<div class="alert error" style="margin-top:10px">${error}</div>`}
         ` : html`
+          ${aiInfo && html`
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+              <span class="badge ${aiInfo.confidence === 'high' ? 'emerald' : aiInfo.confidence === 'low' ? 'rose' : 'amber'}" style="font-size:10px">AI confidence: ${aiInfo.confidence || 'medium'}</span>
+              ${aiInfo.summary?.source && html`<span style="font-size:11px;color:var(--slate-500)">${aiInfo.summary.source}</span>`}
+            </div>
+            ${aiInfo.notes && html`<div class="card" style="background:var(--amber-50);border-color:var(--amber-200);margin-bottom:10px;padding:8px 10px;font-size:11px;color:var(--amber-800)">📝 ${aiInfo.notes}</div>`}
+          `}
           <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px">
             <div class="stat teal" style="padding:8px"><div class="stat-num" style="font-size:16px">${newRows.length}</div><div class="stat-label" style="font-size:10px">New</div></div>
             <div class="stat ${existRows.length ? 'amber' : ''}" style="padding:8px"><div class="stat-num" style="font-size:16px">${existRows.length}</div><div class="stat-label" style="font-size:10px">Already exist</div></div>
