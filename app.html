@@ -757,6 +757,31 @@ const promptInstallApp = async () => {
   return outcome === 'accepted';
 };
 
+// When Chrome refuses to fire beforeinstallprompt, work out WHY so we can give
+// the exact fix instead of generic add-to-home-screen steps. The #1 cause on
+// Android: the app is still installed (a "ghost" WebAPK) because removing the
+// home-screen icon does NOT fully uninstall it — so Chrome thinks it's already
+// installed and never offers install again.
+const diagnoseInstall = async () => {
+  try {
+    if (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) return 'running_standalone';
+    if (navigator.getInstalledRelatedApps) {
+      const apps = await navigator.getInstalledRelatedApps();
+      if (apps && apps.length) return 'ghost_installed';
+    }
+  } catch (_) {}
+  return 'unknown';
+};
+// Shown only when a real one-tap prompt isn't available. Returns after guiding.
+const installFallback = async () => {
+  const state = await diagnoseInstall();
+  if (state === 'ghost_installed') {
+    alert('📲 Loglinkr is still installed on this phone.\n\nRemoving the home-screen icon does not fully uninstall it, so Chrome won\'t offer install again. To reinstall:\n\n1) Android Settings → Apps → Loglinkr → Uninstall\n2) Reopen loglinkr.com/app in Chrome\n3) Tap Install — the one-tap dialog appears.');
+    return;
+  }
+  alert('📲 Install Loglinkr\n\nChrome didn\'t pop the one-tap dialog this time. Do this — it installs instantly:\n\n• Chrome ⋮ menu (top-right) → "Install app" (or "Add to Home screen").\n\nIf that option is missing, tap the ⓘ / lock left of the address bar → Site settings → Clear & reset, reload the page, then tap Install.');
+};
+
 // ============= UTILITIES =============
 const escapeHtml = s => (s || '').toString();
 const fmtDate = d => new Date(d).toLocaleString('en-IN', { day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' });
@@ -28668,9 +28693,8 @@ function PostLoginInstallPrompt() {
     // Chromium (Android / Windows / desktop): fire the real one-tap install.
     const ok = await promptInstallApp();
     if (ok) { close(); return; }
-    // Native prompt genuinely unavailable (already installed, or a browser that
-    // doesn't support it) — only then show the guide.
-    window.open('/install', '_blank', 'noopener'); close();
+    // Native prompt genuinely unavailable — diagnose and give the exact fix.
+    await installFallback(); close();
   };
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) close(); }}>
@@ -28725,8 +28749,8 @@ function HomeInstallBanner() {
     // Chromium (Android / Windows): fire the real one-tap install prompt.
     const ok = await promptInstallApp();
     if (ok) { setHidden(true); return; }
-    // Native prompt genuinely unavailable — fall back to the standalone guide.
-    window.open('/install', '_blank', 'noopener');
+    // Native prompt genuinely unavailable — diagnose and give the exact fix.
+    await installFallback();
   };
   const onDismiss = () => {
     try { localStorage.setItem('loglinkr_install_dismissed_at', String(Date.now())); } catch (_) {}
@@ -29069,7 +29093,7 @@ function InstallAppCard() {
   const handleInstall = async () => {
     const ok = await promptInstallApp();
     if (ok) { setInstalled(true); return; }
-    window.open('/install', '_blank', 'noopener');
+    await installFallback();
   };
   if (installed) return html`
     <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);margin-top:8px">
