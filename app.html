@@ -1549,6 +1549,92 @@ async function loadSharedBillFile() {
   } catch (_) { return null; }
 }
 
+// When a bill/photo is shared into Loglinkr (or picked to route), ask WHERE it
+// should go, then hand it to that module pre-configured. Bill → OCR chat group;
+// Project → chat pre-tagged with project + stage; Petty cash → expense form with
+// the photo attached; Chat → drop into a group to send.
+function ShareRouterModal({ plant, me, file, onRoute, onClose }) {
+  const [step, setStep] = useState('choose');
+  const [projects, setProjects] = useState([]);
+  const [stages, setStages] = useState([]);
+  const [projectId, setProjectId] = useState('');
+  const [stageId, setStageId] = useState('');
+  const [previewUrl, setPreviewUrl] = useState('');
+  const isAdminLike = me?.role === 'admin' || me?.role === 'plant_head';
+
+  useEffect(() => {
+    if (!file) return;
+    if (!file.type?.startsWith('image/')) return;
+    const u = URL.createObjectURL(file); setPreviewUrl(u);
+    return () => URL.revokeObjectURL(u);
+  }, [file]);
+  useEffect(() => {
+    sb.from('mcp_projects').select('id, name, status').eq('plant_id', plant.id).neq('status', 'completed').order('created_at', { ascending: false })
+      .then(({ data }) => setProjects(data || []));
+  }, [plant.id]);
+  useEffect(() => {
+    if (!projectId) { setStages([]); setStageId(''); return; }
+    sb.from('mcp_project_milestones').select('id, name, seq, parent_id, status').eq('project_id', projectId).order('seq')
+      .then(({ data }) => setStages(data || []));
+  }, [projectId]);
+
+  const Dest = ({ emoji, title, sub, onClick, disabled }) => html`
+    <button type="button" onClick=${onClick} disabled=${disabled}
+      style="display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:12px 14px;border:1px solid var(--slate-200);border-radius:10px;background:${disabled ? 'var(--slate-50)' : 'white'};cursor:${disabled ? 'not-allowed' : 'pointer'};margin-bottom:8px;opacity:${disabled ? 0.55 : 1};font-family:inherit"
+      onMouseOver=${e => { if (!disabled) e.currentTarget.style.borderColor = 'var(--teal-400)'; }}
+      onMouseOut=${e => { e.currentTarget.style.borderColor = 'var(--slate-200)'; }}>
+      <span style="font-size:24px;line-height:1">${emoji}</span>
+      <span style="flex:1;min-width:0">
+        <span style="display:block;font-weight:700;font-size:14px;color:var(--slate-800)">${title}</span>
+        <span style="display:block;font-size:11.5px;color:var(--slate-500);margin-top:1px">${sub}</span>
+      </span>
+      <span style="color:var(--slate-300);font-size:18px">›</span>
+    </button>`;
+
+  return html`
+    <div class="modal-backdrop active" style="z-index:70" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:440px">
+        <div class="modal-header">
+          <div class="modal-title">${step === 'choose' ? '📥 Where should this go?' : '📐 Attach to a project'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:10px;padding:8px 10px;margin-bottom:14px">
+          ${previewUrl ? html`<img src=${previewUrl} style="width:46px;height:46px;object-fit:cover;border-radius:8px" />` : html`<span style="font-size:26px">📄</span>`}
+          <div style="min-width:0"><div style="font-size:12px;font-weight:600;color:var(--slate-700);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${file?.name || 'Shared file'}</div><div style="font-size:11px;color:var(--slate-400)">Pick a destination to file it</div></div>
+        </div>
+
+        ${step === 'choose' ? html`
+          <${Dest} emoji="🧾" title="Bill — auto-read (OCR)" sub="Read the bill and file it as a document" onClick=${() => onRoute('bill')} />
+          <${Dest} emoji="📐" title="Attach to a project" sub="Pick the project & stage it belongs to" disabled=${projects.length === 0} onClick=${() => setStep('project')} />
+          <${Dest} emoji="💵" title="Petty cash expense" sub="Log a cash expense with this receipt" disabled=${!isAdminLike} onClick=${() => onRoute('petty_cash')} />
+          <${Dest} emoji="💬" title="Send to a chat" sub="Drop it into a team group" onClick=${() => onRoute('chat')} />
+          ${projects.length === 0 && html`<div style="font-size:11px;color:var(--slate-400);margin-top:2px">No open projects yet — create one to file bills against it.</div>`}
+        ` : html`
+          <div class="field">
+            <label>Project *</label>
+            <select value=${projectId} onChange=${e => setProjectId(e.target.value)}>
+              <option value="">— Select project —</option>
+              ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.name}</option>`)}
+            </select>
+          </div>
+          <div class="field">
+            <label>Stage <span style="font-weight:400;color:var(--slate-400);font-size:11px">· optional</span></label>
+            <select value=${stageId} onChange=${e => setStageId(e.target.value)} disabled=${!projectId}>
+              <option value="">${projectId ? '— Whole project —' : 'Pick a project first'}</option>
+              ${stages.map(s => html`<option key=${s.id} value=${s.id}>${s.parent_id ? '— ' : ''}${s.name}</option>`)}
+            </select>
+            ${projectId && stages.length === 0 && html`<div style="font-size:11px;color:var(--slate-400);margin-top:4px">This project has no stages — it'll be filed to the whole project.</div>`}
+          </div>
+          <div style="display:flex;gap:8px;margin-top:14px">
+            <button type="button" class="btn ghost" style="flex:1" onClick=${() => setStep('choose')}>← Back</button>
+            <button type="button" class="btn" style="flex:2" disabled=${!projectId} onClick=${() => onRoute('project', { projectId, stageId })}>Continue →</button>
+          </div>
+        `}
+      </div>
+    </div>
+  `;
+}
+
 function App() {
   const [user, setUser] = useState(null);
   const [plant, setPlant] = useState(null);
@@ -2659,16 +2745,39 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   const go = (tabKey, sub) => { setTab(tabKey); setNavAction(sub ? { tab: tabKey, sub, ts: Date.now() } : null); };
 
   // Web Share Target: a bill was shared from WhatsApp (→ /app?shared_bill=1).
-  // Route to chat's bill upload once, then scrub the flag so refresh is a no-op.
+  // Load the stashed file and open the destination router; scrub the flag.
+  const [shareFile, setShareFile] = useState(null);
+  const [shareRouterOpen, setShareRouterOpen] = useState(false);
   useEffect(() => {
     try {
       const sp = new URLSearchParams(window.location.search);
       if (sp.get('shared_bill') === '1') {
-        setTimeout(() => go('chat', 'shared_bill'), 60);
         window.history.replaceState({}, '', window.location.pathname + (window.location.hash || ''));
+        (async () => {
+          const f = await loadSharedBillFile();
+          if (f) { setShareFile(f); setShareRouterOpen(true); }
+          else showToast('Could not read the shared file — try Upload Bill from Home.');
+        })();
       }
     } catch (_) {}
   }, []);
+  // Deliver the shared file to the chosen module, pre-configured.
+  const handleShareRoute = (dest, opts = {}) => {
+    window.__routedShareFile = shareFile;
+    setShareRouterOpen(false);
+    if (dest === 'project') {
+      try {
+        sessionStorage.setItem('loglinkr_upload_project_id', opts.projectId || '');
+        if (opts.stageId) sessionStorage.setItem('loglinkr_upload_stage_id', opts.stageId);
+        else sessionStorage.removeItem('loglinkr_upload_stage_id');
+      } catch (_) {}
+      go('chat', 'shared_bill');
+    } else if (dest === 'petty_cash') {
+      go('petty_cash', 'shared_expense');
+    } else {
+      go('chat', 'shared_bill'); // bill (OCR) or plain chat both land in the group
+    }
+  };
 
   // Keep --nav-h synced to the visible top-nav height. The desktop nav wraps its
   // tabs (so its height varies); the fixed chat panel reads --nav-h for its top
@@ -2796,6 +2905,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       </div>`}
       ${!floOpen && html`<button class="flo-fab" title="Ask FLO — your plant copilot" onClick=${() => setFloOpen(true)}>✨</button>`}
       ${floOpen && html`<${AssistantPanel} plant=${plant} me=${me} setTab=${setTab} onClose=${() => setFloOpen(false)} />`}
+      ${shareRouterOpen && shareFile && html`<${ShareRouterModal} plant=${plant} me=${me} file=${shareFile} onClose=${() => setShareRouterOpen(false)} onRoute=${handleShareRoute} />`}
 
       <${Page} active=${pageTab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} myPerms=${myPerms} /></${Page}>
       <${Page} active=${pageTab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -2847,7 +2957,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'expenses'}><${ExpenseLedger} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'machine_prod'}><${MachineProductionModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${pageTab === 'petty_cash'}><${PettyCashModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'petty_cash'}><${PettyCashModule} plant=${plant} me=${me} activeUnit=${activeUnit} navAction=${navAction} /></${Page}>
       <${Page} active=${pageTab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
       <${Page} active=${denied}><${AccessDenied} moduleKey=${tab} /></${Page}>
 
@@ -6510,7 +6620,8 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
     if (navAction?.sub !== 'shared_bill') return;
     let cancelled = false;
     (async () => {
-      const original = await loadSharedBillFile();
+      const routed = window.__routedShareFile; window.__routedShareFile = null;
+      const original = routed || await loadSharedBillFile();
       if (cancelled) return;
       if (!original) { showToast('Could not read the shared file — try Upload Bill from Home.'); return; }
       const { data: aiGroups } = await sb.from('chat_groups')
@@ -15583,7 +15694,7 @@ function AttendanceSetupPage({ plant, me, reload }) {
 // =================================================================
 // PETTY CASH — expenses · advances · recollection
 // =================================================================
-function PettyCashModule({ plant, me, activeUnit }) {
+function PettyCashModule({ plant, me, activeUnit, navAction }) {
   const [books, setBooks] = useState([]);
   const [balances, setBalances] = useState([]);
   const [txns, setTxns] = useState([]);
@@ -15596,6 +15707,14 @@ function PettyCashModule({ plant, me, activeUnit }) {
   const [reportOpen, setReportOpen] = useState(false);
   const [period, setPeriod] = useState('30'); // last N days for txns list
   const [filterType, setFilterType] = useState('all');
+
+  // A receipt shared into Loglinkr and routed to petty cash → open the expense
+  // form with the photo attached, ready for the amount + purpose.
+  useEffect(() => {
+    if (navAction?.sub !== 'shared_expense') return;
+    const f = window.__routedShareFile; window.__routedShareFile = null;
+    setCreateTxnOpen({ type: 'expense', attachmentFile: f || null });
+  }, [navAction?.ts]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -16935,6 +17054,7 @@ function PettyCashTxnModal({ plant, me, books, users, initial, advances, onClose
           <${EntryAttachments} plant=${plant} me=${me} scope="pettycash"
             value=${{ attachments: form.attachments, email_ref: form.email_ref }}
             onChange=${(v) => setForm({...form, attachments: v.attachments, email_ref: v.email_ref})}
+            initialFile=${initial.attachmentFile || null}
             showEmail=${true} />
 
           <button class="btn" disabled=${busy}>${busy ? 'Saving…' : ({topup:'⬆️ Record top-up', expense:'🧾 Record expense', advance_given:'💸 Give advance', advance_returned:'↩️ Record recovery'})[txnType]}</button>
@@ -23861,13 +23981,14 @@ function AttachmentsViewer({ attachments, emailRef, compact = false }) {
   `;
 }
 
-function EntryAttachments({ plant, me, scope, value, onChange, showEmail = true }) {
+function EntryAttachments({ plant, me, scope, value, onChange, showEmail = true, initialFile = null }) {
   const [busy, setBusy] = useState(false);
   const [recording, setRecording] = useState(false);
   const fileRef = useRef(null);
   const cameraRef = useRef(null);
   const mediaRecRef = useRef(null);
   const chunksRef = useRef([]);
+  const ingestedRef = useRef(false);
 
   const attachments = (value && value.attachments) || [];
   const emailRef = (value && value.email_ref) || '';
@@ -23901,6 +24022,15 @@ function EntryAttachments({ plant, me, scope, value, onChange, showEmail = true 
   };
 
   const onFile = (e) => { const f = e.target.files?.[0]; if (f) uploadFile(f, 'photo'); e.target.value = ''; };
+
+  // A file handed in from elsewhere (e.g. a bill shared from WhatsApp routed to
+  // this module) is uploaded automatically, once, so it lands as an attachment.
+  useEffect(() => {
+    if (initialFile && !ingestedRef.current) {
+      ingestedRef.current = true;
+      uploadFile(initialFile, initialFile.type?.startsWith('image/') ? 'photo' : 'file');
+    }
+  }, [initialFile]);
 
   const startRec = async () => {
     try {
