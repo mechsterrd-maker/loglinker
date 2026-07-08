@@ -7578,11 +7578,282 @@ const MASTERS_TREE = [
   },
 ];
 
+// =================================================================
+// Master import specs — each describes the target fields we ask the
+// analyze-master-sheet edge function to extract, plus how to turn an
+// extracted row into a DB insert. keyField drives dedupe vs existing rows.
+// Stock items / raw materials use the dedicated StockImportModal instead.
+// =================================================================
+const _mNum = (v) => { const x = parseFloat(String(v ?? '').replace(/[^0-9.\-]/g, '')); return isFinite(x) ? x : null; };
+const _mInt = (v) => { const x = _mNum(v); return x == null ? null : Math.round(x); };
+const _mEnum = (v, allowed, dflt) => { const s = String(v ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_'); return allowed.includes(s) ? s : dflt; };
+const _mCode = (v, name) => {
+  let c = String(v || '').trim().toUpperCase().replace(/\s+/g, '-').replace(/[^A-Z0-9\-]/g, '').slice(0, 24);
+  if (!c) c = String(name || 'ITEM').trim().toUpperCase().replace(/[^A-Z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24) || 'ITEM';
+  return c;
+};
+
+const MASTER_IMPORT_SPECS = {
+  parts: {
+    table: 'mcp_pdc_parts', label: 'parts', singular: 'part', keyField: 'part_number', icon: '🧩',
+    fields: [
+      { key: 'part_number', desc: 'part number / drawing number / item code (the unique identifier)' },
+      { key: 'name', desc: 'part name or description' },
+      { key: 'revision', desc: 'revision / rev; default "0" if absent' },
+      { key: 'part_type', desc: 'one of: finished, sub_assembly, component, raw_part — infer from context; default component' },
+      { key: 'customer', desc: 'customer / party name or null' },
+      { key: 'customer_part_number', desc: "customer's own part number or null" },
+      { key: 'weight_kg', desc: 'part weight in kg (number) or null' },
+      { key: 'uom', desc: 'unit of measure (nos, kg, set…); default nos' },
+      { key: 'cost_per_piece', desc: 'price per piece if present else null' },
+    ],
+    reviewCols: [{ key: 'part_number', label: 'Part No' }, { key: 'name', label: 'Name' }, { key: 'part_type', label: 'Type' }, { key: 'customer', label: 'Customer' }],
+    keyOf: (r) => r.part_number,
+    genKey: (r) => _mCode(r.part_number, r.name),
+    toRow: (r, ctx) => ({
+      plant_id: ctx.plant.id, part_number: String(r.part_number).trim(), name: String(r.name || r.part_number).trim(),
+      revision: String(r.revision || '0').trim() || '0',
+      part_type: _mEnum(r.part_type, ['finished', 'sub_assembly', 'component', 'raw_part'], 'component'),
+      status: 'active', customer: r.customer || null, customer_part_number: r.customer_part_number || null,
+      weight_kg: _mNum(r.weight_kg), uom: String(r.uom || 'nos').trim() || 'nos', cost_per_piece: _mNum(r.cost_per_piece),
+      created_by: ctx.me?.id || null,
+      ...(ctx.activeUnit?.unit_id ? { unit_id: ctx.activeUnit.unit_id } : {}),
+    }),
+  },
+  machines: {
+    table: 'machines', label: 'machines', singular: 'machine', keyField: 'code', icon: '⚙️', requiresUnit: true,
+    fields: [
+      { key: 'code', desc: 'machine code / asset id / number (unique identifier)' },
+      { key: 'display_name', desc: 'friendly machine name or null' },
+      { key: 'category', desc: 'machine type / category e.g. CNC, VMC, Press, Welding, Lathe, Grinding; default general' },
+      { key: 'make', desc: 'manufacturer / brand or null' },
+      { key: 'model', desc: 'model number or null' },
+      { key: 'tonnage', desc: 'tonnage / capacity as an integer or null' },
+      { key: 'year_of_install', desc: 'year of installation / purchase (4-digit) or null' },
+    ],
+    reviewCols: [{ key: 'code', label: 'Code' }, { key: 'display_name', label: 'Name' }, { key: 'category', label: 'Category' }, { key: 'make', label: 'Make' }],
+    keyOf: (r) => r.code,
+    genKey: (r) => _mCode(r.code, r.display_name || r.category),
+    toRow: (r, ctx) => ({
+      plant_id: ctx.plant.id, unit_id: ctx.activeUnit?.unit_id || ctx.units?.[0]?.id,
+      code: String(r.code).trim(), display_name: r.display_name || null,
+      category: String(r.category || 'general').trim() || 'general', make: r.make || null, model: r.model || null,
+      tonnage: _mInt(r.tonnage), year_of_install: _mInt(r.year_of_install), status: 'idle',
+    }),
+  },
+  tools: {
+    table: 'tools_master', label: 'tools', singular: 'tool', keyField: 'code', icon: '🛠',
+    fields: [
+      { key: 'code', desc: 'tool code / SKU / number (unique identifier); if absent, leave null and one will be generated' },
+      { key: 'name', desc: 'tool name including size/spec' },
+      { key: 'kind', desc: 'one of: insert, drill, tap, end_mill, reamer, wheel, broach, other — infer; default other' },
+      { key: 'make', desc: 'brand / manufacturer or null' },
+      { key: 'grade', desc: 'material grade / coating or null' },
+      { key: 'life_value', desc: 'expected tool life as a number; default 1' },
+      { key: 'life_unit', desc: 'one of: pieces, minutes, shifts, corners; default pieces' },
+      { key: 'cost_per_piece', desc: 'unit price if present else null' },
+    ],
+    reviewCols: [{ key: 'code', label: 'Code' }, { key: 'name', label: 'Name' }, { key: 'kind', label: 'Kind' }, { key: 'make', label: 'Make' }],
+    keyOf: (r) => r.code,
+    genKey: (r) => _mCode(r.code, r.name),
+    toRow: (r, ctx) => ({
+      plant_id: ctx.plant.id, code: _mCode(r.code, r.name), name: String(r.name || r.code || 'Tool').trim(),
+      kind: _mEnum(r.kind, ['insert', 'drill', 'tap', 'end_mill', 'reamer', 'wheel', 'broach', 'other'], 'other'),
+      make: r.make || null, grade: r.grade || null,
+      life_value: _mNum(r.life_value) ?? 1, life_unit: _mEnum(r.life_unit, ['pieces', 'minutes', 'shifts', 'corners'], 'pieces'),
+      corners_per_insert: 1, cost_per_piece: _mNum(r.cost_per_piece), is_active: true, created_by: ctx.me?.id || null,
+      ...(ctx.activeUnit?.unit_id ? { unit_id: ctx.activeUnit.unit_id } : {}),
+    }),
+  },
+  customers: {
+    table: 'mcp_sched_customers', label: 'customers', singular: 'customer', keyField: 'name', icon: '🏢',
+    fields: [
+      { key: 'name', desc: 'customer / company name (unique identifier)' },
+      { key: 'short_code', desc: 'short code / abbreviation or null' },
+      { key: 'gstin', desc: 'GST number or null' },
+      { key: 'city', desc: 'city or null' },
+      { key: 'contact_person', desc: 'contact person name or null' },
+      { key: 'contact_phone', desc: 'phone number or null' },
+    ],
+    reviewCols: [{ key: 'name', label: 'Name' }, { key: 'short_code', label: 'Code' }, { key: 'gstin', label: 'GSTIN' }, { key: 'city', label: 'City' }],
+    keyOf: (r) => r.name,
+    genKey: (r) => String(r.name || '').trim(),
+    toRow: (r, ctx) => ({
+      plant_id: ctx.plant.id, name: String(r.name).trim(), short_code: r.short_code || null, gstin: r.gstin || null,
+      city: r.city || null, contact_person: r.contact_person || null, contact_phone: r.contact_phone || null,
+      active: true, created_by: ctx.me?.id || null,
+    }),
+  },
+  vendors: {
+    table: 'mcp_logistics_vendors', label: 'vendors', singular: 'vendor', keyField: 'name', icon: '🏪',
+    fields: [
+      { key: 'name', desc: 'vendor / supplier name (unique identifier)' },
+      { key: 'gstin', desc: 'GST number or null' },
+      { key: 'city', desc: 'city or null' },
+      { key: 'phone', desc: 'phone number or null' },
+      { key: 'email', desc: 'email or null' },
+    ],
+    reviewCols: [{ key: 'name', label: 'Name' }, { key: 'gstin', label: 'GSTIN' }, { key: 'city', label: 'City' }, { key: 'phone', label: 'Phone' }],
+    keyOf: (r) => r.name,
+    genKey: (r) => String(r.name || '').trim(),
+    toRow: (r, ctx) => ({
+      plant_id: ctx.plant.id, name: String(r.name).trim(), gstin: r.gstin || null, city: r.city || null,
+      phone: r.phone || null, email: r.email || null, is_vendor: true, is_customer: false, is_jobwork_vendor: false,
+    }),
+  },
+};
+
+function MasterImportModal({ plant, me, activeUnit, units, spec, existingItems, onClose, onSaved }) {
+  const [rows, setRows] = useState(null);
+  const [parsing, setParsing] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [error, setError] = useState('');
+  const [fileName, setFileName] = useState('');
+  const [aiInfo, setAiInfo] = useState(null);
+
+  const existingKeys = new Set((existingItems || []).map(i => String(spec.keyOf(i) || '').trim().toLowerCase()));
+
+  const onFile = async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (spec.requiresUnit && !(activeUnit?.unit_id || units?.[0]?.id)) { setError('Add a Unit first — machines must belong to a unit.'); return; }
+    setFileName(f.name); setError(''); setParsing(true); setRows(null); setAiInfo(null);
+    try {
+      const XLSX = await import('https://esm.sh/xlsx@0.18.5');
+      const buf = await f.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+      const sheets = wb.SheetNames.map(name => {
+        const ws = wb.Sheets[name];
+        const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: false, defval: '' });
+        const outRows = aoa.map(r => {
+          const cells = (r || []).map(c => (c == null ? '' : String(c).trim()));
+          while (cells.length && cells[cells.length - 1] === '') cells.pop();
+          return cells;
+        }).filter(r => r.some(c => c !== ''));
+        return { name, rows: outRows };
+      }).filter(s => s.rows.length);
+      if (!sheets.length) throw new Error('The file has no data.');
+
+      const session = (await sb.auth.getSession()).data.session;
+      const resp = await fetch(SUPABASE_URL + '/functions/v1/analyze-master-sheet', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (session?.access_token || ''), 'apikey': SUPABASE_ANON_KEY },
+        body: JSON.stringify({ filename: f.name, label: spec.label, singular: spec.singular, keyField: spec.keyField, fields: spec.fields, sheets }),
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data || !data.success) throw new Error(data?.error || ('HTTP ' + resp.status));
+
+      const seen = new Set();
+      const parsed = (data.items || []).map(it => {
+        let keyVal = spec.keyOf(it);
+        if (!keyVal || !String(keyVal).trim()) { keyVal = spec.genKey(it); it = { ...it, [spec.keyField]: keyVal }; }
+        const kl = String(keyVal).trim().toLowerCase();
+        let status = 'new';
+        if (seen.has(kl)) status = 'dup'; else if (existingKeys.has(kl)) status = 'exists';
+        seen.add(kl);
+        return { ...it, _status: status };
+      });
+      if (!parsed.length) throw new Error('No ' + spec.label + ' were found in the file.');
+      setRows(parsed);
+      setAiInfo({ confidence: data.confidence, notes: data.notes, summary: data.summary });
+    } catch (e2) { setError(e2.message || String(e2)); }
+    finally { setParsing(false); if (e.target) e.target.value = ''; }
+  };
+
+  const newRows = (rows || []).filter(r => r._status === 'new');
+  const dupRows = (rows || []).filter(r => r._status === 'dup');
+  const existRows = (rows || []).filter(r => r._status === 'exists');
+
+  const doImport = async () => {
+    if (!newRows.length) { setError('Nothing new to import.'); return; }
+    setImporting(true); setError('');
+    try {
+      const ctx = { plant, me, activeUnit, units };
+      const dbRows = newRows.map(r => spec.toRow(r, ctx));
+      const { error: iErr } = await sb.from(spec.table).insert(dbRows);
+      if (iErr) throw iErr;
+      showToast('✅ ' + newRows.length + ' ' + spec.label + ' imported' + (existRows.length ? ' · ' + existRows.length + ' already existed' : ''));
+      onSaved();
+    } catch (e) { setError('Import failed: ' + (e.message || e)); }
+    finally { setImporting(false); }
+  };
+
+  const statusBadge = (s) => s === 'new' ? html`<span class="badge emerald" style="font-size:9px">new</span>`
+    : s === 'exists' ? html`<span class="badge amber" style="font-size:9px">exists</span>`
+    : html`<span class="badge rose" style="font-size:9px">dup</span>`;
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:640px">
+        <div class="modal-header">
+          <div class="modal-title">${spec.icon} Import ${spec.label} — AI reads your sheet</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+
+        ${!rows ? html`
+          <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:12px">
+            <div style="font-size:13px;color:var(--slate-700)">Upload your existing ${spec.label} sheet in <strong>whatever format you already have it</strong> (.xlsx / .xls / .csv). No template needed — the AI reads the whole workbook, understands your columns and extracts a clean ${spec.label} list for you to review before importing.</div>
+          </div>
+          <label class="btn" style="width:100%;cursor:pointer;text-align:center">
+            ${parsing ? '🤖 Reading ' + fileName + '…' : '📂 Choose Excel / CSV file'}
+            <input type="file" accept=".xlsx,.xls,.csv" style="display:none" onChange=${onFile} disabled=${parsing} />
+          </label>
+          ${parsing && html`<div style="font-size:11px;color:var(--slate-500);text-align:center;margin-top:8px">Analysing your sheet — big files can take 30–60s.</div>`}
+          ${error && html`<div class="alert error" style="margin-top:10px">${error}</div>`}
+        ` : html`
+          ${aiInfo && html`
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+              <span class="badge ${aiInfo.confidence === 'high' ? 'emerald' : aiInfo.confidence === 'low' ? 'rose' : 'amber'}" style="font-size:10px">AI confidence: ${aiInfo.confidence || 'medium'}</span>
+              ${aiInfo.summary?.source && html`<span style="font-size:11px;color:var(--slate-500)">${aiInfo.summary.source}</span>`}
+            </div>
+            ${aiInfo.notes && html`<div class="card" style="background:var(--amber-50);border-color:var(--amber-200);margin-bottom:10px;padding:8px 10px;font-size:11px;color:var(--amber-800)">📝 ${aiInfo.notes}</div>`}
+          `}
+          <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px">
+            <div class="stat teal" style="padding:8px"><div class="stat-num" style="font-size:16px">${newRows.length}</div><div class="stat-label" style="font-size:10px">New</div></div>
+            <div class="stat ${existRows.length ? 'amber' : ''}" style="padding:8px"><div class="stat-num" style="font-size:16px">${existRows.length}</div><div class="stat-label" style="font-size:10px">Already exist</div></div>
+            <div class="stat ${dupRows.length ? 'rose' : ''}" style="padding:8px"><div class="stat-num" style="font-size:16px">${dupRows.length}</div><div class="stat-label" style="font-size:10px">Duplicate in file</div></div>
+          </div>
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:6px">📎 ${fileName} · only <strong>new</strong> rows are imported. Existing and in-file duplicates are skipped.</div>
+          <div style="max-height:40vh;overflow-y:auto;border:1px solid var(--slate-200);border-radius:8px">
+            <table style="width:100%;border-collapse:collapse;font-size:11.5px">
+              <thead><tr style="background:var(--slate-50);position:sticky;top:0">
+                ${spec.reviewCols.map(c => html`<th style="text-align:left;padding:6px 8px">${c.label}</th>`)}
+                <th style="padding:6px 8px"></th>
+              </tr></thead>
+              <tbody>
+                ${rows.map((r, i) => html`
+                  <tr key=${i} style="border-top:0.5px solid var(--slate-100);${r._status !== 'new' ? 'opacity:.55' : ''}">
+                    ${spec.reviewCols.map((c, ci) => html`<td style="padding:5px 8px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${ci === 0 ? "font-family:'Geist Mono',monospace" : ''}">${r[c.key] || '—'}</td>`)}
+                    <td style="padding:5px 8px;text-align:center">${statusBadge(r._status)}</td>
+                  </tr>
+                `)}
+              </tbody>
+            </table>
+          </div>
+          ${error && html`<div class="alert error" style="margin-top:10px">${error}</div>`}
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <button class="btn ghost" style="flex:1" onClick=${() => { setRows(null); setError(''); }}>← Choose another file</button>
+            <button class="btn" style="flex:2" disabled=${importing || !newRows.length} onClick=${doImport}>${importing ? 'Importing…' : '📦 Import ' + newRows.length + ' ' + spec.label}</button>
+          </div>
+        `}
+      </div>
+    </div>
+  `;
+}
+
 function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
   const isAdminLike = me?.role === 'admin' || me?.role === 'plant_head';
   const canSeeRoles = isAdminLike && myPerms?.rbac_enforced;
   const leafGate = (leaf) => leaf.adminOnly ? canSeeRoles : true;
+  const fab = isFab(plant);
+  // Fab plants don't cast in dies — swap the Dies master for Raw Materials
+  // (raw material = stock items in the raw_material category).
+  const tree = MASTERS_TREE.map(g => g.key === 'production'
+    ? { ...g, leaves: g.leaves.map(l => (l.key === 'dies' && fab) ? { key: 'raw_materials', icon: '🪨', label: 'Raw Materials' } : l) }
+    : g);
   const [active, setActive] = useState('parts');
+  const [importSpecKey, setImportSpecKey] = useState(null);
+  const [itemDefaultCat, setItemDefaultCat] = useState(null);
   const [openGroups, setOpenGroups] = useState({ people:true, production:true, inventory:true, logistics:true });
   const [search, setSearch] = useState('');
   const [modal, setModal] = useState(null);
@@ -7651,10 +7922,14 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
 
+  // Raw materials = stock items in the raw_material category (fab plants).
+  const rawMaterials = stockItems.filter(i => (i.category || '') === 'raw_material');
+
   // Counts for tree badges
   const counts = {
     units: units.length, operators: operators.length, shifts: shifts.length, team: users.length,
     parts: parts.length, machines: machines.length, dies: dies.length, tools: tools.length,
+    raw_materials: rawMaterials.length,
     stock_items: stockItems.length, rejection_types: rejectionTypes.length,
     vendors: vendors.length, customers: customers.length,
   };
@@ -7662,9 +7937,14 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
   // Generic row click → open edit modal
   const openEdit = (type, row) => { setEditTarget(row); setModal(type); };
   const openAdd  = (type)       => { setEditTarget(null); setModal(type); };
+  // Bulk AI import: master types use MasterImportModal; stock/raw use StockImportModal.
+  const openImport = (specKey)  => { setEditTarget(null); setImportSpecKey(specKey); setModal('master_import'); };
+  const openStockImport = ()    => { setEditTarget(null); setModal('stock_import'); };
+  // Raw-material add → the shared item modal, pre-set to the raw_material category.
+  const openAddRaw = () => { setEditTarget(null); setItemDefaultCat('raw_material'); setModal('stock_item'); };
   // For party masters we want a dashboard view on row tap, not the edit form.
   const [detailVendor, setDetailVendor] = useState(null);
-  const closeModal = () => { setModal(null); setEditTarget(null); };
+  const closeModal = () => { setModal(null); setEditTarget(null); setImportSpecKey(null); setItemDefaultCat(null); };
   const saveModal  = () => { closeModal(); refresh(); };
 
   // Filter list by search term
@@ -7687,14 +7967,17 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
     </div>
   `;
 
-  // SECTION HEADER with + Add
-  const SectionHeader = ({ icon, title, n, onAdd, addLabel }) => html`
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--slate-200)">
+  // SECTION HEADER with + Add (and optional 📄 Import from Excel)
+  const SectionHeader = ({ icon, title, n, onAdd, addLabel, onImport }) => html`
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--slate-200)">
       <div>
         <h2 style="font-size:18px;font-weight:700;margin:0">${icon} ${title}</h2>
         <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${n} total</div>
       </div>
-      ${onAdd && html`<button class="btn small" onClick=${onAdd}>${addLabel || '+ Add'}</button>`}
+      <div style="display:flex;gap:6px;flex-shrink:0">
+        ${onImport && html`<button class="btn small ghost" style="border-color:var(--amber-300);color:var(--amber-800)" onClick=${onImport}>📄 Import</button>`}
+        ${onAdd && html`<button class="btn small" onClick=${onAdd}>${addLabel || '+ Add'}</button>`}
+      </div>
     </div>
   `;
 
@@ -7756,7 +8039,7 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
       case 'parts': {
         const list = filterRows(parts, ['part_number','name','customer']);
         return html`
-          <${SectionHeader} icon="🧩" title="Parts" n=${parts.length} onAdd=${() => openAdd('part')} />
+          <${SectionHeader} icon="🧩" title="Parts" n=${parts.length} onAdd=${() => openAdd('part')} onImport=${() => openImport('parts')} />
           ${list.length === 0 ? Empty({ icon:'🧩', msg:'No parts yet', addLabel:'+ Add part', onAdd:() => openAdd('part') }) :
             list.map(p => Row({ title: p.part_number + ' · ' + (p.name||''), sub: 'Rev ' + (p.revision||'?') + ' · ' + p.part_type + (p.customer?' · '+p.customer:''), badge: p.status, badgeColor: p.status==='active'?'emerald':'', onClick: () => openEdit('part', p) }))}
         `;
@@ -7764,7 +8047,7 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
       case 'machines': {
         const list = filterRows(machines, ['code','display_name','make','category']);
         return html`
-          <${SectionHeader} icon="⚙️" title="Machines" n=${machines.length} onAdd=${() => openAdd('machine')} />
+          <${SectionHeader} icon="⚙️" title="Machines" n=${machines.length} onAdd=${() => openAdd('machine')} onImport=${() => openImport('machines')} />
           ${list.length === 0 ? Empty({ icon:'⚙️', msg:'No machines yet', addLabel:'+ Add machine', onAdd:() => openAdd('machine') }) :
             list.map(m => Row({ title: m.code + (m.display_name?' ('+m.display_name+')':'') + ' · ' + (m.make||'—'), sub: m.category + (m.tonnage?' · '+m.tonnage+'T':'') + (m.units?.name?' · '+m.units.name:''), badge: m.status, badgeColor: m.status==='running'?'emerald':m.status==='breakdown'?'rose':'', onClick: () => openEdit('machine', m) }))}
         `;
@@ -7780,7 +8063,7 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
       case 'tools': {
         const list = filterRows(tools, ['code','name','make','kind']);
         return html`
-          <${SectionHeader} icon="🛠" title="Tools" n=${tools.length} onAdd=${() => openAdd('tool')} />
+          <${SectionHeader} icon="🛠" title="Tools" n=${tools.length} onAdd=${() => openAdd('tool')} onImport=${() => openImport('tools')} />
           ${list.length === 0 ? Empty({ icon:'🛠', msg:'No tools yet', addLabel:'+ Add tool', onAdd:() => openAdd('tool') }) :
             list.map(t => Row({ title: t.code + ' · ' + (t.name||''), sub: t.kind + (t.make?' · '+t.make:'') + (t.life_value?' · '+t.life_value+' '+(t.life_unit||''):''), onClick: () => openEdit('tool', t) }))}
         `;
@@ -7788,9 +8071,18 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
       case 'stock_items': {
         const list = filterRows(stockItems, ['code','name','category']);
         return html`
-          <${SectionHeader} icon="📦" title="Stock Items" n=${stockItems.length} onAdd=${() => openAdd('stock_item')} />
+          <${SectionHeader} icon="📦" title="Stock Items" n=${stockItems.length} onAdd=${() => openAdd('stock_item')} onImport=${openStockImport} />
           ${list.length === 0 ? Empty({ icon:'📦', msg:'No items yet', addLabel:'+ New item + opening', onAdd:() => openAdd('stock_item') }) :
             list.map(i => Row({ title: i.code + ' · ' + i.name, sub: (i.category||'general') + ' · ' + fmtNum(i.current_qty) + ' ' + i.uom + (i.reorder_level?' · reorder '+i.reorder_level:''), badge: !i.opening_recorded_at?'NO OPENING':'', badgeColor: !i.opening_recorded_at?'amber':'', onClick: () => openEdit('stock_item', i) }))}
+        `;
+      }
+      case 'raw_materials': {
+        const list = filterRows(rawMaterials, ['code','name','subcategory']);
+        return html`
+          <${SectionHeader} icon="🪨" title="Raw Materials" n=${rawMaterials.length} addLabel="+ New material" onAdd=${openAddRaw} onImport=${openStockImport} />
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Raw material stock (steel, sections, consumables). Tracked as stock items in the <strong>raw_material</strong> category — appears in Stocks too.</div>
+          ${list.length === 0 ? Empty({ icon:'🪨', msg:'No raw materials yet', addLabel:'+ New material', onAdd: openAddRaw }) :
+            list.map(i => Row({ title: i.code + ' · ' + i.name, sub: (i.subcategory ? i.subcategory + ' · ' : '') + fmtNum(i.current_qty) + ' ' + i.uom + (i.reorder_level?' · reorder '+i.reorder_level:''), badge: !i.opening_recorded_at?'NO OPENING':'', badgeColor: !i.opening_recorded_at?'amber':'', onClick: () => openEdit('stock_item', i) }))}
         `;
       }
       case 'rejection_types': {
@@ -7814,7 +8106,7 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
       case 'vendors': {
         const list = filterRows(vendors, ['name','gstin','city']);
         return html`
-          <${SectionHeader} icon="🏪" title="Vendors" n=${vendors.length} onAdd=${() => openAdd('vendor')} />
+          <${SectionHeader} icon="🏪" title="Vendors" n=${vendors.length} onAdd=${() => openAdd('vendor')} onImport=${() => openImport('vendors')} />
           <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Add manually or let approved invoices auto-create them. Tap any row to open the vendor dashboard — ledger, spend trend, document mix and outstanding.</div>
           ${list.length === 0 ? Empty({ icon:'🏪', msg:'No vendors yet', addLabel:'+ Add vendor', onAdd:() => openAdd('vendor') }) :
             list.map(v => Row({ title: v.name + (v.is_jobwork_vendor?' · JW':''), sub: (v.gstin||'no gstin') + (v.city?' · '+v.city:''), onClick: () => setDetailVendor(v) }))}
@@ -7823,7 +8115,7 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
       case 'customers': {
         const list = filterRows(customers, ['name','gstin','city','short_code']);
         return html`
-          <${SectionHeader} icon="🏢" title="Customers" n=${customers.length} onAdd=${() => openAdd('customer')} />
+          <${SectionHeader} icon="🏢" title="Customers" n=${customers.length} onAdd=${() => openAdd('customer')} onImport=${() => openImport('customers')} />
           ${list.length === 0 ? Empty({ icon:'🏢', msg:'No customers yet', addLabel:'+ Add customer', onAdd:() => openAdd('customer') }) :
             list.map(c => Row({ title: c.name + (c.short_code?' ('+c.short_code+')':''), sub: (c.gstin||'no gstin') + (c.city?' · '+c.city:''), onClick: () => openEdit('customer', c) }))}
         `;
@@ -7835,7 +8127,7 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
   // Tree of master groups/leaves. On mobile, tapping a leaf drills into a full page.
   const treeCard = (fullWidth) => html`
     <div class="card" style=${(fullWidth ? 'width:100%;' : 'flex:0 0 240px;max-height:80vh;overflow-y:auto;') + 'max-width:100%;padding:8px 6px;box-sizing:border-box'}>
-      ${MASTERS_TREE.map(group => {
+      ${tree.map(group => {
         const open = openGroups[group.key] !== false;
         const visibleLeaves = group.leaves.filter(leafGate);
         if (visibleLeaves.length === 0) return null;
@@ -7904,7 +8196,9 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
     ${modal === 'machine'    && html`<${MachineModal} plant=${plant} units=${units} users=${[...users, ...operators]} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'die'        && html`<${DieModal} plant=${plant} me=${me} parts=${parts} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'tool'       && html`<${ToolModal} plant=${plant} me=${me} machines=${machines} stockItems=${stockItems} parts=${parts} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
-    ${modal === 'stock_item' && html`<${ItemModal} plant=${plant} me=${me} activeUnit=${activeUnit} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'stock_item' && html`<${ItemModal} plant=${plant} me=${me} activeUnit=${activeUnit} editTarget=${editTarget} allItems=${stockItems} defaultCategory=${itemDefaultCat} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'stock_import' && html`<${StockImportModal} plant=${plant} me=${me} activeUnit=${activeUnit} existingItems=${stockItems} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'master_import' && importSpecKey && html`<${MasterImportModal} plant=${plant} me=${me} activeUnit=${activeUnit} units=${units} spec=${MASTER_IMPORT_SPECS[importSpecKey]} existingItems=${{ parts, machines, tools, customers, vendors }[importSpecKey] || []} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'customer'   && html`<${CustomerModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'vendor'     && html`<${VendorEditModal} plant=${plant} me=${me} vendor=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'invite'     && html`<${InviteModal} plant=${plant} me=${me} units=${units} onClose=${closeModal} onSaved=${saveModal} />`}
@@ -30152,12 +30446,12 @@ function Stocks({ plant, me, activeUnit }) {
   `;
 }
 
-function ItemModal({ plant, me, activeUnit, editTarget, allItems, onClose, onSaved }) {
+function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategory, onClose, onSaved }) {
   const isEdit = !!editTarget;
   // Existing sub-categories in the same category → offered as a datalist so
   // people reuse the same wording instead of inventing near-duplicates.
   const alreadyOpened = isEdit && !!editTarget.opening_recorded_at;
-  const [form, setForm] = useState(editTarget || { code:'', name:'', category:'general', subcategory:'', uom:'nos', reorder_level:'', unit_cost:'', opening_qty: 0 });
+  const [form, setForm] = useState(editTarget || { code:'', name:'', category: defaultCategory || 'general', subcategory:'', uom:'nos', reorder_level:'', unit_cost:'', opening_qty: 0 });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
