@@ -773,7 +773,31 @@ function filterMachinesByOp(machines, opType) {
   if (!cats || cats.length === 0) return machines;
   return machines.filter(m => cats.includes((m.category || '').toLowerCase()));
 }
-const generateInviteCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
+// Invite codes use an unambiguous alphabet (no I, L, O, U — the classic
+// mis-reads that caused "invite code not valid"). canonicalizeCode() folds the
+// look-alikes a user might still type (O→0, I/L→1) back to canonical form.
+const INVITE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+const generateInviteCode = () => {
+  let s = '';
+  const a = new Uint32Array(6);
+  (window.crypto || window.msCrypto).getRandomValues(a);
+  for (let i = 0; i < 6; i++) s += INVITE_ALPHABET[a[i] % INVITE_ALPHABET.length];
+  return s;
+};
+const canonicalizeCode = (raw) => String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+  .replace(/O/g, '0').replace(/[IL]/g, '1').slice(0, 6);
+
+// Normalise an Indian phone to +91XXXXXXXXXX. Strips spaces/dashes, a leading
+// country code (91) or 0, and keeps the last 10 digits — so "+91 98765 43210",
+// "09876543210" and "919876543210" all land on the same value instead of
+// dropping the last digits (the old maxLength=10 truncation bug).
+const normalizePhone = (raw) => {
+  let d = String(raw || '').replace(/\D/g, '');
+  if (d.length > 10 && d.startsWith('91')) d = d.slice(2);
+  d = d.replace(/^0+/, '');
+  if (d.length > 10) d = d.slice(-10);
+  return d ? '+91' + d : '';
+};
 
 // =============== NOTIFICATIONS + SOUND ===============
 let _notifAudioCtx = null;
@@ -1235,7 +1259,7 @@ function Wizard({ user, pendingInvite, onDone }) {
         p_pincode: form.pincode,
         p_state: form.state,
         p_full_name: form.your_name,
-        p_phone: '+91' + form.your_phone,
+        p_phone: normalizePhone(form.your_phone),
         p_iatf_certified: form.business_type === 'auto_iatf' || form.iatf,
         p_business_type: form.business_type,
         p_plan_code: form.plan_code || 'pro',
@@ -1258,9 +1282,9 @@ function Wizard({ user, pendingInvite, onDone }) {
     setError(''); setLoading(true);
     try {
       const { data, error: err } = await sb.rpc('redeem_invite_code', {
-        p_code: joinForm.code.trim().toUpperCase(),
+        p_code: canonicalizeCode(joinForm.code),
         p_full_name: joinForm.full_name,
-        p_phone: '+91' + joinForm.phone
+        p_phone: normalizePhone(joinForm.phone)
       });
       if (err) throw err;
       if (!data || !data.success) throw new Error(data?.error || 'Could not redeem code');
@@ -1311,7 +1335,7 @@ function Wizard({ user, pendingInvite, onDone }) {
           <form onSubmit=${submitJoin}>
             <div class="field">
               <label>Invite Code *</label>
-              <input type="text" required maxLength=${6} style="font-family:'Geist Mono',monospace;letter-spacing:0.15em;text-transform:uppercase;font-size:18px;text-align:center" value=${joinForm.code} onChange=${e => setJoinForm({...joinForm, code: e.target.value.toUpperCase()})} placeholder="ABC123" />
+              <input type="text" required maxLength=${8} style="font-family:'Geist Mono',monospace;letter-spacing:0.15em;text-transform:uppercase;font-size:18px;text-align:center" value=${joinForm.code} onChange=${e => setJoinForm({...joinForm, code: e.target.value.toUpperCase()})} placeholder="ABC123" />
             </div>
             <div class="field">
               <label>Your Full Name *</label>
@@ -1319,7 +1343,7 @@ function Wizard({ user, pendingInvite, onDone }) {
             </div>
             <div class="field">
               <label>Your Phone *</label>
-              <input type="tel" required maxLength=${10} value=${joinForm.phone} onChange=${e => setJoinForm({...joinForm, phone: e.target.value.replace(/\D/g,'')})} placeholder="9876543210" />
+              <input type="tel" required value=${joinForm.phone} onChange=${e => setJoinForm({...joinForm, phone: e.target.value.replace(/[^\d+ ]/g,'')})} placeholder="9876543210" />
             </div>
             <button class="btn" disabled=${loading}>${loading ? 'Joining…' : 'Join plant'}</button>
             ${!pendingInvite && html`<button type="button" class="btn ghost" style="margin-top:8px;width:100%" onClick=${() => setPath('choose')}>← Back</button>`}
@@ -1463,6 +1487,21 @@ const DEEP_LINK = (() => {
     return { tab, group };
   } catch (_) { return null; }
 })();
+
+// Web Share Target: the service worker stashed a shared bill image/PDF in the
+// 'loglinkr-share' cache. Read it back into a File (once), then clear it.
+async function loadSharedBillFile() {
+  try {
+    if (!('caches' in window)) return null;
+    const cache = await caches.open('loglinkr-share');
+    const res = await cache.match('/__shared-bill');
+    if (!res) return null;
+    const blob = await res.blob();
+    const name = res.headers.get('X-Shared-Name') || 'shared-bill';
+    await cache.delete('/__shared-bill');
+    return new File([blob], name, { type: blob.type || res.headers.get('Content-Type') || 'image/jpeg' });
+  } catch (_) { return null; }
+}
 
 function App() {
   const [user, setUser] = useState(null);
@@ -2572,6 +2611,18 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   // navAction.ts rather than a mount-time read. { tab, sub, ts }.
   const [navAction, setNavAction] = useState(null);
   const go = (tabKey, sub) => { setTab(tabKey); setNavAction(sub ? { tab: tabKey, sub, ts: Date.now() } : null); };
+
+  // Web Share Target: a bill was shared from WhatsApp (→ /app?shared_bill=1).
+  // Route to chat's bill upload once, then scrub the flag so refresh is a no-op.
+  useEffect(() => {
+    try {
+      const sp = new URLSearchParams(window.location.search);
+      if (sp.get('shared_bill') === '1') {
+        setTimeout(() => go('chat', 'shared_bill'), 60);
+        window.history.replaceState({}, '', window.location.pathname + (window.location.hash || ''));
+      }
+    } catch (_) {}
+  }, []);
 
   // Keep --nav-h synced to the visible top-nav height. The desktop nav wraps its
   // tabs (so its height varies); the fixed chat panel reads --nav-h for its top
@@ -6407,6 +6458,31 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
   // ai_logistics_enabled = true) and pop its file picker. If there isn't one,
   // fall back to the chat list with a hint so the user can enable AI on a
   // group via settings.
+  // Shared bill (WhatsApp → Loglinkr): the SW stashed the image; drop it into
+  // an AI-OCR group's composer as an attachment, ready to send for extraction.
+  useEffect(() => {
+    if (navAction?.sub !== 'shared_bill') return;
+    let cancelled = false;
+    (async () => {
+      const original = await loadSharedBillFile();
+      if (cancelled) return;
+      if (!original) { showToast('Could not read the shared file — try Upload Bill from Home.'); return; }
+      const { data: aiGroups } = await sb.from('chat_groups')
+        .select('id, name, members, ai_logistics_enabled')
+        .eq('plant_id', plant.id).eq('ai_logistics_enabled', true)
+        .contains('members', [user.id]).limit(1);
+      if (cancelled) return;
+      const target = (aiGroups || [])[0];
+      if (target) setActiveGroup(target);
+      const isImage = original.type.startsWith('image/');
+      const file = isImage ? await resizeImageFile(original, 1600, 0.82).catch(() => original) : original;
+      if (cancelled) return;
+      setAttachment({ file, hiresFile: isImage ? original : null, previewUrl: isImage ? URL.createObjectURL(file) : null, type: file.type, name: file.name });
+      showToast(target ? '📎 Bill attached — tap send to extract it.' : 'Bill attached. Open an AI-extraction group to send it.');
+    })();
+    return () => { cancelled = true; };
+  }, [navAction?.ts]);
+
   useEffect(() => {
     if (navAction?.sub !== 'upload_bill') return;
     let cancelled = false;
@@ -9374,7 +9450,7 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
         plant_id: plant.id,
         invited_by: me.id,
         full_name: form.full_name,
-        phone: '+91' + form.phone,
+        phone: normalizePhone(form.phone),
         email: form.email || null,
         role: form.role,
         invited_role_id: form.invited_role_id,
@@ -9446,7 +9522,7 @@ function InviteModal({ plant, me, units, onClose, onSaved }) {
         ${error && html`<div class="alert error">${error}</div>`}
         <form onSubmit=${submit}>
           <div class="field"><label>Full Name *</label><input type="text" required value=${form.full_name} onChange=${e => setForm({...form, full_name: e.target.value})} placeholder="Selvam K" /></div>
-          <div class="field"><label>Phone *</label><input type="tel" required maxLength=${10} value=${form.phone} onChange=${e => setForm({...form, phone: e.target.value.replace(/\D/g,'')})} placeholder="9876543210" /></div>
+          <div class="field"><label>Phone *</label><input type="tel" required value=${form.phone} onChange=${e => setForm({...form, phone: e.target.value.replace(/[^\d+ ]/g,'')})} placeholder="9876543210" /><div style="font-size:10px;color:var(--slate-400);margin-top:2px">10-digit mobile. +91, spaces and a leading 0 are handled automatically.</div></div>
           <div class="field"><label>Email (optional)</label><input type="email" value=${form.email} onChange=${e => setForm({...form, email: e.target.value})} placeholder="they@email.com" /></div>
           <div class="field"><label>Role *</label>
             <select required value=${form.invited_role_id ? 'custom:'+form.invited_role_id : form.role} onChange=${e => onRoleChange(e.target.value)}>
@@ -30965,6 +31041,170 @@ function ItemDetail({ plant, me, item: initialItem, onClose, onEdit }) {
 }
 
 // ============= ACTION HUB =============
+// Bulk task upload — paste a list or snap a photo of a WhatsApp message; the
+// extract-tasks edge fn splits it into tasks, matches owners/projects and dates.
+function TaskBatchImportModal({ plant, me, users, onClose, onSaved }) {
+  const [mode, setMode] = useState('paste'); // paste | photo
+  const [text, setText] = useState('');
+  const [image, setImage] = useState(null); // { b64, mime, previewUrl, name }
+  const [projects, setProjects] = useState([]);
+  const [rows, setRows] = useState(null);
+  const [parsing, setParsing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [notes, setNotes] = useState(null);
+
+  useEffect(() => {
+    sb.from('mcp_projects').select('id, code, name').eq('plant_id', plant.id).neq('status','completed').neq('status','cancelled').order('name')
+      .then(({ data }) => setProjects(data || []));
+  }, [plant.id]);
+
+  const resolveOwnerId = (name) => {
+    if (!name) return '';
+    const lower = String(name).toLowerCase().trim();
+    for (const u of users) if (u.full_name?.toLowerCase() === lower) return u.id;
+    for (const u of users) { const f = u.full_name?.split(/\s+/)[0]?.toLowerCase(); if (f && f === lower) return u.id; }
+    for (const u of users) if (u.full_name?.toLowerCase().includes(lower)) return u.id;
+    return '';
+  };
+  const resolveProjectId = (name) => {
+    if (!name) return '';
+    const lower = String(name).toLowerCase().trim();
+    for (const p of projects) if (p.name?.toLowerCase() === lower) return p.id;
+    for (const p of projects) if (p.name?.toLowerCase().includes(lower)) return p.id;
+    return '';
+  };
+
+  const onPickImage = async (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    if (!f.type.startsWith('image/')) { setError('Please choose an image (a screenshot of the message).'); return; }
+    const resized = await resizeImageFile(f, 1600, 0.82).catch(() => f);
+    const b64 = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = rej; r.readAsDataURL(resized); });
+    setImage({ b64, mime: resized.type || 'image/jpeg', previewUrl: URL.createObjectURL(resized), name: f.name });
+    setError('');
+    if (e.target) e.target.value = '';
+  };
+
+  const parse = async () => {
+    setError(''); setParsing(true); setRows(null); setNotes(null);
+    try {
+      if (mode === 'paste' && !text.trim()) throw new Error('Paste the task list first.');
+      if (mode === 'photo' && !image) throw new Error('Choose a photo first.');
+      const session = (await sb.auth.getSession()).data.session;
+      const body = {
+        people: users.map(u => u.full_name).filter(Boolean),
+        projects: projects.map(p => p.name).filter(Boolean),
+        today: new Date().toISOString().slice(0, 10),
+      };
+      if (mode === 'paste') body.text = text.trim();
+      else { body.image_base64 = image.b64; body.mime = image.mime; }
+      const resp = await fetch(SUPABASE_URL + '/functions/v1/extract-tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (session?.access_token || ''), 'apikey': SUPABASE_ANON_KEY },
+        body: JSON.stringify(body),
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data || !data.success) throw new Error(data?.error || ('HTTP ' + resp.status));
+      const parsed = (data.tasks || []).map((t, i) => ({
+        id: 'ai-' + i, title: t.title || '',
+        owner_id: resolveOwnerId(t.owner_user_name), owner_hint: t.owner_user_name || '',
+        project_id: resolveProjectId(t.project_name), project_hint: t.project_name || '',
+        due_at: t.due_date ? t.due_date + 'T17:30' : '', priority: t.priority || 'medium', raw_quote: t.raw_quote || '',
+      }));
+      if (!parsed.length) throw new Error('No tasks were found. Try pasting the text instead, or a clearer photo.');
+      setRows(parsed); setNotes(data.notes || null);
+    } catch (e) { setError(e.message || String(e)); }
+    finally { setParsing(false); }
+  };
+
+  const updateRow = (i, patch) => setRows(prev => prev.map((r, idx) => idx === i ? { ...r, ...patch } : r));
+  const removeRow = (i) => setRows(prev => prev.filter((_, idx) => idx !== i));
+
+  const saveAll = async () => {
+    setError(''); setSaving(true);
+    try {
+      const valid = (rows || []).filter(r => r.title.trim());
+      if (!valid.length) throw new Error('At least one task needs a title.');
+      const payload = valid.map(r => ({
+        plant_id: plant.id, source_type: 'manual', title: r.title.trim(),
+        owner_id: r.owner_id || null, project_id: r.project_id || null, assigned_by: me.id,
+        due_at: r.due_at ? new Date(r.due_at).toISOString() : null, priority: r.priority || 'medium',
+        report_to_mode: 'group', status: 'open',
+      }));
+      const { error: err } = await sb.from('actions').insert(payload);
+      if (err) throw err;
+      showToast('✓ ' + payload.length + ' task' + (payload.length === 1 ? '' : 's') + ' created');
+      onSaved();
+    } catch (e) { setError(e.message || String(e)); }
+    finally { setSaving(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget && !parsing && !saving) onClose(); }}>
+      <div class="modal" style="max-width:760px">
+        <div class="modal-header">
+          <div>
+            <div class="modal-title">📋 Bulk add tasks</div>
+            <div style="font-size:11px;color:var(--slate-500);font-weight:400">Paste a list or snap a WhatsApp message — AI splits it into tasks, matches people & dates.</div>
+          </div>
+          <button class="close-btn" onClick=${onClose} disabled=${parsing || saving}>×</button>
+        </div>
+        ${error && html`<div class="alert error" style="font-size:12px">${error}</div>`}
+
+        ${!rows ? html`
+          <div class="auth-tabs" style="margin-bottom:10px">
+            <button class=${'auth-tab' + (mode === 'paste' ? ' active' : '')} onClick=${() => setMode('paste')}>📝 Paste text</button>
+            <button class=${'auth-tab' + (mode === 'photo' ? ' active' : '')} onClick=${() => setMode('photo')}>📷 Photo</button>
+          </div>
+          ${mode === 'paste' ? html`
+            <textarea value=${text} onInput=${e => setText(e.target.value)} placeholder=${'Paste the task list / WhatsApp message here, e.g.\n\nRaju - order corepins by friday\nSelvam check laser welder urgent\nUpdate drawing for MRF bracket'} style="width:100%;min-height:160px;padding:10px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px;font-family:inherit;resize:vertical"></textarea>
+          ` : html`
+            <label class="btn ghost" style="width:100%;cursor:pointer;text-align:center">
+              ${image ? '📷 Change photo' : '📷 Choose a screenshot / photo'}
+              <input type="file" accept="image/*" capture="environment" style="display:none" onChange=${onPickImage} />
+            </label>
+            ${image && html`<img src=${image.previewUrl} style="max-width:100%;max-height:240px;border-radius:8px;margin-top:8px;border:1px solid var(--slate-200)" />`}
+          `}
+          <button class="btn" style="margin-top:12px;width:100%" disabled=${parsing} onClick=${parse}>${parsing ? '🤖 Reading…' : '✨ Extract tasks'}</button>
+        ` : html`
+          ${notes && html`<div class="card" style="background:var(--amber-50);border-color:var(--amber-200);margin-bottom:10px;padding:8px 10px;font-size:11px;color:var(--amber-800)">📝 ${notes}</div>`}
+          <div style="font-size:12px;color:var(--slate-600);margin-bottom:8px">${rows.length} task${rows.length===1?'':'s'} found · review, fix any owner/date, then create.</div>
+          <div style="max-height:46vh;overflow-y:auto;display:flex;flex-direction:column;gap:8px">
+            ${rows.map((r, i) => html`
+              <div key=${r.id} class="card" style="padding:10px;display:flex;flex-direction:column;gap:6px">
+                <div style="display:flex;gap:6px;align-items:flex-start">
+                  <input value=${r.title} onInput=${e => updateRow(i, { title: e.target.value })} placeholder="Task…" style="flex:1;padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px;font-weight:600" />
+                  <button class="btn ghost small" style="padding:4px 8px" onClick=${() => removeRow(i)} title="Remove">✕</button>
+                </div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap">
+                  <select value=${r.owner_id} onChange=${e => updateRow(i, { owner_id: e.target.value })} style="flex:1;min-width:120px;padding:5px 7px;border:1px solid ${r.owner_id ? 'var(--slate-200)' : 'var(--amber-300)'};border-radius:6px;font-size:12px">
+                    <option value="">${r.owner_hint ? '⚠ ' + r.owner_hint + ' — pick' : '— Unassigned —'}</option>
+                    ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + roleLabel(u.role) : ''}</option>`)}
+                  </select>
+                  <select value=${r.project_id} onChange=${e => updateRow(i, { project_id: e.target.value })} style="flex:1;min-width:120px;padding:5px 7px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px">
+                    <option value="">${r.project_hint ? r.project_hint + ' — pick' : '— No project —'}</option>
+                    ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+                  </select>
+                </div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap">
+                  <input type="datetime-local" value=${r.due_at} onChange=${e => updateRow(i, { due_at: e.target.value })} style="flex:1;min-width:150px;padding:5px 7px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px" />
+                  <select value=${r.priority} onChange=${e => updateRow(i, { priority: e.target.value })} style="padding:5px 7px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px">
+                    <option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option>
+                  </select>
+                </div>
+              </div>
+            `)}
+          </div>
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <button class="btn ghost" style="flex:1" onClick=${() => { setRows(null); setError(''); }} disabled=${saving}>← Back</button>
+            <button class="btn" style="flex:2" disabled=${saving} onClick=${saveAll}>${saving ? 'Creating…' : '✅ Create ' + rows.filter(r=>r.title.trim()).length + ' task' + (rows.filter(r=>r.title.trim()).length===1?'':'s')}</button>
+          </div>
+        `}
+      </div>
+    </div>
+  `;
+}
+
 function ActionHub({ plant, me, navAction }) {
   const [actions, setActions] = useState([]);
   const [users, setUsers] = useState([]);
@@ -31073,6 +31313,7 @@ function ActionHub({ plant, me, navAction }) {
 
     <div class="section-h">Tasks · ${filteredActions.length}<span style="display:flex;gap:6px;flex-wrap:wrap">
       <button class="btn small" style="background:linear-gradient(135deg,var(--indigo-600,#4f46e5),var(--indigo-500,#6366f1));color:white;font-size:11px;padding:4px 10px" onClick=${() => setModal('task_voice')} title="Voice batch — dictate tasks, AI assigns">🎙️ Batch</button>
+      <button class="btn small" style="background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white;font-size:11px;padding:4px 10px" onClick=${() => setModal('task_bulk')} title="Paste a list or a WhatsApp photo → many tasks">📋 Bulk</button>
       <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('action'); }}>+ Add</button>
     </span></div>
 
@@ -31097,6 +31338,7 @@ function ActionHub({ plant, me, navAction }) {
 
     ${modal === 'action' && html`<${ActionModal} plant=${plant} me=${me} users=${users} departments=${departments} editTarget=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'task_voice' && html`<${TaskBatchVoiceModal} plant=${plant} me=${me} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
+    ${modal === 'task_bulk' && html`<${TaskBatchImportModal} plant=${plant} me=${me} users=${users} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
   `;
 }
 

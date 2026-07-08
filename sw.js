@@ -1,7 +1,8 @@
 // sw.js — Loglinkr Service Worker
 // Handles: PWA install, offline shell, Web Push notifications, click routing
 
-const CACHE_NAME = 'loglinkr-v11';
+const CACHE_NAME = 'loglinkr-v12';
+const SHARE_CACHE = 'loglinkr-share';
 const APP_SHELL = ['/app'];
 
 // Install: cache app shell
@@ -18,9 +19,30 @@ self.addEventListener('activate', (event) => {
   self.clients.claim();
 });
 
-// Network-first strategy (so updates always reach users), fall back to cache when offline
+// Web Share Target — Android "Share → Loglinkr" posts the shared image/PDF here
+// (manifest share_target action = /app?sharetarget=1). We can't hand a file to a
+// page via URL, so stash the blob in a cache and redirect the opened window to
+// /app?shared_bill=1, which the app reads on load and drops into the bill upload.
 self.addEventListener('fetch', (event) => {
-  if (event.request.method !== 'GET') return;
+  const req = event.request;
+  const u = new URL(req.url);
+  if (req.method === 'POST' && u.origin === self.location.origin && u.searchParams.get('sharetarget') === '1') {
+    event.respondWith((async () => {
+      try {
+        const form = await req.formData();
+        const file = form.get('bill') || form.get('image') || form.get('file');
+        if (file && file.size) {
+          const cache = await caches.open(SHARE_CACHE);
+          await cache.put('/__shared-bill', new Response(file, {
+            headers: { 'Content-Type': file.type || 'application/octet-stream', 'X-Shared-Name': (file.name || 'shared').replace(/[^\w.\-]/g, '_') },
+          }));
+        }
+      } catch (_) { /* fall through to redirect regardless */ }
+      return Response.redirect('/app?shared_bill=1', 303);
+    })());
+    return;
+  }
+  if (req.method !== 'GET') return;
   // Skip API/Supabase/Edge function calls — always live
   const url = new URL(event.request.url);
   if (url.hostname.includes('supabase.co') || url.hostname.includes('anthropic.com')) return;
