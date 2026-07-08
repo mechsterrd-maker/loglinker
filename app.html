@@ -7922,13 +7922,17 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
 
-  // Raw materials = stock items in the raw_material category (fab plants).
+  // Fab plants think of stock, not machining tooling. Map the fab masters onto
+  // stock-item categories: Raw Materials = raw_material, Tools = tools. PDC/
+  // machining plants keep the real tools_master (perishable insert/drill catalog).
   const rawMaterials = stockItems.filter(i => (i.category || '') === 'raw_material');
+  const powerTools = stockItems.filter(i => (i.category || '') === 'tools');
 
   // Counts for tree badges
   const counts = {
     units: units.length, operators: operators.length, shifts: shifts.length, team: users.length,
-    parts: parts.length, machines: machines.length, dies: dies.length, tools: tools.length,
+    parts: parts.length, machines: machines.length, dies: dies.length,
+    tools: fab ? powerTools.length : tools.length,
     raw_materials: rawMaterials.length,
     stock_items: stockItems.length, rejection_types: rejectionTypes.length,
     vendors: vendors.length, customers: customers.length,
@@ -7940,8 +7944,9 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
   // Bulk AI import: master types use MasterImportModal; stock/raw use StockImportModal.
   const openImport = (specKey)  => { setEditTarget(null); setImportSpecKey(specKey); setModal('master_import'); };
   const openStockImport = ()    => { setEditTarget(null); setModal('stock_import'); };
-  // Raw-material add → the shared item modal, pre-set to the raw_material category.
+  // Fab stock-master adds → the shared item modal, pre-set to the category.
   const openAddRaw = () => { setEditTarget(null); setItemDefaultCat('raw_material'); setModal('stock_item'); };
+  const openAddPowerTool = () => { setEditTarget(null); setItemDefaultCat('tools'); setModal('stock_item'); };
   // For party masters we want a dashboard view on row tap, not the edit form.
   const [detailVendor, setDetailVendor] = useState(null);
   const closeModal = () => { setModal(null); setEditTarget(null); setImportSpecKey(null); setItemDefaultCat(null); };
@@ -8061,6 +8066,17 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
         `;
       }
       case 'tools': {
+        // Fab plants: "Tools" = power tools held in stock (category tools), not
+        // the machining insert/drill catalog. Mirror the Raw Materials view.
+        if (fab) {
+          const list = filterRows(powerTools, ['code','name','subcategory']);
+          return html`
+            <${SectionHeader} icon="🛠" title="Tools" n=${powerTools.length} addLabel="+ New tool" onAdd=${openAddPowerTool} onImport=${openStockImport} />
+            <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Power tools & machines held in stock (grinders, welders, drills…). Tracked as stock items in the <strong>tools</strong> category — appears in Stocks too.</div>
+            ${list.length === 0 ? Empty({ icon:'🛠', msg:'No tools yet', addLabel:'+ New tool', onAdd: openAddPowerTool }) :
+              list.map(i => Row({ title: i.code + ' · ' + i.name, sub: (i.subcategory ? i.subcategory + ' · ' : '') + fmtNum(i.current_qty) + ' ' + i.uom + (i.reorder_level?' · reorder '+i.reorder_level:''), badge: !i.opening_recorded_at?'NO OPENING':'', badgeColor: !i.opening_recorded_at?'amber':'', onClick: () => openEdit('stock_item', i) }))}
+          `;
+        }
         const list = filterRows(tools, ['code','name','make','kind']);
         return html`
           <${SectionHeader} icon="🛠" title="Tools" n=${tools.length} onAdd=${() => openAdd('tool')} onImport=${() => openImport('tools')} />
