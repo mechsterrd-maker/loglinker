@@ -1,7 +1,7 @@
 // sw.js — Loglinkr Service Worker
 // Handles: PWA install, offline shell, Web Push notifications, click routing
 
-const CACHE_NAME = 'loglinkr-v13';
+const CACHE_NAME = 'loglinkr-v14';
 const SHARE_CACHE = 'loglinkr-share';
 const APP_SHELL = ['/app'];
 
@@ -26,11 +26,17 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   const u = new URL(req.url);
-  if (req.method === 'POST' && u.origin === self.location.origin && u.searchParams.get('sharetarget') === '1') {
+  // Match the share POST by PATH, not the ?sharetarget=1 query — some Android
+  // builds drop the action's query string on a multipart POST, which made the
+  // handler miss and the app just open blank. The app has no other same-origin
+  // POST navigations (all API calls go to supabase.co, excluded below).
+  const isShareTarget = req.method === 'POST' && u.origin === self.location.origin &&
+    (u.searchParams.get('sharetarget') === '1' || u.pathname === '/app' || u.pathname === '/app.html' || u.pathname === '/app/');
+  if (isShareTarget) {
     event.respondWith((async () => {
       try {
         const form = await req.formData();
-        const file = form.get('bill') || form.get('image') || form.get('file');
+        const file = form.get('bill') || form.get('image') || form.get('file') || (form.getAll ? form.getAll('bill')[0] : null);
         if (file && file.size) {
           const cache = await caches.open(SHARE_CACHE);
           await cache.put('/__shared-bill', new Response(file, {
