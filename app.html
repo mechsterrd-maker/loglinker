@@ -7972,12 +7972,14 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
     </div>
   `;
 
-  // SECTION HEADER with + Add (and optional 📄 Import from Excel)
-  const SectionHeader = ({ icon, title, n, onAdd, addLabel, onImport }) => html`
+  // SECTION HEADER with + Add (and optional 📄 Import from Excel).
+  // countLabel overrides the default "N total" line (used by stock-backed
+  // masters to say "N types · M in stock" so qty isn't mistaken for a count).
+  const SectionHeader = ({ icon, title, n, onAdd, addLabel, onImport, countLabel }) => html`
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--slate-200)">
       <div>
         <h2 style="font-size:18px;font-weight:700;margin:0">${icon} ${title}</h2>
-        <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${n} total</div>
+        <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${countLabel || (n + ' total')}</div>
       </div>
       <div style="display:flex;gap:6px;flex-shrink:0">
         ${onImport && html`<button class="btn small ghost" style="border-color:var(--amber-300);color:var(--amber-800)" onClick=${onImport}>📄 Import</button>`}
@@ -8070,11 +8072,12 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
         // the machining insert/drill catalog. Mirror the Raw Materials view.
         if (fab) {
           const list = filterRows(powerTools, ['code','name','subcategory']);
+          const totalQty = powerTools.reduce((s, i) => s + parseFloat(i.current_qty || 0), 0);
           return html`
-            <${SectionHeader} icon="🛠" title="Tools" n=${powerTools.length} addLabel="+ New tool" onAdd=${openAddPowerTool} onImport=${openStockImport} />
-            <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Power tools & machines held in stock (grinders, welders, drills…). Tracked as stock items in the <strong>tools</strong> category — appears in Stocks too.</div>
+            <${SectionHeader} icon="🛠" title="Tools" n=${powerTools.length} countLabel=${powerTools.length + ' tool ' + (powerTools.length === 1 ? 'type' : 'types') + ' · ' + fmtNum(totalQty) + ' in stock'} addLabel="+ New tool" onAdd=${openAddPowerTool} onImport=${openStockImport} />
+            <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Power tools & machines held in stock (grinders, welders, drills…). Each row is one tool <strong>type</strong>; the badge is how many you have on hand. Tracked as stock items in the <strong>tools</strong> category — appears in Stocks too.</div>
             ${list.length === 0 ? Empty({ icon:'🛠', msg:'No tools yet', addLabel:'+ New tool', onAdd: openAddPowerTool }) :
-              list.map(i => Row({ title: i.code + ' · ' + i.name, sub: (i.subcategory ? i.subcategory + ' · ' : '') + fmtNum(i.current_qty) + ' ' + i.uom + (i.reorder_level?' · reorder '+i.reorder_level:''), badge: !i.opening_recorded_at?'NO OPENING':'', badgeColor: !i.opening_recorded_at?'amber':'', onClick: () => openEdit('stock_item', i) }))}
+              list.map(i => Row({ title: i.code + ' · ' + i.name, sub: (i.subcategory || 'Uncategorized') + (i.reorder_level?' · reorder '+i.reorder_level:''), badge: !i.opening_recorded_at ? 'NO OPENING' : (fmtNum(i.current_qty) + ' ' + i.uom + ' in stock'), badgeColor: !i.opening_recorded_at ? 'amber' : 'emerald', onClick: () => openEdit('stock_item', i) }))}
           `;
         }
         const list = filterRows(tools, ['code','name','make','kind']);
@@ -8094,11 +8097,12 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
       }
       case 'raw_materials': {
         const list = filterRows(rawMaterials, ['code','name','subcategory']);
+        const totalQty = rawMaterials.reduce((s, i) => s + parseFloat(i.current_qty || 0), 0);
         return html`
-          <${SectionHeader} icon="🪨" title="Raw Materials" n=${rawMaterials.length} addLabel="+ New material" onAdd=${openAddRaw} onImport=${openStockImport} />
-          <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Raw material stock (steel, sections, consumables). Tracked as stock items in the <strong>raw_material</strong> category — appears in Stocks too.</div>
+          <${SectionHeader} icon="🪨" title="Raw Materials" n=${rawMaterials.length} countLabel=${rawMaterials.length + ' material ' + (rawMaterials.length === 1 ? 'type' : 'types') + ' · ' + fmtNum(totalQty) + ' in stock'} addLabel="+ New material" onAdd=${openAddRaw} onImport=${openStockImport} />
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Raw material stock (steel, sections, consumables). Each row is one material <strong>type</strong>; the badge is how much you have on hand. Tracked as stock items in the <strong>raw_material</strong> category — appears in Stocks too.</div>
           ${list.length === 0 ? Empty({ icon:'🪨', msg:'No raw materials yet', addLabel:'+ New material', onAdd: openAddRaw }) :
-            list.map(i => Row({ title: i.code + ' · ' + i.name, sub: (i.subcategory ? i.subcategory + ' · ' : '') + fmtNum(i.current_qty) + ' ' + i.uom + (i.reorder_level?' · reorder '+i.reorder_level:''), badge: !i.opening_recorded_at?'NO OPENING':'', badgeColor: !i.opening_recorded_at?'amber':'', onClick: () => openEdit('stock_item', i) }))}
+            list.map(i => Row({ title: i.code + ' · ' + i.name, sub: (i.subcategory || 'Uncategorized') + (i.reorder_level?' · reorder '+i.reorder_level:''), badge: !i.opening_recorded_at ? 'NO OPENING' : (fmtNum(i.current_qty) + ' ' + i.uom + ' in stock'), badgeColor: !i.opening_recorded_at ? 'amber' : 'emerald', onClick: () => openEdit('stock_item', i) }))}
         `;
       }
       case 'rejection_types': {
