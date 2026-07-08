@@ -1,7 +1,7 @@
 // sw.js — Loglinkr Service Worker
 // Handles: PWA install, offline shell, Web Push notifications, click routing
 
-const CACHE_NAME = 'loglinkr-v12';
+const CACHE_NAME = 'loglinkr-v13';
 const SHARE_CACHE = 'loglinkr-share';
 const APP_SHELL = ['/app'];
 
@@ -38,7 +38,9 @@ self.addEventListener('fetch', (event) => {
           }));
         }
       } catch (_) { /* fall through to redirect regardless */ }
-      return Response.redirect('/app?shared_bill=1', 303);
+      // Response.redirect() requires an ABSOLUTE url — a relative path throws a
+      // TypeError, which would drop us back to a plain app load (no bill).
+      return Response.redirect(self.location.origin + '/app?shared_bill=1', 303);
     })());
     return;
   }
