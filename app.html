@@ -2742,7 +2742,21 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   // stay mounted (hidden via CSS), so target components react via useEffect on
   // navAction.ts rather than a mount-time read. { tab, sub, ts }.
   const [navAction, setNavAction] = useState(null);
-  const go = (tabKey, sub) => { setTab(tabKey); setNavAction(sub ? { tab: tabKey, sub, ts: Date.now() } : null); };
+  const billPickRef = useRef(null);
+  // "Upload Bill" from anywhere opens the destination chooser (Bill / Project /
+  // Petty cash / Chat) after picking a photo — the reliable in-app path that
+  // does the same thing the WhatsApp share target aims to.
+  const openBillRouter = () => { try { billPickRef.current?.click(); } catch (_) {} };
+  const go = (tabKey, sub) => {
+    if (sub === 'upload_bill') { openBillRouter(); return; }
+    setTab(tabKey);
+    setNavAction(sub ? { tab: tabKey, sub, ts: Date.now() } : null);
+  };
+  const onBillPicked = (e) => {
+    const f = e.target.files?.[0];
+    if (e.target) e.target.value = '';
+    if (f) { setShareFile(f); setShareRouterOpen(true); }
+  };
 
   // Web Share Target: a bill was shared from WhatsApp (→ /app?shared_bill=1).
   // Load the stashed file and open the destination router; scrub the flag.
@@ -2905,6 +2919,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       </div>`}
       ${!floOpen && html`<button class="flo-fab" title="Ask FLO — your plant copilot" onClick=${() => setFloOpen(true)}>✨</button>`}
       ${floOpen && html`<${AssistantPanel} plant=${plant} me=${me} setTab=${setTab} onClose=${() => setFloOpen(false)} />`}
+      <input type="file" accept="image/*,application/pdf" ref=${billPickRef} onChange=${onBillPicked} style="display:none" />
       ${shareRouterOpen && shareFile && html`<${ShareRouterModal} plant=${plant} me=${me} file=${shareFile} onClose=${() => setShareRouterOpen(false)} onRoute=${handleShareRoute} />`}
 
       <${Page} active=${pageTab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} myPerms=${myPerms} /></${Page}>
