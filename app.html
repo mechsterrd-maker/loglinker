@@ -28791,6 +28791,71 @@ function HomeInstallBanner() {
 // not a data merge. The plant_id + email URL params let CadNexa label uploads,
 // and the iframe contract (window.self !== window.top) suppresses its own
 // landing screen and analytics chrome.
+// ============= WORK ORDER IMPORT =============
+// Marvel already writes work orders in Zoho — instead of retyping, they upload
+// the WO (PDF / photo / Excel) and the extract-workorder edge fn reads it into
+// project fields that pre-fill NewProjectModal. Auto-create without the typing.
+function WorkOrderImportModal({ plant, customers, onClose, onExtracted }) {
+  const [parsing, setParsing] = useState(false);
+  const [error, setError] = useState('');
+  const [fileName, setFileName] = useState('');
+
+  const onFile = async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setFileName(f.name); setError(''); setParsing(true);
+    try {
+      const body = { customers: (customers || []).map(c => c.name).filter(Boolean), today: new Date().toISOString().slice(0, 10) };
+      const isPdf = f.type === 'application/pdf' || /\.pdf$/i.test(f.name);
+      const isImg = f.type.startsWith('image/');
+      const isSheet = /\.(xlsx|xls|csv)$/i.test(f.name);
+      if (isSheet) {
+        const XLSX = await import('https://esm.sh/xlsx@0.18.5');
+        const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' });
+        body.text = wb.SheetNames.map(n => '=== ' + n + ' ===\n' + XLSX.utils.sheet_to_csv(wb.Sheets[n])).join('\n\n').slice(0, 60000);
+      } else if (isPdf) {
+        body.pdf_base64 = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = rej; r.readAsDataURL(f); });
+      } else if (isImg) {
+        const resized = await resizeImageFile(f, 1800, 0.85).catch(() => f);
+        body.mime = resized.type || 'image/jpeg';
+        body.image_base64 = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = rej; r.readAsDataURL(resized); });
+      } else { throw new Error('Please choose a PDF, image, or Excel/CSV work order.'); }
+
+      const session = (await sb.auth.getSession()).data.session;
+      const resp = await fetch(SUPABASE_URL + '/functions/v1/extract-workorder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (session?.access_token || ''), 'apikey': SUPABASE_ANON_KEY },
+        body: JSON.stringify(body),
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data || !data.success) throw new Error(data?.error || ('HTTP ' + resp.status));
+      if (!data.project?.name) throw new Error('Could not find a project in that file. Try a clearer copy or fill the form manually.');
+      onExtracted(data.project, data.notes);
+    } catch (e2) { setError(e2.message || String(e2)); }
+    finally { setParsing(false); if (e.target) e.target.value = ''; }
+  };
+
+  return html`
+    <div class="modal-backdrop active" style="z-index:60" onClick=${e => { if (e.target === e.currentTarget && !parsing) onClose(); }}>
+      <div class="modal" style="max-width:420px">
+        <div class="modal-header">
+          <div class="modal-title">📄 Import from work order</div>
+          <button class="close-btn" onClick=${onClose} disabled=${parsing}>×</button>
+        </div>
+        <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:12px">
+          <div style="font-size:13px;color:var(--slate-700)">Upload your work order from <strong>Zoho</strong> (PDF), a photo of it, or an Excel/CSV. The AI reads it and fills in the project — name, customer, PO no., quantity and target date — for you to confirm.</div>
+        </div>
+        <label class="btn" style="width:100%;cursor:pointer;text-align:center">
+          ${parsing ? '🤖 Reading ' + fileName + '…' : '📂 Choose work order (PDF / photo / Excel)'}
+          <input type="file" accept=".pdf,image/*,.xlsx,.xls,.csv" style="display:none" onChange=${onFile} disabled=${parsing} />
+        </label>
+        ${parsing && html`<div style="font-size:11px;color:var(--slate-500);text-align:center;margin-top:8px">Reading the work order…</div>`}
+        ${error && html`<div class="alert error" style="margin-top:10px">${error}</div>`}
+      </div>
+    </div>
+  `;
+}
+
 // ============= NEW PROJECT MODAL =============
 // Marvel's request: project creation is the origin of every fab workflow. Per
 // the 14-Jun MoM it should read like a sales order (minus shipping/customer
@@ -28816,6 +28881,26 @@ function NewProjectModal({ plant, me, onClose, onCreated, cloneFrom }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [addCustomerOpen, setAddCustomerOpen] = useState(false);
+  const [woOpen, setWoOpen] = useState(false);
+
+  // Pre-fill every field from a work order the AI just read. Customer is matched
+  // to an existing row by name (exact, then contains) so it lands in the dropdown.
+  const applyWorkOrder = (p, aiNotes) => {
+    if (p.name) setName(p.name);
+    if (p.po_number) setPoNumber(p.po_number);
+    if (p.qty != null) setQty(String(p.qty));
+    if (p.uom) { const m = PROJECT_UOMS.find(u => u.toLowerCase() === String(p.uom).toLowerCase()); if (m) setUom(m); }
+    if (p.target_date) setTargetDate(p.target_date);
+    if (p.notes) setNotes(prev => prev || p.notes);
+    if (p.customer_name) {
+      const q = String(p.customer_name).toLowerCase();
+      const match = customers.find(c => (c.name || '').toLowerCase() === q)
+        || customers.find(c => (c.name || '').toLowerCase().includes(q) || q.includes((c.name || '').toLowerCase()));
+      if (match) setCustomerId(match.id);
+    }
+    setWoOpen(false);
+    showToast('✓ Filled from work order — review the details and create' + (aiNotes ? '  ·  ' + String(aiNotes).slice(0, 70) : ''));
+  };
 
   useEffect(() => {
     (async () => {
@@ -28911,6 +28996,10 @@ function NewProjectModal({ plant, me, onClose, onCreated, cloneFrom }) {
         </div>
         ${err && html`<div class="alert error">${err}</div>`}
         ${cloneFrom && html`<div style="font-size:12px;color:var(--teal-800);background:var(--teal-50);border-radius:8px;padding:8px 10px;margin-bottom:12px">⧉ Cloned from <b>${esc(cloneFrom.name)}</b> — edit any field, then create. A fresh target date and project number are assigned.</div>`}
+        ${!cloneFrom && html`
+          <button type="button" class="btn" style="width:100%;background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:#fff;margin-bottom:8px" onClick=${() => setWoOpen(true)}>📄 Import from work order (Zoho) — auto-fill</button>
+          <div style="text-align:center;font-size:11px;color:var(--slate-400);margin-bottom:12px">— or fill in manually —</div>
+        `}
         <form onSubmit=${submit}>
           <div class="field">
             <label>Project name *</label>
@@ -29008,6 +29097,7 @@ function NewProjectModal({ plant, me, onClose, onCreated, cloneFrom }) {
           }
           setAddCustomerOpen(false);
         }} />`}
+      ${woOpen && html`<${WorkOrderImportModal} plant=${plant} customers=${customers} onClose=${() => setWoOpen(false)} onExtracted=${applyWorkOrder} />`}
     </div>
   `;
 }
