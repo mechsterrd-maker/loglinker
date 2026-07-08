@@ -7854,6 +7854,8 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
   const [active, setActive] = useState('parts');
   const [importSpecKey, setImportSpecKey] = useState(null);
   const [itemDefaultCat, setItemDefaultCat] = useState(null);
+  const [siCat, setSiCat] = useState('all');   // Stock Items category filter
+  const [siSub, setSiSub] = useState('all');   // Stock Items sub-category filter
   const [openGroups, setOpenGroups] = useState({ people:true, production:true, inventory:true, logistics:true });
   const [search, setSearch] = useState('');
   const [modal, setModal] = useState(null);
@@ -8088,11 +8090,37 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
         `;
       }
       case 'stock_items': {
-        const list = filterRows(stockItems, ['code','name','category']);
+        const catLabels = { raw_material:'Raw Material', die_spares:'Die Spares', consumables:'Consumables', tools:'Tools', packing:'Packing', bought_out:'Bought-out', general:'General' };
+        const catLbl = (c) => catLabels[c] || c;
+        // Category counts across all items
+        const catCounts = {};
+        for (const i of stockItems) { const c = i.category || 'general'; catCounts[c] = (catCounts[c] || 0) + 1; }
+        const catKeys = Object.keys(catCounts).sort();
+        // Sub-category counts within the selected category
+        const subCounts = {};
+        if (siCat !== 'all') { for (const i of stockItems.filter(i => (i.category||'general') === siCat)) { const s = (i.subcategory||'').trim() || '—'; subCounts[s] = (subCounts[s]||0)+1; } }
+        const subKeys = Object.keys(subCounts).sort((a,b) => (a === '—') - (b === '—') || a.localeCompare(b));
+        // Apply filters + search
+        let list = stockItems;
+        if (siCat !== 'all') list = list.filter(i => (i.category||'general') === siCat);
+        if (siCat !== 'all' && siSub !== 'all') list = list.filter(i => (siSub === '—' ? !i.subcategory : i.subcategory === siSub));
+        list = filterRows(list, ['code','name','category','subcategory']);
         return html`
           <${SectionHeader} icon="📦" title="Stock Items" n=${stockItems.length} onAdd=${() => openAdd('stock_item')} onImport=${openStockImport} />
-          ${list.length === 0 ? Empty({ icon:'📦', msg:'No items yet', addLabel:'+ New item + opening', onAdd:() => openAdd('stock_item') }) :
-            list.map(i => Row({ title: i.code + ' · ' + i.name, sub: (i.category||'general') + ' · ' + fmtNum(i.current_qty) + ' ' + i.uom + (i.reorder_level?' · reorder '+i.reorder_level:''), badge: !i.opening_recorded_at?'NO OPENING':'', badgeColor: !i.opening_recorded_at?'amber':'', onClick: () => openEdit('stock_item', i) }))}
+          <div style="margin-bottom:8px"><button class="btn small ghost" style="border-color:var(--teal-300);color:var(--teal-800)" onClick=${() => { setEditTarget(null); setModal('pick_part_for_stock'); }}>🧩 Stock a part — add opening stock for a part from the master</button></div>
+          <div class="auth-tabs" style="margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
+            <button class=${'auth-tab' + (siCat === 'all' ? ' active' : '')} onClick=${() => { setSiCat('all'); setSiSub('all'); }}>All · ${stockItems.length}</button>
+            ${catKeys.map(c => html`<button key=${c} class=${'auth-tab' + (siCat === c ? ' active' : '')} onClick=${() => { setSiCat(c); setSiSub('all'); }}>${catLbl(c)} · ${catCounts[c]}</button>`)}
+          </div>
+          ${siCat !== 'all' && subKeys.length > 1 && html`
+            <div class="auth-tabs" style="margin-bottom:10px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;gap:6px">
+              <button class=${'auth-tab' + (siSub === 'all' ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => setSiSub('all')}>All sub</button>
+              ${subKeys.map(s => html`<button key=${s} class=${'auth-tab' + (siSub === s ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => setSiSub(s)}>${s === '—' ? 'Ungrouped' : s} · ${subCounts[s]}</button>`)}
+            </div>
+          `}
+          ${stockItems.length === 0 ? Empty({ icon:'📦', msg:'No items yet', addLabel:'+ New item + opening', onAdd:() => openAdd('stock_item') }) :
+            list.length === 0 ? html`<div class="card"><div class="empty">No items match this filter</div></div>` :
+            list.map(i => Row({ title: i.code + ' · ' + i.name, sub: catLbl(i.category||'general') + (i.subcategory ? ' › ' + i.subcategory : '') + (i.reorder_level?' · reorder '+i.reorder_level:''), badge: !i.opening_recorded_at ? 'NO OPENING' : (fmtNum(i.current_qty) + ' ' + i.uom), badgeColor: !i.opening_recorded_at ? 'amber' : 'emerald', onClick: () => openEdit('stock_item', i) }))}
         `;
       }
       case 'raw_materials': {
@@ -8219,6 +8247,8 @@ function MastersHub({ plant, me, myPerms, setTab, activeUnit }) {
     ${modal === 'stock_item' && html`<${ItemModal} plant=${plant} me=${me} activeUnit=${activeUnit} editTarget=${editTarget} allItems=${stockItems} defaultCategory=${itemDefaultCat} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'stock_import' && html`<${StockImportModal} plant=${plant} me=${me} activeUnit=${activeUnit} existingItems=${stockItems} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'master_import' && importSpecKey && html`<${MasterImportModal} plant=${plant} me=${me} activeUnit=${activeUnit} units=${units} spec=${MASTER_IMPORT_SPECS[importSpecKey]} existingItems=${{ parts, machines, tools, customers, vendors }[importSpecKey] || []} onClose=${closeModal} onSaved=${saveModal} />`}
+    ${modal === 'pick_part_for_stock' && html`<${PickPartForStockModal} plant=${plant} stockItems=${stockItems} onPick=${(p) => { setEditTarget(p); setModal('track_stock'); }} onClose=${closeModal} />`}
+    ${modal === 'track_stock' && editTarget && html`<${TrackStockForPartModal} plant=${plant} me=${me} part=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'customer'   && html`<${CustomerModal} plant=${plant} me=${me} editTarget=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'vendor'     && html`<${VendorEditModal} plant=${plant} me=${me} vendor=${editTarget} onClose=${closeModal} onSaved=${saveModal} />`}
     ${modal === 'invite'     && html`<${InviteModal} plant=${plant} me=${me} units=${units} onClose=${closeModal} onSaved=${saveModal} />`}
