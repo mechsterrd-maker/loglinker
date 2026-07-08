@@ -9,6 +9,23 @@
 <title>Loglinkr</title>
 <meta name="theme-color" content="#0d9488">
 <link rel="manifest" href="/manifest.json">
+<script>
+  // Capture the PWA install prompt as EARLY as possible. Chrome/Edge can fire
+  // 'beforeinstallprompt' during page load — before the deferred module script
+  // runs — so registering the listener here (a synchronous head script) is the
+  // difference between a real one-tap install and falling back to a how-to page.
+  // The app reads window.__bipEvent and listens for 'loglinkr-installable'.
+  window.__bipEvent = null;
+  window.addEventListener('beforeinstallprompt', function (e) {
+    e.preventDefault();
+    window.__bipEvent = e;
+    try { window.dispatchEvent(new Event('loglinkr-installable')); } catch (_) {}
+  });
+  window.addEventListener('appinstalled', function () {
+    window.__bipEvent = null;
+    try { window.dispatchEvent(new Event('loglinkr-installed')); } catch (_) {}
+  });
+</script>
 <link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192">
 <link rel="apple-touch-icon" href="/icon-192.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -718,21 +735,25 @@ const disablePushNotifications = async () => {
   }
 };
 
-// PWA install prompt capture
-let deferredInstallPrompt = null;
-window.addEventListener('beforeinstallprompt', (e) => {
-  e.preventDefault();
-  deferredInstallPrompt = e;
+// PWA install prompt — captured super-early by the inline <head> script into
+// window.__bipEvent, so the deferred module never misses it. waitForInstallPrompt
+// gives the event a brief chance to arrive if the user taps Install the instant
+// the page loads. promptInstallApp returns false (no alert) when the browser
+// can't offer a native prompt, letting each caller choose its own fallback.
+const waitForInstallPrompt = (ms = 1500) => new Promise((resolve) => {
+  if (window.__bipEvent) return resolve(window.__bipEvent);
+  let done = false;
+  const finish = () => { if (done) return; done = true; window.removeEventListener('loglinkr-installable', finish); resolve(window.__bipEvent || null); };
+  window.addEventListener('loglinkr-installable', finish);
+  setTimeout(finish, ms);
 });
-
+const canInstallNatively = () => !!window.__bipEvent;
 const promptInstallApp = async () => {
-  if (!deferredInstallPrompt) {
-    alert('To install Loglinkr:\n• Android Chrome: tap menu → "Install app" or "Add to Home screen"\n• iPhone Safari: tap Share → "Add to Home Screen"\n• Mac/Windows Chrome: click the install icon in URL bar');
-    return false;
-  }
-  deferredInstallPrompt.prompt();
-  const { outcome } = await deferredInstallPrompt.userChoice;
-  deferredInstallPrompt = null;
+  const evt = await waitForInstallPrompt();
+  if (!evt) return false;
+  evt.prompt();
+  const { outcome } = await evt.userChoice;
+  if (outcome === 'accepted') window.__bipEvent = null;
   return outcome === 'accepted';
 };
 
@@ -28644,7 +28665,11 @@ function PostLoginInstallPrompt() {
   const close = () => setShow(false);
   const install = async () => {
     if (isIos()) { setIosHelp(true); return; }
-    if (deferredInstallPrompt) { const ok = await promptInstallApp(); if (ok) close(); return; }
+    // Chromium (Android / Windows / desktop): fire the real one-tap install.
+    const ok = await promptInstallApp();
+    if (ok) { close(); return; }
+    // Native prompt genuinely unavailable (already installed, or a browser that
+    // doesn't support it) — only then show the guide.
     window.open('/install', '_blank', 'noopener'); close();
   };
   return html`
@@ -28697,13 +28722,10 @@ function HomeInstallBanner() {
 
   const onInstall = async () => {
     if (isIos()) { setShowIosHelp(true); return; }
-    if (deferredInstallPrompt) {
-      const ok = await promptInstallApp();
-      if (ok) setHidden(true);
-      return;
-    }
-    // No install event yet (browser hasn't fired beforeinstallprompt, or it's
-    // a non-Chromium browser) — fall back to the standalone install guide.
+    // Chromium (Android / Windows): fire the real one-tap install prompt.
+    const ok = await promptInstallApp();
+    if (ok) { setHidden(true); return; }
+    // Native prompt genuinely unavailable — fall back to the standalone guide.
     window.open('/install', '_blank', 'noopener');
   };
   const onDismiss = () => {
@@ -29046,7 +29068,8 @@ function InstallAppCard() {
   const [installed, setInstalled] = useState(window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
   const handleInstall = async () => {
     const ok = await promptInstallApp();
-    if (ok) setInstalled(true);
+    if (ok) { setInstalled(true); return; }
+    window.open('/install', '_blank', 'noopener');
   };
   if (installed) return html`
     <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);margin-top:8px">
