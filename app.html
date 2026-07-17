@@ -2044,6 +2044,7 @@ const MORE_GROUPS = [
       { key:'documents',           icon:'📄', label:'Documents · Bills',         sub:'OCR vendor invoices/DCs, payments, vendors' },
       { key:'movements',           icon:'🔀', label:'Movements',                 sub:'In/out material flow, GRN verification' },
       { key:'expenses',            icon:'💸', label:'Expense Ledger',            sub:'All business expenses, category-wise, monthly rollup' },
+      { key:'project_costing',     icon:'💷', label:'Project Costing',           sub:'Every bill & expense rolled up per project · spend tracker with drill-down' },
     ],
   },
   {
@@ -2964,6 +2965,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'voice_notes'}><${VoiceNotesModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'quality_rejections'}><${QualityAnalyticsModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'project_costing'}><${ProjectCostingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} /></${Page}>
       <${Page} active=${pageTab === 'doc_formats'}><${DocFormatsModule} plant=${plant} me=${me} /></${Page}>
@@ -9075,6 +9077,7 @@ const RBAC_MODULES = [
   { key:'attendance', label:'Attendance Register', group:'workforce' },
   { key:'attendance_setup', label:'Attendance / Payroll Setup', group:'workforce' },
   { key:'quotation', label:'Quotation / Costing', group:'commercial' },
+  { key:'project_costing', label:'Project Costing (expense tracker)', group:'commercial' },
   { key:'reports', label:'Reports', group:'audit' },
   { key:'performance', label:'Performance Dashboards', group:'audit' },
   { key:'trace', label:'Trace / Audit Investigation', group:'audit' },
@@ -14605,6 +14608,168 @@ function computeQuoteBreakup(matCost, processTotal, qty, ld) {
   pct('Overhead', ld.overhead_pct);
   pct('Profit', ld.profit_pct);
   return { prime, lines, final: r };
+}
+
+// ============= PROJECT COSTING · EXPENSE TRACKER =============
+// Per-project spend rollup: every project-linked cost — supplier bills/invoices,
+// job-work, project expenses and project petty-cash — aggregated per project,
+// with a drill-down to each line item. Pure expense tracker (no revenue/margin).
+// Unit-scoped like the rest of the app.
+const PC_COST_DOC_TYPES = ['invoice_in', 'bill', 'job_work_dc_in', 'job_work_dc_out', 'dc_in'];
+const PC_DOC_LABEL = { invoice_in:'Invoice', bill:'Bill', job_work_dc_in:'JW return', job_work_dc_out:'JW out', dc_in:'DC in' };
+function pcINR(n) {
+  n = Number(n || 0); const a = Math.abs(n);
+  if (a >= 1e7) return '₹' + (n / 1e7).toFixed(2) + ' Cr';
+  if (a >= 1e5) return '₹' + (n / 1e5).toFixed(2) + ' L';
+  return '₹' + fmtNum(Math.round(n));
+}
+
+function ProjectCostingModule({ plant, me, activeUnit }) {
+  const [projects, setProjects] = useState([]);
+  const [docs, setDocs] = useState([]);
+  const [expenses, setExpenses] = useState([]);
+  const [petty, setPetty] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState('all');   // all | active | completed | withspend
+  const [sort, setSort] = useState('spend');      // spend | name | items
+  const [search, setSearch] = useState('');
+  const [drill, setDrill] = useState(null);       // project id being expanded
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [p, d, e, pc] = await Promise.all([
+      unitScope(sb.from('mcp_projects').select('id, code, name, customer_name, status, order_value, unit_id').eq('plant_id', plant.id)).order('created_at', { ascending: false }),
+      unitScope(sb.from('mcp_logistics_documents').select('id, project_id, doc_type, doc_number, vendor_name_raw, total_value, doc_date, unit_id').eq('plant_id', plant.id).not('project_id', 'is', null)).limit(3000),
+      unitScope(sb.from('mcp_expenses').select('id, project_id, amount, category, vendor_name, description, expense_date, unit_id').eq('plant_id', plant.id).not('project_id', 'is', null)).limit(3000),
+      unitScope(sb.from('mcp_petty_cash_txns').select('id, project_id, amount, category, vendor_name, description, txn_date, txn_type, unit_id').eq('plant_id', plant.id).eq('txn_type', 'expense').not('project_id', 'is', null)).limit(3000),
+    ]);
+    setProjects(p.data || []); setDocs(d.data || []); setExpenses(e.data || []); setPetty(pc.data || []);
+    setLoading(false);
+  }, [plant.id, _activeUnitId]);
+  useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
+
+  // Roll every cost source up per project into a uniform line-item shape.
+  const rows = useMemo(() => {
+    const by = {};
+    for (const p of projects) by[p.id] = { project: p, items: [], billSpend: 0, expSpend: 0, pettySpend: 0 };
+    for (const d of docs) {
+      const b = by[d.project_id]; if (!b || !PC_COST_DOC_TYPES.includes(d.doc_type)) continue;
+      const v = Number(d.total_value || 0); b.billSpend += v;
+      b.items.push({ kind: 'bill', label: PC_DOC_LABEL[d.doc_type] || d.doc_type, ref: d.doc_number, party: d.vendor_name_raw, amount: v, date: d.doc_date });
+    }
+    for (const e of expenses) {
+      const b = by[e.project_id]; if (!b) continue;
+      const v = Number(e.amount || 0); b.expSpend += v;
+      b.items.push({ kind: 'expense', label: 'Expense', ref: e.category, party: e.vendor_name || e.description, amount: v, date: e.expense_date });
+    }
+    for (const t of petty) {
+      const b = by[t.project_id]; if (!b) continue;
+      const v = Number(t.amount || 0); b.pettySpend += v;
+      b.items.push({ kind: 'petty', label: 'Petty cash', ref: t.category, party: t.vendor_name || t.description, amount: v, date: t.txn_date });
+    }
+    return Object.values(by).map(b => {
+      b.items.sort((x, y) => (y.date || '').localeCompare(x.date || ''));
+      return { ...b, spend: b.billSpend + b.expSpend + b.pettySpend };
+    });
+  }, [projects, docs, expenses, petty]);
+
+  const isActive = (s) => ['in_progress', 'planning', 'on_hold'].includes(s);
+  let list = rows;
+  if (filter === 'active') list = list.filter(r => isActive(r.project.status));
+  else if (filter === 'completed') list = list.filter(r => r.project.status === 'completed');
+  else if (filter === 'withspend') list = list.filter(r => r.items.length > 0);
+  if (search.trim()) {
+    const q = search.toLowerCase();
+    list = list.filter(r => `${r.project.code || ''} ${r.project.name || ''} ${r.project.customer_name || ''}`.toLowerCase().includes(q));
+  }
+  list = [...list].sort((a, b) =>
+    sort === 'name' ? `${a.project.code || ''}${a.project.name}`.localeCompare(`${b.project.code || ''}${b.project.name}`)
+    : sort === 'items' ? b.items.length - a.items.length
+    : b.spend - a.spend);
+
+  const totalSpend = rows.reduce((s, r) => s + r.spend, 0);
+  const totalItems = rows.reduce((s, r) => s + r.items.length, 0);
+  const projWithSpend = rows.filter(r => r.items.length > 0).length;
+  const srcTotals = rows.reduce((a, r) => ({ bill: a.bill + r.billSpend, exp: a.exp + r.expSpend, petty: a.petty + r.pettySpend }), { bill: 0, exp: 0, petty: 0 });
+
+  const STATUS = { planning:{c:'',l:'Planning'}, in_progress:{c:'amber',l:'In progress'}, on_hold:{c:'rose',l:'On hold'}, completed:{c:'emerald',l:'Completed'}, cancelled:{c:'',l:'Cancelled'} };
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  const drillRow = drill ? rows.find(r => r.project.id === drill) : null;
+  if (drillRow) {
+    const p = drillRow.project; const st = STATUS[p.status] || { c:'', l:p.status };
+    const maxAmt = Math.max(1, ...drillRow.items.map(i => i.amount));
+    return html`
+      <div class="page-header" style="display:flex;align-items:flex-start;gap:10px">
+        <button class="btn small ghost" onClick=${() => setDrill(null)} style="flex-shrink:0">← Back</button>
+        <div style="min-width:0"><h1 style="font-size:19px">${p.code ? p.code + ' · ' : ''}${p.name}</h1>
+          <div class="sub">${p.customer_name || 'No customer'} · <span class="badge ${st.c}" style="font-size:10px">${st.l}</span></div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:14px">
+        <${PerfKpi} num=${pcINR(drillRow.spend)} label="Total spend" tone="rose" big=${true} sub="${drillRow.items.length} entries" />
+        <${PerfKpi} num=${pcINR(drillRow.billSpend)} label="Bills / invoices" tone="slate" />
+        <${PerfKpi} num=${pcINR(drillRow.expSpend)} label="Expenses" tone="slate" />
+        <${PerfKpi} num=${pcINR(drillRow.pettySpend)} label="Petty cash" tone="slate" />
+      </div>
+      <div class="section-h">Cost entries · ${drillRow.items.length}</div>
+      ${drillRow.items.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🧾</div>No bills or expenses linked to this project yet.</div></div>` :
+        html`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead><tr style="background:var(--slate-50);text-align:left">${['Date','Type','Party','Ref',''].map(h => html`<th style="padding:7px 8px;font-weight:600;color:var(--slate-600);white-space:nowrap">${h}</th>`)}<th style="padding:7px 8px;font-weight:600;color:var(--slate-600);text-align:right">Amount</th></tr></thead>
+          <tbody>${drillRow.items.map((it, i) => html`<tr key=${i} style="border-top:1px solid var(--slate-100)">
+            <td style="padding:6px 8px;white-space:nowrap">${(it.date || '').slice(0, 10) || '—'}</td>
+            <td style="padding:6px 8px"><span class="badge ${it.kind === 'bill' ? '' : it.kind === 'expense' ? 'amber' : 'teal'}" style="font-size:10px">${it.label}</span></td>
+            <td style="padding:6px 8px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${it.party || '—'}</td>
+            <td style="padding:6px 8px;color:var(--slate-500)">${it.ref || '—'}</td>
+            <td style="padding:6px 8px;width:40%"><div style="height:8px;background:var(--slate-100);border-radius:3px;overflow:hidden"><div style=${'height:100%;border-radius:3px;width:' + (it.amount / maxAmt * 100) + '%;background:var(--teal-400)'}></div></div></td>
+            <td style="padding:6px 8px;text-align:right;font-weight:600;white-space:nowrap">${pcINR(it.amount)}</td>
+          </tr>`)}</tbody>
+        </table></div>`}
+    `;
+  }
+
+  return html`
+    <div class="page-header"><div><h1>💷 Project Costing</h1><div class="sub">Every bill, invoice & expense rolled up per project · tap a project for the breakdown</div></div></div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px">
+      <${PerfKpi} num=${pcINR(totalSpend)} label="Total project spend" tone="rose" big=${true} sub="${totalItems} cost entries" />
+      <${PerfKpi} num=${projWithSpend} label="Projects with spend" tone="slate" big=${true} sub="of ${rows.length} projects" />
+      <${PerfKpi} num=${pcINR(srcTotals.bill)} label="Bills / invoices" tone="teal" />
+      <${PerfKpi} num=${pcINR(srcTotals.exp + srcTotals.petty)} label="Expenses + petty cash" tone="amber" />
+    </div>
+
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      ${[['all','All'],['active','Active'],['completed','Completed'],['withspend','With spend']].map(([k, l]) =>
+        html`<button key=${k} class=${'btn small ' + (filter === k ? '' : 'ghost')} style="font-size:12px" onClick=${() => setFilter(k)}>${l}</button>`)}
+      <div style="flex:1"></div>
+      <select value=${sort} onChange=${e => setSort(e.target.value)} style="font-size:12px;padding:6px 8px;border:1px solid var(--slate-200);border-radius:8px">
+        <option value="spend">Sort: Spend ↓</option><option value="items">Sort: Entries ↓</option><option value="name">Sort: Name</option>
+      </select>
+    </div>
+    <input type="search" value=${search} onInput=${e => setSearch(e.target.value)} placeholder="Search project or customer…" style="width:100%;padding:9px 12px;border:1px solid var(--slate-200);border-radius:9px;margin-bottom:12px;font-family:inherit" />
+
+    <div class="section-h">Projects · ${list.length}</div>
+    ${list.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📐</div>No projects match.</div></div>` :
+      html`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead><tr style="background:var(--slate-50);text-align:left">
+          ${['Project','Customer','Status','Entries'].map(h => html`<th style="padding:8px;font-weight:600;color:var(--slate-600);white-space:nowrap">${h}</th>`)}
+          <th style="padding:8px;font-weight:600;color:var(--slate-600);text-align:right;white-space:nowrap">Spend</th>
+        </tr></thead>
+        <tbody>${list.map(r => { const st = STATUS[r.project.status] || { c:'', l:r.project.status }; return html`
+          <tr key=${r.project.id} onClick=${() => setDrill(r.project.id)} style="border-top:1px solid var(--slate-100);cursor:pointer"
+            onMouseOver=${e => e.currentTarget.style.background = 'var(--slate-50)'} onMouseOut=${e => e.currentTarget.style.background = ''}>
+            <td style="padding:8px;font-weight:600;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.project.code ? r.project.code + ' · ' : ''}${r.project.name}</td>
+            <td style="padding:8px;color:var(--slate-500);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.project.customer_name || '—'}</td>
+            <td style="padding:8px"><span class="badge ${st.c}" style="font-size:10px">${st.l}</span></td>
+            <td style="padding:8px;color:var(--slate-500)">${r.items.length}</td>
+            <td style="padding:8px;text-align:right;font-weight:700;white-space:nowrap;color:${r.spend > 0 ? 'var(--rose-600)' : 'var(--slate-400)'}">${r.spend > 0 ? pcINR(r.spend) : '—'}</td>
+          </tr>`; })}</tbody>
+        <tfoot><tr style="border-top:2px solid var(--slate-200);font-weight:700"><td style="padding:8px" colspan="4">Total</td><td style="padding:8px;text-align:right;color:var(--rose-700);white-space:nowrap">${pcINR(list.reduce((s, r) => s + r.spend, 0))}</td></tr></tfoot>
+      </table></div>`}
+    <div style="font-size:11px;color:var(--slate-500);margin-top:10px;padding:0 2px">Spend = project-linked supplier invoices, bills, job-work, expenses and petty-cash. Link a bill to a project from the Documents module for it to appear here.</div>
+  `;
 }
 
 // ============= QUALITY: DAILY REJECTION & ANALYTICS =============
