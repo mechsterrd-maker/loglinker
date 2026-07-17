@@ -1,7 +1,8 @@
 // sw.js — Loglinkr Service Worker
 // Handles: PWA install, offline shell, Web Push notifications, click routing
 
-const CACHE_NAME = 'loglinkr-v11';
+const CACHE_NAME = 'loglinkr-v14';
+const SHARE_CACHE = 'loglinkr-share';
 const APP_SHELL = ['/app'];
 
 // Install: cache app shell
@@ -18,9 +19,38 @@ self.addEventListener('activate', (event) => {
   self.clients.claim();
 });
 
-// Network-first strategy (so updates always reach users), fall back to cache when offline
+// Web Share Target — Android "Share → Loglinkr" posts the shared image/PDF here
+// (manifest share_target action = /app?sharetarget=1). We can't hand a file to a
+// page via URL, so stash the blob in a cache and redirect the opened window to
+// /app?shared_bill=1, which the app reads on load and drops into the bill upload.
 self.addEventListener('fetch', (event) => {
-  if (event.request.method !== 'GET') return;
+  const req = event.request;
+  const u = new URL(req.url);
+  // Match the share POST by PATH, not the ?sharetarget=1 query — some Android
+  // builds drop the action's query string on a multipart POST, which made the
+  // handler miss and the app just open blank. The app has no other same-origin
+  // POST navigations (all API calls go to supabase.co, excluded below).
+  const isShareTarget = req.method === 'POST' && u.origin === self.location.origin &&
+    (u.searchParams.get('sharetarget') === '1' || u.pathname === '/app' || u.pathname === '/app.html' || u.pathname === '/app/');
+  if (isShareTarget) {
+    event.respondWith((async () => {
+      try {
+        const form = await req.formData();
+        const file = form.get('bill') || form.get('image') || form.get('file') || (form.getAll ? form.getAll('bill')[0] : null);
+        if (file && file.size) {
+          const cache = await caches.open(SHARE_CACHE);
+          await cache.put('/__shared-bill', new Response(file, {
+            headers: { 'Content-Type': file.type || 'application/octet-stream', 'X-Shared-Name': (file.name || 'shared').replace(/[^\w.\-]/g, '_') },
+          }));
+        }
+      } catch (_) { /* fall through to redirect regardless */ }
+      // Response.redirect() requires an ABSOLUTE url — a relative path throws a
+      // TypeError, which would drop us back to a plain app load (no bill).
+      return Response.redirect(self.location.origin + '/app?shared_bill=1', 303);
+    })());
+    return;
+  }
+  if (req.method !== 'GET') return;
   // Skip API/Supabase/Edge function calls — always live
   const url = new URL(event.request.url);
   if (url.hostname.includes('supabase.co') || url.hostname.includes('anthropic.com')) return;
