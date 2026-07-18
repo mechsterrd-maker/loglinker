@@ -2,6 +2,15 @@
 // layout. The frontend parses the workbook (SheetJS) into { sheets:[{name,rows}] }
 // and posts it here; Claude reads the whole thing and returns a clean, deduped
 // stock list regardless of how the company laid it out. No fixed template.
+//
+// Robustness (why this shape): large sheets (hundreds of SKUs) used to make Claude
+// emit a huge verbose-JSON response that ran past the gateway timeout → HTTP 504.
+// Two defences:
+//   1) Claude returns COMPACT pipe-delimited rows (not per-item JSON) — ~3× fewer
+//      output tokens → ~3× faster generation. We parse the rows server-side.
+//   2) The response is STREAMED with a whitespace heartbeat so the gateway never
+//      idle-times-out while Claude is working. The body is "<spaces>{json}", which
+//      JSON.parse (and fetch's res.json()) accept unchanged — no client change.
 // Deployed via Supabase MCP; this file is the tracked mirror.
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
@@ -11,8 +20,9 @@ const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-sonnet-4-6";
-const MAX_CHARS = 90000; // cap the sheet text we send
-const MAX_OUT = 16000;
+const MAX_CHARS = 90000;  // cap the sheet text we send
+const MAX_COLS = 40;      // cap columns per row (day-by-day ledgers can be 100+ wide)
+const MAX_OUT = 8000;     // compact rows: ~12 tokens/item → covers ~600 items
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -24,46 +34,124 @@ const json = (b: unknown, s = 200) =>
 
 const PROMPT = `You are extracting a STOCK / INVENTORY master list from a company's own spreadsheet. Every company lays out their sheet differently — title rows, sub-headings, merged/stacked cells, one logical item spanning several rows, section-per-sheet, extra columns (invoice, warranty, serial no, location), embedded prices like "RATE - 3750 + TAX 675 = 4425". Read it all and produce ONE clean, deduplicated list of stock items.
 
-GRANULARITY (critical): produce a concise STOCK list — ONE row per distinct item TYPE / model, with a QUANTITY. This is stock-on-hand, not an asset register. If a sheet lists the same model many times, once per physical unit (each with its own serial number, invoice, purchase date), COLLAPSE all of them into a SINGLE item whose opening_qty = the count of units. NEVER output one item per serial number or per physical machine. The result should be tens of items, not hundreds. When one sheet = one machine type with many unit-rows, that whole sheet is usually ONE stock item (qty = number of units).
+WHICH SHEET IS THE LIST:
+- If a sheet is clearly a STOCK MASTER (columns like Item Code, Description, UOM, Qty/Balance/Closing, Rate) use THAT as your list — one output row per data row.
+- IGNORE day-by-day movement ledgers (sheets that are mostly a wide grid of dates / daily in-out numbers) — they are transactions, not stock. Never emit an item per ledger column or per day.
+- If a summary/overview sheet already lists item types with quantities, use its names+quantities as the master; use detail sheets only to enrich (cost, spec, uom). Never double-count summary + details.
 
-RULES:
-- If the workbook has a summary/overview sheet that already lists item types with quantities, THAT is your list — use its names and quantities as the master. Use the detailed per-machine sheets only to enrich (cost, spec, uom). Do NOT double-count (summary + details) and do NOT expand the summary back into per-unit rows.
-- Merge the same item across rows/sheets and SUM quantities. Never output the same item twice.
-- Multi-row entries: a single item's brand, serial no, specification, rate and invoice are often stacked in the rows just below its name — treat them as ONE item, not several.
-- SKIP non-item rows: titles, sub-headings, column headers, blank rows, totals/subtotals, "prepared by", dates, signatures, invoice/warranty/serial-only lines.
-- quantity = the on-hand / available quantity (columns named Qty, Qty avl, QTY, Stock, Balance, Nos, etc.). If truly absent, use 1.
-- unit_cost = the per-unit price if present. From messy text like "RATE - 3750 + TAX 675 = 4425" take the final total (4425); if only a base rate is given, use that. Null if none.
-- code = an existing item code / SKU / part no / internal number from the sheet if one clearly identifies the item; otherwise GENERATE a short uppercase code from the name (e.g. "AG4 Grinding machine" -> "AG4-GRINDER", max 24 chars, unique within your output).
-- category = the TOP-LEVEL group, one of: raw_material, consumables, tools, packing, die_spares, bought_out, general. (Power tools / machines / drills / grinders / welders -> tools.)
-- subcategory = the SPECIFIC type/group WITHIN the category, so items align neatly. Use the sheet name / section heading as a strong hint — companies group items by sheet or sub-heading and THAT grouping is usually the subcategory. Examples: a grinder under "tools" -> "Grinding Machines"; a welder -> "Welding Machines"; a drill -> "Drilling Machines"; a cut-off/plasma/bandsaw -> "Cutting Machines"; folding/shearing/rolling -> "Sheet Metal Machines"; an MS bar under "raw_material" -> "MS Steel". Title Case, concise (1-3 words). Group similar items under the SAME subcategory wording so they cluster. Null only if genuinely ungroupable.
-- uom = the unit (nos, pcs, kg, ltr, set, etc.); default "nos" for countable tools/parts.
-- name = a clean human item name (include key spec/model if it distinguishes the item, e.g. "AG5 Grinding Machine (DW831)").
-- notes = optional short extra (location / spec) — keep brief or null.
+GRANULARITY:
+- A distinct SIZE / THICKNESS / MODEL / grade with its own item code or spec IS a distinct stock item — keep them separate (e.g. "MS FLAT 40*5" and "MS FLAT 40*10" are two items).
+- But if the SAME model is listed once per physical unit (each with its own serial no / invoice / purchase date), COLLAPSE those into ONE item whose quantity = the number of units. Never output one row per serial number.
+- Merge a truly identical item appearing twice and SUM quantities. Multi-row entries (brand / serial / spec / rate stacked below a name) are ONE item.
+- SKIP non-item rows: titles, sub-headings, column headers, blank rows, totals/subtotals, "prepared by", dates, signatures, invoice/warranty-only lines.
 
-Return ONLY valid JSON (no markdown, no prose):
-{
-  "items": [
-    {"code":"AG4-GRINDER","name":"AG4 Grinding Machine","category":"tools","subcategory":"Grinding Machines","uom":"nos","opening_qty":2,"unit_cost":4425,"notes":null}
-  ],
-  "summary": {"total_items": 0, "total_qty": 0, "source": "which sheet(s) drove the list"},
-  "confidence": "high|medium|low",
-  "notes": "anything the user should double-check, or null"
-}`;
+PER-FIELD RULES:
+- code = existing item code / SKU / part no from the sheet if present; else GENERATE a short uppercase code from the name (max 24 chars).
+- name = clean human item name incl. key spec/size if it distinguishes the item.
+- category = one of: raw_material, consumables, tools, packing, die_spares, bought_out, general. (Power tools/machines → tools; steel/bar/flat/sheet → raw_material.)
+- subcategory = specific group WITHIN the category (Title Case, 1-3 words). Use the sheet name / section heading as a strong hint. Empty if genuinely ungroupable.
+- uom = unit (nos, pcs, kg, mtr, ltr, set…); default nos for countable items.
+- opening_qty = the on-hand / closing / balance quantity (Qty, Balance, Closing, Stock, Nos…). If truly absent use 1.
+- unit_cost = per-unit price if present. From "RATE - 3750 + TAX 675 = 4425" take the final total (4425). Empty if none.
+- notes = optional short spec/location, or empty.
+
+OUTPUT FORMAT — return ONLY plain text, NOTHING ELSE (no JSON, no markdown, no prose, no header row).
+Optionally a FIRST line: #META confidence=high|medium|low; note=<one short caveat or blank>
+Then ONE stock item PER LINE, pipe-delimited, EXACTLY these 8 fields in this order:
+code|name|category|subcategory|uom|opening_qty|unit_cost|notes
+Leave a field empty (nothing between the pipes) when it does not apply. Example:
+#META confidence=high; note=
+MSFL40-10|MS Flat 40*10|raw_material|MS Steel|mtr|15|48|
+AG4-GRINDER|AG4 Grinding Machine|tools|Grinding Machines|nos|2|4425|shop floor`;
 
 function sheetsToText(sheets: Array<{ name: string; rows: string[][] }>): string {
   let out = "";
   for (const s of sheets || []) {
     out += `\n===== SHEET: ${s.name} =====\n`;
-    for (const r of s.rows || []) out += (r || []).join(" | ") + "\n";
-    if (out.length > MAX_CHARS) { out = out.slice(0, MAX_CHARS) + "\n…(truncated)"; break; }
+    for (const r of s.rows || []) {
+      out += (r || []).slice(0, MAX_COLS).join(" | ") + "\n";
+      if (out.length > MAX_CHARS) return out.slice(0, MAX_CHARS) + "\n…(truncated)";
+    }
   }
   return out;
 }
-function sliceJson(text: string): string {
-  const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/, "").trim();
-  if (cleaned.startsWith("{")) return cleaned;
-  const a = text.indexOf("{"), b = text.lastIndexOf("}");
-  return a >= 0 && b > a ? text.slice(a, b + 1) : cleaned;
+
+const CATS = ["raw_material", "consumables", "tools", "packing", "die_spares", "bought_out", "general"];
+
+function parseRows(text: string): { items: Record<string, unknown>[]; confidence: string | null; notes: string | null } {
+  const lines = text.replace(/```[a-z]*/gi, "").split(/\r?\n/);
+  let confidence: string | null = null, notes: string | null = null;
+  const items: Record<string, unknown>[] = [];
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("#META")) {
+      const cm = line.match(/confidence\s*=\s*(high|medium|low)/i);
+      if (cm) confidence = cm[1].toLowerCase();
+      const nm = line.match(/note\s*=\s*(.+)$/i);
+      if (nm && nm[1].trim()) notes = nm[1].trim();
+      continue;
+    }
+    if (line.startsWith("#") || line.startsWith("=====")) continue;
+    if (!line.includes("|")) continue;
+    const p = line.split("|");
+    if (p.length < 6) continue;               // needs at least the core fields
+    items.push({ code: p[0], name: p[1], category: p[2], subcategory: p[3], uom: p[4], opening_qty: p[5], unit_cost: p[6], notes: p[7] });
+  }
+  return { items, confidence, notes };
+}
+
+async function extract(body: { sheets: Array<{ name: string; rows: string[][] }>; filename?: string }) {
+  const text = sheetsToText(body.sheets);
+  if (!text.trim()) return { error: "No cell data found in the sheet." };
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: MAX_OUT,
+      messages: [{ role: "user", content: [
+        { type: "text", text: "FILE: " + (body.filename || "stock.xlsx") + "\n\nSPREADSHEET CONTENT (pipe-separated cells, one row per line, one section per sheet):\n" + text },
+        { type: "text", text: PROMPT },
+      ] }],
+    }),
+  });
+  const msg = await res.json();
+  if (msg.type === "error" || msg.error) return { error: msg.error?.message || "Claude API error" };
+  const outText = (msg.content || []).filter((b: { type: string }) => b.type === "text").map((b: { text: string }) => b.text).join("\n");
+
+  const { items: raw, confidence, notes } = parseRows(outText);
+  if (!raw.length) return { error: "No stock items were found in the file.", raw: outText.slice(0, 800) };
+
+  // Normalize + de-dup by code (defensive)
+  const seen = new Set<string>();
+  const num = (v: unknown) => { const x = parseFloat(String(v ?? "").replace(/[^0-9.\-]/g, "")); return isFinite(x) ? x : null; };
+  const items = raw.map((it) => {
+    let code = String(it.code || "").trim().toUpperCase().replace(/\s+/g, "-").slice(0, 24);
+    if (!code) code = String(it.name || "ITEM").trim().toUpperCase().replace(/[^A-Z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || "ITEM";
+    let key = code, n = 1;
+    while (seen.has(key)) key = code.slice(0, 20) + "-" + (++n);
+    seen.add(key);
+    return {
+      code: key,
+      name: String(it.name || key).trim(),
+      category: CATS.includes(String(it.category)) ? it.category : "general",
+      subcategory: it.subcategory ? String(it.subcategory).trim().slice(0, 60) : null,
+      uom: String(it.uom || "nos").trim() || "nos",
+      opening_qty: num(it.opening_qty) ?? 1,
+      unit_cost: num(it.unit_cost),
+      notes: it.notes ? String(it.notes).slice(0, 200) : null,
+    };
+  });
+
+  const totalQty = items.reduce((s, i) => s + (Number(i.opening_qty) || 0), 0);
+  return {
+    success: true, items,
+    summary: { total_items: items.length, total_qty: totalQty, source: null },
+    confidence, notes,
+    usage: msg.usage || null,
+  };
 }
 
 Deno.serve(async (req) => {
@@ -81,63 +169,39 @@ Deno.serve(async (req) => {
     const sheets = Array.isArray(body.sheets) ? body.sheets : null;
     if (!sheets || !sheets.length) return json({ error: "sheets[] required" }, 400);
 
-    const text = sheetsToText(sheets);
-    if (!text.trim()) return json({ error: "No cell data found in the sheet." }, 400);
-
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: MAX_OUT,
-        messages: [{ role: "user", content: [
-          { type: "text", text: "FILE: " + (body.filename || "stock.xlsx") + "\n\nSPREADSHEET CONTENT (pipe-separated cells, one row per line, one section per sheet):\n" + text },
-          { type: "text", text: PROMPT },
-        ] }],
-      }),
+    // Stream a whitespace heartbeat while Claude works so the gateway never 504s.
+    // Final chunk is the JSON payload; leading whitespace is valid for JSON.parse.
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        const beat = setInterval(() => { try { controller.enqueue(enc.encode(" ")); } catch { /* closed */ } }, 8000);
+        try {
+          const result = await extract({ sheets, filename: body.filename }) as Record<string, unknown>;
+          // Fire-and-forget usage logging (never blocks the response)
+          if (result.success && result.usage) {
+            try {
+              const u = result.usage as { input_tokens?: number; output_tokens?: number };
+              const svc = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
+              const cost = (u.input_tokens || 0) * 3 / 1e6 + (u.output_tokens || 0) * 15 / 1e6;
+              const { data: me } = await db.from("users").select("plant_id").eq("id", user.id).maybeSingle();
+              if (me?.plant_id) await svc.from("ai_usage").insert({
+                plant_id: me.plant_id, kind: "stock_extract", model: MODEL,
+                input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0,
+                cost_usd: Number(cost.toFixed(6)),
+              });
+            } catch { /* logging must never fail the extract */ }
+          }
+          delete result.usage;
+          controller.enqueue(enc.encode(JSON.stringify(result)));
+        } catch (e) {
+          controller.enqueue(enc.encode(JSON.stringify({ error: (e as Error).message || "Internal error" })));
+        } finally {
+          clearInterval(beat);
+          controller.close();
+        }
+      },
     });
-    const msg = await res.json();
-    if (msg.type === "error" || msg.error) throw new Error(msg.error?.message || "Claude API error");
-    const outText = (msg.content || []).filter((b: { type: string }) => b.type === "text").map((b: { text: string }) => b.text).join("\n");
-    let data: { items?: unknown[] };
-    try { data = JSON.parse(sliceJson(outText)); }
-    catch { return json({ error: "Could not parse extraction", raw: outText.slice(0, 1500) }, 500); }
-
-    // Normalize + de-dup by code (defensive)
-    const seen = new Set<string>();
-    const items = (Array.isArray(data.items) ? data.items : []).map((raw) => {
-      const it = raw as Record<string, unknown>;
-      let code = String(it.code || "").trim().toUpperCase().replace(/\s+/g, "-").slice(0, 24);
-      if (!code) code = String(it.name || "ITEM").trim().toUpperCase().replace(/[^A-Z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || "ITEM";
-      let key = code, n = 1;
-      while (seen.has(key)) key = code.slice(0, 20) + "-" + (++n);
-      seen.add(key);
-      const num = (v: unknown) => { const x = parseFloat(String(v ?? "").replace(/[^0-9.\-]/g, "")); return isFinite(x) ? x : null; };
-      return {
-        code: key,
-        name: String(it.name || key).trim(),
-        category: ["raw_material", "consumables", "tools", "packing", "die_spares", "bought_out", "general"].includes(String(it.category)) ? it.category : "general",
-        subcategory: it.subcategory ? String(it.subcategory).trim().slice(0, 60) : null,
-        uom: String(it.uom || "nos").trim() || "nos",
-        opening_qty: num(it.opening_qty) ?? 1,
-        unit_cost: num(it.unit_cost),
-        notes: it.notes ? String(it.notes).slice(0, 200) : null,
-      };
-    });
-
-    // Log usage (service role)
-    try {
-      const svc = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
-      const cost = (msg.usage?.input_tokens || 0) * 3 / 1e6 + (msg.usage?.output_tokens || 0) * 15 / 1e6;
-      const { data: me } = await db.from("users").select("plant_id").eq("id", user.id).maybeSingle();
-      if (me?.plant_id) await svc.from("ai_usage").insert({
-        plant_id: me.plant_id, kind: "stock_extract", model: MODEL,
-        input_tokens: msg.usage?.input_tokens || 0, output_tokens: msg.usage?.output_tokens || 0,
-        cost_usd: Number(cost.toFixed(6)),
-      });
-    } catch (_) { /* never fail the extraction on logging */ }
-
-    return json({ success: true, items, summary: data.summary || null, confidence: (data as { confidence?: string }).confidence || null, notes: (data as { notes?: string }).notes || null });
+    return new Response(stream, { headers: { ...CORS, "Content-Type": "application/json" } });
   } catch (e) {
     return json({ error: (e as Error).message || "Internal error" }, 500);
   }
