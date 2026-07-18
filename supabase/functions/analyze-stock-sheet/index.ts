@@ -22,7 +22,7 @@ const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-sonnet-4-6";
 const MAX_CHARS = 90000;  // cap the sheet text we send
 const MAX_COLS = 40;      // cap columns per row (day-by-day ledgers can be 100+ wide)
-const MAX_OUT = 8000;     // compact rows: ~12 tokens/item → covers ~600 items
+const MAX_OUT = 16000;    // compact rows ~15-20 tok/item → headroom for ~800 items
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
