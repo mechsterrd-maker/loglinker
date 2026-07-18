@@ -1652,6 +1652,12 @@ function App() {
   }, []);
   const [loading, setLoading] = useState(true);
   const [pendingInvite, setPendingInvite] = useState(null);
+  // Membership resolution: are we still figuring out which plant this user belongs
+  // to (profileLoading), or did the lookup fail (profileErr)? While either is set we
+  // must NOT render the onboarding chooser — an existing user could mis-tap "Set up
+  // a new plant" during the gap and create a duplicate. Starts true (we resolve on mount).
+  const [profileLoading, setProfileLoading] = useState(true);
+  const [profileErr, setProfileErr] = useState(false);
   // RBAC Phase 1: my permissions in the current plant. Set after loadProfile.
   // Shape: { plant_id, rbac_enforced, roles:[{id,slug,display_name}],
   //          permissions:[{module_key, action, filter}] }
@@ -1785,39 +1791,51 @@ function App() {
 
   const loadProfile = async (u) => {
     console.log('[Loglinkr] loadProfile for user:', u.id);
-    const { data: userRow } = await sb.from('users').select('*').eq('id', u.id).maybeSingle();
-    if (!userRow || !userRow.plant_id) {
-      setPlant(null); setMe(null);
-      return;
-    }
-    const { data: plantRow } = await sb.from('plants').select('*').eq('id', userRow.plant_id).maybeSingle();
-    if (!plantRow) {
-      setPlant(null); setMe(null);
-      return;
-    }
-    // Resolve the accessible/active unit BEFORE rendering the Shell, so the
-    // module-global _activeUnitId is set before any module mounts and runs its
-    // loaders. Otherwise loaders fetch with a null active unit (unitScope becomes
-    // a no-op) and a multi-unit manager sees every unit's data until a refetch.
-    await loadUnits();
-    setPlant(plantRow);
-    setMe(userRow);
-    // RBAC Phase 1: fetch my permissions. Non-blocking — if the RPC ever fails
-    // we fall back to the legacy users.role behavior so the app never bricks.
+    setProfileLoading(true); setProfileErr(false);
     try {
-      const { data: perms } = await sb.rpc('my_permissions');
-      setMyPerms(perms || { rbac_enforced: false, permissions: [], roles: [] });
-    } catch (_e) {
-      setMyPerms({ rbac_enforced: false, permissions: [], roles: [] });
-    }
-    // Clear URL query params on successful load, but KEEP the #page hash so a
-    // refresh stays on the current page.
-    if (window.location.search) {
-      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+      const { data: userRow, error: uErr } = await sb.from('users').select('*').eq('id', u.id).maybeSingle();
+      if (uErr) throw uErr;
+      if (!userRow || !userRow.plant_id) {
+        // Confirmed: this user belongs to no plant → onboarding is correct.
+        setPlant(null); setMe(null);
+        return;
+      }
+      const { data: plantRow, error: pErr } = await sb.from('plants').select('*').eq('id', userRow.plant_id).maybeSingle();
+      if (pErr) throw pErr;
+      if (!plantRow) { setPlant(null); setMe(null); return; }
+      // Resolve the accessible/active unit BEFORE rendering the Shell, so the
+      // module-global _activeUnitId is set before any module mounts and runs its
+      // loaders. Otherwise loaders fetch with a null active unit (unitScope becomes
+      // a no-op) and a multi-unit manager sees every unit's data until a refetch.
+      await loadUnits();
+      setPlant(plantRow);
+      setMe(userRow);
+      // RBAC Phase 1: fetch my permissions. Non-blocking — if the RPC ever fails
+      // we fall back to the legacy users.role behavior so the app never bricks.
+      try {
+        const { data: perms } = await sb.rpc('my_permissions');
+        setMyPerms(perms || { rbac_enforced: false, permissions: [], roles: [] });
+      } catch (_e) {
+        setMyPerms({ rbac_enforced: false, permissions: [], roles: [] });
+      }
+      // Clear URL query params on successful load, but KEEP the #page hash so a
+      // refresh stays on the current page.
+      if (window.location.search) {
+        window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+      }
+    } catch (e) {
+      // Couldn't determine membership (network / RLS stall). Do NOT fall through
+      // to the onboarding chooser — an existing user must never be able to
+      // accidentally start a new plant. Show a Retry screen instead.
+      console.warn('[Loglinkr] loadProfile failed:', e);
+      setProfileErr(true);
+    } finally {
+      setProfileLoading(false);
     }
   };
 
   const handleAuth = async (u) => {
+    setProfileLoading(true);   // gate the onboarding chooser from the first frame
     setUser(u);
     await detectInvite(u);
     await loadProfile(u);
@@ -1859,7 +1877,26 @@ function App() {
   // A reset link short-circuits everything else, signed in or not.
   if (resetToken) return html`<${ResetPasswordScreen} token=${resetToken} />`;
   if (!user) return html`<${AuthScreen} onAuth=${handleAuth} pendingInviteCode=${urlCode} />`;
-  if (!plant) return html`<${Wizard} user=${user} pendingInvite=${pendingInvite} onDone=${(p) => loadProfile(user)} />`;
+  if (!plant) {
+    // Still resolving which plant this signed-in user belongs to — show a spinner,
+    // NEVER the onboarding chooser. This is what stops an existing user from seeing
+    // (and mis-tapping) "Set up a new plant" during the sign-in load.
+    if (profileLoading) return html`<div class="loader"><div class="spinner"></div></div>`;
+    // Lookup failed (flaky connection / stalled query) — offer a retry rather than
+    // dropping to onboarding, so a duplicate plant can never be created by accident.
+    if (profileErr) return html`
+      <div class="wizard">
+        <div class="auth-logo" style="margin-bottom:24px"><div class="logo-mark">L</div><div class="display" style="font-size:22px;font-weight:700">Loglinkr</div></div>
+        <div class="wizard-step" style="text-align:center">
+          <h2>Couldn't load your plant</h2>
+          <p class="sub">Check your connection and try again — your account is safe.</p>
+          <button class="btn" style="margin-bottom:10px" onClick=${() => loadProfile(user)}>Retry</button>
+          <button class="btn ghost" style="width:100%" onClick=${async () => { await sb.auth.signOut(); location.reload(); }}>Sign out</button>
+        </div>
+      </div>`;
+    // Confirmed: a genuinely new user with no plant → onboarding chooser.
+    return html`<${Wizard} user=${user} pendingInvite=${pendingInvite} onDone=${(p) => loadProfile(user)} />`;
+  }
   // Founder admin panel — only the platform owner sees it. Toggled via the
   // ?admin=1 URL param so it's never reachable for a customer even by
   // accident. Mounted BEFORE the approval gate so the founder can review
