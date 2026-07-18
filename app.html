@@ -11057,6 +11057,48 @@ function More({ plant, me, myPerms, user, logout, setTab, activeUnit, accessible
       `;
     })()}
 
+    ${(() => {
+      // Non-whitelist plants (fabrication / legacy, enabled_tabs unset): surface
+      // top-level tabs the 4-slot mobile bottom bar can't fit AND that aren't in
+      // MORE_GROUPS — otherwise they're unreachable on mobile. The classic case is
+      // Stocks on a fabrication plant (it lives only in the desktop top bar).
+      const enabledTabs = Array.isArray(plant?.enabled_tabs) ? plant.enabled_tabs : [];
+      if (enabledTabs.length > 0) return null;   // whitelist plants handled above
+      const fab = isFab(plant);
+      const guard = moduleAccessGuard(myPerms);
+      const extra = new Set(Array.isArray(plant?.extra_modules) ? plant.extra_modules : []);
+      const mobilePrimary = fab ? ['home','projects','quality','chat'] : ['home','production','quality','chat'];
+      const candidates = fab
+        ? ['stocks','maintenance','actions','documents','reports']
+        : ['stocks','maintenance','actions','documents','schedules','reports'];
+      const keys = candidates
+        .filter(k => TOP_TAB_META[k])
+        .filter(k => !OPT_IN_TAB_KEYS.has(k) || extra.has(k))
+        .filter(k => !mobilePrimary.includes(k))     // already in the bottom bar
+        .filter(k => !MORE_FLAT_KEYS.includes(k))     // already reachable via a More group
+        .filter(k => !guard.enforce || !RBAC_MODULE_KEYS.has(k) || guard.canView(k));
+      if (keys.length === 0) return null;
+      return html`
+        <div class="section-h">Plant modules</div>
+        <div class="card" style="padding:0;margin-bottom:8px;overflow:hidden">
+          ${keys.map(k => {
+            const meta = TOP_TAB_META[k]; const isActive = k === tab;
+            return html`
+              <div class="list-item" key=${k} onClick=${() => setTab(k)} style=${'border-bottom:1px solid var(--slate-100);'+(isActive?'background:var(--teal-50);border-left:3px solid var(--teal-600)':'')}>
+                <div class="list-item-row">
+                  <div class="list-item-main">
+                    <div class="list-item-title" style=${isActive?'color:var(--teal-800);font-weight:600':''}>${meta.icon}  ${meta.label}${isActive?' · current':''}</div>
+                    <div class="list-item-sub">${meta.sub}</div>
+                  </div>
+                  <span style="color:var(--slate-400);font-size:18px">${isActive?'●':'›'}</span>
+                </div>
+              </div>
+            `;
+          })}
+        </div>
+      `;
+    })()}
+
     <div class="section-h" style="display:flex;justify-content:space-between;align-items:center">
       <span>Modules</span>
       <span style="display:flex;gap:6px">
