@@ -3,14 +3,11 @@
 // and posts it here; Claude reads the whole thing and returns a clean, deduped
 // stock list regardless of how the company laid it out. No fixed template.
 //
-// Robustness (why this shape): large sheets (hundreds of SKUs) used to make Claude
-// emit a huge verbose-JSON response that ran past the gateway timeout → HTTP 504.
-// Two defences:
-//   1) Claude returns COMPACT pipe-delimited rows (not per-item JSON) — ~3× fewer
-//      output tokens → ~3× faster generation. We parse the rows server-side.
-//   2) The response is STREAMED with a whitespace heartbeat so the gateway never
-//      idle-times-out while Claude is working. The body is "<spaces>{json}", which
-//      JSON.parse (and fetch's res.json()) accept unchanged — no client change.
+// Speed/robustness: Claude replies in COMPACT pipe-delimited rows (not verbose
+// per-item JSON) — ~3× fewer output tokens, so even a several-hundred-SKU sheet
+// finishes well inside the platform's wall-clock limit. Wide day-by-day movement
+// ledgers are trimmed (column cap) so they don't dominate the prompt. Plain
+// (non-streamed) JSON response so real errors surface with a proper status code.
 // Deployed via Supabase MCP; this file is the tracked mirror.
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
@@ -22,7 +19,7 @@ const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-sonnet-4-6";
 const MAX_CHARS = 90000;  // cap the sheet text we send
 const MAX_COLS = 40;      // cap columns per row (day-by-day ledgers can be 100+ wide)
-const MAX_OUT = 16000;    // compact rows ~15-20 tok/item → headroom for ~800 items
+const MAX_OUT = 8192;     // compact rows ~12-18 tok/item → ~450-650 items; model-safe cap
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -101,59 +98,6 @@ function parseRows(text: string): { items: Record<string, unknown>[]; confidence
   return { items, confidence, notes };
 }
 
-async function extract(body: { sheets: Array<{ name: string; rows: string[][] }>; filename?: string }) {
-  const text = sheetsToText(body.sheets);
-  if (!text.trim()) return { error: "No cell data found in the sheet." };
-
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: MAX_OUT,
-      messages: [{ role: "user", content: [
-        { type: "text", text: "FILE: " + (body.filename || "stock.xlsx") + "\n\nSPREADSHEET CONTENT (pipe-separated cells, one row per line, one section per sheet):\n" + text },
-        { type: "text", text: PROMPT },
-      ] }],
-    }),
-  });
-  const msg = await res.json();
-  if (msg.type === "error" || msg.error) return { error: msg.error?.message || "Claude API error" };
-  const outText = (msg.content || []).filter((b: { type: string }) => b.type === "text").map((b: { text: string }) => b.text).join("\n");
-
-  const { items: raw, confidence, notes } = parseRows(outText);
-  if (!raw.length) return { error: "No stock items were found in the file.", raw: outText.slice(0, 800) };
-
-  // Normalize + de-dup by code (defensive)
-  const seen = new Set<string>();
-  const num = (v: unknown) => { const x = parseFloat(String(v ?? "").replace(/[^0-9.\-]/g, "")); return isFinite(x) ? x : null; };
-  const items = raw.map((it) => {
-    let code = String(it.code || "").trim().toUpperCase().replace(/\s+/g, "-").slice(0, 24);
-    if (!code) code = String(it.name || "ITEM").trim().toUpperCase().replace(/[^A-Z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || "ITEM";
-    let key = code, n = 1;
-    while (seen.has(key)) key = code.slice(0, 20) + "-" + (++n);
-    seen.add(key);
-    return {
-      code: key,
-      name: String(it.name || key).trim(),
-      category: CATS.includes(String(it.category)) ? it.category : "general",
-      subcategory: it.subcategory ? String(it.subcategory).trim().slice(0, 60) : null,
-      uom: String(it.uom || "nos").trim() || "nos",
-      opening_qty: num(it.opening_qty) ?? 1,
-      unit_cost: num(it.unit_cost),
-      notes: it.notes ? String(it.notes).slice(0, 200) : null,
-    };
-  });
-
-  const totalQty = items.reduce((s, i) => s + (Number(i.opening_qty) || 0), 0);
-  return {
-    success: true, items,
-    summary: { total_items: items.length, total_qty: totalQty, source: null },
-    confidence, notes,
-    usage: msg.usage || null,
-  };
-}
-
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   try {
@@ -169,39 +113,70 @@ Deno.serve(async (req) => {
     const sheets = Array.isArray(body.sheets) ? body.sheets : null;
     if (!sheets || !sheets.length) return json({ error: "sheets[] required" }, 400);
 
-    // Stream a whitespace heartbeat while Claude works so the gateway never 504s.
-    // Final chunk is the JSON payload; leading whitespace is valid for JSON.parse.
-    const enc = new TextEncoder();
-    const stream = new ReadableStream({
-      async start(controller) {
-        const beat = setInterval(() => { try { controller.enqueue(enc.encode(" ")); } catch { /* closed */ } }, 8000);
-        try {
-          const result = await extract({ sheets, filename: body.filename }) as Record<string, unknown>;
-          // Fire-and-forget usage logging (never blocks the response)
-          if (result.success && result.usage) {
-            try {
-              const u = result.usage as { input_tokens?: number; output_tokens?: number };
-              const svc = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
-              const cost = (u.input_tokens || 0) * 3 / 1e6 + (u.output_tokens || 0) * 15 / 1e6;
-              const { data: me } = await db.from("users").select("plant_id").eq("id", user.id).maybeSingle();
-              if (me?.plant_id) await svc.from("ai_usage").insert({
-                plant_id: me.plant_id, kind: "stock_extract", model: MODEL,
-                input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0,
-                cost_usd: Number(cost.toFixed(6)),
-              });
-            } catch { /* logging must never fail the extract */ }
-          }
-          delete result.usage;
-          controller.enqueue(enc.encode(JSON.stringify(result)));
-        } catch (e) {
-          controller.enqueue(enc.encode(JSON.stringify({ error: (e as Error).message || "Internal error" })));
-        } finally {
-          clearInterval(beat);
-          controller.close();
-        }
-      },
+    const text = sheetsToText(sheets);
+    if (!text.trim()) return json({ error: "No cell data found in the sheet." }, 400);
+
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: MAX_OUT,
+        messages: [{ role: "user", content: [
+          { type: "text", text: "FILE: " + (body.filename || "stock.xlsx") + "\n\nSPREADSHEET CONTENT (pipe-separated cells, one row per line, one section per sheet):\n" + text },
+          { type: "text", text: PROMPT },
+        ] }],
+      }),
     });
-    return new Response(stream, { headers: { ...CORS, "Content-Type": "application/json" } });
+    if (!res.ok) {
+      const t = await res.text();
+      return json({ error: "AI request failed (" + res.status + "): " + t.slice(0, 300) }, 502);
+    }
+    const msg = await res.json();
+    if (msg.type === "error" || msg.error) return json({ error: msg.error?.message || "Claude API error" }, 502);
+    const outText = (msg.content || []).filter((b: { type: string }) => b.type === "text").map((b: { text: string }) => b.text).join("\n");
+
+    const { items: raw, confidence, notes } = parseRows(outText);
+    if (!raw.length) return json({ error: "No stock items were found in the file.", raw: outText.slice(0, 800) }, 200);
+
+    // Normalize + de-dup by code (defensive)
+    const seen = new Set<string>();
+    const num = (v: unknown) => { const x = parseFloat(String(v ?? "").replace(/[^0-9.\-]/g, "")); return isFinite(x) ? x : null; };
+    const items = raw.map((it) => {
+      let code = String(it.code || "").trim().toUpperCase().replace(/\s+/g, "-").slice(0, 24);
+      if (!code) code = String(it.name || "ITEM").trim().toUpperCase().replace(/[^A-Z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || "ITEM";
+      let key = code, n = 1;
+      while (seen.has(key)) key = code.slice(0, 20) + "-" + (++n);
+      seen.add(key);
+      return {
+        code: key,
+        name: String(it.name || key).trim(),
+        category: CATS.includes(String(it.category)) ? it.category : "general",
+        subcategory: it.subcategory ? String(it.subcategory).trim().slice(0, 60) : null,
+        uom: String(it.uom || "nos").trim() || "nos",
+        opening_qty: num(it.opening_qty) ?? 1,
+        unit_cost: num(it.unit_cost),
+        notes: it.notes ? String(it.notes).slice(0, 200) : null,
+      };
+    });
+
+    // Log usage (service role) — never fails the extract
+    try {
+      const svc = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
+      const cost = (msg.usage?.input_tokens || 0) * 3 / 1e6 + (msg.usage?.output_tokens || 0) * 15 / 1e6;
+      const { data: me } = await db.from("users").select("plant_id").eq("id", user.id).maybeSingle();
+      if (me?.plant_id) await svc.from("ai_usage").insert({
+        plant_id: me.plant_id, kind: "stock_extract", model: MODEL,
+        input_tokens: msg.usage?.input_tokens || 0, output_tokens: msg.usage?.output_tokens || 0,
+        cost_usd: Number(cost.toFixed(6)),
+      });
+    } catch (_) { /* ignore */ }
+
+    return json({
+      success: true, items,
+      summary: { total_items: items.length, total_qty: items.reduce((s, i) => s + (Number(i.opening_qty) || 0), 0), source: null },
+      confidence, notes,
+    });
   } catch (e) {
     return json({ error: (e as Error).message || "Internal error" }, 500);
   }
