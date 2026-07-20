@@ -12136,34 +12136,81 @@ function ppapCpk(c, vals) {
 const ppapCpkBadge = (band) => band === 'excellent' || band === 'capable' ? 'emerald' : band === 'marginal' ? 'amber' : 'rose';
 const ppapCpkFmt = (v) => v == null ? '—' : v === Infinity ? '∞' : v.toFixed(2);
 
+// AIAG MSA (4th ed.) Average & Range method constants.
+const MSA_K1 = { 2: 0.8862, 3: 0.5908 };                                                                  // trials (1/d2)
+const MSA_K2 = { 2: 0.7071, 3: 0.5231 };                                                                  // operators
+const MSA_K3 = { 2:0.7071, 3:0.5231, 4:0.4467, 5:0.4030, 6:0.3742, 7:0.3534, 8:0.3375, 9:0.3249, 10:0.3146 }; // parts
+// Gauge R&R from raw readings [{op,part,trial,v}]. Returns EV/AV/GRR/PV/TV, the
+// %-of-total-variation split, ndc, %P/T and an accept/marginal/reject verdict.
+function ppapGRR({ readings, n_operators, n_parts, n_trials, tolerance }) {
+  const O = Number(n_operators) || 3, P = Number(n_parts) || 10, T = Number(n_trials) || 3;
+  const rows = (readings || []).map(r => ({ op: Number(r.op), part: Number(r.part), trial: Number(r.trial), v: Number(r.v) })).filter(r => isFinite(r.v));
+  if (rows.length < 2) return null;
+  // per operator+part: trial values → range; operator running values; part values
+  const cell = {}, opVals = {}, partVals = {};
+  for (const r of rows) {
+    (cell[r.op] = cell[r.op] || {}); (cell[r.op][r.part] = cell[r.op][r.part] || []).push(r.v);
+    (opVals[r.op] = opVals[r.op] || []).push(r.v);
+    (partVals[r.part] = partVals[r.part] || []).push(r.v);
+  }
+  let rangeSum = 0, rangeCount = 0;
+  for (const o of Object.keys(cell)) for (const p of Object.keys(cell[o])) {
+    const a = cell[o][p]; if (a.length < 2) continue;
+    rangeSum += Math.max(...a) - Math.min(...a); rangeCount++;
+  }
+  if (!rangeCount) return null;
+  const Rbar = rangeSum / rangeCount;
+  const opAvgs = Object.values(opVals).filter(a => a.length).map(a => a.reduce((s, x) => s + x, 0) / a.length);
+  const Xdiff = opAvgs.length > 1 ? Math.max(...opAvgs) - Math.min(...opAvgs) : 0;
+  const partAvgs = Object.values(partVals).filter(a => a.length).map(a => a.reduce((s, x) => s + x, 0) / a.length);
+  const Rp = partAvgs.length > 1 ? Math.max(...partAvgs) - Math.min(...partAvgs) : 0;
+  const K1 = MSA_K1[T] || (1 / 1.128), K2 = MSA_K2[O] || 0.7071, K3 = MSA_K3[P] || 0.3146;
+  const EV = Rbar * K1;
+  const AV = Math.sqrt(Math.max(0, Math.pow(Xdiff * K2, 2) - (EV * EV) / (P * T)));
+  const GRR = Math.sqrt(EV * EV + AV * AV);
+  const PV = Rp * K3;
+  const TV = Math.sqrt(GRR * GRR + PV * PV);
+  const pct = (x) => TV > 0 ? 100 * x / TV : null;
+  const ndc = GRR > 0 ? Math.floor(1.41 * (PV / GRR)) : null;
+  const tol = tolerance != null && tolerance !== '' ? Number(tolerance) : null;
+  const pctPT = (tol && tol > 0) ? 100 * (6 * GRR) / tol : null;
+  const grrPct = pct(GRR);
+  const verdict = grrPct == null ? '' : grrPct < 10 ? 'acceptable' : grrPct <= 30 ? 'marginal' : 'unacceptable';
+  return { Rbar, Xdiff, Rp, EV, AV, GRR, PV, TV, pctEV: pct(EV), pctAV: pct(AV), pctGRR: grrPct, pctPV: pct(PV), ndc, pctPT, verdict };
+}
+const ppapGrrBadge = (v) => v === 'acceptable' ? 'emerald' : v === 'marginal' ? 'amber' : v === 'unacceptable' ? 'rose' : 'slate';
+
 function PpapBuilder({ plant, me, submission, onBack }) {
   const [chars, setChars] = useState([]);
   const [meas, setMeas] = useState({});             // `${charId}:${sampleNo}` -> actual
   const [steps, setSteps] = useState([]);           // process flow rows
   const [elems, setElems] = useState({});           // element_key -> ppap_elements row
   const [docs, setDocs] = useState([]);             // ppap_documents rows
+  const [msaStudies, setMsaStudies] = useState([]); // ppap_msa_studies rows
   const [sampleCount, setSampleCount] = useState(5);
   const [view, setView] = useState('chars');        // chars | results | flow | elements
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState('');
   const [editChar, setEditChar] = useState(null);   // char row or {_new:true}
   const [editStep, setEditStep] = useState(null);   // step row or {_new:true}
+  const [editMsa, setEditMsa] = useState(null);     // msa study row or {_new:true}
   const [pfmeaOpen, setPfmeaOpen] = useState(false);
   const csvRef = useRef(null);
   const elDocRef = useRef({ key: null, input: null });
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [{ data }, { data: st }, { data: el }, { data: dc }] = await Promise.all([
+    const [{ data }, { data: st }, { data: el }, { data: dc }, { data: ms }] = await Promise.all([
       sb.from('ppap_characteristics').select('*').eq('ppap_id', submission.id).order('seq').order('created_at'),
       sb.from('ppap_process_steps').select('*').eq('ppap_id', submission.id).order('seq').order('created_at'),
       sb.from('ppap_elements').select('*').eq('ppap_id', submission.id),
       sb.from('ppap_documents').select('*').eq('ppap_id', submission.id).order('uploaded_at', { ascending: false }),
+      sb.from('ppap_msa_studies').select('*').eq('ppap_id', submission.id).order('created_at', { ascending: false }),
     ]);
     const list = data || [];
     setChars(list); setSteps(st || []);
     const emap = {}; (el || []).forEach(e => { emap[e.element_key] = e; }); setElems(emap);
-    setDocs(dc || []);
+    setDocs(dc || []); setMsaStudies(ms || []);
     if (list.length) {
       const { data: m } = await sb.from('ppap_measurements').select('characteristic_id, sample_no, actual').in('characteristic_id', list.map(c => c.id));
       const map = {}; let maxS = 5;
@@ -12325,6 +12372,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     const st = (elems[e.key] || {}).status;
     if (st) return st;
     if (e.key === 'dimensional' && chars.length) return hasMeasurements() ? 'complete' : 'in_progress';
+    if (e.key === 'msa' && msaStudies.length) return msaStudies.some(s => { const r = ppapGRR(s); return r && r.verdict === 'unacceptable'; }) ? 'in_progress' : 'complete';
     if (e.key === 'spc' && hasCapability()) return 'in_progress';
     if ((e.key === 'control_plan' || e.key === 'process_flow') && steps.length) return 'in_progress';
     if (e.key === 'psw') return 'complete';
@@ -12375,6 +12423,35 @@ function PpapBuilder({ plant, me, submission, onBack }) {
   const genSpc = () => ppapOpenDoc(reportShell(plant, 'Initial Process Study (Cpk)',
     `${submission.part_number || ''}${submission.part_revision ? ' rev ' + submission.part_revision : ''} · ${submission.customer_name || ''}`,
     spcBodyHtml(), { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Characteristics': chars.length, 'IATF': '9.1.1.1' }));
+
+  // ---- Element 8 · Measurement System Analysis (Gauge R&R) ----
+  const delMsa = async (id) => { if (!confirm('Delete this MSA study?')) return; await sb.from('ppap_msa_studies').delete().eq('id', id); refresh(); };
+  const msaCharLabel = (s) => { const c = chars.find(c => c.id === s.characteristic_id); return c ? (c.balloon_no ? '[' + c.balloon_no + '] ' : '') + (c.description || '') : (s.gauge_name || 'Gauge study'); };
+  const pct1 = (v) => v == null ? '—' : v.toFixed(1) + '%';
+  const msaBodyHtml = () => {
+    if (!msaStudies.length) return '<h2 class="section">Element 8 · Measurement System Analysis</h2><div class="empty">No Gauge R&R studies recorded.</div>';
+    const blocks = msaStudies.map(s => {
+      const r = ppapGRR(s);
+      const head = `<div style="font-weight:700;margin:14px 0 4px">${ppapEsc(s.gauge_name || 'Gauge')}${s.gauge_id_no ? ' · ' + ppapEsc(s.gauge_id_no) : ''} — ${ppapEsc(msaCharLabel(s))}</div>
+        <div style="font-size:11px;color:#64748b">${s.n_operators} operators × ${s.n_parts} parts × ${s.n_trials} trials${s.tolerance != null ? ' · tolerance ' + s.tolerance : ''}</div>`;
+      if (!r) return head + '<div class="empty">Not enough readings to compute.</div>';
+      const verdictTxt = r.verdict === 'acceptable' ? 'Acceptable (&lt; 10%)' : r.verdict === 'marginal' ? 'Marginal (10–30%) — may be accepted per customer/application' : 'Unacceptable (&gt; 30%) — improve the measurement system';
+      return head + `<table class="data"><thead><tr><th>Source</th><th class="num">Std dev</th><th class="num">% of Total Variation</th></tr></thead><tbody>
+        <tr><td>Repeatability (EV)</td><td class="num">${r.EV.toFixed(4)}</td><td class="num">${pct1(r.pctEV)}</td></tr>
+        <tr><td>Reproducibility (AV)</td><td class="num">${r.AV.toFixed(4)}</td><td class="num">${pct1(r.pctAV)}</td></tr>
+        <tr><td><b>Gauge R&amp;R</b></td><td class="num"><b>${r.GRR.toFixed(4)}</b></td><td class="num"><b>${pct1(r.pctGRR)}</b></td></tr>
+        <tr><td>Part Variation (PV)</td><td class="num">${r.PV.toFixed(4)}</td><td class="num">${pct1(r.pctPV)}</td></tr>
+        <tr><td>Total Variation (TV)</td><td class="num">${r.TV.toFixed(4)}</td><td class="num">100%</td></tr>
+        </tbody></table>
+        <div style="font-size:11px;margin-top:4px">ndc (distinct categories) = <b>${r.ndc ?? '—'}</b> ${r.ndc != null && r.ndc >= 5 ? '(≥ 5 ✓)' : '(should be ≥ 5)'}${r.pctPT != null ? ' · %P/T = <b>' + pct1(r.pctPT) + '</b>' : ''}</div>
+        <div style="font-size:11px;margin-top:2px">Verdict: <b>${verdictTxt}</b></div>`;
+    }).join('');
+    return `<h2 class="section">Element 8 · Measurement System Analysis (Gauge R&amp;R)</h2>${blocks}
+      <div style="font-size:10px;color:#94a3b8;margin-top:6px">AIAG MSA (4th ed.) Average &amp; Range method. Acceptance: %GRR &lt; 10% accept · 10–30% marginal · &gt; 30% reject; ndc ≥ 5.</div>`;
+  };
+  const genMsa = () => ppapOpenDoc(reportShell(plant, 'Measurement System Analysis (MSA)',
+    `${submission.part_number || ''}${submission.part_revision ? ' rev ' + submission.part_revision : ''} · ${submission.customer_name || ''}`,
+    msaBodyHtml(), { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Studies': msaStudies.length, 'IATF': '7.1.5.1.1' }));
 
   const pfdTableHtml = () => steps.length === 0
     ? '<div class="empty">No process steps defined.</div>'
@@ -12444,6 +12521,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
       <h2 class="section">Element 9 · Dimensional ${hasMeasurements() ? 'Results' : 'Characteristics'} (${chars.length})</h2>
       ${hasMeasurements() ? dimResultsTableHtml() : charTableHtml()}
       ${hasCapability() ? spcBodyHtml() : ''}
+      ${msaStudies.length ? msaBodyHtml() : ''}
       ${pswBodyHtml()}`;
     ppapOpenDoc(reportShell(plant, 'PPAP Package', `${submission.part_number || ''} · ${submission.customer_name || ''}`, body,
       { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Characteristics': chars.length, 'IATF': '8.3.4.4' }));
@@ -12529,6 +12607,21 @@ function PpapBuilder({ plant, me, submission, onBack }) {
             <td style="padding:6px 8px;text-align:center">${cap ? html`<span class="badge ${ppapCpkBadge(cap.band)}" title=${'mean ' + cap.mean.toFixed(3) + ' · σ ' + cap.sigma.toFixed(4) + (cap.cp!=null?' · Cp ' + ppapCpkFmt(cap.cp):'')}>${ppapCpkFmt(cap.cpk)}</span>` : html`<span style="color:var(--slate-300)">—</span>`}</td>
           </tr>`; })}
           </tbody></table></div>`}
+
+      <div class="section-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-top:8px">
+        <span>🔬 MSA · Gauge R&R studies · ${msaStudies.length}</span>
+        <button class="btn small" onClick=${() => setEditMsa({ _new:true })}>+ Add study</button>
+      </div>
+      ${msaStudies.length === 0 ? html`<div class="card"><div class="empty" style="padding:16px"><div class="icon">🔬</div>No Gauge R&R studies. Add one to prove the measurement system (Element 8) — operators × parts × trials, auto %GRR / ndc.</div></div>` :
+        html`<div class="card" style="padding:0;overflow:hidden;margin-bottom:14px">${msaStudies.map(s => { const r = ppapGRR(s); return html`<div key=${s.id} style="display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--slate-100)">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13px;font-weight:600">${s.gauge_name || 'Gauge'}${s.gauge_id_no ? ' · ' + s.gauge_id_no : ''}</div>
+            <div style="font-size:11px;color:var(--slate-500)">${msaCharLabel(s)} · ${s.n_operators}×${s.n_parts}×${s.n_trials}</div>
+          </div>
+          ${r ? html`<span class="badge ${ppapGrrBadge(r.verdict)}" title=${'ndc ' + (r.ndc ?? '—') + (r.pctPT!=null?' · %P/T ' + r.pctPT.toFixed(1):'')}>%GRR ${r.pctGRR!=null?r.pctGRR.toFixed(1):'—'}%</span>` : html`<span class="badge slate">no data</span>`}
+          <button class="btn small ghost" style="padding:2px 6px;font-size:10px" onClick=${() => setEditMsa(s)}>Edit</button>
+          <button class="btn small ghost" style="padding:2px 6px;font-size:10px;color:var(--rose-600)" onClick=${() => delMsa(s.id)}>✕</button>
+        </div>`; })}</div>`}
     ` : view === 'flow' ? html`
       <div class="section-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
         <span>Process flow · ${steps.length}</span>
@@ -12561,6 +12654,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
               ${st.doc_url ? html`<a href=${st.doc_url} target="_blank" style="font-size:11px;color:var(--teal-700)">📎 attached</a>`
                 : e.key==='dimensional' ? html`<span style="font-size:11px;color:var(--slate-500)">${chars.length} char.${hasMeasurements()?' · results entered':''}</span>`
                 : e.key==='spc' ? (hasCapability() ? (() => { const s = capabilitySummary(); return html`<span style="font-size:11px;color:var(--slate-500)">${s.capable}/${s.computed} capable (Cpk ≥ 1.33)</span>`; })() : html`<span style="font-size:11px;color:var(--slate-500)">enter samples to compute Cpk</span>`)
+                : e.key==='msa' ? html`<span style="font-size:11px;color:var(--slate-500)">${msaStudies.length ? msaStudies.length + ' Gauge R&R stud' + (msaStudies.length===1?'y':'ies') : 'no studies — see Dimensional Results'}</span>`
                 : (e.key==='control_plan'||e.key==='process_flow') ? html`<span style="font-size:11px;color:var(--slate-500)">${steps.length} steps</span>`
                 : e.key==='psw' ? html`<span style="font-size:11px;color:var(--slate-500)">generated on build</span>` : ''}
             </div>
@@ -12583,6 +12677,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
         <button class="btn small ghost" onClick=${genControlPlan}>📋 Control Plan</button>
         <button class="btn small ghost" onClick=${genDimResults}>📏 Dimensional Results</button>
         <button class="btn small ghost" disabled=${!hasCapability()} title=${hasCapability()?'Cp/Cpk study from the entered samples':'Enter ≥2 samples per toleranced characteristic first'} onClick=${genSpc}>📈 Initial Process Study (Cpk)</button>
+        <button class="btn small ghost" disabled=${!msaStudies.length} title=${msaStudies.length?'Gauge R&R summary':'Add a Gauge R&R study on the Dimensional Results tab first'} onClick=${genMsa}>🔬 MSA (Gauge R&R)</button>
         <button class="btn small" onClick=${genPacket}>📑 Build packet (Level ${submission.ppap_level || 3})</button>
       </div>
     </div>
@@ -12590,6 +12685,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     ${editChar && html`<${PpapCharModal} plant=${plant} submission=${submission} row=${editChar} nextSeq=${nextSeq()} onClose=${() => setEditChar(null)} onSaved=${() => { setEditChar(null); refresh(); }} />`}
     ${editStep && html`<${PpapStepModal} plant=${plant} submission=${submission} row=${editStep} nextSeq=${nextStepSeq()} onClose=${() => setEditStep(null)} onSaved=${() => { setEditStep(null); refresh(); }} />`}
     ${pfmeaOpen && html`<${PpapPfmeaDraftModal} plant=${plant} me=${me} submission=${submission} steps=${steps} chars=${chars} onClose=${() => setPfmeaOpen(false)} onCreated=${() => { setPfmeaOpen(false); refresh(); }} />`}
+    ${editMsa && html`<${PpapMsaModal} plant=${plant} me=${me} submission=${submission} chars=${chars} row=${editMsa} onClose=${() => setEditMsa(null)} onSaved=${() => { setEditMsa(null); refresh(); }} />`}
   `;
 }
 
@@ -12762,6 +12858,108 @@ function PpapPfmeaDraftModal({ plant, me, submission, steps, chars, onClose, onC
             <button class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
             <button class="btn" disabled=${creating} onClick=${create} style="flex:2">${creating ? 'Creating…' : '✓ Create PFMEA (' + items.length + ' lines)'}</button>
           </div>`}
+      </div>
+    </div>
+  `;
+}
+
+// Gauge R&R data-entry + live %GRR (AIAG Average & Range). Readings are stored
+// as a flat [{op,part,trial,v}] array; %GRR / ndc / %P-T recompute as you type.
+function PpapMsaModal({ plant, me, submission, chars, row, onClose, onSaved }) {
+  const isNew = !row.id;
+  const [f, setF] = useState({
+    gauge_name: row.gauge_name || '', gauge_id_no: row.gauge_id_no || '',
+    characteristic_id: row.characteristic_id || '',
+    n_operators: row.n_operators || 3, n_parts: row.n_parts || 10, n_trials: row.n_trials || 3,
+    tolerance: row.tolerance ?? '',
+  });
+  const [vals, setVals] = useState(() => { const m = {}; (row.readings || []).forEach(r => { m[r.op + ':' + r.part + ':' + r.trial] = r.v; }); return m; });
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState('');
+
+  const O = Number(f.n_operators) || 3, P = Number(f.n_parts) || 10, T = Number(f.n_trials) || 3;
+  const opName = (o) => String.fromCharCode(64 + o);   // 1→A, 2→B, 3→C
+  const setVal = (op, part, trial, v) => setVals(p => ({ ...p, [op + ':' + part + ':' + trial]: v }));
+  const readingsArr = () => { const out = []; for (let o = 1; o <= O; o++) for (let p = 1; p <= P; p++) for (let t = 1; t <= T; t++) { const v = vals[o + ':' + p + ':' + t]; if (v !== '' && v != null && isFinite(Number(v))) out.push({ op: o, part: p, trial: t, v: Number(v) }); } return out; };
+  const live = ppapGRR({ readings: readingsArr(), n_operators: O, n_parts: P, n_trials: T, tolerance: f.tolerance });
+
+  const pickChar = (id) => {
+    const c = chars.find(c => c.id === id); const patch = { characteristic_id: id };
+    if (c && (f.tolerance === '' || f.tolerance == null)) { const tp = c.tol_plus != null ? Number(c.tol_plus) : 0, tm = c.tol_minus != null ? Number(c.tol_minus) : 0; if (tp || tm) patch.tolerance = tp + tm; }
+    if (c && !f.gauge_name) patch.gauge_name = f.gauge_name;
+    setF(x => ({ ...x, ...patch }));
+  };
+
+  const save = async () => {
+    setSaving(true); setErr('');
+    const payload = {
+      plant_id: plant.id, ppap_id: submission.id, characteristic_id: f.characteristic_id || null,
+      gauge_name: f.gauge_name || null, gauge_id_no: f.gauge_id_no || null,
+      n_operators: O, n_parts: P, n_trials: T, tolerance: f.tolerance === '' ? null : Number(f.tolerance),
+      readings: readingsArr(), updated_at: new Date().toISOString(),
+    };
+    let error;
+    if (isNew) ({ error } = await sb.from('ppap_msa_studies').insert({ ...payload, created_by: me.id }));
+    else       ({ error } = await sb.from('ppap_msa_studies').update(payload).eq('id', row.id));
+    if (error) { setErr(error.message); setSaving(false); return; }
+    showToast('MSA study saved'); onSaved();   // Element 8 status derives from studies
+  };
+
+  const sel = (label, key, opts) => html`<div class="field"><label>${label}</label>
+    <select value=${f[key]} onChange=${e => setF({ ...f, [key]: Number(e.target.value) })} style="padding:5px 6px;border:1px solid var(--slate-200);border-radius:6px">${opts.map(n => html`<option key=${n} value=${n}>${n}</option>`)}</select></div>`;
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:760px;max-height:92vh;overflow-y:auto">
+        <div class="modal-header"><div class="modal-title">🔬 ${isNew ? 'New' : 'Edit'} Gauge R&R study</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field-row">
+          <div class="field"><label>Gauge / instrument</label><input value=${f.gauge_name} onChange=${e => setF({ ...f, gauge_name: e.target.value })} placeholder="Digital micrometer" /></div>
+          <div class="field"><label>Gauge ID</label><input value=${f.gauge_id_no} onChange=${e => setF({ ...f, gauge_id_no: e.target.value })} placeholder="MIC-014" /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Characteristic (optional)</label>
+            <select value=${f.characteristic_id} onChange=${e => pickChar(e.target.value)} style="padding:5px 6px;border:1px solid var(--slate-200);border-radius:6px">
+              <option value="">— none —</option>
+              ${chars.map(c => html`<option key=${c.id} value=${c.id}>${c.balloon_no ? '[' + c.balloon_no + '] ' : ''}${(c.description || '').slice(0, 40)}</option>`)}
+            </select>
+          </div>
+          <div class="field"><label>Tolerance (for %P/T)</label><input type="number" step="any" value=${f.tolerance} onChange=${e => setF({ ...f, tolerance: e.target.value })} placeholder="e.g. 0.2" /></div>
+        </div>
+        <div class="field-row">
+          ${sel('Operators', 'n_operators', [2, 3])}
+          ${sel('Parts', 'n_parts', [2, 3, 4, 5, 6, 7, 8, 9, 10])}
+          ${sel('Trials', 'n_trials', [2, 3])}
+        </div>
+
+        <div style="font-size:12px;color:var(--slate-600);margin:8px 0 4px">Enter each operator's repeated readings of the same parts:</div>
+        ${Array.from({ length: O }, (_, oi) => { const o = oi + 1; return html`<div key=${o} style="margin-bottom:10px">
+          <div style="font-size:12px;font-weight:600;margin-bottom:3px">Operator ${opName(o)}</div>
+          <div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:11px">
+            <thead><tr style="background:var(--slate-50)"><th style="padding:4px 6px;text-align:left;color:var(--slate-500)">Part</th>${Array.from({ length: T }, (_, ti) => html`<th key=${ti} style="padding:4px 6px;color:var(--slate-500)">Trial ${ti + 1}</th>`)}</tr></thead>
+            <tbody>${Array.from({ length: P }, (_, pi) => { const p = pi + 1; return html`<tr key=${p} style="border-top:1px solid var(--slate-100)">
+              <td style="padding:2px 6px;color:var(--slate-400)">${p}</td>
+              ${Array.from({ length: T }, (_, ti) => { const t = ti + 1; return html`<td key=${t} style="padding:2px"><input type="number" step="any" value=${vals[o + ':' + p + ':' + t] ?? ''} onChange=${e => setVal(o, p, t, e.target.value)} style="width:66px;padding:3px;border:1px solid var(--slate-200);border-radius:4px;text-align:right" /></td>`; })}
+            </tr>`; })}</tbody>
+          </table></div>
+        </div>`; })}
+
+        <div class="card" style=${'margin:6px 0;background:' + (live ? (live.verdict === 'acceptable' ? 'var(--emerald-50)' : live.verdict === 'marginal' ? 'var(--amber-50)' : 'var(--rose-50)') : 'var(--slate-50)')}>
+          <div class="card-title">Live result</div>
+          ${live ? html`<div style="display:flex;gap:16px;flex-wrap:wrap;font-size:12px">
+            <div><b>%GRR</b> ${live.pctGRR != null ? live.pctGRR.toFixed(1) + '%' : '—'} <span class="badge ${ppapGrrBadge(live.verdict)}">${live.verdict || '—'}</span></div>
+            <div><b>%EV</b> ${live.pctEV != null ? live.pctEV.toFixed(1) + '%' : '—'}</div>
+            <div><b>%AV</b> ${live.pctAV != null ? live.pctAV.toFixed(1) + '%' : '—'}</div>
+            <div><b>%PV</b> ${live.pctPV != null ? live.pctPV.toFixed(1) + '%' : '—'}</div>
+            <div><b>ndc</b> ${live.ndc ?? '—'} ${live.ndc != null && live.ndc >= 5 ? '✓' : ''}</div>
+            ${live.pctPT != null ? html`<div><b>%P/T</b> ${live.pctPT.toFixed(1)}%</div>` : ''}
+          </div>` : html`<div style="font-size:12px;color:var(--slate-500)">Enter readings (≥2 trials per part) to compute.</div>`}
+        </div>
+
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
+          <button class="btn" disabled=${saving} onClick=${save} style="flex:2">${saving ? 'Saving…' : (isNew ? 'Create study' : 'Save')}</button>
+        </div>
       </div>
     </div>
   `;
