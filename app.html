@@ -11824,6 +11824,7 @@ function PpapModule({ plant, me }) {
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('all'); // all | active | expiring | expired | rejected | gap
   const [editTarget, setEditTarget] = useState(null);
+  const [builder, setBuilder] = useState(null);   // submission row being built into a packet
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -11869,6 +11870,8 @@ function PpapModule({ plant, me }) {
     return html`<span class="badge slate">${r.status}</span>`;
   };
 
+  if (builder) return html`<${PpapBuilder} plant=${plant} me=${me} submission=${builder} onBack=${() => { setBuilder(null); refresh(); }} />`;
+
   return html`
     <div class="page-header" style="display:flex;justify-content:space-between;align-items:center">
       <div><h1>PPAP Submissions</h1><div class="sub">IATF 8.3.4.4 · Production Part Approval Process</div></div>
@@ -11908,7 +11911,8 @@ function PpapModule({ plant, me }) {
               </div>
               <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
                 ${flagBadge(r)}
-                <button class="btn small ghost" style="padding:2px 8px;font-size:11px;margin-left:auto" onClick=${() => setEditTarget(r)}>Edit</button>
+                <button class="btn small" style="padding:2px 10px;font-size:11px;margin-left:auto" onClick=${() => setBuilder(r)}>🏗 Build packet</button>
+                <button class="btn small ghost" style="padding:2px 8px;font-size:11px" onClick=${() => setEditTarget(r)}>Edit</button>
               </div>
             </div>
           </div>
@@ -12045,6 +12049,337 @@ function PpapEditModal({ plant, me, row, onClose, onSaved }) {
           </div>
         `}
         <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Create submission' : 'Save')}</button>
+      </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// PPAP BUILDER (IATF 8.3.4.4) — turns a submission row into a guided
+// packet workflow: characteristics (single source of truth) → PSW +
+// printable packet. Characteristics flow in from CadNexa (postMessage),
+// Special Characteristics, CSV, or manual entry — always human-editable.
+// =================================================================
+
+// The 18 AIAG PPAP elements. `min` = the lowest submission level that
+// includes the element (Level 3 = full; L4 = customer-defined → show all).
+const PPAP_ELEMENTS = [
+  { key:'design_records',   label:'Design Records',                    clause:'', min:1 },
+  { key:'change_docs',      label:'Engineering Change Documents',      clause:'', min:3 },
+  { key:'customer_approval',label:'Customer Engineering Approval',     clause:'', min:3 },
+  { key:'dfmea',            label:'Design FMEA',                       clause:'', min:3 },
+  { key:'process_flow',     label:'Process Flow Diagram',              clause:'', min:3 },
+  { key:'pfmea',            label:'Process FMEA (PFMEA)',              clause:'', min:3 },
+  { key:'control_plan',     label:'Control Plan',                      clause:'8.5.1.1', min:3 },
+  { key:'msa',              label:'Measurement System Analysis (MSA)', clause:'', min:3 },
+  { key:'dimensional',      label:'Dimensional Results',               clause:'', min:2 },
+  { key:'material_tests',   label:'Material / Performance Test Results',clause:'', min:2 },
+  { key:'spc',              label:'Initial Process Studies (SPC)',     clause:'', min:3 },
+  { key:'lab_docs',         label:'Qualified Laboratory Documentation',clause:'', min:3 },
+  { key:'aar',              label:'Appearance Approval Report (AAR)',  clause:'', min:3 },
+  { key:'sample_parts',     label:'Sample Production Parts',           clause:'', min:2 },
+  { key:'master_sample',    label:'Master Sample',                     clause:'', min:3 },
+  { key:'checking_aids',    label:'Checking Aids',                     clause:'', min:3 },
+  { key:'csr',              label:'Customer-Specific Requirements',    clause:'8.2.2', min:3 },
+  { key:'psw',              label:'Part Submission Warrant (PSW)',     clause:'', min:1 },
+];
+const ppapElementsForLevel = (lvl) => {
+  const L = Number(lvl) || 3;
+  if (L === 4 || L === 5) return PPAP_ELEMENTS;      // customer-defined / full review
+  return PPAP_ELEMENTS.filter(e => L >= e.min);
+};
+
+// Open a generated HTML document in a new tab (its own Print / Save-PDF button).
+function ppapOpenDoc(html) {
+  const w = window.open('', '_blank');
+  if (!w) { alert('Please allow pop-ups to open / print the document.'); return false; }
+  w.document.open(); w.document.write(html); w.document.close(); return true;
+}
+const ppapEsc = (s) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const ppapTolLabel = (c) => {
+  const p = c.tol_plus, m = c.tol_minus;
+  if (p == null && m == null) return '';
+  if (p != null && m != null && Number(p) === Number(m)) return '±' + p;
+  return (p != null ? '+' + p : '') + (m != null ? ' / -' + m : '');
+};
+// Pass/fail of a measured value vs nominal + tolerance band.
+function ppapJudge(c, actual) {
+  if (actual == null || actual === '' || c.nominal == null) return null;
+  const a = Number(actual), nom = Number(c.nominal);
+  const hi = nom + (c.tol_plus != null ? Number(c.tol_plus) : 0);
+  const lo = nom - (c.tol_minus != null ? Number(c.tol_minus) : 0);
+  return a >= Math.min(lo, hi) - 1e-9 && a <= Math.max(lo, hi) + 1e-9;
+}
+
+function PpapBuilder({ plant, me, submission, onBack }) {
+  const [chars, setChars] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState('');
+  const [editChar, setEditChar] = useState(null);   // char row or {_new:true}
+  const csvRef = useRef(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('ppap_characteristics').select('*').eq('ppap_id', submission.id).order('seq').order('created_at');
+    setChars(data || []);
+    setLoading(false);
+  }, [submission.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const nextSeq = () => (chars.reduce((m, c) => Math.max(m, c.seq || 0), 0) + 1);
+
+  // ---- CadNexa receiver: the auto-balloon tool posts characteristics back ----
+  // Contract: { type:'CNX_RESULT', kind:'ppap_characteristics', ppapId,
+  //   characteristics:[{ balloon_no, description, nominal, tol_plus, tol_minus, uom, gd_t, classification }] }
+  useEffect(() => {
+    const onMsg = async (ev) => {
+      const d = ev.data;
+      if (!d || d.type !== 'CNX_RESULT' || d.kind !== 'ppap_characteristics') return;
+      if (d.ppapId && d.ppapId !== submission.id) return;
+      const list = Array.isArray(d.characteristics) ? d.characteristics : [];
+      if (!list.length) return;
+      let seq = nextSeq();
+      const rows = list.map(c => ({
+        plant_id: plant.id, ppap_id: submission.id, seq: seq++,
+        balloon_no: c.balloon_no != null ? String(c.balloon_no) : null,
+        description: c.description || null,
+        nominal: c.nominal != null && c.nominal !== '' ? Number(c.nominal) : null,
+        tol_plus: c.tol_plus != null && c.tol_plus !== '' ? Number(c.tol_plus) : null,
+        tol_minus: c.tol_minus != null && c.tol_minus !== '' ? Number(c.tol_minus) : null,
+        uom: c.uom || null, gd_t: c.gd_t || null,
+        classification: ['cc','sc'].includes(String(c.classification).toLowerCase()) ? String(c.classification).toLowerCase() : 'none',
+        source: 'cadnexa',
+      }));
+      const { error } = await sb.from('ppap_characteristics').insert(rows);
+      if (error) showToast('CadNexa import failed: ' + error.message);
+      else { showToast(`Imported ${rows.length} characteristics from CadNexa — review below`); refresh(); }
+    };
+    window.addEventListener('message', onMsg);
+    return () => window.removeEventListener('message', onMsg);
+  }, [submission.id, plant.id, chars]);
+
+  const openCadNexa = () => {
+    const qs = new URLSearchParams({
+      cxauto: 'balloon', tool: 'autoBalloon', mode: 'ppap',
+      plant: plant?.name || '', plant_id: plant?.id || '',
+      user: me?.full_name || '', email: me?.email || '',
+      returnTo: location.origin, ppapId: submission.id,
+      part: submission.part_number || '',
+    });
+    const w = window.open('https://cadnexa.com/app.html?' + qs.toString(), '_blank');
+    if (!w) alert('Pop-up blocked — allow pop-ups so CadNexa can open and post the ballooned characteristics back.');
+  };
+
+  const seedFromScl = async () => {
+    if (!submission.part_number) { showToast('This submission has no part number to match'); return; }
+    setBusy('scl');
+    const { data } = await sb.from('iatf_special_chars').select('*').eq('part_number', submission.part_number);
+    if (!data || !data.length) { showToast('No Special Characteristics found for ' + submission.part_number); setBusy(''); return; }
+    let seq = nextSeq();
+    const rows = data.map(s => ({
+      plant_id: plant.id, ppap_id: submission.id, seq: seq++,
+      balloon_no: s.characteristic_code || null, description: s.description || null,
+      nominal: s.spec_value != null && s.spec_value !== '' ? Number(String(s.spec_value).replace(/[^0-9.\-]/g,'')) || null : null,
+      tol_plus: s.tolerance_plus != null && s.tolerance_plus !== '' ? Number(s.tolerance_plus) : null,
+      tol_minus: s.tolerance_minus != null && s.tolerance_minus !== '' ? Number(s.tolerance_minus) : null,
+      uom: s.uom || null, gd_t: null,
+      classification: s.classification === 'critical' ? 'cc' : (s.classification === 'significant' ? 'sc' : 'none'),
+      source: 'scl',
+    }));
+    const { error } = await sb.from('ppap_characteristics').insert(rows);
+    setBusy('');
+    if (error) showToast(error.message); else { showToast(`Seeded ${rows.length} from Special Characteristics`); refresh(); }
+  };
+
+  const importCsv = async (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    setBusy('csv');
+    try {
+      const XLSX = await import('https://esm.sh/xlsx@0.18.5');
+      const wb = XLSX.read(await f.arrayBuffer(), { type:'array' });
+      const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header:1, blankrows:false, defval:'' });
+      if (aoa.length < 2) throw new Error('No data rows found.');
+      const hdr = aoa[0].map(h => String(h).toLowerCase().trim());
+      const col = (...names) => { for (const n of names) { const i = hdr.findIndex(h => h.includes(n)); if (i >= 0) return i; } return -1; };
+      const ci = { bal: col('balloon','ball','sr','s.no','no'), desc: col('description','feature','characteristic','char'), nom: col('nominal','spec','value'), tp: col('tol+','tol +','upper','+tol','plus'), tm: col('tol-','tol -','lower','-tol','minus'), uom: col('uom','unit'), gdt: col('gd','gd&t','gdt'), cls: col('class','cc','sc','type') };
+      const num = (v) => { const x = parseFloat(String(v).replace(/[^0-9.\-]/g,'')); return isFinite(x) ? x : null; };
+      let seq = nextSeq();
+      const rows = aoa.slice(1).filter(r => r.some(c => String(c).trim() !== '')).map(r => {
+        const g = (i) => i >= 0 ? r[i] : '';
+        const cls = String(g(ci.cls)).toLowerCase();
+        return { plant_id: plant.id, ppap_id: submission.id, seq: seq++,
+          balloon_no: ci.bal >= 0 ? String(g(ci.bal)) : null, description: ci.desc >= 0 ? String(g(ci.desc)) : null,
+          nominal: num(g(ci.nom)), tol_plus: num(g(ci.tp)), tol_minus: num(g(ci.tm)),
+          uom: ci.uom >= 0 ? String(g(ci.uom)) || null : null, gd_t: ci.gdt >= 0 ? String(g(ci.gdt)) || null : null,
+          classification: cls.includes('cc') || cls.includes('critical') ? 'cc' : (cls.includes('sc') || cls.includes('signif') ? 'sc' : 'none'),
+          source: 'csv' };
+      }).filter(r => r.description || r.balloon_no);
+      if (!rows.length) throw new Error('Could not read any characteristic rows.');
+      const { error } = await sb.from('ppap_characteristics').insert(rows);
+      if (error) throw error;
+      showToast(`Imported ${rows.length} characteristics from ${f.name}`); refresh();
+    } catch (err) { showToast(err.message || 'CSV import failed'); }
+    finally { setBusy(''); if (e.target) e.target.value = ''; }
+  };
+
+  const delChar = async (id) => { if (!confirm('Delete this characteristic?')) return; await sb.from('ppap_characteristics').delete().eq('id', id); refresh(); };
+
+  const applicable = ppapElementsForLevel(submission.ppap_level);
+
+  // ---- Document builders (reportShell + browser print) ----
+  const charTableHtml = () => chars.length === 0
+    ? '<div class="empty">No characteristics captured yet.</div>'
+    : `<table class="data"><thead><tr><th>#</th><th>Balloon</th><th>Characteristic</th><th class="num">Nominal</th><th>Tolerance</th><th>UOM</th><th>GD&amp;T</th><th>Class</th></tr></thead><tbody>${
+        chars.map((c, i) => `<tr><td class="num">${i+1}</td><td>${ppapEsc(c.balloon_no)}</td><td>${ppapEsc(c.description)}</td><td class="num">${c.nominal ?? ''}</td><td>${ppapEsc(ppapTolLabel(c))}</td><td>${ppapEsc(c.uom)}</td><td>${ppapEsc(c.gd_t)}</td><td>${c.classification && c.classification !== 'none' ? '<span class="badge amber">' + c.classification.toUpperCase() + '</span>' : ''}</td></tr>`).join('')
+      }</tbody></table>`;
+
+  const pswBodyHtml = () => {
+    const idx = applicable.map((e, i) => `<tr><td class="num">${i+1}</td><td>${e.label}</td><td>${e.key === 'dimensional' ? (chars.length ? '<span class="badge green">' + chars.length + ' char.</span>' : '<span class="badge slate">pending</span>') : e.key === 'psw' ? '<span class="badge green">this document</span>' : '<span class="badge slate">—</span>'}</td></tr>`).join('');
+    return `
+      <h2 class="section">Part Submission Warrant</h2>
+      <table class="data"><tbody>
+        <tr><th>Part number</th><td>${ppapEsc(submission.part_number)} ${submission.part_revision ? 'rev ' + ppapEsc(submission.part_revision) : ''}</td><th>Customer</th><td>${ppapEsc(submission.customer_name)}</td></tr>
+        <tr><th>Customer part #</th><td>${ppapEsc(submission.customer_part_number)}</td><th>PPAP level</th><td>Level ${submission.ppap_level || 3}</td></tr>
+        <tr><th>Reason</th><td>${ppapEsc((submission.reason||'').replace(/_/g,' '))}</td><th>Submission ref</th><td>${ppapEsc(submission.submission_ref)}</td></tr>
+        <tr><th>Submitted on</th><td>${ppapEsc(submission.submitted_on)}</td><th>Status</th><td>${ppapEsc(submission.status)}</td></tr>
+      </tbody></table>
+      <h2 class="section">Element checklist (Level ${submission.ppap_level || 3})</h2>
+      <table class="data"><thead><tr><th>#</th><th>Element</th><th>Status</th></tr></thead><tbody>${idx}</tbody></table>
+      <h2 class="section">Declaration</h2>
+      <p style="font-size:11px">The results reported represent parts produced under production conditions on production tooling and processes at the stated rate. We certify these samples meet all customer drawing and specification requirements unless noted.</p>
+      <table class="data" style="margin-top:24px"><thead><tr><th>Prepared by</th><th>Approved by (Supplier)</th><th>Customer approval</th></tr></thead>
+        <tbody><tr><td style="height:56px">${ppapEsc(me.full_name || '')}</td><td>${ppapEsc(submission.approver_name || '')}</td><td></td></tr>
+        <tr><td>Date:</td><td>Date:</td><td>Date:</td></tr></tbody></table>`;
+  };
+
+  const genPsw = () => ppapOpenDoc(reportShell(plant, 'Part Submission Warrant (PSW)',
+    `${submission.part_number || ''}${submission.part_revision ? ' rev ' + submission.part_revision : ''} · ${submission.customer_name || ''}`,
+    pswBodyHtml(), { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Reason': (submission.reason||'').replace(/_/g,' '), 'IATF': '8.3.4.4' }));
+
+  const genPacket = () => {
+    const idx = applicable.map((e, i) => `<tr><td class="num">${i+1}</td><td>${e.label}</td><td>${e.clause || ''}</td></tr>`).join('');
+    const body = `
+      <div style="text-align:center;padding:30px 0 20px;border-bottom:0.5px solid #e2e8f0;margin-bottom:16px">
+        <div style="font-size:22px;font-weight:800;color:#0f766e">PPAP Submission Packet</div>
+        <div style="font-size:14px;margin-top:6px">${ppapEsc(submission.part_number)} ${submission.part_revision ? 'rev ' + ppapEsc(submission.part_revision) : ''}</div>
+        <div style="font-size:12px;color:#64748b;margin-top:2px">${ppapEsc(submission.customer_name)} · Level ${submission.ppap_level || 3} · ${ppapEsc((submission.reason||'').replace(/_/g,' '))}</div>
+      </div>
+      <h2 class="section">Contents — Level ${submission.ppap_level || 3} elements</h2>
+      <table class="data"><thead><tr><th>#</th><th>Element</th><th>Clause</th></tr></thead><tbody>${idx}</tbody></table>
+      <h2 class="section">Element 9 · Dimensional Characteristics (${chars.length})</h2>
+      ${charTableHtml()}
+      ${pswBodyHtml()}`;
+    ppapOpenDoc(reportShell(plant, 'PPAP Package', `${submission.part_number || ''} · ${submission.customer_name || ''}`, body,
+      { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Characteristics': chars.length, 'IATF': '8.3.4.4' }));
+  };
+
+  const clsBadge = (c) => c.classification === 'cc' ? html`<span class="badge rose" style="font-size:10px">CC</span>` : c.classification === 'sc' ? html`<span class="badge amber" style="font-size:10px">SC</span>` : '';
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:flex-start;gap:10px">
+      <button class="btn small ghost" onClick=${onBack} style="flex-shrink:0">← Back</button>
+      <div style="min-width:0"><h1 style="font-size:19px">🏗 PPAP Builder</h1>
+        <div class="sub">${submission.part_number || ''}${submission.part_revision ? ' rev ' + submission.part_revision : ''} · ${submission.customer_name || ''} · Level ${submission.ppap_level || 3}</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:12px">
+      <div class="card-title">Submission</div>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--slate-600)">
+        <div><b>Reason</b> · ${(submission.reason||'').replace(/_/g,' ')}</div>
+        <div><b>Ref</b> · ${submission.submission_ref || '—'}</div>
+        <div><b>Status</b> · ${submission.status}</div>
+        <div><b>Applicable elements</b> · ${applicable.length}</div>
+      </div>
+    </div>
+
+    <div class="section-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
+      <span>Characteristics · ${chars.length}</span>
+      <span style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn small" onClick=${() => setEditChar({ _new:true })}>+ Add</button>
+        <button class="btn small ghost" disabled=${busy==='scl'} onClick=${seedFromScl}>${busy==='scl'?'…':'Seed from CC/SC'}</button>
+        <button class="btn small ghost" disabled=${busy==='csv'} onClick=${() => csvRef.current?.click()}>${busy==='csv'?'…':'Import CSV'}</button>
+        <button class="btn small ghost" onClick=${openCadNexa}>🎯 CadNexa balloon</button>
+        <input ref=${csvRef} type="file" accept=".xlsx,.xls,.csv" style="display:none" onChange=${importCsv} />
+      </span>
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      chars.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📐</div>No characteristics yet. Balloon a drawing in CadNexa, seed from Special Characteristics, import a CSV, or add manually.</div></div>` :
+      html`<div style="overflow-x:auto;margin-bottom:14px"><table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead><tr style="background:var(--slate-50);text-align:left">
+          ${['#','Balloon','Characteristic','Nominal','Tol','UOM','GD&T','',''].map(h => html`<th style="padding:7px 8px;font-weight:600;color:var(--slate-600);white-space:nowrap">${h}</th>`)}
+        </tr></thead><tbody>
+        ${chars.map((c, i) => html`<tr key=${c.id} style="border-top:1px solid var(--slate-100)">
+          <td style="padding:6px 8px;color:var(--slate-400)">${i+1}</td>
+          <td style="padding:6px 8px;font-weight:600">${c.balloon_no || '—'}</td>
+          <td style="padding:6px 8px">${c.description || '—'} ${clsBadge(c)}</td>
+          <td style="padding:6px 8px;font-variant-numeric:tabular-nums">${c.nominal ?? ''}</td>
+          <td style="padding:6px 8px;color:var(--slate-500)">${ppapTolLabel(c)}</td>
+          <td style="padding:6px 8px;color:var(--slate-500)">${c.uom || ''}</td>
+          <td style="padding:6px 8px;color:var(--slate-500)">${c.gd_t || ''}</td>
+          <td style="padding:6px 8px"><button class="btn small ghost" style="padding:2px 6px;font-size:10px" onClick=${() => setEditChar(c)}>Edit</button></td>
+          <td style="padding:6px 8px"><button class="btn small ghost" style="padding:2px 6px;font-size:10px;color:var(--rose-600)" onClick=${() => delChar(c.id)}>✕</button></td>
+        </tr>`)}
+        </tbody></table></div>`}
+
+    <div class="card" style="background:var(--teal-50);border-color:var(--teal-200)">
+      <div class="card-title">Generate</div>
+      <div style="font-size:12px;color:var(--slate-600);margin-bottom:10px">Produce the auditor-ready documents. Each opens in a new tab with a Print / Save-PDF button.</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn small" onClick=${genPsw}>📄 PSW</button>
+        <button class="btn small" onClick=${genPacket}>📑 Build packet (Level ${submission.ppap_level || 3})</button>
+      </div>
+    </div>
+
+    ${editChar && html`<${PpapCharModal} plant=${plant} submission=${submission} row=${editChar} nextSeq=${nextSeq()} onClose=${() => setEditChar(null)} onSaved=${() => { setEditChar(null); refresh(); }} />`}
+  `;
+}
+
+function PpapCharModal({ plant, submission, row, nextSeq, onClose, onSaved }) {
+  const isNew = !!row._new;
+  const [f, setF] = useState({
+    balloon_no: row.balloon_no || '', description: row.description || '',
+    nominal: row.nominal ?? '', tol_plus: row.tol_plus ?? '', tol_minus: row.tol_minus ?? '',
+    uom: row.uom || '', gd_t: row.gd_t || '', classification: row.classification || 'none',
+  });
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+  const num = (v) => v === '' || v == null ? null : Number(v);
+  const save = async () => {
+    if (!f.description.trim() && !f.balloon_no.trim()) { setErr('Enter a balloon # or characteristic'); return; }
+    setBusy(true); setErr('');
+    const payload = {
+      balloon_no: f.balloon_no || null, description: f.description || null,
+      nominal: num(f.nominal), tol_plus: num(f.tol_plus), tol_minus: num(f.tol_minus),
+      uom: f.uom || null, gd_t: f.gd_t || null, classification: f.classification || 'none',
+    };
+    let error;
+    if (isNew) ({ error } = await sb.from('ppap_characteristics').insert({ ...payload, plant_id: plant.id, ppap_id: submission.id, seq: nextSeq, source: 'manual' }));
+    else ({ error } = await sb.from('ppap_characteristics').update(payload).eq('id', row.id));
+    setBusy(false);
+    if (error) setErr(error.message); else { showToast(isNew ? 'Characteristic added' : 'Updated'); onSaved(); }
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:520px">
+        <div class="modal-header"><div class="modal-title">${isNew ? '+ Add' : 'Edit'} characteristic</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field-row">
+          <div class="field" style="flex:0 0 110px"><label>Balloon #</label><input value=${f.balloon_no} onInput=${e => set('balloon_no', e.target.value)} placeholder="1" /></div>
+          <div class="field"><label>Characteristic *</label><input value=${f.description} onInput=${e => set('description', e.target.value)} placeholder="Bore Ø / thread / etc" /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Nominal</label><input type="number" step="any" value=${f.nominal} onInput=${e => set('nominal', e.target.value)} /></div>
+          <div class="field"><label>Tol +</label><input type="number" step="any" value=${f.tol_plus} onInput=${e => set('tol_plus', e.target.value)} placeholder="0.1" /></div>
+          <div class="field"><label>Tol −</label><input type="number" step="any" value=${f.tol_minus} onInput=${e => set('tol_minus', e.target.value)} placeholder="0.1" /></div>
+        </div>
+        <div class="field-row">
+          <div class="field" style="flex:0 0 100px"><label>UOM</label><input value=${f.uom} onInput=${e => set('uom', e.target.value)} placeholder="mm" /></div>
+          <div class="field"><label>GD&T</label><input value=${f.gd_t} onInput=${e => set('gd_t', e.target.value)} placeholder="⌖ 0.05 A B" /></div>
+          <div class="field" style="flex:0 0 120px"><label>Class</label><select value=${f.classification} onChange=${e => set('classification', e.target.value)}><option value="none">—</option><option value="cc">CC (critical)</option><option value="sc">SC (significant)</option></select></div>
+        </div>
+        <button class="btn" disabled=${busy} onClick=${save} style="width:100%">${busy ? 'Saving…' : (isNew ? 'Add' : 'Save')}</button>
       </div>
     </div>
   `;
