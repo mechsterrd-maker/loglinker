@@ -12110,6 +12110,31 @@ function ppapJudge(c, actual) {
   const lo = nom - (c.tol_minus != null ? Number(c.tol_minus) : 0);
   return a >= Math.min(lo, hi) - 1e-9 && a <= Math.max(lo, hi) + 1e-9;
 }
+// Initial process capability (Cp / Cpk) for a characteristic from its measured
+// samples. Returns null if it can't be computed (no spec limits, <2 readings).
+// USL/LSL come from nominal ± tolerance; one-sided tolerances give a one-sided Cpk.
+function ppapCpk(c, vals) {
+  const xs = (vals || []).map(Number).filter(v => isFinite(v));
+  if (xs.length < 2 || c.nominal == null) return null;
+  const nom = Number(c.nominal);
+  const hasHi = c.tol_plus != null, hasLo = c.tol_minus != null;
+  if (!hasHi && !hasLo) return null;
+  const USL = hasHi ? nom + Number(c.tol_plus) : null;
+  const LSL = hasLo ? nom - Number(c.tol_minus) : null;
+  const n = xs.length;
+  const mean = xs.reduce((s, v) => s + v, 0) / n;
+  const sigma = Math.sqrt(xs.reduce((s, v) => s + (v - mean) * (v - mean), 0) / (n - 1));
+  if (!(sigma > 0)) return { n, mean, sigma: 0, cp: null, cpk: Infinity, band: 'excellent' };
+  const cpu = USL != null ? (USL - mean) / (3 * sigma) : null;
+  const cpl = LSL != null ? (mean - LSL) / (3 * sigma) : null;
+  const cp = (USL != null && LSL != null) ? (USL - LSL) / (6 * sigma) : null;
+  const sides = [cpu, cpl].filter(v => v != null);
+  const cpk = sides.length ? Math.min(...sides) : null;
+  const band = cpk == null ? '' : cpk >= 1.67 ? 'excellent' : cpk >= 1.33 ? 'capable' : cpk >= 1.0 ? 'marginal' : 'incapable';
+  return { n, mean, sigma, cp, cpk, band };
+}
+const ppapCpkBadge = (band) => band === 'excellent' || band === 'capable' ? 'emerald' : band === 'marginal' ? 'amber' : 'rose';
+const ppapCpkFmt = (v) => v == null ? '—' : v === Infinity ? '∞' : v.toFixed(2);
 
 function PpapBuilder({ plant, me, submission, onBack }) {
   const [chars, setChars] = useState([]);
@@ -12300,6 +12325,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     const st = (elems[e.key] || {}).status;
     if (st) return st;
     if (e.key === 'dimensional' && chars.length) return hasMeasurements() ? 'complete' : 'in_progress';
+    if (e.key === 'spc' && hasCapability()) return 'in_progress';
     if ((e.key === 'control_plan' || e.key === 'process_flow') && steps.length) return 'in_progress';
     if (e.key === 'psw') return 'complete';
     return 'pending';
@@ -12329,6 +12355,26 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     `${submission.part_number || ''}${submission.part_revision ? ' rev ' + submission.part_revision : ''} · ${submission.customer_name || ''}`,
     `<h2 class="section">Element 9 · Dimensional Results (${sampleCount} samples)</h2>${chars.length ? dimResultsTableHtml() : '<div class="empty">No characteristics.</div>'}`,
     { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Characteristics': chars.length, 'IATF': '8.3.4.4' }));
+
+  // ---- Element 11 · Initial Process Study (Cp/Cpk) ----
+  const capabilityRows = () => chars.map(c => ({ c, cap: ppapCpk(c, charVerdict(c).vals) }));
+  const hasCapability = () => capabilityRows().some(r => r.cap);
+  const capabilitySummary = () => { const r = capabilityRows().filter(x => x.cap); return { computed: r.length, capable: r.filter(x => x.cap.cpk == null || x.cap.cpk >= 1.33).length }; };
+  const spcBodyHtml = () => {
+    const rows = capabilityRows();
+    if (!rows.some(r => r.cap)) return '<h2 class="section">Element 11 · Initial Process Study (Cpk)</h2><div class="empty">No capability computable yet — enter at least 2 measured samples for characteristics that carry a tolerance.</div>';
+    const body = rows.map(({ c, cap }, i) => {
+      if (!cap) return `<tr><td class="num">${i+1}</td><td>${ppapEsc(c.balloon_no)}</td><td>${ppapEsc(c.description)}</td><td class="num">${c.nominal ?? ''}</td><td>${ppapEsc(ppapTolLabel(c))}</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td>insufficient data</td></tr>`;
+      const verdict = cap.cpk == null ? '—' : cap.cpk >= 1.33 ? 'Capable' : cap.cpk >= 1.0 ? 'Marginal — reduce variation' : 'Not capable — action required';
+      return `<tr><td class="num">${i+1}</td><td>${ppapEsc(c.balloon_no)}</td><td>${ppapEsc(c.description)}${c.classification && c.classification !== 'none' ? ' <span class="badge amber">' + c.classification.toUpperCase() + '</span>' : ''}</td><td class="num">${c.nominal ?? ''}</td><td>${ppapEsc(ppapTolLabel(c))}</td><td class="num">${cap.n}</td><td class="num">${cap.mean.toFixed(3)}</td><td class="num">${cap.sigma.toFixed(4)}</td><td class="num">${ppapCpkFmt(cap.cp)}</td><td class="num"><b>${ppapCpkFmt(cap.cpk)}</b></td><td>${verdict}</td></tr>`;
+    }).join('');
+    return `<h2 class="section">Element 11 · Initial Process Study (Cpk)</h2>
+      <table class="data"><thead><tr><th>#</th><th>Balloon</th><th>Characteristic</th><th class="num">Nominal</th><th>Tol</th><th class="num">n</th><th class="num">Mean</th><th class="num">σ</th><th class="num">Cp</th><th class="num">Cpk</th><th>Verdict</th></tr></thead><tbody>${body}</tbody></table>
+      <div style="font-size:10px;color:#94a3b8;margin-top:6px">Cpk ≥ 1.67 excellent · ≥ 1.33 capable · 1.00–1.33 marginal · &lt; 1.00 not capable. Short-run study from the sample readings entered (sample σ, n−1) — where a customer-specific requirement mandates a 25-subgroup study, run that separately.</div>`;
+  };
+  const genSpc = () => ppapOpenDoc(reportShell(plant, 'Initial Process Study (Cpk)',
+    `${submission.part_number || ''}${submission.part_revision ? ' rev ' + submission.part_revision : ''} · ${submission.customer_name || ''}`,
+    spcBodyHtml(), { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Characteristics': chars.length, 'IATF': '9.1.1.1' }));
 
   const pfdTableHtml = () => steps.length === 0
     ? '<div class="empty">No process steps defined.</div>'
@@ -12397,6 +12443,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
       ${controlPlanBodyHtml()}
       <h2 class="section">Element 9 · Dimensional ${hasMeasurements() ? 'Results' : 'Characteristics'} (${chars.length})</h2>
       ${hasMeasurements() ? dimResultsTableHtml() : charTableHtml()}
+      ${hasCapability() ? spcBodyHtml() : ''}
       ${pswBodyHtml()}`;
     ppapOpenDoc(reportShell(plant, 'PPAP Package', `${submission.part_number || ''} · ${submission.customer_name || ''}`, body,
       { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Characteristics': chars.length, 'IATF': '8.3.4.4' }));
@@ -12423,10 +12470,10 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     </div>
 
     <div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">
-      <button class=${'btn small ' + (view==='chars'?'':'ghost')} onClick=${() => setView('chars')}>📐 Characteristics · ${chars.length}</button>
-      <button class=${'btn small ' + (view==='results'?'':'ghost')} onClick=${() => setView('results')}>📏 Dimensional Results</button>
-      <button class=${'btn small ' + (view==='flow'?'':'ghost')} onClick=${() => setView('flow')}>🏭 Process Flow · ${steps.length}</button>
-      <button class=${'btn small ' + (view==='elements'?'':'ghost')} onClick=${() => setView('elements')}>✅ Elements · ${applicable.length}</button>
+      <button class=${'btn small ' + (view==='chars'?'':'ghost')} onClick=${() => setView('chars')}>1 · 📐 Characteristics · ${chars.length}</button>
+      <button class=${'btn small ' + (view==='flow'?'':'ghost')} onClick=${() => setView('flow')}>2 · 🏭 Process Flow · ${steps.length}</button>
+      <button class=${'btn small ' + (view==='results'?'':'ghost')} onClick=${() => setView('results')}>3 · 📏 Dimensional Results</button>
+      <button class=${'btn small ' + (view==='elements'?'':'ghost')} onClick=${() => setView('elements')}>4 · ✅ Elements · ${applicable.length}</button>
     </div>
 
     ${loading ? html`<div class="loader"><div class="spinner"></div></div>` : view === 'chars' ? html`
@@ -12459,7 +12506,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
           </tbody></table></div>`}
     ` : view === 'results' ? html`
       <div class="section-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
-        <span>Measured samples → auto pass/fail</span>
+        <span>Measured samples → auto pass/fail<span style="font-size:11px;color:var(--slate-400);font-weight:400"> · Cpk: <span style="color:var(--emerald-600)">●</span> ≥1.33 capable <span style="color:var(--amber-600)">●</span> 1.0–1.33 <span style="color:var(--rose-600)">●</span> &lt;1.0</span></span>
         <label style="font-size:12px;color:var(--slate-600)">Samples
           <select value=${sampleCount} onChange=${e => setSampleCount(Number(e.target.value))} style="margin-left:6px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:6px">${[1,3,5,10].map(n => html`<option key=${n} value=${n}>${n}</option>`)}</select>
         </label>
@@ -12470,14 +12517,16 @@ function PpapBuilder({ plant, me, submission, onBack }) {
             ${['#','Balloon','Characteristic','Nominal ±Tol'].map(h => html`<th style="padding:7px 8px;font-weight:600;color:var(--slate-600);white-space:nowrap">${h}</th>`)}
             ${Array.from({ length: sampleCount }, (_, i) => html`<th key=${i} style="padding:7px 8px;font-weight:600;color:var(--slate-600);text-align:center">S${i+1}</th>`)}
             <th style="padding:7px 8px;font-weight:600;color:var(--slate-600)">Result</th>
+            <th style="padding:7px 8px;font-weight:600;color:var(--slate-600);text-align:center" title="Initial process capability (min 2 samples + tolerance)">Cpk</th>
           </tr></thead><tbody>
-          ${chars.map((c, i) => { const v = charVerdict(c); return html`<tr key=${c.id} style="border-top:1px solid var(--slate-100)">
+          ${chars.map((c, i) => { const v = charVerdict(c); const cap = ppapCpk(c, v.vals); return html`<tr key=${c.id} style="border-top:1px solid var(--slate-100)">
             <td style="padding:6px 8px;color:var(--slate-400)">${i+1}</td>
             <td style="padding:6px 8px;font-weight:600;white-space:nowrap">${c.balloon_no || '—'}</td>
             <td style="padding:6px 8px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${c.description || '—'} ${clsBadge(c)}</td>
             <td style="padding:6px 8px;color:var(--slate-500);white-space:nowrap">${c.nominal ?? ''} ${ppapTolLabel(c)}</td>
             ${Array.from({ length: sampleCount }, (_, s) => { const val = meas[c.id + ':' + (s+1)]; const j = (val === '' || val == null) ? null : ppapJudge(c, val); return html`<td key=${s} style="padding:2px 3px"><input type="number" step="any" value=${val ?? ''} onChange=${e => saveMeas(c.id, s+1, e.target.value)} style=${'width:60px;padding:4px;border:1px solid ' + (j===false?'var(--rose-400)':'var(--slate-200)') + ';border-radius:4px;text-align:right;' + (j===false?'color:var(--rose-600);font-weight:600':'')} /></td>`; })}
             <td style="padding:6px 8px">${v.state==='pass'?html`<span class="badge emerald">PASS</span>`:v.state==='fail'?html`<span class="badge rose">FAIL</span>`:v.state==='partial'?html`<span class="badge amber">CHECK</span>`:html`<span class="badge slate">—</span>`}</td>
+            <td style="padding:6px 8px;text-align:center">${cap ? html`<span class="badge ${ppapCpkBadge(cap.band)}" title=${'mean ' + cap.mean.toFixed(3) + ' · σ ' + cap.sigma.toFixed(4) + (cap.cp!=null?' · Cp ' + ppapCpkFmt(cap.cp):'')}>${ppapCpkFmt(cap.cpk)}</span>` : html`<span style="color:var(--slate-300)">—</span>`}</td>
           </tr>`; })}
           </tbody></table></div>`}
     ` : view === 'flow' ? html`
@@ -12511,6 +12560,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
               <div style="font-size:13px;font-weight:600">${i+1}. ${e.label}</div>
               ${st.doc_url ? html`<a href=${st.doc_url} target="_blank" style="font-size:11px;color:var(--teal-700)">📎 attached</a>`
                 : e.key==='dimensional' ? html`<span style="font-size:11px;color:var(--slate-500)">${chars.length} char.${hasMeasurements()?' · results entered':''}</span>`
+                : e.key==='spc' ? (hasCapability() ? (() => { const s = capabilitySummary(); return html`<span style="font-size:11px;color:var(--slate-500)">${s.capable}/${s.computed} capable (Cpk ≥ 1.33)</span>`; })() : html`<span style="font-size:11px;color:var(--slate-500)">enter samples to compute Cpk</span>`)
                 : (e.key==='control_plan'||e.key==='process_flow') ? html`<span style="font-size:11px;color:var(--slate-500)">${steps.length} steps</span>`
                 : e.key==='psw' ? html`<span style="font-size:11px;color:var(--slate-500)">generated on build</span>` : ''}
             </div>
@@ -12532,6 +12582,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
         <button class="btn small" onClick=${genPsw}>📄 PSW</button>
         <button class="btn small ghost" onClick=${genControlPlan}>📋 Control Plan</button>
         <button class="btn small ghost" onClick=${genDimResults}>📏 Dimensional Results</button>
+        <button class="btn small ghost" disabled=${!hasCapability()} title=${hasCapability()?'Cp/Cpk study from the entered samples':'Enter ≥2 samples per toleranced characteristic first'} onClick=${genSpc}>📈 Initial Process Study (Cpk)</button>
         <button class="btn small" onClick=${genPacket}>📑 Build packet (Level ${submission.ppap_level || 3})</button>
       </div>
     </div>
