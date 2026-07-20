@@ -31966,7 +31966,7 @@ function Stocks({ plant, me, activeUnit }) {
   const [transactions, setTransactions] = useState([]);
   const [pendingReceptions, setPendingReceptions] = useState([]); // doc-backed GRNs awaiting verification
   const [view, setView] = useState('home'); // home | items | transactions
-  const [layout, setLayout] = useState('by_category'); // grouped view reads clearest, esp. after a bulk import
+  const [layout, setLayout] = useState('table'); // table reads clearest after a bulk import (name · category · qty · value)
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [subcategoryFilter, setSubcategoryFilter] = useState('all');
   const [search, setSearch] = useState('');
@@ -32199,11 +32199,12 @@ function Stocks({ plant, me, activeUnit }) {
     ${view === 'items' && html`
       <div style="display:flex;gap:6px;margin-bottom:10px">
         <input type="search" value=${search} onChange=${e => setSearch(e.target.value)} placeholder="Search items…" style="flex:1;padding:8px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+        <button class="btn small ${layout === 'table' ? '' : 'ghost'}" onClick=${() => setLayout('table')}>Table</button>
         <button class="btn small ${layout === 'list' ? '' : 'ghost'}" onClick=${() => setLayout('list')}>List</button>
         <button class="btn small ${layout === 'by_category' ? '' : 'ghost'}" onClick=${() => setLayout('by_category')}>By Category</button>
       </div>
 
-      ${layout === 'list' && html`
+      ${(layout === 'list' || layout === 'table') && html`
         <div class="auth-tabs" style="margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
           <button class=${'auth-tab' + (categoryFilter === 'all' ? ' active' : '')} onClick=${() => { setCategoryFilter('all'); setSubcategoryFilter('all'); }}>All · ${items.length}</button>
           ${Object.keys(categoryLabels).map(c => categoryCounts[c] > 0 && html`
@@ -32227,6 +32228,41 @@ function Stocks({ plant, me, activeUnit }) {
 
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
         filteredItems.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📦</div>${items.length === 0 ? 'No items yet' : 'No items match this filter'}</div></div>` :
+        layout === 'table' ? (() => {
+          const totVal = filteredItems.reduce((s, i) => s + (parseFloat(i.current_qty || 0) * parseFloat(i.unit_cost || 0)), 0);
+          const anyVal = filteredItems.some(i => i.unit_cost);
+          return html`<div style="overflow-x:auto;border:1px solid var(--slate-200);border-radius:10px;-webkit-overflow-scrolling:touch">
+            <table style="width:100%;border-collapse:collapse;font-size:12.5px">
+              <thead><tr style="background:var(--slate-50);position:sticky;top:0">
+                <th style="text-align:left;padding:8px 10px;font-weight:700;color:var(--slate-600)">Item</th>
+                <th style="text-align:left;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Category</th>
+                <th style="text-align:right;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">In stock</th>
+                <th style="text-align:right;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Rate</th>
+                <th style="text-align:right;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Value</th>
+              </tr></thead>
+              <tbody>
+                ${filteredItems.map(i => {
+                  const isLow = i.reorder_level && i.current_qty <= i.reorder_level;
+                  const val = (parseFloat(i.current_qty || 0) * parseFloat(i.unit_cost || 0));
+                  return html`<tr key=${i.id} onClick=${() => setActiveItem(i)} style="border-top:1px solid var(--slate-100);cursor:pointer">
+                    <td style="padding:7px 10px">
+                      <div style="font-weight:600">${i.name || i.code}</div>
+                      ${i.code ? html`<div style="font-size:10px;color:var(--slate-400);font-family:'Geist Mono',monospace">${i.code}</div>` : ''}
+                    </td>
+                    <td style="padding:7px 10px;color:var(--slate-500);white-space:nowrap">${lbl(i.category || 'general')}${i.subcategory ? html`<div style="font-size:10px;color:var(--slate-400)">${i.subcategory}</div>` : ''}</td>
+                    <td style="padding:7px 10px;text-align:right;white-space:nowrap"><span style=${'font-weight:700;color:' + (isLow ? 'var(--rose-600)' : 'var(--slate-800)')}>${fmtNum(i.current_qty)}</span> <span style="color:var(--slate-400);font-size:11px">${i.uom}</span>${isLow ? html`<div style="font-size:9px;color:var(--rose-600);font-weight:600">LOW</div>` : (!i.opening_recorded_at ? html`<div style="font-size:9px;color:var(--amber-700);font-weight:600">NO OPENING</div>` : '')}</td>
+                    <td style="padding:7px 10px;text-align:right;color:var(--slate-500);white-space:nowrap">${i.unit_cost ? '₹' + fmtNum(i.unit_cost) : '—'}</td>
+                    <td style="padding:7px 10px;text-align:right;white-space:nowrap;font-weight:600">${val ? '₹' + fmtNum(val) : '—'}</td>
+                  </tr>`;
+                })}
+              </tbody>
+              ${anyVal ? html`<tfoot><tr style="border-top:2px solid var(--slate-200);background:var(--slate-50)">
+                <td style="padding:8px 10px;font-weight:700" colspan="4">Total stock value · ${filteredItems.length} item${filteredItems.length === 1 ? '' : 's'}</td>
+                <td style="padding:8px 10px;text-align:right;font-weight:800;color:var(--teal-700);white-space:nowrap">₹${fmtNum(totVal)}</td>
+              </tr></tfoot>` : ''}
+            </table>
+          </div>`;
+        })() :
         layout === 'by_category' ? html`
           ${Object.entries(byCategory).sort((a,b) => b[1].length - a[1].length).map(([cat, list]) => {
             // Sub-group each category by sub-category. Items with no sub-category
