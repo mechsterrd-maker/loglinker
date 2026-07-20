@@ -12123,6 +12123,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
   const [busy, setBusy] = useState('');
   const [editChar, setEditChar] = useState(null);   // char row or {_new:true}
   const [editStep, setEditStep] = useState(null);   // step row or {_new:true}
+  const [pfmeaOpen, setPfmeaOpen] = useState(false);
   const csvRef = useRef(null);
   const elDocRef = useRef({ key: null, input: null });
 
@@ -12482,7 +12483,10 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     ` : view === 'flow' ? html`
       <div class="section-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
         <span>Process flow · ${steps.length}</span>
-        <button class="btn small" onClick=${() => setEditStep({ _new:true })}>+ Add step</button>
+        <span style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn small ghost" disabled=${steps.length===0} title=${steps.length===0?'Add process steps first':'AI-draft a Process FMEA'} onClick=${() => setPfmeaOpen(true)}>🤖 Draft PFMEA</button>
+          <button class="btn small" onClick=${() => setEditStep({ _new:true })}>+ Add step</button>
+        </span>
       </div>
       ${steps.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🏭</div>No process steps yet. Add operations (e.g. cutting → CNC → plating → inspection) to drive the Process Flow Diagram and Control Plan.</div></div>` :
         html`<div style="overflow-x:auto;margin-bottom:14px"><table style="width:100%;border-collapse:collapse;font-size:12px">
@@ -12534,6 +12538,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
 
     ${editChar && html`<${PpapCharModal} plant=${plant} submission=${submission} row=${editChar} nextSeq=${nextSeq()} onClose=${() => setEditChar(null)} onSaved=${() => { setEditChar(null); refresh(); }} />`}
     ${editStep && html`<${PpapStepModal} plant=${plant} submission=${submission} row=${editStep} nextSeq=${nextStepSeq()} onClose=${() => setEditStep(null)} onSaved=${() => { setEditStep(null); refresh(); }} />`}
+    ${pfmeaOpen && html`<${PpapPfmeaDraftModal} plant=${plant} me=${me} submission=${submission} steps=${steps} chars=${chars} onClose=${() => setPfmeaOpen(false)} onCreated=${() => { setPfmeaOpen(false); refresh(); }} />`}
   `;
 }
 
@@ -12617,6 +12622,95 @@ function PpapCharModal({ plant, submission, row, nextSeq, onClose, onSaved }) {
           <div class="field" style="flex:0 0 120px"><label>Class</label><select value=${f.classification} onChange=${e => set('classification', e.target.value)}><option value="none">—</option><option value="cc">CC (critical)</option><option value="sc">SC (significant)</option></select></div>
         </div>
         <button class="btn" disabled=${busy} onClick=${save} style="width:100%">${busy ? 'Saving…' : (isNew ? 'Add' : 'Save')}</button>
+      </div>
+    </div>
+  `;
+}
+
+// AI-drafted Process FMEA. Calls the suggest-pfmea edge function with the PPAP
+// project's process flow + characteristics, shows the draft for review, and on
+// accept writes a draft iatf_fmea + iatf_fmea_items (visible/editable in the
+// PFMEA module) and marks PPAP Element 6 complete.
+function PpapPfmeaDraftModal({ plant, me, submission, steps, chars, onClose, onCreated }) {
+  const [loading, setLoading] = useState(true);
+  const [items, setItems] = useState([]);
+  const [notes, setNotes] = useState('');
+  const [err, setErr] = useState('');
+  const [creating, setCreating] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true); setErr('');
+      try {
+        const session = (await sb.auth.getSession()).data.session;
+        const resp = await fetch(SUPABASE_URL + '/functions/v1/suggest-pfmea', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (session?.access_token || ''), 'apikey': SUPABASE_ANON_KEY },
+          body: JSON.stringify({ part_number: submission.part_number, process_steps: steps, characteristics: chars }),
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok || !data || !data.success) throw new Error(data?.error || ('HTTP ' + resp.status));
+        setItems(data.items || []); setNotes(data.notes || '');
+      } catch (e) { setErr(e.message || String(e)); }
+      finally { setLoading(false); }
+    })();
+  }, []);
+
+  const rpnColor = (r) => r >= 200 ? 'var(--rose-600)' : r >= 100 ? 'var(--amber-700)' : 'var(--slate-600)';
+
+  const create = async () => {
+    if (!items.length) return;
+    setCreating(true); setErr('');
+    try {
+      const { data: hdr, error: hErr } = await sb.from('iatf_fmea').insert({
+        plant_id: plant.id, fmea_type: 'process', part_number: submission.part_number || null,
+        process_name: (submission.part_number || 'Part') + ' — process', revision: '1',
+        fmea_date: new Date().toISOString().slice(0, 10), status: 'draft',
+        team_members: me.full_name || null, notes: 'AI-drafted from PPAP process flow', created_by: me.id,
+      }).select('id').single();
+      if (hErr) throw hErr;
+      const rows = items.map(it => ({
+        plant_id: plant.id, fmea_id: hdr.id, step_no: it.step_no || 1, process_step: it.process_step,
+        function_text: it.function_text, failure_mode: it.failure_mode, failure_effect: it.failure_effect,
+        severity: it.severity, cause: it.cause, occurrence: it.occurrence,
+        current_controls: it.current_controls, detection: it.detection, recommended_action: it.recommended_action,
+      }));
+      const { error: iErr } = await sb.from('iatf_fmea_items').insert(rows);
+      if (iErr) throw iErr;
+      await sb.from('ppap_elements').upsert(
+        { plant_id: plant.id, ppap_id: submission.id, element_key: 'pfmea', status: 'complete', source_ref: 'FMEA (' + rows.length + ' lines)', updated_at: new Date().toISOString() },
+        { onConflict: 'ppap_id,element_key' });
+      showToast('PFMEA created — ' + rows.length + ' lines. Review in the PFMEA module.');
+      onCreated();
+    } catch (e) { setErr(e.message || String(e)); }
+    finally { setCreating(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:820px;max-height:92vh;overflow-y:auto">
+        <div class="modal-header"><div class="modal-title">🤖 AI-drafted PFMEA</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        ${loading ? html`<div style="padding:30px;text-align:center"><div class="spinner"></div><div style="font-size:12px;color:var(--slate-500);margin-top:10px">Drafting from ${steps.length} operations + ${chars.length} characteristics…</div></div>` :
+          items.length === 0 ? html`<div class="empty" style="padding:20px">No draft produced.</div>` : html`
+          <div style="font-size:12px;color:var(--slate-600);margin-bottom:8px">Review the draft. Creating it adds a <b>draft</b> Process FMEA (editable in the PFMEA module) and marks PPAP Element 6 complete.${notes ? html`<div style="color:var(--amber-700);margin-top:4px">⚠ ${notes}</div>` : ''}</div>
+          <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px">
+            <thead><tr style="background:var(--slate-50);text-align:left">${['Op','Failure mode','Effect','S','O','D','RPN','Recommended action'].map(h => html`<th style="padding:6px;font-weight:600;color:var(--slate-600)">${h}</th>`)}</tr></thead>
+            <tbody>${items.map((it, i) => html`<tr key=${i} style="border-top:1px solid var(--slate-100)">
+              <td style="padding:5px 6px;white-space:nowrap">${it.step_no}. ${it.process_step}</td>
+              <td style="padding:5px 6px">${it.failure_mode}</td>
+              <td style="padding:5px 6px;color:var(--slate-500)">${it.failure_effect}</td>
+              <td style="padding:5px 6px;text-align:center">${it.severity}</td>
+              <td style="padding:5px 6px;text-align:center">${it.occurrence}</td>
+              <td style="padding:5px 6px;text-align:center">${it.detection}</td>
+              <td style="padding:5px 6px;text-align:center;font-weight:700;color:${rpnColor(it.rpn)}">${it.rpn}</td>
+              <td style="padding:5px 6px;color:var(--slate-600)">${it.recommended_action}</td>
+            </tr>`)}</tbody>
+          </table></div>
+          <div style="display:flex;gap:8px;margin-top:14px">
+            <button class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
+            <button class="btn" disabled=${creating} onClick=${create} style="flex:2">${creating ? 'Creating…' : '✓ Create PFMEA (' + items.length + ' lines)'}</button>
+          </div>`}
       </div>
     </div>
   `;
