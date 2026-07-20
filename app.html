@@ -31966,7 +31966,7 @@ function Stocks({ plant, me, activeUnit }) {
   const [transactions, setTransactions] = useState([]);
   const [pendingReceptions, setPendingReceptions] = useState([]); // doc-backed GRNs awaiting verification
   const [view, setView] = useState('home'); // home | items | transactions
-  const [layout, setLayout] = useState('list');
+  const [layout, setLayout] = useState('by_category'); // grouped view reads clearest, esp. after a bulk import
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [subcategoryFilter, setSubcategoryFilter] = useState('all');
   const [search, setSearch] = useState('');
@@ -32062,18 +32062,23 @@ function Stocks({ plant, me, activeUnit }) {
   };
   const lbl = (c) => categoryLabels[c] || c;
 
+  // Name-first row: the item name is what the shop floor recognises, so it leads;
+  // the (often auto-generated) code is demoted to a small muted tag. The quantity
+  // in hand is the headline number with a plain "in stock / LOW" caption.
   const ItemRow = ({ i }) => {
     const isLow = i.reorder_level && i.current_qty <= i.reorder_level;
     return html`
       <div class="list-item" key=${i.id} onClick=${() => setActiveItem(i)}>
         <div class="list-item-row">
           <div class="list-item-main">
-            <div class="list-item-title">${i.code} · ${i.name}</div>
-            <div class="list-item-sub">${lbl(i.category || 'general')}${i.subcategory ? ' › ' + i.subcategory : ''}${i.reorder_level ? ' · reorder at ' + i.reorder_level + ' ' + i.uom : ''}${i.unit_cost ? ' · ₹' + i.unit_cost + '/' + i.uom : ''}</div>
+            <div class="list-item-title">${i.name || i.code}</div>
+            <div class="list-item-sub">${lbl(i.category || 'general')}${i.subcategory ? ' › ' + i.subcategory : ''}${i.unit_cost ? ' · ₹' + fmtNum(i.unit_cost) + '/' + i.uom : ''}${i.code ? html` · <span style="font-family:'Geist Mono',monospace;font-size:10px;color:var(--slate-400)">${i.code}</span>` : ''}</div>
           </div>
-          <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
-            <span class=${'badge ' + (isLow ? 'rose' : 'emerald')}>${fmtNum(i.current_qty)} ${i.uom}</span>
-            ${!i.opening_recorded_at && html`<span style="font-size:9px;color:var(--amber-700);font-weight:600">NO OPENING</span>`}
+          <div style="display:flex;flex-direction:column;gap:1px;align-items:flex-end;flex-shrink:0">
+            <span class=${'badge ' + (isLow ? 'rose' : 'emerald')} style="font-size:12.5px">${fmtNum(i.current_qty)} ${i.uom}</span>
+            ${!i.opening_recorded_at ? html`<span style="font-size:9px;color:var(--amber-700);font-weight:600">NO OPENING</span>`
+              : isLow ? html`<span style="font-size:9px;color:var(--rose-600);font-weight:600">LOW · reorder ${fmtNum(i.reorder_level)}</span>`
+              : html`<span style="font-size:9px;color:var(--slate-400)">in stock</span>`}
           </div>
         </div>
       </div>
@@ -32155,7 +32160,7 @@ function Stocks({ plant, me, activeUnit }) {
               <div class="list-item" key=${i.id} onClick=${() => setActiveItem(i)} style="border-left:3px solid var(--rose-500)">
                 <div class="list-item-row">
                   <div class="list-item-main">
-                    <div class="list-item-title">${i.code} · ${i.name}</div>
+                    <div class="list-item-title">${i.name || i.code}</div>
                     <div class="list-item-sub">at ${fmtNum(i.current_qty)} ${i.uom} · reorder ${fmtNum(i.reorder_level)} ${i.uom}</div>
                   </div>
                   <span class="badge rose">LOW</span>
