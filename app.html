@@ -12527,6 +12527,113 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     `${submission.part_number || ''} · ${submission.customer_name || ''}`,
     csrBodyHtml(), { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Requirements': csrItems.length, 'IATF': '8.2.2' }));
 
+  // ---- True merged single PDF: generated sections (jsPDF + autoTable) with the
+  // uploaded element files (drawings / certs / ballooned PDFs / images) appended
+  // via pdf-lib, saved as one binary. ----
+  const genMergedPdf = async () => {
+    setBusy('merge');
+    try {
+      const [jspdfMod, autoMod, pdflibMod] = await Promise.all([
+        import('https://esm.sh/jspdf@2.5.1'),
+        import('https://esm.sh/jspdf-autotable@3.8.2?deps=jspdf@2.5.1'),
+        import('https://esm.sh/pdf-lib@1.17.1'),
+      ]);
+      const jsPDF = jspdfMod.jsPDF || jspdfMod.default;
+      const autoTable = autoMod.default || autoMod.autoTable;
+      const { PDFDocument } = pdflibMod;
+      const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+      const teal = [15, 118, 110], slate = [71, 85, 105], head = [241, 245, 249];
+      const lvl = submission.ppap_level || 3;
+
+      // Cover
+      doc.setFontSize(22); doc.setTextColor(...teal); doc.text('PPAP Submission Packet', 105, 44, { align: 'center' });
+      doc.setFontSize(14); doc.setTextColor(30, 41, 59); doc.text((submission.part_number || '') + (submission.part_revision ? ' rev ' + submission.part_revision : ''), 105, 56, { align: 'center' });
+      doc.setFontSize(11); doc.setTextColor(...slate); doc.text((submission.customer_name || '') + '  ·  Level ' + lvl + '  ·  ' + (submission.reason || '').replace(/_/g, ' '), 105, 64, { align: 'center' });
+      doc.setFontSize(9); doc.setTextColor(120, 130, 145); doc.text((plant.name || '') + '   ' + new Date().toISOString().slice(0, 10), 105, 72, { align: 'center' });
+
+      const sec = (title, headRow, body, startY) => {
+        if (!body || !body.length) return;
+        let y = startY != null ? startY : (doc.lastAutoTable ? doc.lastAutoTable.finalY + 9 : 86);
+        if (y > 265) { doc.addPage(); y = 20; }
+        doc.setFontSize(11); doc.setTextColor(...teal); doc.text(title, 14, y);
+        autoTable(doc, { head: [headRow], body, startY: y + 3, styles: { fontSize: 8, cellPadding: 1.4, overflow: 'linebreak' }, headStyles: { fillColor: head, textColor: slate, fontStyle: 'bold' }, margin: { left: 14, right: 14 } });
+      };
+      const S = (v) => v == null ? '' : String(v);
+
+      // Contents
+      sec('Contents — Level ' + lvl + ' elements', ['#', 'Element', 'Clause', 'Status'],
+        applicable.map((e, i) => [i + 1, e.label, e.clause || '', elStatus(e).replace(/_/g, ' ')]), 86);
+
+      // Process flow
+      if (steps.length) sec('Element 5 · Process Flow Diagram', ['Op', 'Operation', 'Machine', 'Controls'],
+        steps.map((s, i) => [s.seq || i + 1, S(s.operation), S(s.machine), S(s.control_method)]));
+
+      // Control plan
+      if (chars.length) sec('Element 7 · Control Plan', ['Balloon', 'Characteristic', 'Nominal', 'Spec / Tol', 'Sample', 'Frequency', 'Reaction'],
+        chars.map((c, i) => { const key = c.classification && c.classification !== 'none'; return [S(c.balloon_no || (i + 1)) + (key ? ' ' + c.classification.toUpperCase() : ''), S(c.description), S(c.nominal), ppapTolLabel(c) + ' ' + S(c.uom), key ? '5 pcs' : '3 pcs', key ? 'Per setup + hourly' : 'Per lot', '100% sort; inform QA' + (key ? '; verify Cpk' : '')]; }));
+
+      // Dimensional results (cap sample columns)
+      if (chars.length) {
+        const sc = Math.min(sampleCount, 10);
+        const dHead = ['#', 'Balloon', 'Characteristic', 'Nominal', 'Tol', ...Array.from({ length: sc }, (_, i) => 'S' + (i + 1)), 'Result'];
+        const dBody = chars.map((c, i) => { const v = charVerdict(c); const cells = Array.from({ length: sc }, (_, s) => S(meas[c.id + ':' + (s + 1)])); return [i + 1, S(c.balloon_no), S(c.description), S(c.nominal), ppapTolLabel(c), ...cells, (v.state || '—').toUpperCase()]; });
+        sec('Element 9 · Dimensional Results', dHead, dBody);
+      }
+
+      // Cpk
+      if (hasCapability()) sec('Element 11 · Initial Process Study (Cpk)', ['#', 'Balloon', 'Characteristic', 'n', 'Mean', 'Sigma', 'Cp', 'Cpk'],
+        capabilityRows().filter(r => r.cap).map(({ c, cap }, i) => [i + 1, S(c.balloon_no), S(c.description), cap.n, cap.mean.toFixed(3), cap.sigma.toFixed(4), ppapCpkFmt(cap.cp), ppapCpkFmt(cap.cpk)]));
+
+      // MSA
+      if (msaStudies.length) sec('Element 8 · MSA (Gauge R&R)', ['Gauge', 'Characteristic', '%GRR', 'ndc', 'Verdict'],
+        msaStudies.map(s => { const r = ppapGRR(s); return [S(s.gauge_name || 'Gauge') + (s.gauge_id_no ? ' · ' + s.gauge_id_no : ''), msaCharLabel(s), r && r.pctGRR != null ? r.pctGRR.toFixed(1) + '%' : '—', r ? S(r.ndc) : '—', r ? r.verdict : 'no data']; }));
+
+      // CSR
+      if (csrItems.length) sec('Element 17 · Customer-Specific Requirements', ['#', 'Requirement', 'Rule', 'Status', 'Detail'],
+        csrItems.map((it, i) => { const r = evalCsr(it); return [i + 1, S(it.requirement), (CSR_RULE_LABELS[it.rule_type] || it.rule_type) + (it.threshold != null ? ' ' + it.threshold : ''), csrStateLabel(r.state), S(r.detail)]; }));
+
+      // PSW
+      sec('Part Submission Warrant', ['Field', 'Value'], [
+        ['Part number', S(submission.part_number) + (submission.part_revision ? ' rev ' + submission.part_revision : '')],
+        ['Customer', S(submission.customer_name)], ['Customer part #', S(submission.customer_part_number)],
+        ['PPAP level', 'Level ' + lvl], ['Reason', S((submission.reason || '').replace(/_/g, ' '))],
+        ['Submission ref', S(submission.submission_ref)], ['Status', S(submission.status)],
+        ['Prepared by', S(me.full_name)], ['Supplier approver', S(submission.approver_name)],
+      ]);
+      let dy = (doc.lastAutoTable ? doc.lastAutoTable.finalY : 90) + 8;
+      if (dy > 250) { doc.addPage(); dy = 20; }
+      doc.setFontSize(8); doc.setTextColor(...slate);
+      doc.text(doc.splitTextToSize('Declaration: the results reported represent parts produced under production conditions on production tooling and processes at the stated rate, and meet all customer drawing and specification requirements unless noted.', 182), 14, dy);
+
+      // Append uploaded element files
+      const out = await PDFDocument.load(doc.output('arraybuffer'));
+      let appended = 0, skipped = 0;
+      const addImagePage = (img) => { const page = out.addPage(); const pw = page.getWidth(), ph = page.getHeight(), m = 28; const sc = Math.min((pw - m * 2) / img.width, (ph - m * 2) / img.height, 1); const w = img.width * sc, h = img.height * sc; page.drawImage(img, { x: (pw - w) / 2, y: (ph - h) / 2, width: w, height: h }); };
+      for (const d of docs) {
+        if (!d.file_url) continue;
+        try {
+          const resp = await fetch(d.file_url); if (!resp.ok) { skipped++; continue; }
+          const buf = await resp.arrayBuffer();
+          const ct = (d.content_type || '').toLowerCase(), url = d.file_url.toLowerCase();
+          if (ct.includes('pdf') || url.endsWith('.pdf')) {
+            const src = await PDFDocument.load(buf, { ignoreEncryption: true });
+            const pages = await out.copyPages(src, src.getPageIndices()); pages.forEach(p => out.addPage(p)); appended++;
+          } else if (ct.includes('png') || url.endsWith('.png')) { addImagePage(await out.embedPng(buf)); appended++; }
+          else if (ct.includes('jpg') || ct.includes('jpeg') || url.endsWith('.jpg') || url.endsWith('.jpeg')) { addImagePage(await out.embedJpg(buf)); appended++; }
+          else skipped++;
+        } catch (_) { skipped++; }
+      }
+      const bytes = await out.save();
+      const blob = new Blob([bytes], { type: 'application/pdf' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'PPAP_' + (submission.part_number || 'packet').replace(/[^a-z0-9]+/gi, '_') + '.pdf';
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+      showToast('Merged PDF — ' + out.getPageCount() + ' pages' + (appended ? ', ' + appended + ' file(s) attached' : '') + (skipped ? ', ' + skipped + ' skipped' : ''));
+    } catch (e) { showToast(e.message || 'PDF merge failed'); }
+    finally { setBusy(''); }
+  };
+
   const pfdTableHtml = () => steps.length === 0
     ? '<div class="empty">No process steps defined.</div>'
     : `<table class="data"><thead><tr><th>Op</th><th>Operation</th><th>Machine / Equipment</th><th>Controls</th><th>Notes</th></tr></thead><tbody>${
@@ -12769,7 +12876,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
 
     <div class="card" style="background:var(--teal-50);border-color:var(--teal-200)">
       <div class="card-title">Generate</div>
-      <div style="font-size:12px;color:var(--slate-600);margin-bottom:10px">Produce the auditor-ready documents. Each opens in a new tab with a Print / Save-PDF button.</div>
+      <div style="font-size:12px;color:var(--slate-600);margin-bottom:10px">Produce the auditor-ready documents. The individual reports open in a new tab with a Print / Save-PDF button; <b>Merged PDF</b> downloads one binary file combining the generated sections with every uploaded drawing / cert.</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn small" onClick=${genPsw}>📄 PSW</button>
         <button class="btn small ghost" onClick=${genControlPlan}>📋 Control Plan</button>
@@ -12778,6 +12885,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
         <button class="btn small ghost" disabled=${!msaStudies.length} title=${msaStudies.length?'Gauge R&R summary':'Add a Gauge R&R study on the Dimensional Results tab first'} onClick=${genMsa}>🔬 MSA (Gauge R&R)</button>
         <button class="btn small ghost" disabled=${!csrItems.length} title=${csrItems.length?'Customer-specific requirements checklist':'Add customer requirements on the Elements tab first'} onClick=${genCsr}>📋 CSR checklist</button>
         <button class="btn small" onClick=${genPacket}>📑 Build packet (Level ${submission.ppap_level || 3})</button>
+        <button class="btn small" disabled=${busy==='merge'} title="One binary PDF: generated sections + uploaded drawings/certs" onClick=${genMergedPdf}>${busy==='merge'?'Merging…':'🧾 Merged PDF (all-in-one)'}</button>
       </div>
     </div>
 
