@@ -12187,6 +12187,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
   const [elems, setElems] = useState({});           // element_key -> ppap_elements row
   const [docs, setDocs] = useState([]);             // ppap_documents rows
   const [msaStudies, setMsaStudies] = useState([]); // ppap_msa_studies rows
+  const [csrItems, setCsrItems] = useState([]);     // ppap_csr_items rows
   const [sampleCount, setSampleCount] = useState(5);
   const [view, setView] = useState('chars');        // chars | results | flow | elements
   const [loading, setLoading] = useState(true);
@@ -12194,23 +12195,25 @@ function PpapBuilder({ plant, me, submission, onBack }) {
   const [editChar, setEditChar] = useState(null);   // char row or {_new:true}
   const [editStep, setEditStep] = useState(null);   // step row or {_new:true}
   const [editMsa, setEditMsa] = useState(null);     // msa study row or {_new:true}
+  const [editCsr, setEditCsr] = useState(null);     // csr item or {_new:true}
   const [pfmeaOpen, setPfmeaOpen] = useState(false);
   const csvRef = useRef(null);
   const elDocRef = useRef({ key: null, input: null });
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [{ data }, { data: st }, { data: el }, { data: dc }, { data: ms }] = await Promise.all([
+    const [{ data }, { data: st }, { data: el }, { data: dc }, { data: ms }, { data: cs }] = await Promise.all([
       sb.from('ppap_characteristics').select('*').eq('ppap_id', submission.id).order('seq').order('created_at'),
       sb.from('ppap_process_steps').select('*').eq('ppap_id', submission.id).order('seq').order('created_at'),
       sb.from('ppap_elements').select('*').eq('ppap_id', submission.id),
       sb.from('ppap_documents').select('*').eq('ppap_id', submission.id).order('uploaded_at', { ascending: false }),
       sb.from('ppap_msa_studies').select('*').eq('ppap_id', submission.id).order('created_at', { ascending: false }),
+      sb.from('ppap_csr_items').select('*').eq('ppap_id', submission.id).order('seq').order('created_at'),
     ]);
     const list = data || [];
     setChars(list); setSteps(st || []);
     const emap = {}; (el || []).forEach(e => { emap[e.element_key] = e; }); setElems(emap);
-    setDocs(dc || []); setMsaStudies(ms || []);
+    setDocs(dc || []); setMsaStudies(ms || []); setCsrItems(cs || []);
     if (list.length) {
       const { data: m } = await sb.from('ppap_measurements').select('characteristic_id, sample_no, actual').in('characteristic_id', list.map(c => c.id));
       const map = {}; let maxS = 5;
@@ -12373,6 +12376,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     if (st) return st;
     if (e.key === 'dimensional' && chars.length) return hasMeasurements() ? 'complete' : 'in_progress';
     if (e.key === 'msa' && msaStudies.length) return msaStudies.some(s => { const r = ppapGRR(s); return r && r.verdict === 'unacceptable'; }) ? 'in_progress' : 'complete';
+    if (e.key === 'csr' && csrItems.length) { const s = csrSummary(); return (s.fail === 0 && s.pending === 0) ? 'complete' : 'in_progress'; }
     if (e.key === 'spc' && hasCapability()) return 'in_progress';
     if ((e.key === 'control_plan' || e.key === 'process_flow') && steps.length) return 'in_progress';
     if (e.key === 'psw') return 'complete';
@@ -12453,6 +12457,75 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     `${submission.part_number || ''}${submission.part_revision ? ' rev ' + submission.part_revision : ''} · ${submission.customer_name || ''}`,
     msaBodyHtml(), { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Studies': msaStudies.length, 'IATF': '7.1.5.1.1' }));
 
+  // ---- Element 17 · Customer-Specific Requirements (CSR) checker ----
+  // Auto-verify what the packet already knows; 'manual' rules are user-confirmed.
+  const CSR_RULE_LABELS = { min_cpk: 'Min Cpk', min_ppap_level: 'Min PPAP level', max_grr: 'Max %GRR', require_element: 'Element required', manual: 'Manual check' };
+  const evalCsr = (item) => {
+    switch (item.rule_type) {
+      case 'min_cpk': {
+        const th = Number(item.threshold);
+        const rows = capabilityRows().filter(r => r.cap && r.cap.cpk != null && isFinite(r.cap.cpk));
+        if (!rows.length) return { state: 'na', detail: 'no Cpk computed yet' };
+        const bad = rows.filter(r => r.cap.cpk < th);
+        return bad.length ? { state: 'fail', detail: bad.length + ' char below ' + th + ': ' + bad.map(r => r.c.balloon_no || r.c.description || '?').slice(0, 4).join(', ') } : { state: 'pass', detail: 'all ' + rows.length + ' ≥ ' + th };
+      }
+      case 'min_ppap_level': {
+        const th = Number(item.threshold), lvl = Number(submission.ppap_level) || 3;
+        return lvl >= th ? { state: 'pass', detail: 'Level ' + lvl } : { state: 'fail', detail: 'Level ' + lvl + ' < ' + th };
+      }
+      case 'max_grr': {
+        const th = Number(item.threshold);
+        const rs = msaStudies.map(s => ppapGRR(s)).filter(r => r && r.pctGRR != null);
+        if (!rs.length) return { state: 'na', detail: 'no MSA studies' };
+        const bad = rs.filter(r => r.pctGRR > th);
+        return bad.length ? { state: 'fail', detail: bad.length + ' study > ' + th + '%' } : { state: 'pass', detail: 'all ≤ ' + th + '%' };
+      }
+      case 'require_element': {
+        if (!item.element_key || item.element_key === 'csr') return { state: 'na', detail: '—' };
+        const e = PPAP_ELEMENTS.find(x => x.key === item.element_key);
+        if (!e) return { state: 'na', detail: 'unknown element' };
+        const st = elStatus(e);
+        return st === 'complete' ? { state: 'pass', detail: e.label + ' complete' } : { state: 'fail', detail: e.label + ' is ' + st.replace(/_/g, ' ') };
+      }
+      default: return item.met ? { state: 'pass', detail: 'confirmed' } : { state: 'pending', detail: 'awaiting confirmation' };
+    }
+  };
+  const csrSummary = () => { const ev = csrItems.map(evalCsr); return { total: ev.length, pass: ev.filter(x => x.state === 'pass').length, fail: ev.filter(x => x.state === 'fail').length, pending: ev.filter(x => x.state === 'pending').length, na: ev.filter(x => x.state === 'na').length }; };
+  const nextCsrSeq = () => csrItems.reduce((m, c) => Math.max(m, c.seq || 0), 0) + 1;
+  const toggleCsrMet = async (item) => { const met = !item.met; setCsrItems(p => p.map(x => x.id === item.id ? { ...x, met } : x)); await sb.from('ppap_csr_items').update({ met, updated_at: new Date().toISOString() }).eq('id', item.id); };
+  const delCsr = async (id) => { if (!confirm('Delete this requirement?')) return; await sb.from('ppap_csr_items').delete().eq('id', id); refresh(); };
+  const seedCsr = async () => {
+    setBusy('csr');
+    let seq = nextCsrSeq();
+    const rows = [
+      { requirement: 'Full Level-3 PPAP submission', rule_type: 'min_ppap_level', threshold: 3 },
+      { requirement: 'Cpk ≥ 1.33 on all measured characteristics', rule_type: 'min_cpk', threshold: 1.33 },
+      { requirement: 'Gauge R&R %GRR < 10%', rule_type: 'max_grr', threshold: 10 },
+      { requirement: 'PFMEA completed & reviewed', rule_type: 'require_element', element_key: 'pfmea' },
+      { requirement: 'Control Plan approved', rule_type: 'require_element', element_key: 'control_plan' },
+      { requirement: 'PSW on customer-specified form', rule_type: 'manual' },
+      { requirement: 'IMDS entry submitted & accepted', rule_type: 'manual' },
+      { requirement: 'Parts labelled per customer packaging standard', rule_type: 'manual' },
+    ].map(r => ({ plant_id: plant.id, ppap_id: submission.id, seq: seq++, met: false, created_by: me.id, threshold: null, element_key: null, ...r }));
+    const { error } = await sb.from('ppap_csr_items').insert(rows);
+    setBusy('');
+    if (error) showToast(error.message); else { showToast('Added ' + rows.length + ' common CSRs — edit to match the customer'); refresh(); }
+  };
+  const csrBadge = (st) => st === 'pass' ? 'emerald' : st === 'fail' ? 'rose' : st === 'pending' ? 'amber' : 'slate';
+  const csrStateLabel = (st) => st === 'pass' ? '✓ met' : st === 'fail' ? '✗ conflict' : st === 'pending' ? 'confirm' : 'n/a';
+  const csrBodyHtml = () => {
+    if (!csrItems.length) return '<h2 class="section">Element 17 · Customer-Specific Requirements</h2><div class="empty">No customer-specific requirements recorded.</div>';
+    const s = csrSummary();
+    const rows = csrItems.map((it, i) => { const r = evalCsr(it); const b = r.state === 'pass' ? 'green' : r.state === 'fail' ? 'rose' : r.state === 'pending' ? 'amber' : 'slate'; return `<tr><td class="num">${i + 1}</td><td>${ppapEsc(it.requirement)}</td><td>${CSR_RULE_LABELS[it.rule_type] || it.rule_type}${it.threshold != null ? ' ' + it.threshold : ''}</td><td><span class="badge ${b}">${csrStateLabel(r.state)}</span></td><td style="font-size:11px;color:#64748b">${ppapEsc(r.detail)}</td></tr>`; }).join('');
+    return `<h2 class="section">Element 17 · Customer-Specific Requirements (CSR)</h2>
+      <div style="font-size:12px;margin-bottom:6px">${s.pass} met · ${s.fail} conflict${s.fail === 1 ? '' : 's'} · ${s.pending} to confirm · ${s.na} n/a</div>
+      <table class="data"><thead><tr><th>#</th><th>Requirement</th><th>Rule</th><th>Status</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>
+      ${s.fail ? '<div style="font-size:11px;color:#be123c;margin-top:6px">⚠ ' + s.fail + ' requirement(s) conflict with the current packet — resolve before submission.</div>' : ''}`;
+  };
+  const genCsr = () => ppapOpenDoc(reportShell(plant, 'Customer-Specific Requirements (CSR)',
+    `${submission.part_number || ''} · ${submission.customer_name || ''}`,
+    csrBodyHtml(), { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Requirements': csrItems.length, 'IATF': '8.2.2' }));
+
   const pfdTableHtml = () => steps.length === 0
     ? '<div class="empty">No process steps defined.</div>'
     : `<table class="data"><thead><tr><th>Op</th><th>Operation</th><th>Machine / Equipment</th><th>Controls</th><th>Notes</th></tr></thead><tbody>${
@@ -12522,6 +12595,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
       ${hasMeasurements() ? dimResultsTableHtml() : charTableHtml()}
       ${hasCapability() ? spcBodyHtml() : ''}
       ${msaStudies.length ? msaBodyHtml() : ''}
+      ${csrItems.length ? csrBodyHtml() : ''}
       ${pswBodyHtml()}`;
     ppapOpenDoc(reportShell(plant, 'PPAP Package', `${submission.part_number || ''} · ${submission.customer_name || ''}`, body,
       { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Characteristics': chars.length, 'IATF': '8.3.4.4' }));
@@ -12655,6 +12729,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
                 : e.key==='dimensional' ? html`<span style="font-size:11px;color:var(--slate-500)">${chars.length} char.${hasMeasurements()?' · results entered':''}</span>`
                 : e.key==='spc' ? (hasCapability() ? (() => { const s = capabilitySummary(); return html`<span style="font-size:11px;color:var(--slate-500)">${s.capable}/${s.computed} capable (Cpk ≥ 1.33)</span>`; })() : html`<span style="font-size:11px;color:var(--slate-500)">enter samples to compute Cpk</span>`)
                 : e.key==='msa' ? html`<span style="font-size:11px;color:var(--slate-500)">${msaStudies.length ? msaStudies.length + ' Gauge R&R stud' + (msaStudies.length===1?'y':'ies') : 'no studies — see Dimensional Results'}</span>`
+                : e.key==='csr' ? (csrItems.length ? (() => { const s = csrSummary(); return html`<span style="font-size:11px;color:${s.fail?'var(--rose-600)':'var(--slate-500)'}">${s.pass} met · ${s.fail} conflict · ${s.pending} to confirm</span>`; })() : html`<span style="font-size:11px;color:var(--slate-500)">add customer requirements below</span>`)
                 : (e.key==='control_plan'||e.key==='process_flow') ? html`<span style="font-size:11px;color:var(--slate-500)">${steps.length} steps</span>`
                 : e.key==='psw' ? html`<span style="font-size:11px;color:var(--slate-500)">generated on build</span>` : ''}
             </div>
@@ -12665,6 +12740,26 @@ function PpapBuilder({ plant, me, submission, onBack }) {
           </div>`;
         })}
       </div>
+
+      <div class="section-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
+        <span>📋 Element 17 · Customer-Specific Requirements${csrItems.length ? ' · ' + csrItems.length : ''}</span>
+        <span style="display:flex;gap:6px;flex-wrap:wrap">
+          ${csrItems.length === 0 ? html`<button class="btn small ghost" disabled=${busy==='csr'} onClick=${seedCsr}>${busy==='csr'?'…':'Add common CSRs'}</button>` : ''}
+          <button class="btn small" onClick=${() => setEditCsr({ _new:true })}>+ Add</button>
+        </span>
+      </div>
+      ${csrItems.length === 0 ? html`<div class="card"><div class="empty" style="padding:16px"><div class="icon">📋</div>No customer-specific requirements. Add the customer's CSRs — Cpk / %GRR / level / element rules auto-verify against the packet; others you confirm by hand.</div></div>` :
+        html`<div class="card" style="padding:0;overflow:hidden;margin-bottom:14px">${csrItems.map(it => { const r = evalCsr(it); return html`<div key=${it.id} style="display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--slate-100)">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13px;font-weight:600">${it.requirement}</div>
+            <div style="font-size:11px;color:var(--slate-500)">${CSR_RULE_LABELS[it.rule_type] || it.rule_type}${it.threshold != null ? ' · ' + it.threshold : ''}${it.element_key ? ' · ' + it.element_key : ''} — ${r.detail}</div>
+          </div>
+          ${it.rule_type === 'manual'
+            ? html`<label style="font-size:11px;color:var(--slate-600);display:flex;align-items:center;gap:4px"><input type="checkbox" checked=${it.met} onChange=${() => toggleCsrMet(it)} /> met</label>`
+            : html`<span class="badge ${csrBadge(r.state)}">${csrStateLabel(r.state)}</span>`}
+          <button class="btn small ghost" style="padding:2px 6px;font-size:10px" onClick=${() => setEditCsr(it)}>Edit</button>
+          <button class="btn small ghost" style="padding:2px 6px;font-size:10px;color:var(--rose-600)" onClick=${() => delCsr(it.id)}>✕</button>
+        </div>`; })}</div>`}
     `}
 
     <input ref=${el => { elDocRef.current.input = el; }} type="file" style="display:none" onChange=${e => { const f = e.target.files?.[0]; const k = elDocRef.current.key; if (f && k) uploadElementDoc(k, f); if (e.target) e.target.value = ''; }} />
@@ -12678,6 +12773,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
         <button class="btn small ghost" onClick=${genDimResults}>📏 Dimensional Results</button>
         <button class="btn small ghost" disabled=${!hasCapability()} title=${hasCapability()?'Cp/Cpk study from the entered samples':'Enter ≥2 samples per toleranced characteristic first'} onClick=${genSpc}>📈 Initial Process Study (Cpk)</button>
         <button class="btn small ghost" disabled=${!msaStudies.length} title=${msaStudies.length?'Gauge R&R summary':'Add a Gauge R&R study on the Dimensional Results tab first'} onClick=${genMsa}>🔬 MSA (Gauge R&R)</button>
+        <button class="btn small ghost" disabled=${!csrItems.length} title=${csrItems.length?'Customer-specific requirements checklist':'Add customer requirements on the Elements tab first'} onClick=${genCsr}>📋 CSR checklist</button>
         <button class="btn small" onClick=${genPacket}>📑 Build packet (Level ${submission.ppap_level || 3})</button>
       </div>
     </div>
@@ -12686,6 +12782,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     ${editStep && html`<${PpapStepModal} plant=${plant} submission=${submission} row=${editStep} nextSeq=${nextStepSeq()} onClose=${() => setEditStep(null)} onSaved=${() => { setEditStep(null); refresh(); }} />`}
     ${pfmeaOpen && html`<${PpapPfmeaDraftModal} plant=${plant} me=${me} submission=${submission} steps=${steps} chars=${chars} onClose=${() => setPfmeaOpen(false)} onCreated=${() => { setPfmeaOpen(false); refresh(); }} />`}
     ${editMsa && html`<${PpapMsaModal} plant=${plant} me=${me} submission=${submission} chars=${chars} row=${editMsa} onClose=${() => setEditMsa(null)} onSaved=${() => { setEditMsa(null); refresh(); }} />`}
+    ${editCsr && html`<${PpapCsrModal} plant=${plant} me=${me} submission=${submission} row=${editCsr} nextSeq=${nextCsrSeq()} onClose=${() => setEditCsr(null)} onSaved=${() => { setEditCsr(null); refresh(); }} />`}
   `;
 }
 
@@ -12959,6 +13056,64 @@ function PpapMsaModal({ plant, me, submission, chars, row, onClose, onSaved }) {
         <div style="display:flex;gap:8px;margin-top:10px">
           <button class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
           <button class="btn" disabled=${saving} onClick=${save} style="flex:2">${saving ? 'Saving…' : (isNew ? 'Create study' : 'Save')}</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// Add / edit one Customer-Specific Requirement. Auto rule types check the packet
+// (Cpk / %GRR / PPAP level / element completion); 'manual' is a hand-ticked item.
+function PpapCsrModal({ plant, me, submission, row, nextSeq, onClose, onSaved }) {
+  const isNew = !row.id;
+  const [f, setF] = useState({
+    requirement: row.requirement || '', rule_type: row.rule_type || 'manual',
+    threshold: row.threshold ?? '', element_key: row.element_key || 'pfmea',
+  });
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState('');
+  const needsThreshold = ['min_cpk', 'min_ppap_level', 'max_grr'].includes(f.rule_type);
+  const needsElement = f.rule_type === 'require_element';
+
+  const save = async () => {
+    if (!f.requirement.trim()) { setErr('Enter the requirement text'); return; }
+    setSaving(true); setErr('');
+    const payload = {
+      plant_id: plant.id, ppap_id: submission.id, requirement: f.requirement.trim(), rule_type: f.rule_type,
+      threshold: needsThreshold && f.threshold !== '' ? Number(f.threshold) : null,
+      element_key: needsElement ? f.element_key : null, updated_at: new Date().toISOString(),
+    };
+    let error;
+    if (isNew) ({ error } = await sb.from('ppap_csr_items').insert({ ...payload, seq: nextSeq, met: false, created_by: me.id }));
+    else       ({ error } = await sb.from('ppap_csr_items').update(payload).eq('id', row.id));
+    if (error) { setErr(error.message); setSaving(false); return; }
+    showToast(isNew ? 'Requirement added' : 'Saved'); onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:520px">
+        <div class="modal-header"><div class="modal-title">📋 ${isNew ? 'New' : 'Edit'} customer requirement</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field"><label>Requirement *</label><input value=${f.requirement} onChange=${e => setF({ ...f, requirement: e.target.value })} placeholder="e.g. Cpk ≥ 1.67 on all safety characteristics" /></div>
+        <div class="field"><label>How to verify</label>
+          <select value=${f.rule_type} onChange=${e => setF({ ...f, rule_type: e.target.value })} style="padding:6px;border:1px solid var(--slate-200);border-radius:6px">
+            <option value="manual">Manual — I confirm by hand</option>
+            <option value="min_cpk">Auto — min Cpk on every characteristic</option>
+            <option value="min_ppap_level">Auto — minimum PPAP level</option>
+            <option value="max_grr">Auto — max %GRR on every MSA study</option>
+            <option value="require_element">Auto — a packet element must be complete</option>
+          </select>
+        </div>
+        ${needsThreshold && html`<div class="field"><label>${f.rule_type === 'max_grr' ? 'Max %GRR' : f.rule_type === 'min_ppap_level' ? 'Minimum level (1–5)' : 'Minimum Cpk'}</label>
+          <input type="number" step="any" value=${f.threshold} onChange=${e => setF({ ...f, threshold: e.target.value })} placeholder=${f.rule_type === 'max_grr' ? '10' : f.rule_type === 'min_ppap_level' ? '3' : '1.33'} /></div>`}
+        ${needsElement && html`<div class="field"><label>Element that must be complete</label>
+          <select value=${f.element_key} onChange=${e => setF({ ...f, element_key: e.target.value })} style="padding:6px;border:1px solid var(--slate-200);border-radius:6px">
+            ${PPAP_ELEMENTS.filter(e => e.key !== 'csr').map(e => html`<option key=${e.key} value=${e.key}>${e.label}</option>`)}
+          </select></div>`}
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
+          <button class="btn" disabled=${saving} onClick=${save} style="flex:2">${saving ? 'Saving…' : (isNew ? 'Add' : 'Save')}</button>
         </div>
       </div>
     </div>
