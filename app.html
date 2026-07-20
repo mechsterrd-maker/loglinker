@@ -12113,6 +12113,9 @@ function ppapJudge(c, actual) {
 
 function PpapBuilder({ plant, me, submission, onBack }) {
   const [chars, setChars] = useState([]);
+  const [meas, setMeas] = useState({});             // `${charId}:${sampleNo}` -> actual
+  const [sampleCount, setSampleCount] = useState(5);
+  const [view, setView] = useState('chars');        // chars | results
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState('');
   const [editChar, setEditChar] = useState(null);   // char row or {_new:true}
@@ -12121,10 +12124,37 @@ function PpapBuilder({ plant, me, submission, onBack }) {
   const refresh = useCallback(async () => {
     setLoading(true);
     const { data } = await sb.from('ppap_characteristics').select('*').eq('ppap_id', submission.id).order('seq').order('created_at');
-    setChars(data || []);
+    const list = data || [];
+    setChars(list);
+    if (list.length) {
+      const { data: m } = await sb.from('ppap_measurements').select('characteristic_id, sample_no, actual').in('characteristic_id', list.map(c => c.id));
+      const map = {}; let maxS = 5;
+      (m || []).forEach(r => { map[r.characteristic_id + ':' + r.sample_no] = r.actual; if (r.sample_no > maxS) maxS = r.sample_no; });
+      setMeas(map); setSampleCount(maxS);
+    } else { setMeas({}); }
     setLoading(false);
   }, [submission.id]);
   useEffect(() => { refresh(); }, [refresh]);
+
+  // Save a single measured value (upsert on characteristic + sample).
+  const saveMeas = async (charId, sampleNo, val) => {
+    const key = charId + ':' + sampleNo;
+    setMeas(p => ({ ...p, [key]: val }));
+    const actual = val === '' || val == null ? null : Number(val);
+    await sb.from('ppap_measurements').upsert(
+      { plant_id: plant.id, characteristic_id: charId, sample_no: sampleNo, actual },
+      { onConflict: 'characteristic_id,sample_no' });
+  };
+  // Per-characteristic verdict across all samples.
+  const charVerdict = (c) => {
+    const vals = [];
+    for (let s = 1; s <= sampleCount; s++) { const v = meas[c.id + ':' + s]; if (v !== '' && v != null) vals.push(Number(v)); }
+    if (!vals.length) return { state: 'none', vals };
+    const judged = vals.map(v => ppapJudge(c, v));
+    if (judged.some(j => j === false)) return { state: 'fail', vals };
+    if (judged.every(j => j === true)) return { state: 'pass', vals };
+    return { state: 'partial', vals };
+  };
 
   const nextSeq = () => (chars.reduce((m, c) => Math.max(m, c.seq || 0), 0) + 1);
 
@@ -12233,6 +12263,23 @@ function PpapBuilder({ plant, me, submission, onBack }) {
         chars.map((c, i) => `<tr><td class="num">${i+1}</td><td>${ppapEsc(c.balloon_no)}</td><td>${ppapEsc(c.description)}</td><td class="num">${c.nominal ?? ''}</td><td>${ppapEsc(ppapTolLabel(c))}</td><td>${ppapEsc(c.uom)}</td><td>${ppapEsc(c.gd_t)}</td><td>${c.classification && c.classification !== 'none' ? '<span class="badge amber">' + c.classification.toUpperCase() + '</span>' : ''}</td></tr>`).join('')
       }</tbody></table>`;
 
+  const hasMeasurements = () => chars.some(c => { for (let s = 1; s <= sampleCount; s++) { const v = meas[c.id + ':' + s]; if (v !== '' && v != null) return true; } return false; });
+  const dimResultsTableHtml = () => {
+    const sampleHdrs = Array.from({ length: sampleCount }, (_, i) => `<th class="num">S${i+1}</th>`).join('');
+    const badge = (st) => st === 'pass' ? '<span class="badge green">PASS</span>' : st === 'fail' ? '<span class="badge rose">FAIL</span>' : st === 'partial' ? '<span class="badge amber">CHECK</span>' : '<span class="badge slate">—</span>';
+    return `<table class="data"><thead><tr><th>#</th><th>Balloon</th><th>Characteristic</th><th class="num">Nominal</th><th>Tol</th>${sampleHdrs}<th>Result</th></tr></thead><tbody>${
+      chars.map((c, i) => {
+        const v = charVerdict(c);
+        const cells = Array.from({ length: sampleCount }, (_, s) => { const val = meas[c.id + ':' + (s+1)]; const j = (val === '' || val == null) ? null : ppapJudge(c, val); return `<td class="num"${j === false ? ' style="color:#be123c;font-weight:700"' : ''}>${val ?? ''}</td>`; }).join('');
+        return `<tr><td class="num">${i+1}</td><td>${ppapEsc(c.balloon_no)}</td><td>${ppapEsc(c.description)}</td><td class="num">${c.nominal ?? ''}</td><td>${ppapEsc(ppapTolLabel(c))}</td>${cells}<td>${badge(v.state)}</td></tr>`;
+      }).join('')
+    }</tbody></table>`;
+  };
+  const genDimResults = () => ppapOpenDoc(reportShell(plant, 'Dimensional Results',
+    `${submission.part_number || ''}${submission.part_revision ? ' rev ' + submission.part_revision : ''} · ${submission.customer_name || ''}`,
+    `<h2 class="section">Element 9 · Dimensional Results (${sampleCount} samples)</h2>${chars.length ? dimResultsTableHtml() : '<div class="empty">No characteristics.</div>'}`,
+    { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Characteristics': chars.length, 'IATF': '8.3.4.4' }));
+
   const pswBodyHtml = () => {
     const idx = applicable.map((e, i) => `<tr><td class="num">${i+1}</td><td>${e.label}</td><td>${e.key === 'dimensional' ? (chars.length ? '<span class="badge green">' + chars.length + ' char.</span>' : '<span class="badge slate">pending</span>') : e.key === 'psw' ? '<span class="badge green">this document</span>' : '<span class="badge slate">—</span>'}</td></tr>`).join('');
     return `
@@ -12266,8 +12313,8 @@ function PpapBuilder({ plant, me, submission, onBack }) {
       </div>
       <h2 class="section">Contents — Level ${submission.ppap_level || 3} elements</h2>
       <table class="data"><thead><tr><th>#</th><th>Element</th><th>Clause</th></tr></thead><tbody>${idx}</tbody></table>
-      <h2 class="section">Element 9 · Dimensional Characteristics (${chars.length})</h2>
-      ${charTableHtml()}
+      <h2 class="section">Element 9 · Dimensional ${hasMeasurements() ? 'Results' : 'Characteristics'} (${chars.length})</h2>
+      ${hasMeasurements() ? dimResultsTableHtml() : charTableHtml()}
       ${pswBodyHtml()}`;
     ppapOpenDoc(reportShell(plant, 'PPAP Package', `${submission.part_number || ''} · ${submission.customer_name || ''}`, body,
       { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Characteristics': chars.length, 'IATF': '8.3.4.4' }));
@@ -12293,41 +12340,70 @@ function PpapBuilder({ plant, me, submission, onBack }) {
       </div>
     </div>
 
-    <div class="section-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
-      <span>Characteristics · ${chars.length}</span>
-      <span style="display:flex;gap:6px;flex-wrap:wrap">
-        <button class="btn small" onClick=${() => setEditChar({ _new:true })}>+ Add</button>
-        <button class="btn small ghost" disabled=${busy==='scl'} onClick=${seedFromScl}>${busy==='scl'?'…':'Seed from CC/SC'}</button>
-        <button class="btn small ghost" disabled=${busy==='csv'} onClick=${() => csvRef.current?.click()}>${busy==='csv'?'…':'Import CSV'}</button>
-        <button class="btn small ghost" onClick=${openCadNexa}>🎯 CadNexa balloon</button>
-        <input ref=${csvRef} type="file" accept=".xlsx,.xls,.csv" style="display:none" onChange=${importCsv} />
-      </span>
+    <div style="display:flex;gap:6px;margin-bottom:10px">
+      <button class=${'btn small ' + (view==='chars'?'':'ghost')} onClick=${() => setView('chars')}>📐 Characteristics · ${chars.length}</button>
+      <button class=${'btn small ' + (view==='results'?'':'ghost')} onClick=${() => setView('results')}>📏 Dimensional Results</button>
     </div>
 
-    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
-      chars.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📐</div>No characteristics yet. Balloon a drawing in CadNexa, seed from Special Characteristics, import a CSV, or add manually.</div></div>` :
-      html`<div style="overflow-x:auto;margin-bottom:14px"><table style="width:100%;border-collapse:collapse;font-size:12px">
-        <thead><tr style="background:var(--slate-50);text-align:left">
-          ${['#','Balloon','Characteristic','Nominal','Tol','UOM','GD&T','',''].map(h => html`<th style="padding:7px 8px;font-weight:600;color:var(--slate-600);white-space:nowrap">${h}</th>`)}
-        </tr></thead><tbody>
-        ${chars.map((c, i) => html`<tr key=${c.id} style="border-top:1px solid var(--slate-100)">
-          <td style="padding:6px 8px;color:var(--slate-400)">${i+1}</td>
-          <td style="padding:6px 8px;font-weight:600">${c.balloon_no || '—'}</td>
-          <td style="padding:6px 8px">${c.description || '—'} ${clsBadge(c)}</td>
-          <td style="padding:6px 8px;font-variant-numeric:tabular-nums">${c.nominal ?? ''}</td>
-          <td style="padding:6px 8px;color:var(--slate-500)">${ppapTolLabel(c)}</td>
-          <td style="padding:6px 8px;color:var(--slate-500)">${c.uom || ''}</td>
-          <td style="padding:6px 8px;color:var(--slate-500)">${c.gd_t || ''}</td>
-          <td style="padding:6px 8px"><button class="btn small ghost" style="padding:2px 6px;font-size:10px" onClick=${() => setEditChar(c)}>Edit</button></td>
-          <td style="padding:6px 8px"><button class="btn small ghost" style="padding:2px 6px;font-size:10px;color:var(--rose-600)" onClick=${() => delChar(c.id)}>✕</button></td>
-        </tr>`)}
-        </tbody></table></div>`}
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` : view === 'chars' ? html`
+      <div class="section-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
+        <span>Characteristics · ${chars.length}</span>
+        <span style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn small" onClick=${() => setEditChar({ _new:true })}>+ Add</button>
+          <button class="btn small ghost" disabled=${busy==='scl'} onClick=${seedFromScl}>${busy==='scl'?'…':'Seed from CC/SC'}</button>
+          <button class="btn small ghost" disabled=${busy==='csv'} onClick=${() => csvRef.current?.click()}>${busy==='csv'?'…':'Import CSV'}</button>
+          <button class="btn small ghost" onClick=${openCadNexa}>🎯 CadNexa balloon</button>
+          <input ref=${csvRef} type="file" accept=".xlsx,.xls,.csv" style="display:none" onChange=${importCsv} />
+        </span>
+      </div>
+      ${chars.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📐</div>No characteristics yet. Balloon a drawing in CadNexa, seed from Special Characteristics, import a CSV, or add manually.</div></div>` :
+        html`<div style="overflow-x:auto;margin-bottom:14px"><table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead><tr style="background:var(--slate-50);text-align:left">
+            ${['#','Balloon','Characteristic','Nominal','Tol','UOM','GD&T','',''].map(h => html`<th style="padding:7px 8px;font-weight:600;color:var(--slate-600);white-space:nowrap">${h}</th>`)}
+          </tr></thead><tbody>
+          ${chars.map((c, i) => html`<tr key=${c.id} style="border-top:1px solid var(--slate-100)">
+            <td style="padding:6px 8px;color:var(--slate-400)">${i+1}</td>
+            <td style="padding:6px 8px;font-weight:600">${c.balloon_no || '—'}</td>
+            <td style="padding:6px 8px">${c.description || '—'} ${clsBadge(c)}</td>
+            <td style="padding:6px 8px;font-variant-numeric:tabular-nums">${c.nominal ?? ''}</td>
+            <td style="padding:6px 8px;color:var(--slate-500)">${ppapTolLabel(c)}</td>
+            <td style="padding:6px 8px;color:var(--slate-500)">${c.uom || ''}</td>
+            <td style="padding:6px 8px;color:var(--slate-500)">${c.gd_t || ''}</td>
+            <td style="padding:6px 8px"><button class="btn small ghost" style="padding:2px 6px;font-size:10px" onClick=${() => setEditChar(c)}>Edit</button></td>
+            <td style="padding:6px 8px"><button class="btn small ghost" style="padding:2px 6px;font-size:10px;color:var(--rose-600)" onClick=${() => delChar(c.id)}>✕</button></td>
+          </tr>`)}
+          </tbody></table></div>`}
+    ` : html`
+      <div class="section-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
+        <span>Measured samples → auto pass/fail</span>
+        <label style="font-size:12px;color:var(--slate-600)">Samples
+          <select value=${sampleCount} onChange=${e => setSampleCount(Number(e.target.value))} style="margin-left:6px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:6px">${[1,3,5,10].map(n => html`<option key=${n} value=${n}>${n}</option>`)}</select>
+        </label>
+      </div>
+      ${chars.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📏</div>Add characteristics first, then enter measured values here.</div></div>` :
+        html`<div style="overflow-x:auto;margin-bottom:14px"><table style="border-collapse:collapse;font-size:12px">
+          <thead><tr style="background:var(--slate-50);text-align:left">
+            ${['#','Balloon','Characteristic','Nominal ±Tol'].map(h => html`<th style="padding:7px 8px;font-weight:600;color:var(--slate-600);white-space:nowrap">${h}</th>`)}
+            ${Array.from({ length: sampleCount }, (_, i) => html`<th key=${i} style="padding:7px 8px;font-weight:600;color:var(--slate-600);text-align:center">S${i+1}</th>`)}
+            <th style="padding:7px 8px;font-weight:600;color:var(--slate-600)">Result</th>
+          </tr></thead><tbody>
+          ${chars.map((c, i) => { const v = charVerdict(c); return html`<tr key=${c.id} style="border-top:1px solid var(--slate-100)">
+            <td style="padding:6px 8px;color:var(--slate-400)">${i+1}</td>
+            <td style="padding:6px 8px;font-weight:600;white-space:nowrap">${c.balloon_no || '—'}</td>
+            <td style="padding:6px 8px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${c.description || '—'} ${clsBadge(c)}</td>
+            <td style="padding:6px 8px;color:var(--slate-500);white-space:nowrap">${c.nominal ?? ''} ${ppapTolLabel(c)}</td>
+            ${Array.from({ length: sampleCount }, (_, s) => { const val = meas[c.id + ':' + (s+1)]; const j = (val === '' || val == null) ? null : ppapJudge(c, val); return html`<td key=${s} style="padding:2px 3px"><input type="number" step="any" value=${val ?? ''} onChange=${e => saveMeas(c.id, s+1, e.target.value)} style=${'width:60px;padding:4px;border:1px solid ' + (j===false?'var(--rose-400)':'var(--slate-200)') + ';border-radius:4px;text-align:right;' + (j===false?'color:var(--rose-600);font-weight:600':'')} /></td>`; })}
+            <td style="padding:6px 8px">${v.state==='pass'?html`<span class="badge emerald">PASS</span>`:v.state==='fail'?html`<span class="badge rose">FAIL</span>`:v.state==='partial'?html`<span class="badge amber">CHECK</span>`:html`<span class="badge slate">—</span>`}</td>
+          </tr>`; })}
+          </tbody></table></div>`}
+    `}
 
     <div class="card" style="background:var(--teal-50);border-color:var(--teal-200)">
       <div class="card-title">Generate</div>
       <div style="font-size:12px;color:var(--slate-600);margin-bottom:10px">Produce the auditor-ready documents. Each opens in a new tab with a Print / Save-PDF button.</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn small" onClick=${genPsw}>📄 PSW</button>
+        <button class="btn small ghost" onClick=${genDimResults}>📏 Dimensional Results</button>
         <button class="btn small" onClick=${genPacket}>📑 Build packet (Level ${submission.ppap_level || 3})</button>
       </div>
     </div>
