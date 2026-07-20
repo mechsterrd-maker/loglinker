@@ -12196,6 +12196,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
   const [editStep, setEditStep] = useState(null);   // step row or {_new:true}
   const [editMsa, setEditMsa] = useState(null);     // msa study row or {_new:true}
   const [editCsr, setEditCsr] = useState(null);     // csr item or {_new:true}
+  const [tplOpen, setTplOpen] = useState(false);    // part-family template library
   const [pfmeaOpen, setPfmeaOpen] = useState(false);
   const csvRef = useRef(null);
   const elDocRef = useRef({ key: null, input: null });
@@ -12636,6 +12637,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
           <button class="btn small ghost" disabled=${busy==='scl'} onClick=${seedFromScl}>${busy==='scl'?'…':'Seed from CC/SC'}</button>
           <button class="btn small ghost" disabled=${busy==='csv'} onClick=${() => csvRef.current?.click()}>${busy==='csv'?'…':'Import CSV'}</button>
           <button class="btn small ghost" onClick=${openCadNexa}>🎯 CadNexa balloon</button>
+          <button class="btn small ghost" onClick=${() => setTplOpen(true)}>📚 Templates</button>
           <input ref=${csvRef} type="file" accept=".xlsx,.xls,.csv" style="display:none" onChange=${importCsv} />
         </span>
       </div>
@@ -12700,6 +12702,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
       <div class="section-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
         <span>Process flow · ${steps.length}</span>
         <span style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn small ghost" onClick=${() => setTplOpen(true)}>📚 Templates</button>
           <button class="btn small ghost" disabled=${steps.length===0} title=${steps.length===0?'Add process steps first':'AI-draft a Process FMEA'} onClick=${() => setPfmeaOpen(true)}>🤖 Draft PFMEA</button>
           <button class="btn small" onClick=${() => setEditStep({ _new:true })}>+ Add step</button>
         </span>
@@ -12783,6 +12786,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     ${pfmeaOpen && html`<${PpapPfmeaDraftModal} plant=${plant} me=${me} submission=${submission} steps=${steps} chars=${chars} onClose=${() => setPfmeaOpen(false)} onCreated=${() => { setPfmeaOpen(false); refresh(); }} />`}
     ${editMsa && html`<${PpapMsaModal} plant=${plant} me=${me} submission=${submission} chars=${chars} row=${editMsa} onClose=${() => setEditMsa(null)} onSaved=${() => { setEditMsa(null); refresh(); }} />`}
     ${editCsr && html`<${PpapCsrModal} plant=${plant} me=${me} submission=${submission} row=${editCsr} nextSeq=${nextCsrSeq()} onClose=${() => setEditCsr(null)} onSaved=${() => { setEditCsr(null); refresh(); }} />`}
+    ${tplOpen && html`<${PpapTemplateModal} plant=${plant} me=${me} submission=${submission} steps=${steps} chars=${chars} onClose=${() => setTplOpen(false)} onApplied=${() => { setTplOpen(false); refresh(); }} />`}
   `;
 }
 
@@ -13115,6 +13119,92 @@ function PpapCsrModal({ plant, me, submission, row, nextSeq, onClose, onSaved })
           <button class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
           <button class="btn" disabled=${saving} onClick=${save} style="flex:2">${saving ? 'Saving…' : (isNew ? 'Add' : 'Save')}</button>
         </div>
+      </div>
+    </div>
+  `;
+}
+
+// Part-family library. Save the current process flow + characteristics as a
+// reusable template, or apply a saved one into this submission (appends; then
+// re-run Draft PFMEA to regenerate the FMEA). Plant-wide, unit-isolated.
+function PpapTemplateModal({ plant, me, submission, steps, chars, onClose, onApplied }) {
+  const [tpls, setTpls] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState('');
+  const [err, setErr] = useState('');
+  const [name, setName] = useState('');
+  const [family, setFamily] = useState('');
+  const [incFlow, setIncFlow] = useState(steps.length > 0);
+  const [incChars, setIncChars] = useState(chars.length > 0);
+
+  const load = async () => {
+    setLoading(true);
+    const { data } = await sb.from('ppap_templates').select('*').order('family', { nullsFirst: true }).order('name');
+    setTpls(data || []); setLoading(false);
+  };
+  useEffect(() => { load(); }, []);
+
+  const saveTpl = async () => {
+    if (!name.trim()) { setErr('Name the template'); return; }
+    if (!incFlow && !incChars) { setErr('Include the process flow, characteristics, or both'); return; }
+    setBusy('save'); setErr('');
+    const cleanSteps = incFlow ? steps.map(s => ({ seq: s.seq, operation: s.operation, machine: s.machine, control_method: s.control_method, notes: s.notes })) : [];
+    const cleanChars = incChars ? chars.map(c => ({ balloon_no: c.balloon_no, description: c.description, nominal: c.nominal, tol_plus: c.tol_plus, tol_minus: c.tol_minus, uom: c.uom, gd_t: c.gd_t, classification: c.classification })) : [];
+    const { error } = await sb.from('ppap_templates').insert({ plant_id: plant.id, name: name.trim(), family: family.trim() || null, steps: cleanSteps, chars: cleanChars, created_by: me.id });
+    setBusy('');
+    if (error) { setErr(error.message); return; }
+    setName(''); setFamily(''); showToast('Template saved'); load();
+  };
+
+  const applyTpl = async (tpl) => {
+    setBusy('apply:' + tpl.id); setErr('');
+    try {
+      const tSteps = Array.isArray(tpl.steps) ? tpl.steps : [];
+      const tChars = Array.isArray(tpl.chars) ? tpl.chars : [];
+      let sSeq = steps.reduce((m, s) => Math.max(m, s.seq || 0), 0) + 1;
+      let cSeq = chars.reduce((m, c) => Math.max(m, c.seq || 0), 0) + 1;
+      const sRows = tSteps.map(s => ({ plant_id: plant.id, ppap_id: submission.id, seq: sSeq++, operation: s.operation || null, machine: s.machine || null, control_method: s.control_method || null, notes: s.notes || null }));
+      const cRows = tChars.map(c => ({ plant_id: plant.id, ppap_id: submission.id, seq: cSeq++, balloon_no: c.balloon_no != null ? String(c.balloon_no) : null, description: c.description || null, nominal: c.nominal ?? null, tol_plus: c.tol_plus ?? null, tol_minus: c.tol_minus ?? null, uom: c.uom || null, gd_t: c.gd_t || null, classification: ['cc', 'sc'].includes(String(c.classification)) ? c.classification : 'none', source: 'template' }));
+      if (sRows.length) { const { error } = await sb.from('ppap_process_steps').insert(sRows); if (error) throw error; }
+      if (cRows.length) { const { error } = await sb.from('ppap_characteristics').insert(cRows); if (error) throw error; }
+      showToast('Applied — added ' + sRows.length + ' steps, ' + cRows.length + ' characteristics');
+      onApplied();
+    } catch (e) { setErr(e.message || 'Apply failed'); setBusy(''); }
+  };
+
+  const delTpl = async (id) => { if (!confirm('Delete this template?')) return; await sb.from('ppap_templates').delete().eq('id', id); load(); };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:620px;max-height:92vh;overflow-y:auto">
+        <div class="modal-header"><div class="modal-title">📚 Part-family library</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+
+        <div class="card" style="background:var(--slate-50);margin-bottom:12px">
+          <div class="card-title">Save current setup as a template</div>
+          <div class="field-row">
+            <div class="field"><label>Name *</label><input value=${name} onChange=${e => setName(e.target.value)} placeholder="Turned steel shaft — standard" /></div>
+            <div class="field"><label>Part family</label><input value=${family} onChange=${e => setFamily(e.target.value)} placeholder="Shafts" /></div>
+          </div>
+          <div style="display:flex;gap:14px;font-size:12px;margin:4px 0 8px">
+            <label style="display:flex;align-items:center;gap:5px"><input type="checkbox" checked=${incFlow} disabled=${steps.length===0} onChange=${e => setIncFlow(e.target.checked)} /> Process flow (${steps.length})</label>
+            <label style="display:flex;align-items:center;gap:5px"><input type="checkbox" checked=${incChars} disabled=${chars.length===0} onChange=${e => setIncChars(e.target.checked)} /> Characteristics (${chars.length})</label>
+          </div>
+          <button class="btn small" disabled=${busy==='save'} onClick=${saveTpl}>${busy==='save'?'Saving…':'💾 Save template'}</button>
+        </div>
+
+        <div class="card-title">Apply a template</div>
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+          tpls.length === 0 ? html`<div class="empty" style="padding:16px">No templates yet. Save one above to reuse it on the next part in this family.</div>` :
+          html`<div class="card" style="padding:0;overflow:hidden">${tpls.map(t => html`<div key=${t.id} style="display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--slate-100)">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:13px;font-weight:600">${t.name}</div>
+              <div style="font-size:11px;color:var(--slate-500)">${t.family ? t.family + ' · ' : ''}${(t.steps||[]).length} steps · ${(t.chars||[]).length} characteristics</div>
+            </div>
+            <button class="btn small" disabled=${busy==='apply:'+t.id} onClick=${() => applyTpl(t)}>${busy==='apply:'+t.id?'…':'Apply'}</button>
+            <button class="btn small ghost" style="padding:2px 6px;font-size:10px;color:var(--rose-600)" onClick=${() => delTpl(t.id)}>✕</button>
+          </div>`)}</div>`}
+        <div style="font-size:11px;color:var(--slate-400);margin-top:8px">Applying appends to this submission — it never overwrites. After adding a flow, re-run 🤖 Draft PFMEA to regenerate the FMEA.</div>
       </div>
     </div>
   `;
