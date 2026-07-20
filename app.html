@@ -12114,18 +12114,30 @@ function ppapJudge(c, actual) {
 function PpapBuilder({ plant, me, submission, onBack }) {
   const [chars, setChars] = useState([]);
   const [meas, setMeas] = useState({});             // `${charId}:${sampleNo}` -> actual
+  const [steps, setSteps] = useState([]);           // process flow rows
+  const [elems, setElems] = useState({});           // element_key -> ppap_elements row
+  const [docs, setDocs] = useState([]);             // ppap_documents rows
   const [sampleCount, setSampleCount] = useState(5);
-  const [view, setView] = useState('chars');        // chars | results
+  const [view, setView] = useState('chars');        // chars | results | flow | elements
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState('');
   const [editChar, setEditChar] = useState(null);   // char row or {_new:true}
+  const [editStep, setEditStep] = useState(null);   // step row or {_new:true}
   const csvRef = useRef(null);
+  const elDocRef = useRef({ key: null, input: null });
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const { data } = await sb.from('ppap_characteristics').select('*').eq('ppap_id', submission.id).order('seq').order('created_at');
+    const [{ data }, { data: st }, { data: el }, { data: dc }] = await Promise.all([
+      sb.from('ppap_characteristics').select('*').eq('ppap_id', submission.id).order('seq').order('created_at'),
+      sb.from('ppap_process_steps').select('*').eq('ppap_id', submission.id).order('seq').order('created_at'),
+      sb.from('ppap_elements').select('*').eq('ppap_id', submission.id),
+      sb.from('ppap_documents').select('*').eq('ppap_id', submission.id).order('uploaded_at', { ascending: false }),
+    ]);
     const list = data || [];
-    setChars(list);
+    setChars(list); setSteps(st || []);
+    const emap = {}; (el || []).forEach(e => { emap[e.element_key] = e; }); setElems(emap);
+    setDocs(dc || []);
     if (list.length) {
       const { data: m } = await sb.from('ppap_measurements').select('characteristic_id, sample_no, actual').in('characteristic_id', list.map(c => c.id));
       const map = {}; let maxS = 5;
@@ -12135,6 +12147,31 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     setLoading(false);
   }, [submission.id]);
   useEffect(() => { refresh(); }, [refresh]);
+  const nextStepSeq = () => (steps.reduce((m, s) => Math.max(m, s.seq || 0), 0) + 1);
+  const delStep = async (id) => { if (!confirm('Delete this process step?')) return; await sb.from('ppap_process_steps').delete().eq('id', id); refresh(); };
+
+  const setElement = async (key, patch) => {
+    setElems(p => ({ ...p, [key]: { ...(p[key] || { element_key: key }), ...patch } }));   // optimistic
+    await sb.from('ppap_elements').upsert(
+      { plant_id: plant.id, ppap_id: submission.id, element_key: key, ...patch, updated_at: new Date().toISOString() },
+      { onConflict: 'ppap_id,element_key' });
+  };
+  const uploadElementDoc = async (key, file) => {
+    if (!file) return;
+    setBusy('el:' + key);
+    try {
+      const ext = (file.name.split('.').pop() || 'dat').toLowerCase();
+      const path = 'ppap/' + plant.id + '/' + submission.id + '/' + crypto.randomUUID() + '.' + ext;
+      const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, file, { cacheControl: '3600', contentType: file.type || 'application/octet-stream' });
+      if (upErr) throw upErr;
+      const url = sb.storage.from('chat-attachments').getPublicUrl(path).data.publicUrl;
+      await sb.from('ppap_documents').insert({ plant_id: plant.id, ppap_id: submission.id, kind: key, title: file.name, file_url: url, file_size: file.size, content_type: file.type, uploaded_by: me.id });
+      await setElement(key, { status: 'complete', doc_url: url });
+      showToast('Attached to ' + key.replace(/_/g, ' '));
+      refresh();
+    } catch (err) { showToast(err.message || 'Upload failed'); }
+    finally { setBusy(''); }
+  };
 
   // Save a single measured value (upsert on characteristic + sample).
   const saveMeas = async (charId, sampleNo, val) => {
@@ -12256,6 +12293,18 @@ function PpapBuilder({ plant, me, submission, onBack }) {
 
   const applicable = ppapElementsForLevel(submission.ppap_level);
 
+  // Effective element status: explicit ppap_elements value, else derived from
+  // what the builder already knows (dimensional/control plan/psw auto-progress).
+  const elStatus = (e) => {
+    const st = (elems[e.key] || {}).status;
+    if (st) return st;
+    if (e.key === 'dimensional' && chars.length) return hasMeasurements() ? 'complete' : 'in_progress';
+    if ((e.key === 'control_plan' || e.key === 'process_flow') && steps.length) return 'in_progress';
+    if (e.key === 'psw') return 'complete';
+    return 'pending';
+  };
+  const elStatusBadge = (s) => s === 'complete' ? '<span class="badge green">complete</span>' : s === 'in_progress' ? '<span class="badge amber">in progress</span>' : s === 'na' ? '<span class="badge slate">N/A</span>' : '<span class="badge slate">pending</span>';
+
   // ---- Document builders (reportShell + browser print) ----
   const charTableHtml = () => chars.length === 0
     ? '<div class="empty">No characteristics captured yet.</div>'
@@ -12280,8 +12329,39 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     `<h2 class="section">Element 9 · Dimensional Results (${sampleCount} samples)</h2>${chars.length ? dimResultsTableHtml() : '<div class="empty">No characteristics.</div>'}`,
     { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Characteristics': chars.length, 'IATF': '8.3.4.4' }));
 
+  const pfdTableHtml = () => steps.length === 0
+    ? '<div class="empty">No process steps defined.</div>'
+    : `<table class="data"><thead><tr><th>Op</th><th>Operation</th><th>Machine / Equipment</th><th>Controls</th><th>Notes</th></tr></thead><tbody>${
+        steps.map((s, i) => `<tr><td class="num">${s.seq || i+1}</td><td>${ppapEsc(s.operation)}</td><td>${ppapEsc(s.machine)}</td><td>${ppapEsc(s.control_method)}</td><td>${ppapEsc(s.notes)}</td></tr>`).join('')
+      }</tbody></table>`;
+  const controlPlanBodyHtml = () => {
+    const rows = chars.length === 0 ? '<tr><td colspan="8" style="text-align:center;color:#94a3b8">No characteristics.</td></tr>' :
+      chars.map((c, i) => {
+        const key = c.classification && c.classification !== 'none';
+        return `<tr>
+          <td class="num">${ppapEsc(c.balloon_no || (i+1))}</td>
+          <td>${ppapEsc(c.description)}${key ? ' <span class="badge amber">' + c.classification.toUpperCase() + '</span>' : ''}</td>
+          <td class="num">${c.nominal ?? ''}</td>
+          <td>${ppapEsc(ppapTolLabel(c))} ${ppapEsc(c.uom || '')}</td>
+          <td>${c.gd_t ? 'Gauge / GD&amp;T' : 'Measurement'}</td>
+          <td>${key ? '5 pcs' : '3 pcs'}</td>
+          <td>${key ? 'Per setup + hourly' : 'Per lot'}</td>
+          <td>Quarantine suspect stock; inform QA; 100% sort${key ? '; verify Cpk ≥ 1.33' : ''}</td>
+        </tr>`;
+      }).join('');
+    return `
+      <h2 class="section">Element 5 · Process Flow Diagram</h2>
+      ${pfdTableHtml()}
+      <h2 class="section">Element 7 · Control Plan</h2>
+      <table class="data"><thead><tr><th>Balloon</th><th>Characteristic</th><th class="num">Nominal</th><th>Spec / Tol</th><th>Evaluation method</th><th>Sample</th><th>Frequency</th><th>Reaction plan</th></tr></thead><tbody>${rows}</tbody></table>
+      <div style="font-size:10px;color:#94a3b8;margin-top:6px">Auto-drafted from characteristics + process flow — review method / sample / frequency / reaction before submission.</div>`;
+  };
+  const genControlPlan = () => ppapOpenDoc(reportShell(plant, 'Control Plan',
+    `${submission.part_number || ''}${submission.part_revision ? ' rev ' + submission.part_revision : ''} · ${submission.customer_name || ''}`,
+    controlPlanBodyHtml(), { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Steps': steps.length, 'IATF': '8.5.1.1' }));
+
   const pswBodyHtml = () => {
-    const idx = applicable.map((e, i) => `<tr><td class="num">${i+1}</td><td>${e.label}</td><td>${e.key === 'dimensional' ? (chars.length ? '<span class="badge green">' + chars.length + ' char.</span>' : '<span class="badge slate">pending</span>') : e.key === 'psw' ? '<span class="badge green">this document</span>' : '<span class="badge slate">—</span>'}</td></tr>`).join('');
+    const idx = applicable.map((e, i) => { const st = elems[e.key] || {}; return `<tr><td class="num">${i+1}</td><td>${e.label}${st.doc_url ? ' <a href="' + st.doc_url + '">📎</a>' : ''}</td><td>${elStatusBadge(elStatus(e))}</td></tr>`; }).join('');
     return `
       <h2 class="section">Part Submission Warrant</h2>
       <table class="data"><tbody>
@@ -12304,7 +12384,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
     pswBodyHtml(), { 'PPAP Level': 'Level ' + (submission.ppap_level || 3), 'Reason': (submission.reason||'').replace(/_/g,' '), 'IATF': '8.3.4.4' }));
 
   const genPacket = () => {
-    const idx = applicable.map((e, i) => `<tr><td class="num">${i+1}</td><td>${e.label}</td><td>${e.clause || ''}</td></tr>`).join('');
+    const idx = applicable.map((e, i) => { const st = elems[e.key] || {}; return `<tr><td class="num">${i+1}</td><td>${e.label}${st.doc_url ? ' <a href="' + st.doc_url + '">📎</a>' : ''}</td><td>${e.clause || ''}</td><td>${elStatusBadge(elStatus(e))}</td></tr>`; }).join('');
     const body = `
       <div style="text-align:center;padding:30px 0 20px;border-bottom:0.5px solid #e2e8f0;margin-bottom:16px">
         <div style="font-size:22px;font-weight:800;color:#0f766e">PPAP Submission Packet</div>
@@ -12312,7 +12392,8 @@ function PpapBuilder({ plant, me, submission, onBack }) {
         <div style="font-size:12px;color:#64748b;margin-top:2px">${ppapEsc(submission.customer_name)} · Level ${submission.ppap_level || 3} · ${ppapEsc((submission.reason||'').replace(/_/g,' '))}</div>
       </div>
       <h2 class="section">Contents — Level ${submission.ppap_level || 3} elements</h2>
-      <table class="data"><thead><tr><th>#</th><th>Element</th><th>Clause</th></tr></thead><tbody>${idx}</tbody></table>
+      <table class="data"><thead><tr><th>#</th><th>Element</th><th>Clause</th><th>Status</th></tr></thead><tbody>${idx}</tbody></table>
+      ${controlPlanBodyHtml()}
       <h2 class="section">Element 9 · Dimensional ${hasMeasurements() ? 'Results' : 'Characteristics'} (${chars.length})</h2>
       ${hasMeasurements() ? dimResultsTableHtml() : charTableHtml()}
       ${pswBodyHtml()}`;
@@ -12340,9 +12421,11 @@ function PpapBuilder({ plant, me, submission, onBack }) {
       </div>
     </div>
 
-    <div style="display:flex;gap:6px;margin-bottom:10px">
+    <div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">
       <button class=${'btn small ' + (view==='chars'?'':'ghost')} onClick=${() => setView('chars')}>📐 Characteristics · ${chars.length}</button>
       <button class=${'btn small ' + (view==='results'?'':'ghost')} onClick=${() => setView('results')}>📏 Dimensional Results</button>
+      <button class=${'btn small ' + (view==='flow'?'':'ghost')} onClick=${() => setView('flow')}>🏭 Process Flow · ${steps.length}</button>
+      <button class=${'btn small ' + (view==='elements'?'':'ghost')} onClick=${() => setView('elements')}>✅ Elements · ${applicable.length}</button>
     </div>
 
     ${loading ? html`<div class="loader"><div class="spinner"></div></div>` : view === 'chars' ? html`
@@ -12373,7 +12456,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
             <td style="padding:6px 8px"><button class="btn small ghost" style="padding:2px 6px;font-size:10px;color:var(--rose-600)" onClick=${() => delChar(c.id)}>✕</button></td>
           </tr>`)}
           </tbody></table></div>`}
-    ` : html`
+    ` : view === 'results' ? html`
       <div class="section-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
         <span>Measured samples → auto pass/fail</span>
         <label style="font-size:12px;color:var(--slate-600)">Samples
@@ -12396,19 +12479,97 @@ function PpapBuilder({ plant, me, submission, onBack }) {
             <td style="padding:6px 8px">${v.state==='pass'?html`<span class="badge emerald">PASS</span>`:v.state==='fail'?html`<span class="badge rose">FAIL</span>`:v.state==='partial'?html`<span class="badge amber">CHECK</span>`:html`<span class="badge slate">—</span>`}</td>
           </tr>`; })}
           </tbody></table></div>`}
+    ` : view === 'flow' ? html`
+      <div class="section-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
+        <span>Process flow · ${steps.length}</span>
+        <button class="btn small" onClick=${() => setEditStep({ _new:true })}>+ Add step</button>
+      </div>
+      ${steps.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🏭</div>No process steps yet. Add operations (e.g. cutting → CNC → plating → inspection) to drive the Process Flow Diagram and Control Plan.</div></div>` :
+        html`<div style="overflow-x:auto;margin-bottom:14px"><table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead><tr style="background:var(--slate-50);text-align:left">
+            ${['Op','Operation','Machine','Controls','',''].map(h => html`<th style="padding:7px 8px;font-weight:600;color:var(--slate-600);white-space:nowrap">${h}</th>`)}
+          </tr></thead><tbody>
+          ${steps.map((s, i) => html`<tr key=${s.id} style="border-top:1px solid var(--slate-100)">
+            <td style="padding:6px 8px;color:var(--slate-400)">${s.seq || i+1}</td>
+            <td style="padding:6px 8px;font-weight:600">${s.operation || '—'}</td>
+            <td style="padding:6px 8px;color:var(--slate-500)">${s.machine || ''}</td>
+            <td style="padding:6px 8px;color:var(--slate-500)">${s.control_method || ''}</td>
+            <td style="padding:6px 8px"><button class="btn small ghost" style="padding:2px 6px;font-size:10px" onClick=${() => setEditStep(s)}>Edit</button></td>
+            <td style="padding:6px 8px"><button class="btn small ghost" style="padding:2px 6px;font-size:10px;color:var(--rose-600)" onClick=${() => delStep(s.id)}>✕</button></td>
+          </tr>`)}
+          </tbody></table></div>`}
+    ` : html`
+      <div class="section-h">PPAP elements · Level ${submission.ppap_level || 3} (${applicable.length})</div>
+      <div class="card" style="padding:0;overflow:hidden;margin-bottom:14px">
+        ${applicable.map((e, i) => { const st = elems[e.key] || {}; const status = st.status || 'pending';
+          return html`<div key=${e.key} style="display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--slate-100)">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:13px;font-weight:600">${i+1}. ${e.label}</div>
+              ${st.doc_url ? html`<a href=${st.doc_url} target="_blank" style="font-size:11px;color:var(--teal-700)">📎 attached</a>`
+                : e.key==='dimensional' ? html`<span style="font-size:11px;color:var(--slate-500)">${chars.length} char.${hasMeasurements()?' · results entered':''}</span>`
+                : (e.key==='control_plan'||e.key==='process_flow') ? html`<span style="font-size:11px;color:var(--slate-500)">${steps.length} steps</span>`
+                : e.key==='psw' ? html`<span style="font-size:11px;color:var(--slate-500)">generated on build</span>` : ''}
+            </div>
+            <select value=${status} onChange=${ev => setElement(e.key, { status: ev.target.value })} style=${'font-size:12px;padding:4px 6px;border:1px solid var(--slate-200);border-radius:6px;background:' + (status==='complete'?'var(--emerald-50)':status==='na'?'var(--slate-50)':'white')}>
+              <option value="na">N/A</option><option value="pending">Pending</option><option value="in_progress">In progress</option><option value="complete">Complete</option>
+            </select>
+            <button class="btn small ghost" style="font-size:11px;padding:3px 8px" disabled=${busy==='el:'+e.key} onClick=${() => { elDocRef.current.key = e.key; elDocRef.current.input?.click(); }}>${busy==='el:'+e.key?'…':'📎'}</button>
+          </div>`;
+        })}
+      </div>
     `}
+
+    <input ref=${el => { elDocRef.current.input = el; }} type="file" style="display:none" onChange=${e => { const f = e.target.files?.[0]; const k = elDocRef.current.key; if (f && k) uploadElementDoc(k, f); if (e.target) e.target.value = ''; }} />
 
     <div class="card" style="background:var(--teal-50);border-color:var(--teal-200)">
       <div class="card-title">Generate</div>
       <div style="font-size:12px;color:var(--slate-600);margin-bottom:10px">Produce the auditor-ready documents. Each opens in a new tab with a Print / Save-PDF button.</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn small" onClick=${genPsw}>📄 PSW</button>
+        <button class="btn small ghost" onClick=${genControlPlan}>📋 Control Plan</button>
         <button class="btn small ghost" onClick=${genDimResults}>📏 Dimensional Results</button>
         <button class="btn small" onClick=${genPacket}>📑 Build packet (Level ${submission.ppap_level || 3})</button>
       </div>
     </div>
 
     ${editChar && html`<${PpapCharModal} plant=${plant} submission=${submission} row=${editChar} nextSeq=${nextSeq()} onClose=${() => setEditChar(null)} onSaved=${() => { setEditChar(null); refresh(); }} />`}
+    ${editStep && html`<${PpapStepModal} plant=${plant} submission=${submission} row=${editStep} nextSeq=${nextStepSeq()} onClose=${() => setEditStep(null)} onSaved=${() => { setEditStep(null); refresh(); }} />`}
+  `;
+}
+
+function PpapStepModal({ plant, submission, row, nextSeq, onClose, onSaved }) {
+  const isNew = !!row._new;
+  const [f, setF] = useState({
+    seq: row.seq ?? nextSeq, operation: row.operation || '', machine: row.machine || '',
+    control_method: row.control_method || '', notes: row.notes || '',
+  });
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+  const save = async () => {
+    if (!f.operation.trim()) { setErr('Enter the operation'); return; }
+    setBusy(true); setErr('');
+    const payload = { seq: Number(f.seq) || nextSeq, operation: f.operation || null, machine: f.machine || null, control_method: f.control_method || null, notes: f.notes || null };
+    let error;
+    if (isNew) ({ error } = await sb.from('ppap_process_steps').insert({ ...payload, plant_id: plant.id, ppap_id: submission.id }));
+    else ({ error } = await sb.from('ppap_process_steps').update(payload).eq('id', row.id));
+    setBusy(false);
+    if (error) setErr(error.message); else { showToast(isNew ? 'Step added' : 'Updated'); onSaved(); }
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:480px">
+        <div class="modal-header"><div class="modal-title">${isNew ? '+ Add' : 'Edit'} process step</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field-row">
+          <div class="field" style="flex:0 0 80px"><label>Op #</label><input type="number" value=${f.seq} onInput=${e => set('seq', e.target.value)} /></div>
+          <div class="field"><label>Operation *</label><input value=${f.operation} onInput=${e => set('operation', e.target.value)} placeholder="CNC turning" /></div>
+        </div>
+        <div class="field"><label>Machine / Equipment</label><input value=${f.machine} onInput=${e => set('machine', e.target.value)} placeholder="VMC-01" /></div>
+        <div class="field"><label>Controls</label><input value=${f.control_method} onInput=${e => set('control_method', e.target.value)} placeholder="First-off + in-process gauge" /></div>
+        <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onInput=${e => set('notes', e.target.value)}></textarea></div>
+        <button class="btn" disabled=${busy} onClick=${save} style="width:100%">${busy ? 'Saving…' : (isNew ? 'Add' : 'Save')}</button>
+      </div>
+    </div>
   `;
 }
 
