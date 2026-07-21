@@ -12201,6 +12201,8 @@ function PpapBuilder({ plant, me, submission, onBack }) {
   const csvRef = useRef(null);
   const drawingRef = useRef(null);
   const elDocRef = useRef({ key: null, input: null });
+  const balloonFileRef = useRef(null);   // drawing held for the cadnexa.com balloon popup bridge
+  const balloonWinRef = useRef(null);    // handle to the opened cadnexa.com window
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -12273,46 +12275,104 @@ function PpapBuilder({ plant, me, submission, onBack }) {
 
   const nextSeq = () => (chars.reduce((m, c) => Math.max(m, c.seq || 0), 0) + 1);
 
-  // ---- CadNexa receiver: the auto-balloon tool posts characteristics back ----
-  // Contract: { type:'CNX_RESULT', kind:'ppap_characteristics', ppapId,
-  //   characteristics:[{ balloon_no, description, nominal, tol_plus, tol_minus, uom, gd_t, classification }] }
+  const CNX_CAPS = { view3d: true, drawing2d: true, balloonTool: true, faiReport: true, bom: true, estimator: true, rfq: true };
+
+  // File a CadNexa-returned PDF onto this packet: ballooned drawing → Design
+  // Records (Element 1), FAI report → Dimensional Results (Element 9).
+  const fileCnxResult = async (cnxKind, file) => {
+    const elementKey = cnxKind === 'fai_report' ? 'dimensional' : 'design_records';
+    try {
+      const ext = (file.name.split('.').pop() || 'pdf').toLowerCase();
+      const path = 'ppap/' + plant.id + '/' + submission.id + '/' + crypto.randomUUID() + '.' + ext;
+      const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, file, { cacheControl: '3600', contentType: file.type || 'application/pdf' });
+      if (upErr) throw upErr;
+      const url = sb.storage.from('chat-attachments').getPublicUrl(path).data.publicUrl;
+      await sb.from('ppap_documents').insert({ plant_id: plant.id, ppap_id: submission.id, kind: cnxKind, title: file.name, file_url: url, file_size: file.size, content_type: file.type, uploaded_by: me.id });
+      await setElement(elementKey, { status: 'complete', doc_url: url });
+      showToast(cnxKind === 'fai_report' ? '📑 FAI report filed → Dimensional Results' : '🎯 Ballooned drawing filed → Design Records');
+      refresh();
+    } catch (e) { showToast('Could not file ' + cnxKind.replace(/_/g, ' ') + ': ' + (e.message || e)); }
+  };
+
+  // ---- CadNexa round-trip receiver ----
+  // Serves the held drawing + auth to the popup, and files what it posts back:
+  //  { type:'CNX_RESULT', kind:'ppap_characteristics', characteristics:[…] }  → editable table
+  //  { type:'CNX_RESULT', kind:'balloon_drawing'|'fai_report', dataUrl|url }  → Element 1 / Element 9
   useEffect(() => {
     const onMsg = async (ev) => {
-      const d = ev.data;
-      if (!d || d.type !== 'CNX_RESULT' || d.kind !== 'ppap_characteristics') return;
+      const d = ev && ev.data;
+      if (!d) return;
+      if (d.type === 'CADNEXA_REQUEST_SHARED_FILE') {
+        if (balloonFileRef.current) { try { (ev.source || balloonWinRef.current)?.postMessage({ type: 'CADNEXA_SHARED_FILE', file: balloonFileRef.current }, '*'); } catch (_) {} }
+        return;
+      }
+      if (d.type === 'CNX_REQUEST_AUTH') {
+        try { (ev.source || balloonWinRef.current)?.postMessage({ type: 'CNX_AUTH', capabilities: CNX_CAPS, effectivePlan: 'bundle', isDemoMode: false, isAnonymous: false }, '*'); } catch (_) {}
+        return;
+      }
+      if (d.type !== 'CNX_RESULT') return;
       if (d.ppapId && d.ppapId !== submission.id) return;
-      const list = Array.isArray(d.characteristics) ? d.characteristics : [];
-      if (!list.length) return;
-      let seq = nextSeq();
-      const rows = list.map(c => ({
-        plant_id: plant.id, ppap_id: submission.id, seq: seq++,
-        balloon_no: c.balloon_no != null ? String(c.balloon_no) : null,
-        description: c.description || null,
-        nominal: c.nominal != null && c.nominal !== '' ? Number(c.nominal) : null,
-        tol_plus: c.tol_plus != null && c.tol_plus !== '' ? Number(c.tol_plus) : null,
-        tol_minus: c.tol_minus != null && c.tol_minus !== '' ? Number(c.tol_minus) : null,
-        uom: c.uom || null, gd_t: c.gd_t || null,
-        classification: ['cc','sc'].includes(String(c.classification).toLowerCase()) ? String(c.classification).toLowerCase() : 'none',
-        source: 'cadnexa',
-      }));
-      const { error } = await sb.from('ppap_characteristics').insert(rows);
-      if (error) showToast('CadNexa import failed: ' + error.message);
-      else { showToast(`Imported ${rows.length} characteristics from CadNexa — review below`); refresh(); }
+      if (d.projectId && d.projectId !== submission.id) return;   // tolerate either id key
+      if (d.kind === 'ppap_characteristics') {
+        const list = Array.isArray(d.characteristics) ? d.characteristics : [];
+        if (!list.length) return;
+        let seq = nextSeq();
+        const rows = list.map(c => ({
+          plant_id: plant.id, ppap_id: submission.id, seq: seq++,
+          balloon_no: c.balloon_no != null ? String(c.balloon_no) : null,
+          description: c.description || null,
+          nominal: c.nominal != null && c.nominal !== '' ? Number(c.nominal) : null,
+          tol_plus: c.tol_plus != null && c.tol_plus !== '' ? Number(c.tol_plus) : null,
+          tol_minus: c.tol_minus != null && c.tol_minus !== '' ? Number(c.tol_minus) : null,
+          uom: c.uom || null, gd_t: c.gd_t || null,
+          classification: ['cc', 'sc'].includes(String(c.classification).toLowerCase()) ? String(c.classification).toLowerCase() : 'none',
+          source: 'cadnexa',
+        }));
+        const { error } = await sb.from('ppap_characteristics').insert(rows);
+        if (error) showToast('CadNexa import failed: ' + error.message);
+        else { showToast(`Imported ${rows.length} characteristics from CadNexa — review below`); refresh(); }
+        return;
+      }
+      if (d.kind === 'balloon_drawing' || d.kind === 'fai_report') {
+        try {
+          let file;
+          if (d.dataUrl) { const r = await fetch(d.dataUrl); const b = await r.blob(); file = new File([b], d.name || (d.kind + '.pdf'), { type: b.type || 'application/pdf' }); }
+          else if (d.url) { file = await npdUrlToFile(d.url, d.name || (d.kind + '.pdf'), d.contentType); }
+          else return;
+          await fileCnxResult(d.kind, file);
+        } catch (err) { console.warn('[PPAP CNX_RESULT]', err); }
+      }
     };
     window.addEventListener('message', onMsg);
     return () => window.removeEventListener('message', onMsg);
-  }, [submission.id, plant.id, chars]);
+  }, [submission.id, plant.id, chars, docs]);
 
-  const openCadNexa = () => {
+  // Open CadNexa's balloon tool. If a drawing is already on the packet (uploaded
+  // via 🤖 AI from drawing → Design Records), push it in so CadNexa balloons it
+  // and can post the ballooned PDF + FAI report straight back onto the packet.
+  const openCadNexa = async () => {
+    const drawingDoc = docs.find(d => d.kind === 'design_records' || d.kind === 'customer_drawing' || d.kind === 'balloon_drawing');
+    let f = null;
+    if (drawingDoc?.file_url) { try { f = await npdUrlToFile(drawingDoc.file_url, drawingDoc.title || 'drawing', drawingDoc.content_type); balloonFileRef.current = f; } catch (_) {} }
     const qs = new URLSearchParams({
       cxauto: 'balloon', tool: 'autoBalloon', mode: 'ppap',
       plant: plant?.name || '', plant_id: plant?.id || '',
       user: me?.full_name || '', email: me?.email || '',
-      returnTo: location.origin, ppapId: submission.id,
+      returnTo: location.origin, ppapId: submission.id, projectId: submission.id,
       part: submission.part_number || '',
+      ...(f && drawingDoc ? { fileUrl: drawingDoc.file_url, fileName: drawingDoc.title || '' } : {}),
     });
     const w = window.open('https://cadnexa.com/app.html?' + qs.toString(), '_blank');
-    if (!w) alert('Pop-up blocked — allow pop-ups so CadNexa can open and post the ballooned characteristics back.');
+    balloonWinRef.current = w;
+    if (!w) { alert('Pop-up blocked — allow pop-ups so CadNexa can open and post the ballooned drawing + FAI report back.'); return; }
+    if (f) {
+      let n = 0;
+      const h = setInterval(() => {
+        n++; if (n > 20 || !balloonWinRef.current || balloonWinRef.current.closed) { clearInterval(h); return; }
+        try { w.postMessage({ type: 'CADNEXA_SHARED_FILE', file: f }, '*'); } catch (_) {}
+        try { w.postMessage({ type: 'CNX_AUTH', capabilities: CNX_CAPS, effectivePlan: 'bundle', isDemoMode: false, isAnonymous: false }, '*'); } catch (_) {}
+      }, 500);
+    }
   };
 
   const seedFromScl = async () => {
@@ -12795,7 +12855,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
           <button class="btn small ghost" disabled=${busy==='ai'} title="Read a drawing PDF/image and extract characteristics" onClick=${() => drawingRef.current?.click()}>${busy==='ai'?'🤖 Reading drawing…':'🤖 AI from drawing'}</button>
           <button class="btn small ghost" disabled=${busy==='scl'} onClick=${seedFromScl}>${busy==='scl'?'…':'Seed from CC/SC'}</button>
           <button class="btn small ghost" disabled=${busy==='csv'} onClick=${() => csvRef.current?.click()}>${busy==='csv'?'…':'Import CSV'}</button>
-          <button class="btn small ghost" onClick=${openCadNexa}>🎯 CadNexa balloon</button>
+          <button class="btn small ghost" title="Balloon the drawing in CadNexa — the ballooned drawing + FAI report file straight back onto this packet" onClick=${openCadNexa}>🎯 CadNexa balloon</button>
           <button class="btn small ghost" onClick=${() => setTplOpen(true)}>📚 Templates</button>
           <input ref=${csvRef} type="file" accept=".xlsx,.xls,.csv" style="display:none" onChange=${importCsv} />
           <input ref=${drawingRef} type="file" accept=".pdf,image/*" style="display:none" onChange=${extractFromDrawing} />
