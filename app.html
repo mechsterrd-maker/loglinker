@@ -12199,6 +12199,7 @@ function PpapBuilder({ plant, me, submission, onBack }) {
   const [tplOpen, setTplOpen] = useState(false);    // part-family template library
   const [pfmeaOpen, setPfmeaOpen] = useState(false);
   const csvRef = useRef(null);
+  const drawingRef = useRef(null);
   const elDocRef = useRef({ key: null, input: null });
 
   const refresh = useCallback(async () => {
@@ -12363,6 +12364,56 @@ function PpapBuilder({ plant, me, submission, onBack }) {
       if (error) throw error;
       showToast(`Imported ${rows.length} characteristics from ${f.name}`); refresh();
     } catch (err) { showToast(err.message || 'CSV import failed'); }
+    finally { setBusy(''); if (e.target) e.target.value = ''; }
+  };
+
+  // AI: read an engineering drawing (PDF / image) → extract characteristics into
+  // the review table, and file the drawing itself as Design Records (Element 1).
+  const extractFromDrawing = async (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    setBusy('ai');
+    try {
+      const isPdf = f.type === 'application/pdf' || /\.pdf$/i.test(f.name);
+      const b64 = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = rej; r.readAsDataURL(f); });
+      const session = (await sb.auth.getSession()).data.session;
+      const resp = await fetch(SUPABASE_URL + '/functions/v1/extract-ppap-characteristics', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (session?.access_token || ''), 'apikey': SUPABASE_ANON_KEY },
+        body: JSON.stringify(isPdf ? { pdf_base64: b64 } : { image_base64: b64, mime: f.type || 'image/jpeg' }),
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data || !data.success) throw new Error(data?.error || ('HTTP ' + resp.status));
+      const list = Array.isArray(data.characteristics) ? data.characteristics : [];
+      if (!list.length) throw new Error('No characteristics could be read from the drawing.');
+      let seq = nextSeq();
+      const rows = list.map(c => ({
+        plant_id: plant.id, ppap_id: submission.id, seq: seq++,
+        balloon_no: c.balloon_no != null ? String(c.balloon_no) : null,
+        description: c.feature || c.spec_text || null,
+        nominal: c.nominal != null ? Number(c.nominal) : null,
+        tol_plus: c.tol_plus != null ? Number(c.tol_plus) : null,
+        tol_minus: c.tol_minus != null ? Number(c.tol_minus) : null,
+        uom: c.unit || null,
+        gd_t: c.char_type === 'gdt' ? (c.spec_text || null) : null,
+        classification: c.classification === 'critical' ? 'cc' : (c.classification === 'major' ? 'sc' : 'none'),
+        source: 'ai',
+      }));
+      const { error } = await sb.from('ppap_characteristics').insert(rows);
+      if (error) throw error;
+      // File the drawing as Design Records (Element 1)
+      try {
+        const ext = (f.name.split('.').pop() || 'dat').toLowerCase();
+        const path = 'ppap/' + plant.id + '/' + submission.id + '/' + crypto.randomUUID() + '.' + ext;
+        const { error: upErr } = await sb.storage.from('chat-attachments').upload(path, f, { contentType: f.type || 'application/octet-stream' });
+        if (!upErr) {
+          const url = sb.storage.from('chat-attachments').getPublicUrl(path).data.publicUrl;
+          await sb.from('ppap_documents').insert({ plant_id: plant.id, ppap_id: submission.id, kind: 'design_records', title: f.name, file_url: url, file_size: f.size, content_type: f.type, uploaded_by: me.id });
+          await setElement('design_records', { status: 'complete', doc_url: url });
+        }
+      } catch (_) { /* drawing filing is best-effort */ }
+      showToast('AI read ' + rows.length + ' characteristics' + (data.confidence ? ' · confidence ' + data.confidence : '') + (data.notes ? ' · ⚠ review flagged' : '') + ' — check below');
+      refresh();
+    } catch (err) { showToast(err.message || 'Drawing extraction failed'); }
     finally { setBusy(''); if (e.target) e.target.value = ''; }
   };
 
@@ -12741,14 +12792,16 @@ function PpapBuilder({ plant, me, submission, onBack }) {
         <span>Characteristics · ${chars.length}</span>
         <span style="display:flex;gap:6px;flex-wrap:wrap">
           <button class="btn small" onClick=${() => setEditChar({ _new:true })}>+ Add</button>
+          <button class="btn small ghost" disabled=${busy==='ai'} title="Read a drawing PDF/image and extract characteristics" onClick=${() => drawingRef.current?.click()}>${busy==='ai'?'🤖 Reading drawing…':'🤖 AI from drawing'}</button>
           <button class="btn small ghost" disabled=${busy==='scl'} onClick=${seedFromScl}>${busy==='scl'?'…':'Seed from CC/SC'}</button>
           <button class="btn small ghost" disabled=${busy==='csv'} onClick=${() => csvRef.current?.click()}>${busy==='csv'?'…':'Import CSV'}</button>
           <button class="btn small ghost" onClick=${openCadNexa}>🎯 CadNexa balloon</button>
           <button class="btn small ghost" onClick=${() => setTplOpen(true)}>📚 Templates</button>
           <input ref=${csvRef} type="file" accept=".xlsx,.xls,.csv" style="display:none" onChange=${importCsv} />
+          <input ref=${drawingRef} type="file" accept=".pdf,image/*" style="display:none" onChange=${extractFromDrawing} />
         </span>
       </div>
-      ${chars.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📐</div>No characteristics yet. Balloon a drawing in CadNexa, seed from Special Characteristics, import a CSV, or add manually.</div></div>` :
+      ${chars.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📐</div>No characteristics yet. <b>🤖 AI from drawing</b> reads a drawing PDF/image and extracts them (and files it as Design Records) — or balloon in CadNexa, seed from Special Characteristics, import a CSV, or add manually.</div></div>` :
         html`<div style="overflow-x:auto;margin-bottom:14px"><table style="width:100%;border-collapse:collapse;font-size:12px">
           <thead><tr style="background:var(--slate-50);text-align:left">
             ${['#','Balloon','Characteristic','Nominal','Tol','UOM','GD&T','',''].map(h => html`<th style="padding:7px 8px;font-weight:600;color:var(--slate-600);white-space:nowrap">${h}</th>`)}
