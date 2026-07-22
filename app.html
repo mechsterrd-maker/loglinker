@@ -16133,7 +16133,7 @@ function ToolingModule({ plant, me, activeUnit }) {
     const since = new Date(Date.now() - 30 * 86400000).toISOString();
     const [{ data: its }, { data: tx }] = await Promise.all([
       unitScope(sb.from('tooling_items').select('*').eq('active', true).order('name')),
-      sb.from('tooling_txns').select('item_id, qty, txn_type, created_at').eq('plant_id', plant.id).eq('txn_type', 'consumption').gte('created_at', since),
+      sb.from('tooling_txns').select('item_id, qty, txn_type, created_at').eq('plant_id', plant.id).in('txn_type', ['consumption', 'scrap']).gte('created_at', since),
     ]);
     setItems(its || []);
     const u = {}; (tx || []).forEach(r => { u[r.item_id] = (u[r.item_id] || 0) + (Number(r.qty) || 0); }); setUsage(u);
@@ -16211,8 +16211,8 @@ function ToolingModule({ plant, me, activeUnit }) {
               <td style="padding:7px 9px;text-align:right;white-space:nowrap">${fmtNum(c.stock)} <span style="color:var(--slate-400);font-size:10px">${i.uom}</span>${c.cover!=null?html`<div style="font-size:10px;color:${c.cover<1?'var(--rose-600)':'var(--slate-400)'}">${c.cover.toFixed(1)} mo cover</div>`:''}</td>
               <td style="padding:7px 9px;text-align:right;white-space:nowrap">${c.toOrder>0?html`<span class="badge ${toolStatusBadge(c.status)}" style="font-size:12px">${c.toOrder}</span>`:html`<span class="badge emerald">OK</span>`}${c.orderCost?html`<div style="font-size:10px;color:var(--slate-400)">${toolINR(c.orderCost)}</div>`:''}</td>
               <td style="padding:7px 5px;white-space:nowrap">
-                <button class="btn small ghost" style="padding:2px 6px;font-size:10px" title="Log usage" onClick=${() => setTxn({ item:i, kind:'use' })}>− Use</button>
-                <button class="btn small ghost" style="padding:2px 6px;font-size:10px" title="Receive stock" onClick=${() => setTxn({ item:i, kind:'receive' })}>+ In</button>
+                <button class="btn small ghost" style="padding:2px 6px;font-size:10px" title="Log daily wear or breakage" onClick=${() => setTxn({ item:i, kind:'use' })}>− Use</button>
+                <button class="btn small ghost" style="padding:2px 6px;font-size:10px" title="Receive / add opening stock" onClick=${() => setTxn({ item:i, kind:'receive' })}>+ In</button>
               </td>
               <td style="padding:7px 5px;white-space:nowrap">
                 <button class="btn small ghost" style="padding:2px 6px;font-size:10px" onClick=${() => setEdit(i)}>Edit</button>
@@ -16286,7 +16286,7 @@ function ToolingItemModal({ plant, me, row, onClose, onSaved }) {
 
         <div class="section-h" style="margin-top:6px">Stock</div>
         <div class="field-row">
-          <div class="field"><label>Current stock</label><input type="number" step="any" value=${f.current_stock} onInput=${e => set('current_stock', e.target.value)} /></div>
+          <div class="field"><label>${isNew ? 'Opening stock' : 'Current stock'}</label><input type="number" step="any" value=${f.current_stock} onInput=${e => set('current_stock', e.target.value)} /></div>
           <div class="field"><label>Safety stock</label><input type="number" step="any" value=${f.safety_stock} onInput=${e => set('safety_stock', e.target.value)} placeholder="0" /></div>
           <div class="field" style="flex:0 0 90px"><label>UOM</label><input value=${f.uom} onInput=${e => set('uom', e.target.value)} placeholder="nos" /></div>
         </div>
@@ -16307,13 +16307,17 @@ function ToolingItemModal({ plant, me, row, onClose, onSaved }) {
   `;
 }
 
-// Quick usage / receipt — adjusts stock and logs a txn (usage feeds the trend).
+// Quick receipt, or a daily wear / breakage entry. Both usage reasons
+// (consumed = life ended, scrap = broken early) decrement stock and feed the
+// 30-day usage trend, so the reorder requirement reflects real consumption.
 function ToolingTxnModal({ plant, me, item, kind, onClose, onSaved }) {
   const receive = kind === 'receive';
+  const [reason, setReason] = useState('consumption');   // consumption | scrap
   const [qty, setQty] = useState('');
   const [parts, setParts] = useState('');
   const [ref, setRef] = useState('');
   const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const broken = !receive && reason === 'scrap';
 
   const save = async () => {
     const q = Number(qty);
@@ -16321,27 +16325,30 @@ function ToolingTxnModal({ plant, me, item, kind, onClose, onSaved }) {
     setBusy(true); setErr('');
     const newStock = Math.max(0, (Number(item.current_stock) || 0) + (receive ? q : -q));
     const { error: e1 } = await sb.from('tooling_txns').insert({
-      plant_id: plant.id, item_id: item.id, txn_type: receive ? 'receipt' : 'consumption',
-      qty: q, parts_made: !receive && parts !== '' ? Number(parts) : null, reference: ref || null, performed_by: me.id,
+      plant_id: plant.id, item_id: item.id, txn_type: receive ? 'receipt' : reason,
+      qty: q, parts_made: (!receive && reason === 'consumption' && parts !== '') ? Number(parts) : null, reference: ref || null, performed_by: me.id,
     });
     if (e1) { setErr(e1.message); setBusy(false); return; }
     const { error: e2 } = await sb.from('tooling_items').update({ current_stock: newStock, updated_at: new Date().toISOString() }).eq('id', item.id);
     setBusy(false);
     if (e2) { setErr(e2.message); return; }
-    showToast(receive ? `+${q} received · stock ${fmtNum(newStock)}` : `−${q} used · stock ${fmtNum(newStock)}`);
+    showToast(receive ? `+${q} received · stock ${fmtNum(newStock)}` : `${broken ? '⚠ ' : ''}−${q} ${broken ? 'broken' : 'used'} · stock ${fmtNum(newStock)}`);
     onSaved();
   };
+
+  const seg = (val, label) => html`<button onClick=${() => setReason(val)} style=${'flex:1;padding:7px;border:1px solid ' + (reason===val?'var(--teal-600)':'var(--slate-200)') + ';background:' + (reason===val?'var(--teal-50)':'white') + ';color:' + (reason===val?'var(--teal-700)':'var(--slate-600)') + ';border-radius:7px;font-size:12px;font-weight:600;cursor:pointer'}>${label}</button>`;
 
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal" style="max-width:420px">
-        <div class="modal-header"><div class="modal-title">${receive ? '📥 Receive' : '🔧 Log usage'} · ${item.name}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        <div class="modal-header"><div class="modal-title">${receive ? '📥 Receive' : '🔧 Daily wear / breakage'} · ${item.name}</div><button class="close-btn" onClick=${onClose}>×</button></div>
         ${err && html`<div class="alert error">${err}</div>`}
         <div style="font-size:12px;color:var(--slate-500);margin-bottom:8px">In stock now · <b>${fmtNum(item.current_stock)} ${item.uom}</b></div>
-        <div class="field"><label>${receive ? 'Received' : 'Used'} (${item.uom}) *</label><input type="number" step="any" value=${qty} onInput=${e => setQty(e.target.value)} autofocus /></div>
-        ${!receive && html`<div class="field"><label>Parts made with them (optional)</label><input type="number" step="any" value=${parts} onInput=${e => setParts(e.target.value)} placeholder="for actual tool-life tracking" /></div>`}
-        <div class="field"><label>Reference / note</label><input value=${ref} onInput=${e => setRef(e.target.value)} placeholder=${receive ? 'Invoice / PO no.' : 'Shift / machine'} /></div>
-        <button class="btn" disabled=${busy} onClick=${save} style="width:100%">${busy ? 'Saving…' : (receive ? 'Add to stock' : 'Log usage')}</button>
+        ${!receive && html`<div style="display:flex;gap:6px;margin-bottom:10px">${seg('consumption','🔧 Consumed (life ended)')}${seg('scrap','⚠ Broken / scrap')}</div>`}
+        <div class="field"><label>${receive ? 'Received' : broken ? 'Broken' : 'Used'} (${item.uom}) *</label><input type="number" step="any" value=${qty} onInput=${e => setQty(e.target.value)} autofocus /></div>
+        ${(!receive && reason === 'consumption') && html`<div class="field"><label>Parts made with them (optional)</label><input type="number" step="any" value=${parts} onInput=${e => setParts(e.target.value)} placeholder="for actual tool-life tracking" /></div>`}
+        <div class="field"><label>Reference / note</label><input value=${ref} onInput=${e => setRef(e.target.value)} placeholder=${receive ? 'Invoice / PO no.' : broken ? 'Cause / machine / shift' : 'Shift / machine'} /></div>
+        <button class="btn" disabled=${busy} onClick=${save} style="width:100%">${busy ? 'Saving…' : (receive ? 'Add to stock' : broken ? 'Log breakage' : 'Log usage')}</button>
       </div>
     </div>
   `;
