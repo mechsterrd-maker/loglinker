@@ -16099,12 +16099,23 @@ const TOOL_CATS = [
 const toolCatLabel = (k) => (TOOL_CATS.find(c => c.k === k) || {}).label || k;
 const toolINR = (v) => v == null ? '—' : '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 0 });
 
-// Pure calc — reused by the table and the purchase-list report.
-function toolingCalc(it, actualMonthly) {
+// Pure calc — reused by the table and the purchase-list report. `apps` is the
+// item's application lines (insert × part × operation); when present the monthly
+// need rolls up across them (each with its own life), else the item-level fields.
+function toolingCalc(it, actualMonthly, apps) {
   const edges = Number(it.edges_per_insert) || 1;
   const perEdge = it.parts_per_edge != null && it.parts_per_edge !== '' ? Number(it.parts_per_edge) : null;
   const pcsPerInsert = (perEdge != null && perEdge > 0) ? edges * perEdge : null;
-  const plannedNeed = (pcsPerInsert && Number(it.monthly_parts) > 0) ? Math.ceil(Number(it.monthly_parts) / pcsPerInsert) : null;
+  const lines = Array.isArray(apps) ? apps.filter(a => Number(a.pcs_per_insert) > 0 && Number(a.monthly_parts) > 0) : [];
+  const usingApps = lines.length > 0;
+  const appCount = Array.isArray(apps) ? apps.length : 0;
+  let plannedNeed;
+  if (usingApps) {
+    const sum = lines.reduce((s, a) => s + Number(a.monthly_parts) / Number(a.pcs_per_insert), 0);
+    plannedNeed = Math.ceil(sum);
+  } else {
+    plannedNeed = (pcsPerInsert && Number(it.monthly_parts) > 0) ? Math.ceil(Number(it.monthly_parts) / pcsPerInsert) : null;
+  }
   const actual = (actualMonthly != null && actualMonthly > 0) ? Math.round(actualMonthly) : null;
   const requirement = (plannedNeed != null || actual != null) ? Math.max(plannedNeed || 0, actual || 0) : null;
   const stock = Number(it.current_stock) || 0;
@@ -16114,7 +16125,7 @@ function toolingCalc(it, actualMonthly) {
   const status = requirement == null ? 'setup' : (stock >= requirement + safety ? 'ok' : (stock < requirement ? 'reorder' : 'low'));
   const monthlyCost = (requirement != null && it.unit_cost) ? requirement * Number(it.unit_cost) : null;
   const orderCost = (toOrder > 0 && it.unit_cost) ? toOrder * Number(it.unit_cost) : null;
-  return { edges, perEdge, pcsPerInsert, plannedNeed, actual, requirement, stock, safety, toOrder, cover, status, monthlyCost, orderCost };
+  return { edges, perEdge, pcsPerInsert, plannedNeed, actual, requirement, stock, safety, toOrder, cover, status, monthlyCost, orderCost, usingApps, appCount };
 }
 const toolStatusBadge = (s) => s === 'ok' ? 'emerald' : s === 'low' ? 'amber' : s === 'reorder' ? 'rose' : 'slate';
 const toolStatusLabel = (s) => s === 'ok' ? 'OK' : s === 'low' ? 'LOW' : s === 'reorder' ? 'ORDER' : 'set life';
@@ -16122,21 +16133,28 @@ const toolStatusLabel = (s) => s === 'ok' ? 'OK' : s === 'low' ? 'LOW' : s === '
 function ToolingModule({ plant, me, activeUnit }) {
   const [items, setItems] = useState([]);
   const [usage, setUsage] = useState({});     // item_id -> inserts consumed in last 30d
+  const [apps, setApps] = useState({});       // item_id -> [application lines]
+  const [parts, setParts] = useState([]);     // parts master for the picker
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [catFilter, setCatFilter] = useState('all');
   const [edit, setEdit] = useState(null);     // item or {_new:true}
   const [txn, setTxn] = useState(null);       // { item, kind:'use'|'receive' }
+  const [appsFor, setAppsFor] = useState(null); // item whose applications are open
 
   const refresh = useCallback(async () => {
     setLoading(true);
     const since = new Date(Date.now() - 30 * 86400000).toISOString();
-    const [{ data: its }, { data: tx }] = await Promise.all([
+    const [{ data: its }, { data: tx }, { data: ap }, { data: pts }] = await Promise.all([
       unitScope(sb.from('tooling_items').select('*').eq('active', true).order('name')),
       sb.from('tooling_txns').select('item_id, qty, txn_type, created_at').eq('plant_id', plant.id).in('txn_type', ['consumption', 'scrap']).gte('created_at', since),
+      unitScope(sb.from('tooling_applications').select('*').order('seq')),
+      unitScope(sb.from('mcp_pdc_parts').select('id, part_number, name').order('part_number')),
     ]);
     setItems(its || []);
     const u = {}; (tx || []).forEach(r => { u[r.item_id] = (u[r.item_id] || 0) + (Number(r.qty) || 0); }); setUsage(u);
+    const a = {}; (ap || []).forEach(r => { (a[r.item_id] = a[r.item_id] || []).push(r); }); setApps(a);
+    setParts(pts || []);
     setLoading(false);
   }, [plant.id, activeUnit?.unit_id]);
   useEffect(() => { refresh(); }, [refresh]);
@@ -16144,7 +16162,7 @@ function ToolingModule({ plant, me, activeUnit }) {
   const rows = items
     .filter(i => catFilter === 'all' || i.category === catFilter)
     .filter(i => !search.trim() || (i.name + ' ' + (i.iso_code || '') + ' ' + (i.machine || '')).toLowerCase().includes(search.toLowerCase()))
-    .map(i => ({ i, c: toolingCalc(i, usage[i.id]) }));
+    .map(i => ({ i, c: toolingCalc(i, usage[i.id], apps[i.id]) }));
 
   const reorderRows = rows.filter(r => r.c.toOrder > 0);
   const totalToOrder = reorderRows.reduce((s, r) => s + r.c.toOrder, 0);
@@ -16205,8 +16223,8 @@ function ToolingModule({ plant, me, activeUnit }) {
                 <div style="font-size:10px;color:var(--slate-400)">${toolCatLabel(i.category)}${i.iso_code ? ' · ' + i.iso_code : ''}</div>
               </td>
               <td style="padding:7px 9px;color:var(--slate-500);white-space:nowrap">${i.machine || '—'}${i.operation ? html`<div style="font-size:10px">${i.operation}</div>` : ''}</td>
-              <td style="padding:7px 9px;text-align:right;white-space:nowrap;color:var(--slate-600)">${c.pcsPerInsert != null ? html`${fmtNum(c.pcsPerInsert)} <span style="font-size:10px;color:var(--slate-400)">pcs/${i.category==='insert'?'insert':'tool'}</span><div style="font-size:10px;color:var(--slate-400)">${fmtNum(c.edges)}×${c.perEdge!=null?fmtNum(c.perEdge):'—'}</div>` : html`<span style="color:var(--amber-600);font-size:11px">set life</span>`}</td>
-              <td style="padding:7px 9px;text-align:right;white-space:nowrap">${fmtNum(i.monthly_parts)}${c.actual!=null?html`<div style="font-size:10px;color:var(--slate-400)">used ${fmtNum(c.actual)}/mo</div>`:''}</td>
+              <td style="padding:7px 9px;text-align:right;white-space:nowrap;color:var(--slate-600)">${c.usingApps ? html`<span style="font-size:11px;color:var(--teal-700)">per part</span>` : (c.pcsPerInsert != null ? html`${fmtNum(c.pcsPerInsert)} <span style="font-size:10px;color:var(--slate-400)">pcs/${i.category==='insert'?'insert':'tool'}</span><div style="font-size:10px;color:var(--slate-400)">${fmtNum(c.edges)}×${c.perEdge!=null?fmtNum(c.perEdge):'—'}</div>` : html`<span style="color:var(--amber-600);font-size:11px">set life</span>`)}</td>
+              <td style="padding:7px 9px;text-align:right;white-space:nowrap">${c.usingApps ? html`<span style="color:var(--teal-700);cursor:pointer" onClick=${() => setAppsFor(i)}>${c.appCount} part${c.appCount===1?'':'s'} 🔗</span>` : fmtNum(i.monthly_parts)}${c.actual!=null?html`<div style="font-size:10px;color:var(--slate-400)">used ${fmtNum(c.actual)}/mo</div>`:''}</td>
               <td style="padding:7px 9px;text-align:right;font-weight:700;white-space:nowrap">${c.requirement ?? '—'}</td>
               <td style="padding:7px 9px;text-align:right;white-space:nowrap">${fmtNum(c.stock)} <span style="color:var(--slate-400);font-size:10px">${i.uom}</span>${c.cover!=null?html`<div style="font-size:10px;color:${c.cover<1?'var(--rose-600)':'var(--slate-400)'}">${c.cover.toFixed(1)} mo cover</div>`:''}</td>
               <td style="padding:7px 9px;text-align:right;white-space:nowrap">${c.toOrder>0?html`<span class="badge ${toolStatusBadge(c.status)}" style="font-size:12px">${c.toOrder}</span>`:html`<span class="badge emerald">OK</span>`}${c.orderCost?html`<div style="font-size:10px;color:var(--slate-400)">${toolINR(c.orderCost)}</div>`:''}</td>
@@ -16215,6 +16233,7 @@ function ToolingModule({ plant, me, activeUnit }) {
                 <button class="btn small ghost" style="padding:2px 6px;font-size:10px" title="Receive / add opening stock" onClick=${() => setTxn({ item:i, kind:'receive' })}>+ In</button>
               </td>
               <td style="padding:7px 5px;white-space:nowrap">
+                <button class="btn small ghost" style="padding:2px 6px;font-size:10px" title="Parts & operations this tool runs" onClick=${() => setAppsFor(i)}>🔗 Apps${c.appCount?' · '+c.appCount:''}</button>
                 <button class="btn small ghost" style="padding:2px 6px;font-size:10px" onClick=${() => setEdit(i)}>Edit</button>
                 <button class="btn small ghost" style="padding:2px 6px;font-size:10px;color:var(--rose-600)" onClick=${() => delItem(i.id)}>✕</button>
               </td>
@@ -16226,6 +16245,7 @@ function ToolingModule({ plant, me, activeUnit }) {
 
     ${edit && html`<${ToolingItemModal} plant=${plant} me=${me} row=${edit} onClose=${() => setEdit(null)} onSaved=${() => { setEdit(null); refresh(); }} />`}
     ${txn && html`<${ToolingTxnModal} plant=${plant} me=${me} item=${txn.item} kind=${txn.kind} onClose=${() => setTxn(null)} onSaved=${() => { setTxn(null); refresh(); }} />`}
+    ${appsFor && html`<${ToolingAppsModal} plant=${plant} me=${me} item=${appsFor} parts=${parts} onClose=${() => setAppsFor(null)} onSaved=${() => { setAppsFor(null); refresh(); }} />`}
   `;
 }
 
@@ -16277,7 +16297,8 @@ function ToolingItemModal({ plant, me, row, onClose, onSaved }) {
         </div>
         <div class="field"><label>Operation (optional)</label><input value=${f.operation} onInput=${e => set('operation', e.target.value)} placeholder="OD turning" /></div>
 
-        <div class="section-h" style="margin-top:6px">Tool life &amp; demand</div>
+        <div class="section-h" style="margin-top:6px">Tool life &amp; demand <span style="font-size:10px;font-weight:400;color:var(--slate-400)">— single-job mode</span></div>
+        <div style="font-size:11px;color:var(--slate-500);margin-bottom:6px">For a tool that runs <b>one</b> part, fill these. If it's <b>shared across parts</b> (each with a different life), leave these and add per-part lines under <b>🔗 Apps</b> instead — the requirement then rolls up across parts.</div>
         <div class="field-row">
           <div class="field"><label>Edges / corners per ${f.category==='insert'?'insert':'tool'}</label><input type="number" step="any" value=${f.edges_per_insert} onInput=${e => set('edges_per_insert', e.target.value)} placeholder="4" /></div>
           <div class="field"><label>Parts per edge (life)</label><input type="number" step="any" value=${f.parts_per_edge} onInput=${e => set('parts_per_edge', e.target.value)} placeholder="50" /></div>
@@ -16349,6 +16370,90 @@ function ToolingTxnModal({ plant, me, item, kind, onClose, onSaved }) {
         ${(!receive && reason === 'consumption') && html`<div class="field"><label>Parts made with them (optional)</label><input type="number" step="any" value=${parts} onInput=${e => setParts(e.target.value)} placeholder="for actual tool-life tracking" /></div>`}
         <div class="field"><label>Reference / note</label><input value=${ref} onInput=${e => setRef(e.target.value)} placeholder=${receive ? 'Invoice / PO no.' : broken ? 'Cause / machine / shift' : 'Shift / machine'} /></div>
         <button class="btn" disabled=${busy} onClick=${save} style="width:100%">${busy ? 'Saving…' : (receive ? 'Add to stock' : broken ? 'Log breakage' : 'Log usage')}</button>
+      </div>
+    </div>
+  `;
+}
+
+// Applications matrix for one tool — the parts & operations it runs, each with
+// its own tool life. Monthly need rolls up as Σ(monthly parts ÷ life). This is
+// how a shared insert with a different life per product is planned.
+function ToolingAppsModal({ plant, me, item, parts, onClose, onSaved }) {
+  const blank = () => ({ part_number: '', part_id: null, operation: '', pcs_per_insert: '', monthly_parts: '' });
+  const [lines, setLines] = useState([blank()]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+
+  useEffect(() => { (async () => {
+    const { data } = await sb.from('tooling_applications').select('*').eq('item_id', item.id).order('seq');
+    setLines((data && data.length ? data : [blank()]).map(d => ({ part_number: d.part_number || '', part_id: d.part_id || null, operation: d.operation || '', pcs_per_insert: d.pcs_per_insert ?? '', monthly_parts: d.monthly_parts ?? '' })));
+    setLoading(false);
+  })(); }, []);
+
+  const setLine = (i, patch) => setLines(ls => ls.map((l, j) => j === i ? { ...l, ...patch } : l));
+  const addLine = () => setLines(ls => [...ls, blank()]);
+  const delLine = (i) => setLines(ls => ls.length > 1 ? ls.filter((_, j) => j !== i) : [blank()]);
+
+  const lineNeed = (l) => (Number(l.monthly_parts) > 0 && Number(l.pcs_per_insert) > 0) ? Number(l.monthly_parts) / Number(l.pcs_per_insert) : null;
+  const totalRaw = lines.reduce((s, l) => s + (lineNeed(l) || 0), 0);
+  const total = totalRaw > 0 ? Math.ceil(totalRaw) : 0;
+
+  const pickPart = (i, val) => { const p = parts.find(p => p.part_number === val); setLine(i, { part_number: val, part_id: p ? p.id : null }); };
+
+  const save = async () => {
+    setBusy(true); setErr('');
+    const valid = lines.filter(l => (l.part_number || '').trim() || Number(l.monthly_parts) > 0 || Number(l.pcs_per_insert) > 0);
+    const { error: dErr } = await sb.from('tooling_applications').delete().eq('item_id', item.id);
+    if (dErr) { setErr(dErr.message); setBusy(false); return; }
+    if (valid.length) {
+      const rows = valid.map((l, i) => ({
+        plant_id: plant.id, item_id: item.id, seq: i + 1,
+        part_id: l.part_id || null, part_number: (l.part_number || '').trim() || null, operation: l.operation || null,
+        pcs_per_insert: l.pcs_per_insert !== '' && l.pcs_per_insert != null ? Number(l.pcs_per_insert) : null,
+        monthly_parts: l.monthly_parts !== '' && l.monthly_parts != null ? Number(l.monthly_parts) : 0,
+      }));
+      const { error } = await sb.from('tooling_applications').insert(rows);
+      if (error) { setErr(error.message); setBusy(false); return; }
+    }
+    setBusy(false);
+    showToast(valid.length ? 'Saved ' + valid.length + ' application(s)' : 'Applications cleared');
+    onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:640px;max-height:92vh;overflow-y:auto">
+        <div class="modal-header"><div class="modal-title">🔗 Parts & operations · ${item.name}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div style="font-size:12px;color:var(--slate-600);margin-bottom:10px">Add each part this ${item.category==='insert'?'insert':'tool'} runs, with its <b>own tool life</b>. The monthly requirement rolls up across all of them.</div>
+        <datalist id="tool-parts-dl">${parts.map(p => html`<option key=${p.id} value=${p.part_number}>${p.name || ''}</option>`)}</datalist>
+
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` : html`
+          <div style="display:flex;flex-direction:column;gap:8px">
+            ${lines.map((l, i) => { const n = lineNeed(l); return html`<div key=${i} class="card" style="padding:9px 10px;background:var(--slate-50)">
+              <div class="field-row" style="margin-bottom:6px">
+                <div class="field" style="margin:0"><label style="font-size:10px">Part</label><input list="tool-parts-dl" value=${l.part_number} onInput=${e => pickPart(i, e.target.value)} placeholder="part number" /></div>
+                <div class="field" style="margin:0"><label style="font-size:10px">Operation</label><input value=${l.operation} onInput=${e => setLine(i, { operation: e.target.value })} placeholder="OD turning" /></div>
+              </div>
+              <div style="display:flex;gap:8px;align-items:flex-end">
+                <div class="field" style="margin:0;flex:1"><label style="font-size:10px">Life (pcs/${item.category==='insert'?'insert':'tool'})</label><input type="number" step="any" value=${l.pcs_per_insert} onInput=${e => setLine(i, { pcs_per_insert: e.target.value })} placeholder="200" /></div>
+                <div class="field" style="margin:0;flex:1"><label style="font-size:10px">Parts / month</label><input type="number" step="any" value=${l.monthly_parts} onInput=${e => setLine(i, { monthly_parts: e.target.value })} placeholder="8000" /></div>
+                <div style="flex:0 0 78px;text-align:right;padding-bottom:6px"><div style="font-size:10px;color:var(--slate-400)">need/mo</div><div style="font-weight:700;color:var(--teal-700)">${n != null ? (Math.round(n*10)/10) : '—'}</div></div>
+                <button class="btn small ghost" style="padding:4px 8px;color:var(--rose-600);margin-bottom:4px" onClick=${() => delLine(i)}>✕</button>
+              </div>
+            </div>`; })}
+          </div>
+          <button class="btn small ghost" style="margin-top:8px" onClick=${addLine}>+ Add part</button>
+
+          <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-top:10px;display:flex;justify-content:space-between;align-items:center">
+            <div style="font-size:12px;color:var(--slate-600)">Total monthly requirement for this ${item.category==='insert'?'insert':'tool'}</div>
+            <div style="font-size:22px;font-weight:800;color:var(--teal-700)">${total} <span style="font-size:12px;font-weight:600;color:var(--slate-500)">/ mo</span></div>
+          </div>
+
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <button class="btn ghost" onClick=${onClose} style="flex:1">Cancel</button>
+            <button class="btn" disabled=${busy} onClick=${save} style="flex:2">${busy ? 'Saving…' : 'Save applications'}</button>
+          </div>`}
       </div>
     </div>
   `;
