@@ -2027,6 +2027,7 @@ const MORE_GROUPS = [
       { key:'tpm',           icon:'🛠', label:'TPM Daily Checks',     sub:'30-sec machine checks · oil, coolant, leaks, guards' },
       { key:'maintenance',   icon:'🔧', label:'Maintenance',          sub:'Breakdowns log, machine status' },
       { key:'cutting',       icon:'✂️', label:'Cutting Planner',      sub:'1D cutting optimisation for rods, tubes, bars · auto layout with kerf · waste %' },
+      { key:'tooling',       icon:'🪛', label:'Tool & Insert Planner', sub:'CNC inserts & tools · auto reorder qty from tool life × monthly production' },
       { key:'attendance',    icon:'📅', label:'Attendance',           sub:'Daily P/A/HD/Leave per employee · monthly summary · payroll CSV' },
       { key:'petty_cash',    icon:'💰', label:'Petty Cash',           sub:'Expenses · advances · recollection · who owes how much' },
       { key:'jobwork',       icon:'🏭', label:'Sub-Contracting',      sub:'Send / receive parts at job-work vendors · 180-day GST clock' },
@@ -3004,6 +3005,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'customer_complaints'}><${CustomerComplaintsModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'quality_rejections'}><${QualityAnalyticsModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'project_costing'}><${ProjectCostingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'tooling'}><${ToolingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} /></${Page}>
       <${Page} active=${pageTab === 'doc_formats'}><${DocFormatsModule} plant=${plant} me=${me} /></${Page}>
@@ -9086,6 +9088,7 @@ const RBAC_MODULES = [
   { key:'stocks', label:'Stocks', group:'ops' },
   { key:'tpm', label:'TPM Checks', group:'ops' },
   { key:'cutting', label:'Cutting Planner (1D + 2D)', group:'ops' },
+  { key:'tooling', label:'Tool & Insert Planner', group:'ops' },
   { key:'machine_prod', label:'Machine OEE', group:'ops' },
   { key:'actions', label:'Action Hub / Tasks', group:'projects' },
   { key:'projects', label:'Projects', group:'projects' },
@@ -16076,6 +16079,272 @@ function pcINR(n) {
   if (a >= 1e7) return '₹' + (n / 1e7).toFixed(2) + ' Cr';
   if (a >= 1e5) return '₹' + (n / 1e5).toFixed(2) + ' L';
   return '₹' + fmtNum(Math.round(n));
+}
+
+// =================================================================
+// TOOL & INSERT PLANNER — consumable tooling replenishment for machining.
+// Tool life (edges × parts/edge) + monthly production → monthly insert need,
+// reorder qty and months of cover. Usage & receipts keep stock live and feed
+// an "actual used / month" figure; the requirement is the larger of planned vs
+// actual, so it self-corrects to real consumption.
+// =================================================================
+const TOOL_CATS = [
+  { k:'insert',  label:'CNC Insert' },
+  { k:'drill',   label:'Drill' },
+  { k:'endmill', label:'End mill' },
+  { k:'tap',     label:'Tap' },
+  { k:'tool',    label:'Holder / Tool' },
+  { k:'other',   label:'Other' },
+];
+const toolCatLabel = (k) => (TOOL_CATS.find(c => c.k === k) || {}).label || k;
+const toolINR = (v) => v == null ? '—' : '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+
+// Pure calc — reused by the table and the purchase-list report.
+function toolingCalc(it, actualMonthly) {
+  const edges = Number(it.edges_per_insert) || 1;
+  const perEdge = it.parts_per_edge != null && it.parts_per_edge !== '' ? Number(it.parts_per_edge) : null;
+  const pcsPerInsert = (perEdge != null && perEdge > 0) ? edges * perEdge : null;
+  const plannedNeed = (pcsPerInsert && Number(it.monthly_parts) > 0) ? Math.ceil(Number(it.monthly_parts) / pcsPerInsert) : null;
+  const actual = (actualMonthly != null && actualMonthly > 0) ? Math.round(actualMonthly) : null;
+  const requirement = (plannedNeed != null || actual != null) ? Math.max(plannedNeed || 0, actual || 0) : null;
+  const stock = Number(it.current_stock) || 0;
+  const safety = Number(it.safety_stock) || 0;
+  const toOrder = requirement != null ? Math.max(0, Math.ceil(requirement + safety - stock)) : Math.max(0, Math.ceil(safety - stock));
+  const cover = (requirement && requirement > 0) ? stock / requirement : null;
+  const status = requirement == null ? 'setup' : (stock >= requirement + safety ? 'ok' : (stock < requirement ? 'reorder' : 'low'));
+  const monthlyCost = (requirement != null && it.unit_cost) ? requirement * Number(it.unit_cost) : null;
+  const orderCost = (toOrder > 0 && it.unit_cost) ? toOrder * Number(it.unit_cost) : null;
+  return { edges, perEdge, pcsPerInsert, plannedNeed, actual, requirement, stock, safety, toOrder, cover, status, monthlyCost, orderCost };
+}
+const toolStatusBadge = (s) => s === 'ok' ? 'emerald' : s === 'low' ? 'amber' : s === 'reorder' ? 'rose' : 'slate';
+const toolStatusLabel = (s) => s === 'ok' ? 'OK' : s === 'low' ? 'LOW' : s === 'reorder' ? 'ORDER' : 'set life';
+
+function ToolingModule({ plant, me, activeUnit }) {
+  const [items, setItems] = useState([]);
+  const [usage, setUsage] = useState({});     // item_id -> inserts consumed in last 30d
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [catFilter, setCatFilter] = useState('all');
+  const [edit, setEdit] = useState(null);     // item or {_new:true}
+  const [txn, setTxn] = useState(null);       // { item, kind:'use'|'receive' }
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const since = new Date(Date.now() - 30 * 86400000).toISOString();
+    const [{ data: its }, { data: tx }] = await Promise.all([
+      unitScope(sb.from('tooling_items').select('*').eq('active', true).order('name')),
+      sb.from('tooling_txns').select('item_id, qty, txn_type, created_at').eq('plant_id', plant.id).eq('txn_type', 'consumption').gte('created_at', since),
+    ]);
+    setItems(its || []);
+    const u = {}; (tx || []).forEach(r => { u[r.item_id] = (u[r.item_id] || 0) + (Number(r.qty) || 0); }); setUsage(u);
+    setLoading(false);
+  }, [plant.id, activeUnit?.unit_id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const rows = items
+    .filter(i => catFilter === 'all' || i.category === catFilter)
+    .filter(i => !search.trim() || (i.name + ' ' + (i.iso_code || '') + ' ' + (i.machine || '')).toLowerCase().includes(search.toLowerCase()))
+    .map(i => ({ i, c: toolingCalc(i, usage[i.id]) }));
+
+  const reorderRows = rows.filter(r => r.c.toOrder > 0);
+  const totalToOrder = reorderRows.reduce((s, r) => s + r.c.toOrder, 0);
+  const monthlySpend = rows.reduce((s, r) => s + (r.c.monthlyCost || 0), 0);
+  const orderSpend = reorderRows.reduce((s, r) => s + (r.c.orderCost || 0), 0);
+
+  const delItem = async (id) => { if (!confirm('Remove this tool?')) return; await sb.from('tooling_items').update({ active: false }).eq('id', id); refresh(); };
+
+  const genOrderList = () => {
+    const body = `
+      <h2 class="section">Reorder list — ${reorderRows.length} item(s)</h2>
+      ${reorderRows.length === 0 ? '<div class="empty">Nothing to order — all tools are covered.</div>' : `
+      <table class="data"><thead><tr><th>#</th><th>Tool</th><th>Grade / ISO</th><th>Machine</th><th class="num">Req/mo</th><th class="num">In stock</th><th class="num">Order qty</th><th class="num">Est. cost</th></tr></thead><tbody>
+      ${reorderRows.map((r, i) => `<tr><td class="num">${i+1}</td><td>${ppapEsc(r.i.name)}</td><td>${ppapEsc(r.i.iso_code)}</td><td>${ppapEsc(r.i.machine)}</td><td class="num">${r.c.requirement ?? '—'}</td><td class="num">${r.c.stock}</td><td class="num"><b>${r.c.toOrder}</b></td><td class="num">${r.c.orderCost != null ? toolINR(r.c.orderCost) : '—'}</td></tr>`).join('')}
+      <tr><td colspan="6" style="text-align:right"><b>Total inserts to order</b></td><td class="num"><b>${totalToOrder}</b></td><td class="num"><b>${orderSpend ? toolINR(orderSpend) : '—'}</b></td></tr>
+      </tbody></table>`}
+      <div style="font-size:10px;color:#94a3b8;margin-top:6px">Requirement = larger of (monthly production ÷ tool life) and actual usage over the last 30 days, plus safety stock, minus current stock.</div>`;
+    ppapOpenDoc(reportShell(plant, 'Tooling Reorder List', plant.name + ' · ' + new Date().toISOString().slice(0,10), body, { 'Items': String(rows.length), 'To order': String(reorderRows.length), 'Inserts': String(totalToOrder) }));
+  };
+
+  const Stat = (label, value, tone) => html`<div class="stat ${tone||''}" style="padding:10px"><div class="stat-num" style="font-size:20px">${value}</div><div class="stat-label" style="font-size:10px">${label}</div></div>`;
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+      <div><h1>🪛 Tool & Insert Planner</h1><div class="sub">Auto reorder qty from tool life × monthly production</div></div>
+      <span style="display:flex;gap:6px">
+        <button class="btn small ghost" disabled=${reorderRows.length===0} onClick=${genOrderList}>🛒 Order list${reorderRows.length?' · '+reorderRows.length:''}</button>
+        <button class="btn small" onClick=${() => setEdit({ _new:true })}>+ Add tool</button>
+      </span>
+    </div>
+
+    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px">
+      ${Stat('Tools tracked', rows.length, 'teal')}
+      ${Stat('Need reorder', reorderRows.length, reorderRows.length ? 'rose' : 'teal')}
+      ${Stat('Inserts to order', totalToOrder, totalToOrder ? 'amber' : 'teal')}
+      ${Stat('Est. spend / mo', monthlySpend ? toolINR(monthlySpend) : '—', 'teal')}
+    </div>
+
+    <div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">
+      <input type="search" value=${search} onInput=${e => setSearch(e.target.value)} placeholder="Search tool / grade / machine…" style="flex:1;min-width:160px;padding:8px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+      <select value=${catFilter} onChange=${e => setCatFilter(e.target.value)} style="padding:8px 10px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px;background:white">
+        <option value="all">All types</option>
+        ${TOOL_CATS.map(c => html`<option key=${c.k} value=${c.k}>${c.label}</option>`)}
+      </select>
+    </div>
+
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      rows.length === 0 ? html`<div class="card"><div class="empty" style="padding:22px"><div class="icon">🪛</div>${items.length===0 ? 'No tools yet. Add a CNC insert or tool — enter its tool life (edges × parts per edge) and the monthly production it serves, and the reorder quantity is worked out for you.' : 'No tools match this filter.'}</div></div>` :
+      html`<div style="overflow-x:auto;border:1px solid var(--slate-200);border-radius:10px;-webkit-overflow-scrolling:touch">
+        <table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead><tr style="background:var(--slate-50)">
+            ${['Tool','Machine / Op','Tool life','Prod/mo','Req/mo','In stock','To order','',''].map((h,i) => html`<th key=${i} style="padding:8px 9px;text-align:${i>=3&&i<=6?'right':'left'};font-weight:700;color:var(--slate-600);white-space:nowrap">${h}</th>`)}
+          </tr></thead>
+          <tbody>
+            ${rows.map(({ i, c }) => html`<tr key=${i.id} style="border-top:1px solid var(--slate-100)">
+              <td style="padding:7px 9px">
+                <div style="font-weight:600">${i.name}</div>
+                <div style="font-size:10px;color:var(--slate-400)">${toolCatLabel(i.category)}${i.iso_code ? ' · ' + i.iso_code : ''}</div>
+              </td>
+              <td style="padding:7px 9px;color:var(--slate-500);white-space:nowrap">${i.machine || '—'}${i.operation ? html`<div style="font-size:10px">${i.operation}</div>` : ''}</td>
+              <td style="padding:7px 9px;text-align:right;white-space:nowrap;color:var(--slate-600)">${c.pcsPerInsert != null ? html`${fmtNum(c.pcsPerInsert)} <span style="font-size:10px;color:var(--slate-400)">pcs/${i.category==='insert'?'insert':'tool'}</span><div style="font-size:10px;color:var(--slate-400)">${fmtNum(c.edges)}×${c.perEdge!=null?fmtNum(c.perEdge):'—'}</div>` : html`<span style="color:var(--amber-600);font-size:11px">set life</span>`}</td>
+              <td style="padding:7px 9px;text-align:right;white-space:nowrap">${fmtNum(i.monthly_parts)}${c.actual!=null?html`<div style="font-size:10px;color:var(--slate-400)">used ${fmtNum(c.actual)}/mo</div>`:''}</td>
+              <td style="padding:7px 9px;text-align:right;font-weight:700;white-space:nowrap">${c.requirement ?? '—'}</td>
+              <td style="padding:7px 9px;text-align:right;white-space:nowrap">${fmtNum(c.stock)} <span style="color:var(--slate-400);font-size:10px">${i.uom}</span>${c.cover!=null?html`<div style="font-size:10px;color:${c.cover<1?'var(--rose-600)':'var(--slate-400)'}">${c.cover.toFixed(1)} mo cover</div>`:''}</td>
+              <td style="padding:7px 9px;text-align:right;white-space:nowrap">${c.toOrder>0?html`<span class="badge ${toolStatusBadge(c.status)}" style="font-size:12px">${c.toOrder}</span>`:html`<span class="badge emerald">OK</span>`}${c.orderCost?html`<div style="font-size:10px;color:var(--slate-400)">${toolINR(c.orderCost)}</div>`:''}</td>
+              <td style="padding:7px 5px;white-space:nowrap">
+                <button class="btn small ghost" style="padding:2px 6px;font-size:10px" title="Log usage" onClick=${() => setTxn({ item:i, kind:'use' })}>− Use</button>
+                <button class="btn small ghost" style="padding:2px 6px;font-size:10px" title="Receive stock" onClick=${() => setTxn({ item:i, kind:'receive' })}>+ In</button>
+              </td>
+              <td style="padding:7px 5px;white-space:nowrap">
+                <button class="btn small ghost" style="padding:2px 6px;font-size:10px" onClick=${() => setEdit(i)}>Edit</button>
+                <button class="btn small ghost" style="padding:2px 6px;font-size:10px;color:var(--rose-600)" onClick=${() => delItem(i.id)}>✕</button>
+              </td>
+            </tr>`)}
+          </tbody>
+        </table>
+      </div>
+      <div style="font-size:11px;color:var(--slate-500);margin-top:8px">💡 <b>Req/mo</b> is the larger of <b>(monthly production ÷ tool life)</b> and <b>actual usage</b> logged over the last 30 days. <b>To order</b> = requirement + safety − current stock.</div>`}
+
+    ${edit && html`<${ToolingItemModal} plant=${plant} me=${me} row=${edit} onClose=${() => setEdit(null)} onSaved=${() => { setEdit(null); refresh(); }} />`}
+    ${txn && html`<${ToolingTxnModal} plant=${plant} me=${me} item=${txn.item} kind=${txn.kind} onClose=${() => setTxn(null)} onSaved=${() => { setTxn(null); refresh(); }} />`}
+  `;
+}
+
+// Add / edit a tool. Live preview of the computed monthly need + reorder qty.
+function ToolingItemModal({ plant, me, row, onClose, onSaved }) {
+  const isNew = !!row._new;
+  const [f, setF] = useState({
+    name: row.name || '', iso_code: row.iso_code || '', category: row.category || 'insert',
+    machine: row.machine || '', operation: row.operation || '',
+    edges_per_insert: row.edges_per_insert ?? 4, parts_per_edge: row.parts_per_edge ?? '',
+    monthly_parts: row.monthly_parts ?? '', current_stock: row.current_stock ?? 0,
+    safety_stock: row.safety_stock ?? 0, unit_cost: row.unit_cost ?? '', uom: row.uom || 'nos', notes: row.notes || '',
+  });
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+  const num = (v) => v === '' || v == null ? null : Number(v);
+  const preview = toolingCalc({ edges_per_insert: f.edges_per_insert, parts_per_edge: f.parts_per_edge, monthly_parts: f.monthly_parts, current_stock: f.current_stock, safety_stock: f.safety_stock, unit_cost: f.unit_cost }, null);
+
+  const save = async () => {
+    if (!f.name.trim()) { setErr('Enter a tool name'); return; }
+    setBusy(true); setErr('');
+    const payload = {
+      name: f.name.trim(), iso_code: f.iso_code || null, category: f.category, machine: f.machine || null, operation: f.operation || null,
+      edges_per_insert: num(f.edges_per_insert) || 1, parts_per_edge: num(f.parts_per_edge), monthly_parts: num(f.monthly_parts) || 0,
+      current_stock: num(f.current_stock) || 0, safety_stock: num(f.safety_stock) || 0, unit_cost: num(f.unit_cost), uom: f.uom || 'nos', notes: f.notes || null,
+      updated_at: new Date().toISOString(),
+    };
+    let error;
+    if (isNew) ({ error } = await sb.from('tooling_items').insert({ ...payload, plant_id: plant.id, created_by: me.id }));
+    else ({ error } = await sb.from('tooling_items').update(payload).eq('id', row.id));
+    setBusy(false);
+    if (error) setErr(error.message); else { showToast(isNew ? 'Tool added' : 'Saved'); onSaved(); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px;max-height:92vh;overflow-y:auto">
+        <div class="modal-header"><div class="modal-title">🪛 ${isNew ? 'Add' : 'Edit'} tool</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field-row">
+          <div class="field"><label>Tool name *</label><input value=${f.name} onInput=${e => set('name', e.target.value)} placeholder="Roughing insert — shaft OD" /></div>
+          <div class="field" style="flex:0 0 140px"><label>Type</label>
+            <select value=${f.category} onChange=${e => set('category', e.target.value)}>${TOOL_CATS.map(c => html`<option key=${c.k} value=${c.k}>${c.label}</option>`)}</select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Grade / ISO code</label><input value=${f.iso_code} onInput=${e => set('iso_code', e.target.value)} placeholder="CNMG120408" /></div>
+          <div class="field"><label>Machine</label><input value=${f.machine} onInput=${e => set('machine', e.target.value)} placeholder="CNC Lathe L-2" /></div>
+        </div>
+        <div class="field"><label>Operation (optional)</label><input value=${f.operation} onInput=${e => set('operation', e.target.value)} placeholder="OD turning" /></div>
+
+        <div class="section-h" style="margin-top:6px">Tool life &amp; demand</div>
+        <div class="field-row">
+          <div class="field"><label>Edges / corners per ${f.category==='insert'?'insert':'tool'}</label><input type="number" step="any" value=${f.edges_per_insert} onInput=${e => set('edges_per_insert', e.target.value)} placeholder="4" /></div>
+          <div class="field"><label>Parts per edge (life)</label><input type="number" step="any" value=${f.parts_per_edge} onInput=${e => set('parts_per_edge', e.target.value)} placeholder="50" /></div>
+        </div>
+        <div class="field"><label>Monthly production served (parts / month)</label><input type="number" step="any" value=${f.monthly_parts} onInput=${e => set('monthly_parts', e.target.value)} placeholder="8000" /></div>
+
+        <div class="section-h" style="margin-top:6px">Stock</div>
+        <div class="field-row">
+          <div class="field"><label>Current stock</label><input type="number" step="any" value=${f.current_stock} onInput=${e => set('current_stock', e.target.value)} /></div>
+          <div class="field"><label>Safety stock</label><input type="number" step="any" value=${f.safety_stock} onInput=${e => set('safety_stock', e.target.value)} placeholder="0" /></div>
+          <div class="field" style="flex:0 0 90px"><label>UOM</label><input value=${f.uom} onInput=${e => set('uom', e.target.value)} placeholder="nos" /></div>
+        </div>
+        <div class="field"><label>Unit cost (₹, optional)</label><input type="number" step="any" value=${f.unit_cost} onInput=${e => set('unit_cost', e.target.value)} placeholder="480" /></div>
+
+        <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin:8px 0">
+          <div style="font-size:12px;color:var(--slate-600);display:flex;gap:16px;flex-wrap:wrap">
+            <div><b>Tool life</b> · ${preview.pcsPerInsert != null ? fmtNum(preview.pcsPerInsert) + ' pcs' : '—'}</div>
+            <div><b>Need / mo</b> · ${preview.plannedNeed ?? '—'}</div>
+            <div><b>To order now</b> · <span style="color:${preview.toOrder>0?'var(--rose-600)':'var(--emerald-600)'};font-weight:700">${preview.toOrder}</span></div>
+            ${preview.orderCost?html`<div><b>≈</b> ${toolINR(preview.orderCost)}</div>`:''}
+          </div>
+        </div>
+
+        <button class="btn" disabled=${busy} onClick=${save} style="width:100%">${busy ? 'Saving…' : (isNew ? 'Add tool' : 'Save')}</button>
+      </div>
+    </div>
+  `;
+}
+
+// Quick usage / receipt — adjusts stock and logs a txn (usage feeds the trend).
+function ToolingTxnModal({ plant, me, item, kind, onClose, onSaved }) {
+  const receive = kind === 'receive';
+  const [qty, setQty] = useState('');
+  const [parts, setParts] = useState('');
+  const [ref, setRef] = useState('');
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+
+  const save = async () => {
+    const q = Number(qty);
+    if (!q || q <= 0) { setErr('Enter a quantity'); return; }
+    setBusy(true); setErr('');
+    const newStock = Math.max(0, (Number(item.current_stock) || 0) + (receive ? q : -q));
+    const { error: e1 } = await sb.from('tooling_txns').insert({
+      plant_id: plant.id, item_id: item.id, txn_type: receive ? 'receipt' : 'consumption',
+      qty: q, parts_made: !receive && parts !== '' ? Number(parts) : null, reference: ref || null, performed_by: me.id,
+    });
+    if (e1) { setErr(e1.message); setBusy(false); return; }
+    const { error: e2 } = await sb.from('tooling_items').update({ current_stock: newStock, updated_at: new Date().toISOString() }).eq('id', item.id);
+    setBusy(false);
+    if (e2) { setErr(e2.message); return; }
+    showToast(receive ? `+${q} received · stock ${fmtNum(newStock)}` : `−${q} used · stock ${fmtNum(newStock)}`);
+    onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:420px">
+        <div class="modal-header"><div class="modal-title">${receive ? '📥 Receive' : '🔧 Log usage'} · ${item.name}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div style="font-size:12px;color:var(--slate-500);margin-bottom:8px">In stock now · <b>${fmtNum(item.current_stock)} ${item.uom}</b></div>
+        <div class="field"><label>${receive ? 'Received' : 'Used'} (${item.uom}) *</label><input type="number" step="any" value=${qty} onInput=${e => setQty(e.target.value)} autofocus /></div>
+        ${!receive && html`<div class="field"><label>Parts made with them (optional)</label><input type="number" step="any" value=${parts} onInput=${e => setParts(e.target.value)} placeholder="for actual tool-life tracking" /></div>`}
+        <div class="field"><label>Reference / note</label><input value=${ref} onInput=${e => setRef(e.target.value)} placeholder=${receive ? 'Invoice / PO no.' : 'Shift / machine'} /></div>
+        <button class="btn" disabled=${busy} onClick=${save} style="width:100%">${busy ? 'Saving…' : (receive ? 'Add to stock' : 'Log usage')}</button>
+      </div>
+    </div>
+  `;
 }
 
 function ProjectCostingModule({ plant, me, activeUnit }) {
