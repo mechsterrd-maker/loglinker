@@ -2029,6 +2029,7 @@ const MORE_GROUPS = [
       { key:'cutting',       icon:'✂️', label:'Cutting Planner',      sub:'1D cutting optimisation for rods, tubes, bars · auto layout with kerf · waste %' },
       { key:'tooling',       icon:'🪛', label:'Tool & Insert Planner', sub:'CNC inserts & tools · auto reorder qty from tool life × monthly production' },
       { key:'attendance',    icon:'📅', label:'Attendance',           sub:'Daily P/A/HD/Leave per employee · monthly summary · payroll CSV' },
+      { key:'face_attendance', icon:'😀', label:'Face Attendance', sub:'Gate kiosk — recognises workers by face & punches IN/OUT (opt-in, in-browser)' },
       { key:'petty_cash',    icon:'💰', label:'Petty Cash',           sub:'Expenses · advances · recollection · who owes how much' },
       { key:'jobwork',       icon:'🏭', label:'Sub-Contracting',      sub:'Send / receive parts at job-work vendors · 180-day GST clock' },
       { key:'supplier_chase',icon:'🛒', label:'Supplier Chase', mfg:true, sub:'Raw material runway vs upcoming schedule · auto-alerts which vendor to chase' },
@@ -3006,6 +3007,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'quality_rejections'}><${QualityAnalyticsModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'project_costing'}><${ProjectCostingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'tooling'}><${ToolingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'face_attendance'}><${FaceAttendanceModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} /></${Page}>
       <${Page} active=${pageTab === 'doc_formats'}><${DocFormatsModule} plant=${plant} me=${me} /></${Page}>
@@ -9109,6 +9111,7 @@ const RBAC_MODULES = [
   { key:'quality_rejections', label:'Daily Rejection & Analytics', group:'quality' },
   { key:'self_attendance', label:'Punch IN / My Attendance', group:'workforce' },
   { key:'attendance', label:'Attendance Register', group:'workforce' },
+  { key:'face_attendance', label:'Face Attendance Kiosk', group:'workforce' },
   { key:'attendance_setup', label:'Attendance / Payroll Setup', group:'workforce' },
   { key:'quotation', label:'Quotation / Costing', group:'commercial' },
   { key:'project_costing', label:'Project Costing (expense tracker)', group:'commercial' },
@@ -16079,6 +16082,254 @@ function pcINR(n) {
   if (a >= 1e7) return '₹' + (n / 1e7).toFixed(2) + ' Cr';
   if (a >= 1e5) return '₹' + (n / 1e5).toFixed(2) + ' L';
   return '₹' + fmtNum(Math.round(n));
+}
+
+// =================================================================
+// FACE ATTENDANCE KIOSK — a shared gate device identifies a worker by face
+// (fully in-browser via @vladmandic/face-api) and punches them, no login.
+// Face descriptors are biometric data: opt-in consent, stored per plant,
+// matched client-side. Enrol each worker once; the kiosk does the rest.
+// =================================================================
+const FACEAPI_SRC = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js';
+const FACEAPI_MODELS = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model';
+const FACE_MATCH_THRESHOLD = 0.52;   // euclidean distance; lower = stricter
+let _faceReady = null;
+function loadFaceApi() {
+  if (_faceReady) return _faceReady;
+  _faceReady = new Promise((resolve, reject) => {
+    const boot = async (f) => {
+      try {
+        await f.nets.tinyFaceDetector.loadFromUri(FACEAPI_MODELS);
+        await f.nets.faceLandmark68TinyNet.loadFromUri(FACEAPI_MODELS);
+        await f.nets.faceRecognitionNet.loadFromUri(FACEAPI_MODELS);
+        resolve(f);
+      } catch (e) { _faceReady = null; reject(e); }
+    };
+    if (window.faceapi) return boot(window.faceapi);
+    const s = document.createElement('script');
+    s.src = FACEAPI_SRC; s.crossOrigin = 'anonymous';
+    s.onload = () => boot(window.faceapi);
+    s.onerror = () => { _faceReady = null; reject(new Error('Could not load the face engine — check the internet connection.')); };
+    document.head.appendChild(s);
+  });
+  return _faceReady;
+}
+async function faceDetect(faceapi, video) {
+  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+  return await faceapi.detectSingleFace(video, opts).withFaceLandmarks(true).withFaceDescriptor();
+}
+function faceDistance(a, b) { let s = 0; for (let i = 0; i < 128; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); }
+
+function FaceAttendanceModule({ plant, me }) {
+  const [view, setView] = useState('kiosk');       // kiosk | people
+  const [enroll, setEnroll] = useState({});         // user_id -> enrollment row
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [enrollFor, setEnrollFor] = useState(null); // user being enrolled
+  // kiosk state
+  const [engine, setEngine] = useState('idle');     // idle | loading | running
+  const [result, setResult] = useState(null);       // { ok, name, message }
+  const [kerr, setKerr] = useState('');
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const runningRef = useRef(false);
+  const cooldownRef = useRef({});
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [{ data: en }, { data: us }] = await Promise.all([
+      sb.from('attendance_face_enrollments').select('*').eq('plant_id', plant.id),
+      sb.from('users').select('id, full_name, role').eq('plant_id', plant.id).order('full_name'),
+    ]);
+    const m = {}; (en || []).forEach(r => { m[r.user_id] = r; }); setEnroll(m);
+    setUsers(us || []); setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const stopCamera = () => {
+    runningRef.current = false;
+    try { streamRef.current?.getTracks().forEach(t => t.stop()); } catch (_) {}
+    streamRef.current = null;
+  };
+  useEffect(() => () => stopCamera(), []);
+
+  const enrolledList = () => Object.values(enroll).filter(e => e.consent && Array.isArray(e.descriptors) && e.descriptors.length);
+  const bestMatch = (desc) => {
+    let best = null;
+    for (const e of enrolledList()) {
+      for (const d of e.descriptors) {
+        const dist = faceDistance(desc, d);
+        if (dist < FACE_MATCH_THRESHOLD && (!best || dist < best.dist)) best = { user_id: e.user_id, dist };
+      }
+    }
+    if (best) best.name = (users.find(u => u.id === best.user_id) || {}).full_name || 'Worker';
+    return best;
+  };
+
+  const punch = async (userId) => {
+    try {
+      const { data, error } = await sb.rpc('attendance_kiosk_punch', { p_plant_id: plant.id, p_user_id: userId, p_dir: null });
+      if (error) throw error;
+      setResult({ ok: !!data?.success, name: data?.name || '', message: data?.success ? data.message : (data?.error || 'Failed') });
+    } catch (e) { setResult({ ok: false, name: '', message: e.message || 'Punch failed' }); }
+    setTimeout(() => setResult(null), 3500);
+  };
+
+  const tick = async (faceapi) => {
+    if (!runningRef.current) return;
+    const v = videoRef.current;
+    try {
+      if (v && v.videoWidth) {
+        const det = await faceDetect(faceapi, v);
+        if (det && det.descriptor) {
+          const match = bestMatch(det.descriptor);
+          if (match && Date.now() > (cooldownRef.current[match.user_id] || 0)) {
+            cooldownRef.current[match.user_id] = Date.now() + 12000;
+            await punch(match.user_id);
+          }
+        }
+      }
+    } catch (_) {}
+    if (runningRef.current) setTimeout(() => tick(faceapi), 850);
+  };
+
+  const startKiosk = async () => {
+    setKerr(''); setEngine('loading');
+    if (!enrolledList().length) { setKerr('No workers enrolled yet — enrol faces under the People tab first.'); setEngine('idle'); return; }
+    let faceapi;
+    try { faceapi = await loadFaceApi(); }
+    catch (e) { setKerr(e.message); setEngine('idle'); return; }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+      streamRef.current = stream; runningRef.current = true; setEngine('running');
+      setTimeout(() => { const v = videoRef.current; if (v) { v.srcObject = stream; v.play().catch(() => {}); } tick(faceapi); }, 120);
+    } catch (e) { setKerr('Camera permission denied — allow the camera and retry.'); setEngine('idle'); }
+  };
+  const stopKiosk = () => { stopCamera(); setEngine('idle'); setResult(null); };
+
+  const delEnroll = async (userId) => { if (!confirm('Delete this face enrollment?')) return; await sb.from('attendance_face_enrollments').delete().eq('plant_id', plant.id).eq('user_id', userId); refresh(); };
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+      <div><h1>😀 Face Attendance</h1><div class="sub">Gate kiosk · identifies workers by face & punches IN/OUT</div></div>
+      <div style="display:flex;gap:5px">
+        <button class="btn small ${view==='kiosk'?'':'ghost'}" onClick=${() => { setView('kiosk'); }}>Kiosk</button>
+        <button class="btn small ${view==='people'?'':'ghost'}" onClick=${() => { stopKiosk(); setView('people'); }}>People · ${enrolledList().length}</button>
+      </div>
+    </div>
+
+    ${view === 'kiosk' ? html`
+      <div class="card" style="text-align:center;padding:16px">
+        ${engine !== 'running' ? html`
+          <div style="font-size:13px;color:var(--slate-600);margin-bottom:12px">Mount a tablet/phone at the gate, open this page, and press start. Each worker looks at the camera to punch — first look of the day = IN, next = OUT.</div>
+          <button class="btn" style="font-size:16px;padding:12px 28px" disabled=${engine==='loading'} onClick=${startKiosk}>${engine==='loading' ? '⏳ Loading face engine…' : '▶ Start kiosk'}</button>
+          ${kerr && html`<div class="alert error" style="margin-top:12px;text-align:left">${kerr}</div>`}
+        ` : html`
+          <div style="position:relative;max-width:520px;margin:0 auto">
+            <video ref=${videoRef} playsinline muted style="width:100%;border-radius:12px;background:#000;transform:scaleX(-1)"></video>
+            ${result && html`<div style=${'position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:12px;background:' + (result.ok ? 'rgba(5,150,105,.85)' : 'rgba(225,29,72,.85)') + ';color:#fff'}>
+              <div style="font-size:40px">${result.ok ? '✓' : '✕'}</div>
+              <div style="font-size:22px;font-weight:800">${result.name || ''}</div>
+              <div style="font-size:14px;margin-top:4px;padding:0 16px;text-align:center">${result.message}</div>
+            </div>`}
+          </div>
+          <div style="font-size:12px;color:var(--slate-500);margin-top:10px">Watching ${enrolledList().length} enrolled worker(s)… look straight at the camera.</div>
+          <button class="btn ghost" style="margin-top:10px" onClick=${stopKiosk}>■ Stop</button>
+        `}
+      </div>
+      <div style="font-size:11px;color:var(--slate-500);margin-top:10px;padding:10px 12px;background:var(--slate-50);border-radius:8px;line-height:1.5">
+        🔒 <b>Privacy:</b> face data is a mathematical descriptor stored only for this plant, used solely for attendance, and only for workers who consented. It is matched on this device — no images are uploaded. Delete anyone's enrollment anytime under People.
+        <br/>⚠ <b>Note:</b> recognition is convenient but not spoof-proof (a printed photo can fool it). Use it with a supervisor present at the gate, or keep GPS+QR punch for high-integrity needs.
+      </div>
+    ` : html`
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        html`<div class="card" style="padding:0;overflow:hidden">
+          ${users.map(u => { const e = enroll[u.id]; const done = e && e.consent && (e.descriptors||[]).length; return html`<div key=${u.id} style="display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--slate-100)">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:14px;font-weight:600">${u.full_name}</div>
+              <div style="font-size:11px;color:var(--slate-500)">${roleLabel ? roleLabel(u.role) : u.role}${done ? ' · enrolled' : e && !e.consent ? ' · consent pending' : ''}</div>
+            </div>
+            ${done ? html`<span class="badge emerald">✓ face</span>` : html`<span class="badge slate">not enrolled</span>`}
+            <button class="btn small" onClick=${() => setEnrollFor(u)}>${done ? 'Re-enroll' : 'Enroll'}</button>
+            ${e ? html`<button class="btn small ghost" style="color:var(--rose-600)" onClick=${() => delEnroll(u.id)}>✕</button>` : ''}
+          </div>`; })}
+        </div>`}
+    `}
+
+    ${enrollFor && html`<${FaceEnrollModal} plant=${plant} me=${me} user=${enrollFor} onClose=${() => setEnrollFor(null)} onSaved=${() => { setEnrollFor(null); refresh(); }} />`}
+  `;
+}
+
+// Capture a worker's face descriptor (with explicit consent) and store it.
+function FaceEnrollModal({ plant, me, user, onClose, onSaved }) {
+  const [phase, setPhase] = useState('start');   // start | camera | captured
+  const [desc, setDesc] = useState(null);
+  const [consent, setConsent] = useState(false);
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const videoRef = useRef(null); const streamRef = useRef(null); const faceRef = useRef(null);
+
+  const stop = () => { try { streamRef.current?.getTracks().forEach(t => t.stop()); } catch (_) {} streamRef.current = null; };
+  useEffect(() => () => stop(), []);
+
+  const openCam = async () => {
+    setErr(''); setPhase('camera');
+    try { faceRef.current = await loadFaceApi(); }
+    catch (e) { setErr(e.message); setPhase('start'); return; }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+      streamRef.current = stream;
+      setTimeout(() => { const v = videoRef.current; if (v) { v.srcObject = stream; v.play().catch(() => {}); } }, 120);
+    } catch (e) { setErr('Camera permission denied.'); setPhase('start'); }
+  };
+
+  const capture = async () => {
+    setErr('');
+    const v = videoRef.current;
+    if (!v || !v.videoWidth) { setErr('Camera not ready'); return; }
+    try {
+      const det = await faceDetect(faceRef.current, v);
+      if (!det || !det.descriptor) { setErr('No face detected — look straight at the camera in good light.'); return; }
+      setDesc(Array.from(det.descriptor)); stop(); setPhase('captured');
+    } catch (e) { setErr(e.message || 'Capture failed'); }
+  };
+
+  const save = async () => {
+    if (!desc) { setErr('Capture a face first'); return; }
+    if (!consent) { setErr('Worker consent is required to store face data'); return; }
+    setBusy(true); setErr('');
+    const { error } = await sb.from('attendance_face_enrollments').upsert({
+      plant_id: plant.id, user_id: user.id, descriptors: [desc], consent: true, enrolled_by: me.id, updated_at: new Date().toISOString(),
+    }, { onConflict: 'plant_id,user_id' });
+    setBusy(false);
+    if (error) { setErr(error.message); return; }
+    showToast('✓ ' + user.full_name + ' enrolled'); onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) { stop(); onClose(); } }}>
+      <div class="modal" style="max-width:460px">
+        <div class="modal-header"><div class="modal-title">😀 Enroll · ${user.full_name}</div><button class="close-btn" onClick=${() => { stop(); onClose(); }}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        ${phase === 'start' ? html`
+          <div style="font-size:13px;color:var(--slate-600);margin-bottom:12px">Capture this worker's face once. Good, even lighting and a straight-on look work best.</div>
+          <button class="btn" style="width:100%" onClick=${openCam}>📷 Open camera</button>
+        ` : phase === 'camera' ? html`
+          <video ref=${videoRef} playsinline muted style="width:100%;border-radius:10px;background:#000;transform:scaleX(-1)"></video>
+          <button class="btn" style="width:100%;margin-top:10px" onClick=${capture}>Capture face</button>
+        ` : html`
+          <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);text-align:center;padding:14px"><div style="font-size:30px">✓</div><div style="font-size:13px;color:var(--slate-700)">Face captured</div></div>
+          <label style="display:flex;align-items:flex-start;gap:8px;margin:12px 0;font-size:12px;color:var(--slate-700);cursor:pointer">
+            <input type="checkbox" checked=${consent} onChange=${e => setConsent(e.target.checked)} style="margin-top:2px" />
+            <span>${user.full_name} <b>consents</b> to storing their face data for attendance. It's used only for punching, kept for this plant, and can be deleted anytime.</span>
+          </label>
+          <div style="display:flex;gap:8px">
+            <button class="btn ghost" style="flex:1" onClick=${() => { setDesc(null); openCam(); }}>Retake</button>
+            <button class="btn" style="flex:2" disabled=${busy || !consent} onClick=${save}>${busy ? 'Saving…' : 'Save enrollment'}</button>
+          </div>
+        `}
+      </div>
+    </div>
+  `;
 }
 
 // =================================================================
