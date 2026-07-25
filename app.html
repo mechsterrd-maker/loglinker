@@ -1888,6 +1888,14 @@ function App() {
     return () => { window.removeEventListener('loglinkr-pulse', onPulse); clearTimeout(t); sb.removeChannel(ch); };
   }, [user?.id, refreshMyPerms]);
 
+  // Belt-and-suspenders offline cache: whenever a plant is successfully loaded
+  // (any code path), stash plant + profile so the next offline boot can restore it.
+  useEffect(() => {
+    if (user?.id && plant && me) {
+      try { localStorage.setItem('llk_boot_' + user.id, JSON.stringify({ me, plant, perms: myPerms })); } catch (_) {}
+    }
+  }, [user?.id, plant, me, myPerms]);
+
   if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
   // A reset link short-circuits everything else, signed in or not.
   if (resetToken) return html`<${ResetPasswordScreen} token=${resetToken} />`;
@@ -17154,6 +17162,7 @@ function FaceAttendanceModule({ plant, me }) {
             <input type="checkbox" checked=${voice} onChange=${e => { setVoice(e.target.checked); try { localStorage.setItem('llk_kiosk_voice', e.target.checked ? '1' : '0'); } catch (_) {} if (e.target.checked) speakKiosk('Voice on'); }} /> 🔊 Speak the worker's name aloud
           </label><br/>
           <button class="btn" style="font-size:16px;padding:12px 28px" disabled=${engine==='loading'} onClick=${startKiosk}>${engine==='loading' ? '⏳ Loading face engine…' : '▶ Start kiosk'}</button>
+          ${(() => { let n = 0; try { const c = JSON.parse(localStorage.getItem('llk_kiosk_cache_' + plant.id) || 'null'); n = c && c.users ? c.users.length : 0; } catch (_) {} return html`<div style="margin-top:10px;font-size:12px;font-weight:600;color:${n ? 'var(--emerald-700)' : 'var(--amber-700)'}">${n ? '✓ Offline-ready — ' + n + ' workers cached on this device' : '⚠ Open once online to enable offline use'}</div>`; })()}
           ${kerr && html`<div class="alert error" style="margin-top:12px;text-align:left">${kerr}</div>`}
         ` : html`
           <div style="position:relative;max-width:520px;margin:0 auto">
