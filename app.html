@@ -1639,7 +1639,7 @@ function App() {
   const [user, setUser] = useState(null);
   const [plant, setPlant] = useState(null);
   const [me, setMe] = useState(null);
-  const [tab, _setTab] = useState(() => DEEP_LINK?.tab || (window.location.hash || '').replace(/^#/, '') || 'home');
+  const [tab, _setTab] = useState(() => DEEP_LINK?.tab || (window.location.hash || '').replace(/^#/, '') || (isHrApp() ? 'face_attendance' : 'home'));
   // Keep the current page in the URL hash so a refresh restores it (instead of
   // dropping back to Home), and so the phone/Android back button moves between
   // pages instead of exiting the app.
@@ -2110,12 +2110,27 @@ const MORE_FLAT_KEYS = MORE_GROUPS.flatMap(g => g.items.map(i => i.key));
 // plant, add its key to that plant's plants.enabled_tabs.
 const OPT_IN_TAB_KEYS = new Set(['self_attendance', 'attendance', 'attendance_setup', 'petty_cash', 'npd', 'quotation', 'people']);
 
+// Standalone "HR & Attendance" build (the Android / TWA kiosk app). Activated by
+// opening the app with ?app=hr (persisted so it sticks across reloads inside the
+// wrapper); ?app=full clears it. It hard-limits every nav surface to the
+// workforce modules, so the SAME codebase ships as a focused HR app with no fork.
+const HR_APP_KEYS = new Set(['home', 'more', 'face_attendance', 'attendance', 'self_attendance', 'attendance_setup', 'people', 'training', 'petty_cash']);
+const APP_MODE = (() => {
+  try {
+    const q = new URLSearchParams(window.location.search).get('app');
+    if (q === 'hr' || q === 'full') localStorage.setItem('llk_app_mode', q);
+    return localStorage.getItem('llk_app_mode') === 'hr' ? 'hr' : 'full';
+  } catch (_) { return 'full'; }
+})();
+const isHrApp = () => APP_MODE === 'hr';
+
 // Display metadata for the top-level tabs (home/attendance/people/…). These are
 // NOT in MORE_GROUPS, so for whitelist plants (Starter Pack: plants.enabled_tabs
 // is set) the mobile More page uses this to list every enabled module — the
 // 4-slot bottom bar can't fit them all, and they'd otherwise be unreachable.
 const TOP_TAB_META = {
   home:            { icon:'🏠', label:'Home',                       sub:'Dashboard & shortcuts' },
+  face_attendance: { icon:'😀', label:'Face Attendance',            sub:'Gate kiosk — punch by face' },
   self_attendance: { icon:'📍', label:'Punch IN',                   sub:'Mark your own attendance' },
   attendance:      { icon:'🗓️', label:'Attendance Register',        sub:'Mark & review the team' },
   attendance_setup:{ icon:'⚙️', label:'Attendance / Payroll Setup', sub:'Shifts, holidays, payroll' },
@@ -2191,6 +2206,12 @@ function visibleMoreGroups(plant, myPerms) {
     const extra = new Set(Array.isArray(plant?.extra_modules) ? plant.extra_modules : []);
     groups = groups
       .map(g => ({ ...g, items: g.items.filter(it => !OPT_IN_TAB_KEYS.has(it.key) || extra.has(it.key)) }))
+      .filter(g => g.items.length > 0);
+  }
+  // HR-app build: keep only workforce modules on every menu surface.
+  if (isHrApp()) {
+    groups = groups
+      .map(g => ({ ...g, items: g.items.filter(it => HR_APP_KEYS.has(it.key)) }))
       .filter(g => g.items.length > 0);
   }
   return groups;
@@ -2906,7 +2927,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   const fab = isFab(plant);
   // Primary mobile tabs (the rest live behind "More"). Fabrication swaps the
   // PDC Production tab for Projects.
-  const mobilePrimaryKeys = fab ? ['home','projects','quality','chat'] : ['home','production','quality','chat'];
+  const mobilePrimaryKeys = isHrApp() ? ['face_attendance','attendance','people','self_attendance'] : (fab ? ['home','projects','quality','chat'] : ['home','production','quality','chat']);
 
   // RBAC page-render gate. When enforced, a tab the user can't view renders an
   // Access-denied card instead of the module. We redirect the page switch to a
@@ -2915,10 +2936,13 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   // gated here. Owners / zero-perm users bypass via moduleAccessGuard.
   const accessGuard = moduleAccessGuard(myPerms);
   const denied = accessGuard.enforce && RBAC_MODULE_KEYS.has(tab) && !accessGuard.canView(tab);
-  const pageTab = denied ? '__denied__' : tab;
+  // HR-app build: any tab outside the workforce set is redirected to the kiosk,
+  // so a stray deep-link or Home shortcut can never escape the focused app.
+  const hrLock = isHrApp() && !HR_APP_KEYS.has(tab);
+  const pageTab = denied ? '__denied__' : (hrLock ? 'face_attendance' : tab);
   // A nav tab is shown only if it's allowed: not gated (off / outside matrix)
-  // or explicitly viewable. Shared by the mobile tabbar below.
-  const tabAllowed = (key) => !accessGuard.enforce || !RBAC_MODULE_KEYS.has(key) || accessGuard.canView(key);
+  // or explicitly viewable, and — in the HR build — within the workforce set.
+  const tabAllowed = (key) => (!isHrApp() || HR_APP_KEYS.has(key)) && (!accessGuard.enforce || !RBAC_MODULE_KEYS.has(key) || accessGuard.canView(key));
 
   return html`
     <div class="app">
@@ -3039,7 +3063,14 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
             ? new Set(['home', ...plant.enabled_tabs])
             : null;
           let mobileTabs;
-          if (enabled) {
+          if (isHrApp()) {
+            mobileTabs = [
+              { key:'face_attendance', icon:'face',     label:'Face' },
+              { key:'attendance',      icon:'calendar', label:'Attendance' },
+              { key:'people',          icon:'people',   label:'Team' },
+              { key:'self_attendance', icon:'home',     label:'Punch IN' },
+            ];
+          } else if (enabled) {
             mobileTabs = allMobile.filter(t => enabled.has(t.key)).slice(0, 4);
           } else {
             // Legacy default: Home / Production-or-Projects / Quality / Chat
@@ -3136,6 +3167,8 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
     chat: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>`,
     people: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
     more: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>`,
+    face: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>`,
+    calendar: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`,
   };
 
   // Close dropdown on outside click. The dropdown itself is now portal-style
@@ -3318,6 +3351,8 @@ function TabBtn({ icon, label, active, onClick, badge }) {
     chat: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>`,
     people: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
     more: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>`,
+    face: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>`,
+    calendar: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`,
   };
   return html`<button class=${'tab' + (active ? ' active' : '')} onClick=${onClick} style="position:relative">${icons[icon]}<span class="tab-label">${label}</span>${badge > 0 ? html`<span style="position:absolute;top:4px;right:calc(50% - 18px);background:var(--rose-500);color:white;font-size:9px;font-weight:700;padding:1px 5px;border-radius:999px;min-width:16px;text-align:center;line-height:1.4">${badge > 99 ? '99+' : badge}</span>` : ''}</button>`;
 }

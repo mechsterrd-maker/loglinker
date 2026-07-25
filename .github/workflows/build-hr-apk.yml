@@ -1,0 +1,53 @@
+name: Build Loglinkr HR APK
+
+# Manual "Run workflow" button, or push a tag like hr-v1.0. Produces a signed,
+# sideloadable .apk as a downloadable artifact — no Android Studio needed.
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'hr-v*' ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: yes | sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools" > /dev/null
+
+      - name: Build signed release APK
+        working-directory: android
+        # Optional: set repo secrets LLK_KEYSTORE_B64 / LLK_STORE_PASS / LLK_KEY_ALIAS /
+        # LLK_KEY_PASS to sign with your own key. Without them it uses the committed
+        # internal keystore (fine for sideloading; rotate before any Play release).
+        env:
+          LLK_STORE_PASS: ${{ secrets.LLK_STORE_PASS }}
+          LLK_KEY_ALIAS: ${{ secrets.LLK_KEY_ALIAS }}
+          LLK_KEY_PASS: ${{ secrets.LLK_KEY_PASS }}
+        run: |
+          if [ -n "${{ secrets.LLK_KEYSTORE_B64 }}" ]; then
+            echo "${{ secrets.LLK_KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/llk.keystore"
+            export LLK_KEYSTORE="$RUNNER_TEMP/llk.keystore"
+          fi
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APK
+        run: cp android/app/build/outputs/apk/release/app-release.apk loglinkr-hr.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loglinkr-hr-apk
+          path: loglinkr-hr.apk
+          if-no-files-found: error
