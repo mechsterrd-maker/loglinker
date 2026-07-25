@@ -16619,6 +16619,18 @@ const KIOSK_STATUS = {
   move:   { t: '✔ Recognised — move slightly to confirm', c: 'var(--teal-600)' },
   recog:  { t: 'Recognising…', c: 'var(--teal-600)' },
 };
+// Offline punch queue — when the gate has no connection, a punch is stored on the
+// device with the REAL time it happened and replayed to the server (with p_at)
+// the moment connectivity returns. Nothing is ever lost.
+const PUNCH_QUEUE_KEY = 'llk_punch_queue';
+const loadPunchQueue = () => { try { return JSON.parse(localStorage.getItem(PUNCH_QUEUE_KEY) || '[]'); } catch (_) { return []; } };
+const savePunchQueue = (q) => { try { localStorage.setItem(PUNCH_QUEUE_KEY, JSON.stringify(q)); } catch (_) {} };
+const isNetworkErr = (e) => {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return true;
+  const m = String((e && (e.message || e.name)) || '').toLowerCase();
+  return e?.name === 'TypeError' || m.includes('failed to fetch') || m.includes('networkerror') || m.includes('fetch') || m.includes('network') || m.includes('timeout');
+};
+
 function FaceAttendanceModule({ plant, me }) {
   const [view, setView] = useState('kiosk');       // kiosk | people
   const [enroll, setEnroll] = useState({});         // user_id -> enrollment row
@@ -16634,6 +16646,9 @@ function FaceAttendanceModule({ plant, me }) {
   const [pinPad, setPinPad] = useState(false);
   const [pinVal, setPinVal] = useState('');
   const [pinErr, setPinErr] = useState('');
+  const [pending, setPending] = useState(loadPunchQueue().length);   // queued offline punches
+  const [online, setOnline] = useState(typeof navigator === 'undefined' ? true : navigator.onLine);
+  const syncingRef = useRef(false);
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const runningRef = useRef(false);
@@ -16704,16 +16719,68 @@ function FaceAttendanceModule({ plant, me }) {
     for (let i = 0; i < pts.length; i++) { ctx.beginPath(); ctx.arc(mx(pts[i].x), my(pts[i].y), 1.7, 0, 6.29); ctx.fill(); }
   };
 
+  const enqueuePunch = (userId, via) => {
+    const q = loadPunchQueue();
+    q.push({ user_id: userId, plant_id: plant.id, at: new Date().toISOString() });
+    savePunchQueue(q); setPending(q.length);
+    setResult({ ok: true, offline: true, name: nameOf(userId), message: 'Saved offline ✓ — will sync' + (via ? ' · ' + via : '') });
+  };
+
   const punch = async (userId, via) => {
     busyRef.current = true;
-    try {
-      const { data, error } = await sb.rpc('attendance_kiosk_punch', { p_plant_id: plant.id, p_user_id: userId, p_dir: null });
-      if (error) throw error;
-      setResult({ ok: !!data?.success, name: data?.name || nameOf(userId), message: (data?.success ? data.message : (data?.error || 'Failed')) + (via ? ' · ' + via : '') });
-    } catch (e) { setResult({ ok: false, name: nameOf(userId), message: e.message || 'Punch failed' }); }
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      enqueuePunch(userId, via);
+    } else {
+      try {
+        const { data, error } = await sb.rpc('attendance_kiosk_punch', { p_plant_id: plant.id, p_user_id: userId, p_dir: null });
+        if (error) throw error;
+        setResult({ ok: !!data?.success, name: data?.name || nameOf(userId), message: (data?.success ? data.message : (data?.error || 'Failed')) + (via ? ' · ' + via : '') });
+      } catch (e) {
+        if (isNetworkErr(e)) enqueuePunch(userId, via);   // don't lose it — queue & sync later
+        else setResult({ ok: false, name: nameOf(userId), message: e.message || 'Punch failed' });
+      }
+    }
     resetLock();
     setTimeout(() => { setResult(null); busyRef.current = false; }, 3200);
   };
+
+  // Drain the offline queue in the order punches happened, replaying each with its
+  // real time (p_at). A processed punch — success OR a business rejection like
+  // "already IN & OUT" — is removed; only a network error stops the drain.
+  const syncQueue = useCallback(async () => {
+    if (syncingRef.current) return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+    let q = loadPunchQueue();
+    if (!q.length) return;
+    syncingRef.current = true;
+    q.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+    let synced = 0;
+    while (q.length) {
+      const item = q[0];
+      try {
+        const { error } = await sb.rpc('attendance_kiosk_punch', { p_plant_id: item.plant_id, p_user_id: item.user_id, p_dir: null, p_at: item.at });
+        if (error) throw error;
+        q.shift(); synced++;
+      } catch (e) {
+        if (isNetworkErr(e)) break;   // still offline → keep the rest for later
+        q.shift();                    // unrecoverable for this item → drop so the queue never jams
+      }
+      savePunchQueue(q); setPending(q.length);
+    }
+    syncingRef.current = false;
+    if (synced) showToast('✓ Synced ' + synced + ' offline punch' + (synced === 1 ? '' : 'es'));
+  }, [plant.id]);
+
+  // Sync on mount, whenever connectivity returns, and as a 30s safety net.
+  useEffect(() => {
+    const goOnline = () => { setOnline(true); syncQueue(); };
+    const goOffline = () => setOnline(false);
+    window.addEventListener('online', goOnline);
+    window.addEventListener('offline', goOffline);
+    syncQueue();
+    const iv = setInterval(() => { if (typeof navigator === 'undefined' || navigator.onLine) { if (loadPunchQueue().length) syncQueue(); } }, 30000);
+    return () => { window.removeEventListener('online', goOnline); window.removeEventListener('offline', goOffline); clearInterval(iv); };
+  }, [syncQueue]);
 
   // Two-phase loop. SCAN: heavy detect (with descriptor) recognises a face. Once a
   // worker is locked and liveness is on, LIVE: fast landmark-only sampling watches
@@ -16823,6 +16890,10 @@ function FaceAttendanceModule({ plant, me }) {
     </div>
 
     ${view === 'kiosk' ? html`
+      ${(!online || pending > 0) && html`<div style=${'display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;padding:9px 12px;border-radius:10px;font-size:12.5px;font-weight:600;' + (online ? 'background:#fffbeb;border:1px solid #fde68a;color:#b45309' : 'background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8')}>
+        <span>${online ? ('⏳ ' + pending + ' punch' + (pending === 1 ? '' : 'es') + ' waiting to sync') : ('📴 Offline — ' + (pending > 0 ? pending + ' punch' + (pending === 1 ? '' : 'es') + ' saved on this device' : 'punches are saved here') + ', syncing when back online')}</span>
+        ${online && pending > 0 ? html`<button class="btn small" onClick=${syncQueue}>Sync now</button>` : ''}
+      </div>`}
       <div class="card" style="text-align:center;padding:16px">
         ${engine !== 'running' ? html`
           <div style="font-size:13px;color:var(--slate-600);margin-bottom:12px">Mount a tablet/phone at the gate, open this page, and press start. Each worker looks at the camera to punch — first look of the day = IN, next = OUT.</div>
@@ -16839,8 +16910,8 @@ function FaceAttendanceModule({ plant, me }) {
             ${!result && html`<div style="position:absolute;left:0;right:0;bottom:10px;text-align:center">
               <span style=${'display:inline-block;background:rgba(15,23,42,.72);color:#fff;font-size:14px;font-weight:600;padding:6px 16px;border-radius:999px'}>${st.t}</span>
             </div>`}
-            ${result && html`<div style=${'position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:12px;background:' + (result.ok ? 'rgba(5,150,105,.88)' : 'rgba(225,29,72,.88)') + ';color:#fff'}>
-              <div style="font-size:40px">${result.ok ? '✓' : '✕'}</div>
+            ${result && html`<div style=${'position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:12px;background:' + (result.offline ? 'rgba(37,99,235,.9)' : result.ok ? 'rgba(5,150,105,.88)' : 'rgba(225,29,72,.88)') + ';color:#fff'}>
+              <div style="font-size:40px">${result.offline ? '📴' : result.ok ? '✓' : '✕'}</div>
               <div style="font-size:22px;font-weight:800">${result.name || ''}</div>
               <div style="font-size:14px;margin-top:4px;padding:0 16px;text-align:center">${result.message}</div>
             </div>`}
@@ -16867,6 +16938,7 @@ function FaceAttendanceModule({ plant, me }) {
       <div style="font-size:11px;color:var(--slate-500);margin-top:10px;padding:10px 12px;background:var(--slate-50);border-radius:8px;line-height:1.5">
         🔒 <b>Privacy:</b> face data is a mathematical descriptor stored only for this plant, matched on this device — no images are uploaded. Delete anyone's enrollment anytime under People.
         <br/>✅ <b>Anti-proxy:</b> the lock stays on the face while it moves and reads real 3D head motion (nose depth vs the eyes) — a flat printed or on-screen photo is planar and can't produce it, held still or waved. It confirms on the smallest natural movement. (A replayed video of a moving person can't be beaten by any camera-only app — for that keep a supervisor at the gate; PIN + audit are there too.)
+        <br/>📴 <b>Works offline:</b> if the internet drops, punches are saved on the device (with the real time) and sync automatically when the connection returns — nothing is lost. Recognition itself runs on-device, so it keeps working too.
       </div>
     ` : html`
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :

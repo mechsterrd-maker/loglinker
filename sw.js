@@ -1,9 +1,13 @@
 // sw.js — Loglinkr Service Worker
 // Handles: PWA install, offline shell, Web Push notifications, click routing
 
-const CACHE_NAME = 'loglinkr-v14';
+const CACHE_NAME = 'loglinkr-v15';
 const SHARE_CACHE = 'loglinkr-share';
 const APP_SHELL = ['/app'];
+// CDN hosts whose assets (Preact/htm, jsPDF, face-api script + face models) must
+// be cached so the app boots AND face recognition works with no internet. These
+// URLs are version-pinned, so cache-first can never serve something stale.
+const CDN_HOSTS = ['esm.sh', 'cdn.jsdelivr.net'];
 
 // Install: cache app shell
 self.addEventListener('install', (event) => {
@@ -54,6 +58,17 @@ self.addEventListener('fetch', (event) => {
   // Skip API/Supabase/Edge function calls — always live
   const url = new URL(event.request.url);
   if (url.hostname.includes('supabase.co') || url.hostname.includes('anthropic.com')) return;
+  // Version-pinned CDN assets (app runtime + face-api + face models): cache-first
+  // so the kiosk loads and recognises faces fully offline after one online visit.
+  if (CDN_HOSTS.some(h => url.hostname.endsWith(h))) {
+    event.respondWith(
+      caches.match(event.request).then(cached => cached || fetch(event.request).then(res => {
+        if (res && res.ok) { const clone = res.clone(); caches.open(CACHE_NAME).then(c => c.put(event.request, clone)).catch(() => {}); }
+        return res;
+      }).catch(() => cached))
+    );
+    return;
+  }
   event.respondWith(
     fetch(event.request)
       .then(res => {
