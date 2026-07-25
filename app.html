@@ -16851,14 +16851,27 @@ function FaceAttendanceModule({ plant, me }) {
   const canvRef = useRef(null);
   const overlayRef = useRef(null);
 
+  // Cache the enrolled workers + face signatures locally, so the kiosk can boot,
+  // recognise and punch with NO internet. When online we refresh + re-cache; when
+  // offline (queries return no data) we fall back to the last cached copy.
+  const KIOSK_CACHE_KEY = 'llk_kiosk_cache_' + plant.id;
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [{ data: en }, { data: us }] = await Promise.all([
+    const [enRes, usRes] = await Promise.all([
       sb.from('attendance_face_enrollments').select('*').eq('plant_id', plant.id),
       sb.from('users').select('id, full_name, role').eq('plant_id', plant.id).order('full_name'),
     ]);
-    const m = {}; (en || []).forEach(r => { m[r.user_id] = r; }); setEnroll(m);
-    setUsers(us || []); setLoading(false);
+    if (enRes.data && usRes.data) {
+      const m = {}; enRes.data.forEach(r => { m[r.user_id] = r; });
+      setEnroll(m); setUsers(usRes.data);
+      try { localStorage.setItem(KIOSK_CACHE_KEY, JSON.stringify({ enroll: m, users: usRes.data })); } catch (_) {}
+    } else {
+      try {
+        const c = JSON.parse(localStorage.getItem(KIOSK_CACHE_KEY) || 'null');
+        if (c) { setEnroll(c.enroll || {}); setUsers(c.users || []); }
+      } catch (_) {}
+    }
+    setLoading(false);
   }, [plant.id]);
   useEffect(() => { refresh(); }, [refresh]);
 
