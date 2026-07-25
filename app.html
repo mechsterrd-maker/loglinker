@@ -16707,7 +16707,29 @@ function FaceAttendanceModule({ plant, me }) {
     return { state: 'ok', user_id: top.user_id, name: nameOf(top.user_id), dist: top.dist };
   };
 
-  const resetLock = () => { lockRef.current = { uid: null, yMin: 0, yMax: 0, pMin: 0, pMax: 0, seen: 0, poseInit: false, lostSince: 0, lastRecog: 0 }; };
+  const resetLock = () => { lockRef.current = { uid: null, yMin: 0, yMax: 0, pMin: 0, pMax: 0, seen: 0, poseInit: false, lostSince: 0, lastRecog: 0, desc: null, dist: null }; };
+  const learnedRef = useRef({});   // user_id -> date already learned (throttle: once/day/person)
+
+  // Adaptive learning: on a VERY confident, live, online match, quietly add that
+  // frame's face as an extra reference (keep original 3 anchors + newest, cap 8).
+  // The reference set keeps up with slow changes — a beard growing in, aging,
+  // varying makeup — so recognition stays sharp with no admin effort. Gated hard
+  // (dist < FACE_LEARN_MAX, once/day) so a wrong face can never poison a template.
+  const FACE_LEARN_MAX = 0.40;
+  const learnFace = async (userId, desc) => {
+    if (!desc) return;
+    const today = new Date().toISOString().slice(0, 10);
+    if (learnedRef.current[userId] === today) return;
+    learnedRef.current[userId] = today;
+    const row = enroll[userId];
+    if (!row || !Array.isArray(row.descriptors) || !row.descriptors.length) return;
+    let next = [...row.descriptors, desc];
+    if (next.length > 8) next = [...next.slice(0, 3), ...next.slice(next.length - 5)];
+    const { error } = await sb.from('attendance_face_enrollments')
+      .update({ descriptors: next, updated_at: new Date().toISOString() })
+      .eq('plant_id', plant.id).eq('user_id', userId);
+    if (!error) setEnroll(e => ({ ...e, [userId]: { ...e[userId], descriptors: next } }));
+  };
   const CLR_SCAN = 'rgba(245,158,11,.95)', CLR_LOCK = 'rgba(20,184,166,.98)', CLR_OK = 'rgba(16,185,129,.98)';
 
   // Draw the tracking wireframe (box + landmark dots) over the mirrored video so
@@ -16738,7 +16760,7 @@ function FaceAttendanceModule({ plant, me }) {
     setResult({ ok: true, offline: true, name: nameOf(userId), message: 'Saved offline ✓ — will sync' + (via ? ' · ' + via : '') });
   };
 
-  const punch = async (userId, via) => {
+  const punch = async (userId, via, learnDesc, learnDist) => {
     busyRef.current = true;
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
       enqueuePunch(userId, via);
@@ -16747,6 +16769,8 @@ function FaceAttendanceModule({ plant, me }) {
         const { data, error } = await sb.rpc('attendance_kiosk_punch', { p_plant_id: plant.id, p_user_id: userId, p_dir: null });
         if (error) throw error;
         setResult({ ok: !!data?.success, name: data?.name || nameOf(userId), message: (data?.success ? data.message : (data?.error || 'Failed')) + (via ? ' · ' + via : '') });
+        // We're online and it was a confident, live face match → let the template adapt.
+        if (learnDesc && learnDist != null && learnDist < FACE_LEARN_MAX) { try { await learnFace(userId, learnDesc); } catch (_) {} }
       } catch (e) {
         if (isNetworkErr(e)) enqueuePunch(userId, via);   // don't lose it — queue & sync later
         else setResult({ ok: false, name: nameOf(userId), message: e.message || 'Punch failed' });
@@ -16831,13 +16855,15 @@ function FaceAttendanceModule({ plant, me }) {
             const m = bestMatch(det.descriptor);
             if (m.state === 'ok') {
               if (Lk.uid !== m.user_id) { resetLock(); lockRef.current.uid = m.user_id; lockRef.current.lastRecog = now; }
+              const L2 = lockRef.current;                        // keep the BEST (closest) descriptor seen this lock, for adaptive learning
+              if (L2.dist == null || m.dist < L2.dist) { L2.dist = m.dist; L2.desc = Array.from(det.descriptor); }
             } else if (!Lk.uid) { setStatus('unknown'); drawFace(det, CLR_SCAN); blocked = true; }
           }
           if (!blocked) {
             const L = lockRef.current;
             if (!L.uid) { setStatus('look'); drawFace(det, CLR_SCAN); }
             else if (now <= (cooldownRef.current[L.uid] || 0)) { setStatus('recog'); drawFace(det, CLR_OK); }
-            else if (!liveness) { drawFace(det, CLR_OK); cooldownRef.current[L.uid] = now + 12000; await punch(L.uid); }
+            else if (!liveness) { drawFace(det, CLR_OK); cooldownRef.current[L.uid] = now + 12000; await punch(L.uid, null, L.desc, L.dist); }
             else {
               const hp = headPose(det.landmarks);
               if (hp) {
@@ -16854,8 +16880,8 @@ function FaceAttendanceModule({ plant, me }) {
                 L.seen++;
                 const moved = (L.yMax - L.yMin) > LIVE_MOVE || (L.pMax - L.pMin) > LIVE_MOVE;
                 if (L.seen >= 3 && moved) {
-                  const uid = L.uid; cooldownRef.current[uid] = now + 12000; resetLock();
-                  drawFace(det, CLR_OK); await punch(uid);
+                  const uid = L.uid, ldesc = L.desc, ldist = L.dist; cooldownRef.current[uid] = now + 12000; resetLock();
+                  drawFace(det, CLR_OK); await punch(uid, null, ldesc, ldist);
                 } else { setStatus('move'); drawFace(det, CLR_LOCK); }
               } else drawFace(det, CLR_LOCK);
             }
@@ -16988,6 +17014,7 @@ function FaceEnrollModal({ plant, me, user, existing, onClose, onSaved }) {
   const [pin, setPin] = useState(existing?.pin || '');
   const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
   const [snap, setSnap] = useState(false);       // brief flash after a capture
+  const [append, setAppend] = useState(false);   // "add a look" — merge with existing instead of replacing
   const videoRef = useRef(null); const streamRef = useRef(null); const faceRef = useRef(null); const capCanvRef = useRef(null);
   const hadFace = existing && Array.isArray(existing.descriptors) && existing.descriptors.length > 0;
 
@@ -17030,7 +17057,17 @@ function FaceEnrollModal({ plant, me, user, existing, onClose, onSaved }) {
       plant_id: plant.id, user_id: user.id, consent: true, enrolled_by: me.id,
       pin: cleanPin || null, updated_at: new Date().toISOString(),
     };
-    if (samples.length >= ENROLL_STEPS.length) row.descriptors = samples;   // only overwrite face if re-captured
+    if (samples.length >= ENROLL_STEPS.length) {
+      if (append && hadFace) {
+        // "Add a look" — keep the existing face(s) and append the new set, so both
+        // looks (e.g. beard & clean-shaven) recognise. Cap 12: original 3 + newest 9.
+        let merged = [...(existing.descriptors || []), ...samples];
+        if (merged.length > 12) merged = [...merged.slice(0, 3), ...merged.slice(merged.length - 9)];
+        row.descriptors = merged;
+      } else {
+        row.descriptors = samples;   // fresh enrol / full re-capture (replace)
+      }
+    }
     const { error } = await sb.from('attendance_face_enrollments').upsert(row, { onConflict: 'plant_id,user_id' });
     setBusy(false);
     if (error) { setErr(error.message); return; }
@@ -17045,8 +17082,9 @@ function FaceEnrollModal({ plant, me, user, existing, onClose, onSaved }) {
         ${err && html`<div class="alert error">${err}</div>`}
         ${phase === 'start' ? html`
           <div style="font-size:13px;color:var(--slate-600);margin-bottom:10px">We take <b>3 quick snaps</b> at slightly different angles so the gate recognises ${user.full_name.split(' ')[0]} reliably. Good, even light works best.</div>
-          ${hadFace && html`<div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);padding:10px;font-size:12px;color:var(--slate-700);margin-bottom:10px">✓ Face already enrolled (${existing.descriptors.length} sample${existing.descriptors.length===1?'':'s'})${existing.pin?' · PIN set':''}. Re-capture only if recognition is unreliable.</div>`}
-          <button class="btn" style="width:100%" onClick=${openCam}>📷 ${hadFace ? 'Re-capture face' : 'Open camera'}</button>
+          ${hadFace && html`<div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);padding:10px;font-size:12px;color:var(--slate-700);margin-bottom:10px">✓ Face already enrolled (${existing.descriptors.length} sample${existing.descriptors.length===1?'':'s'})${existing.pin?' · PIN set':''}. <b>Add a look</b> for a big change (beard / clean-shaven / glasses); re-capture only if recognition is unreliable.</div>`}
+          <button class="btn" style="width:100%" onClick=${() => { setAppend(false); openCam(); }}>📷 ${hadFace ? 'Re-capture face (replace)' : 'Open camera'}</button>
+          ${hadFace && html`<button class="btn" style="width:100%;margin-top:8px;background:var(--teal-50);color:var(--teal-700);border:1px solid var(--teal-200)" onClick=${() => { setAppend(true); openCam(); }}>➕ Add another look</button>`}
           ${hadFace && html`<button class="btn ghost" style="width:100%;margin-top:8px" onClick=${() => setPhase('review')}>Just update PIN →</button>`}
         ` : phase === 'camera' ? html`
           <div style="text-align:center;font-weight:600;font-size:15px;color:var(--slate-800)">${cur.t}</div>
@@ -17060,7 +17098,7 @@ function FaceEnrollModal({ plant, me, user, existing, onClose, onSaved }) {
           </div>
           <button class="btn" style="width:100%;margin-top:6px" onClick=${capture}>📸 Capture snap ${samples.length + 1}</button>
         ` : html`
-          <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);text-align:center;padding:14px"><div style="font-size:30px">✓</div><div style="font-size:13px;color:var(--slate-700)">${samples.length >= ENROLL_STEPS.length ? samples.length + ' face samples captured' : 'Face already enrolled'}</div></div>
+          <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);text-align:center;padding:14px"><div style="font-size:30px">✓</div><div style="font-size:13px;color:var(--slate-700)">${samples.length >= ENROLL_STEPS.length ? (append ? 'New look captured — added alongside the existing face' : samples.length + ' face samples captured') : 'Face already enrolled'}</div></div>
           <label style="display:block;margin:14px 0 4px;font-size:12px;font-weight:600;color:var(--slate-700)">Backup PIN (optional)</label>
           <input inputmode="numeric" maxlength="6" value=${pin} onInput=${e => setPin(e.target.value.replace(/\D/g, ''))} placeholder="4–6 digits" style="width:100%;padding:9px 11px;border:1px solid var(--slate-300);border-radius:8px;font-size:15px;letter-spacing:3px;text-align:center" />
           <div style="font-size:11px;color:var(--slate-500);margin-top:4px">If the camera can't get a clean match, ${user.full_name.split(' ')[0]} can punch with this PIN. Leave blank to skip.</div>
