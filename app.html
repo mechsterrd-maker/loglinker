@@ -16151,15 +16151,26 @@ async function faceLandmarksOnly(faceapi, input) {
 }
 function faceDistance(a, b) { let s = 0; for (let i = 0; i < 128; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); }
 const FACE_MATCH_MARGIN = 0.05;   // best match must beat 2nd-best by this — blocks wrong-person punches
-// Eye-aspect-ratio for blink-based liveness (defeats a held-up photo).
-function eyeEAR(e) { const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y); const w = d(e[0], e[3]) || 1; return (d(e[1], e[5]) + d(e[2], e[4])) / (2 * w); }
-function faceEAR(landmarks) { try { return (eyeEAR(landmarks.getLeftEye()) + eyeEAR(landmarks.getRightEye())) / 2; } catch (_) { return null; } }
+const LIVE_MOVE = 0.14;           // head-movement (nose vs eye-mid, normalised) needed to pass liveness
+// Head-pose proxy: nose tip position relative to the eye midpoint, normalised by
+// inter-eye distance. ~0 looking straight; a turn moves yaw, a nod moves pitch.
+// A single deliberate movement is a big, clean signal — far more reliable than
+// blink on the tiny landmark model, and a flat static photo can't produce it.
+function headPose(landmarks) {
+  try {
+    const mean = (pts) => ({ x: pts.reduce((s, p) => s + p.x, 0) / pts.length, y: pts.reduce((s, p) => s + p.y, 0) / pts.length });
+    const le = mean(landmarks.getLeftEye()), re = mean(landmarks.getRightEye());
+    const nose = landmarks.getNose(); const tip = nose[3] || nose[nose.length - 1];
+    const midX = (le.x + re.x) / 2, midY = (le.y + re.y) / 2;
+    const io = Math.hypot(le.x - re.x, le.y - re.y) || 1;
+    return { yaw: (tip.x - midX) / io, pitch: (tip.y - midY) / io };
+  } catch (_) { return null; }
+}
 
 const KIOSK_STATUS = {
   look:   { t: 'Look at the camera', c: 'var(--slate-500)' },
   unknown:{ t: 'Face not recognised — line up in the frame', c: 'var(--amber-600)' },
-  blink:  { t: '👁 Blink to confirm', c: 'var(--teal-600)' },
-  hold:   { t: '✓ Blink detected…', c: 'var(--teal-600)' },
+  move:   { t: '↔ Turn your head or nod to confirm', c: 'var(--teal-600)' },
   recog:  { t: 'Recognising…', c: 'var(--teal-600)' },
 };
 function FaceAttendanceModule({ plant, me }) {
@@ -16181,9 +16192,10 @@ function FaceAttendanceModule({ plant, me }) {
   const streamRef = useRef(null);
   const runningRef = useRef(false);
   const cooldownRef = useRef({});
-  const lockRef = useRef({ uid: null, base: 0, n: 0, armed: false, lost: 0, t0: 0 });
+  const lockRef = useRef({ uid: null, y0: 0, p0: 0, n: 0, lost: 0, t0: 0 });
   const busyRef = useRef(false);
   const canvRef = useRef(null);
+  const overlayRef = useRef(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -16222,7 +16234,28 @@ function FaceAttendanceModule({ plant, me }) {
     return { state: 'ok', user_id: top.user_id, name: nameOf(top.user_id), dist: top.dist };
   };
 
-  const resetLock = () => { lockRef.current = { uid: null, base: 0, n: 0, armed: false, lost: 0, t0: 0 }; };
+  const resetLock = () => { lockRef.current = { uid: null, y0: 0, p0: 0, n: 0, lost: 0, t0: 0 }; };
+
+  // Draw the tracking wireframe (box + landmark dots) over the mirrored video so
+  // the worker sees the system lock onto their face instantly.
+  const drawFace = (det, color) => {
+    const cv = overlayRef.current, v = videoRef.current; if (!cv || !v) return;
+    const W = v.clientWidth, H = v.clientHeight; if (!W || !H) return;
+    if (cv.width !== W) cv.width = W; if (cv.height !== H) cv.height = H;
+    const ctx = cv.getContext('2d'); ctx.clearRect(0, 0, W, H);
+    if (!det) return;
+    const sw = (canvRef.current && canvRef.current.width) || 320; const scale = W / sw;
+    const mx = (x) => W - x * scale, my = (y) => y * scale;   // mirror X to match the flipped video
+    const b = det.detection.box;
+    const x1 = mx(b.x), x2 = mx(b.x + b.width), bx = Math.min(x1, x2), by = my(b.y), bw = Math.abs(x2 - x1), bh = b.height * scale;
+    ctx.strokeStyle = color; ctx.lineWidth = 3;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(bx, by, bw, bh, 16); else ctx.rect(bx, by, bw, bh);
+    ctx.stroke();
+    ctx.fillStyle = color;
+    const pts = det.landmarks.positions;
+    for (let i = 0; i < pts.length; i++) { ctx.beginPath(); ctx.arc(mx(pts[i].x), my(pts[i].y), 1.7, 0, 6.29); ctx.fill(); }
+  };
 
   const punch = async (userId, via) => {
     busyRef.current = true;
@@ -16252,40 +16285,38 @@ function FaceAttendanceModule({ plant, me }) {
         if (!Lk.uid) {
           // ---- SCAN ----  heavy detect + fingerprint to recognise who it is
           const det = await faceDetect(faceapi, frame);
-          if (!det || !det.descriptor) { setStatus('look'); }
+          if (!det || !det.descriptor) { setStatus('look'); drawFace(null); }
           else {
             const m = bestMatch(det.descriptor);
-            if (m.state !== 'ok') setStatus('unknown');
-            else if (Date.now() <= (cooldownRef.current[m.user_id] || 0)) setStatus('recog');
-            else if (!liveness) { cooldownRef.current[m.user_id] = Date.now() + 12000; await punch(m.user_id); }
+            if (m.state !== 'ok') { setStatus('unknown'); drawFace(det, 'rgba(245,158,11,.95)'); }
+            else if (Date.now() <= (cooldownRef.current[m.user_id] || 0)) { setStatus('recog'); drawFace(det, 'rgba(16,185,129,.95)'); }
+            else if (!liveness) { drawFace(det, 'rgba(16,185,129,.95)'); cooldownRef.current[m.user_id] = Date.now() + 12000; await punch(m.user_id); }
             else {
-              const ear = faceEAR(det.landmarks) || 0;
-              lockRef.current = { uid: m.user_id, base: ear, n: 1, armed: false, lost: 0, t0: Date.now() };
-              setStatus('blink'); next = 70;
+              const hp = headPose(det.landmarks) || { yaw: 0, pitch: 0 };
+              lockRef.current = { uid: m.user_id, y0: hp.yaw, p0: hp.pitch, n: 1, lost: 0, t0: Date.now() };
+              setStatus('move'); drawFace(det, 'rgba(20,184,166,.98)'); next = 70;
             }
           }
         } else {
-          // ---- LIVE ----  fast landmark-only blink watch; identity already locked
+          // ---- LIVE ----  fast landmark-only watch for one head movement; identity already locked
           next = 70;
-          if (Date.now() - Lk.t0 > 10000) { resetLock(); setStatus('look'); }   // give up, back to scan
+          if (Date.now() - Lk.t0 > 12000) { resetLock(); setStatus('look'); drawFace(null); }   // give up, back to scan
           else {
             const det = await faceLandmarksOnly(faceapi, frame);
-            if (!det) { Lk.lost++; if (Lk.lost > 10) { resetLock(); setStatus('look'); } }
+            if (!det) { Lk.lost++; drawFace(null); if (Lk.lost > 12) { resetLock(); setStatus('look'); } }
             else {
               Lk.lost = 0;
-              const ear = faceEAR(det.landmarks);
-              if (ear != null) {
+              const hp = headPose(det.landmarks);
+              if (hp) {
                 Lk.n++;
-                Lk.base = Lk.base > 0 ? Math.max(ear, Lk.base * 0.985) : ear;    // decaying running-max baseline
-                const base = Lk.base || 0.3;
-                const closeT = Math.max(0.16, base * 0.75);
-                const openT = base * 0.85;
-                if (!Lk.armed) { setStatus('blink'); if (Lk.n >= 2 && ear < closeT) Lk.armed = true; }
-                else if (ear > openT) {
-                  // blink complete → punch straight away (identity already verified at lock)
-                  const uid = Lk.uid; cooldownRef.current[uid] = Date.now() + 12000; resetLock();
-                  await punch(uid);
-                } else setStatus('hold');
+                if (Lk.n <= 2) { Lk.y0 = hp.yaw; Lk.p0 = hp.pitch; setStatus('move'); drawFace(det, 'rgba(20,184,166,.98)'); }
+                else {
+                  const dev = Math.hypot(hp.yaw - Lk.y0, hp.pitch - Lk.p0);
+                  if (dev > LIVE_MOVE) {
+                    const uid = Lk.uid; cooldownRef.current[uid] = Date.now() + 12000; resetLock();
+                    drawFace(det, 'rgba(16,185,129,.98)'); await punch(uid);
+                  } else { setStatus('move'); drawFace(det, 'rgba(20,184,166,.98)'); }
+                }
               }
             }
           }
@@ -16307,7 +16338,7 @@ function FaceAttendanceModule({ plant, me }) {
       setTimeout(() => { const v = videoRef.current; if (v) { v.srcObject = stream; v.play().catch(() => {}); } tick(faceapi); }, 120);
     } catch (e) { setKerr('Camera permission denied — allow the camera and retry.'); setEngine('idle'); }
   };
-  const stopKiosk = () => { stopCamera(); setEngine('idle'); setResult(null); setPinPad(false); };
+  const stopKiosk = () => { stopCamera(); setEngine('idle'); setResult(null); setPinPad(false); try { drawFace(null); } catch (_) {} };
 
   // PIN fallback — never leave a worker stuck if the camera won't recognise them.
   const submitPin = async () => {
@@ -16335,14 +16366,15 @@ function FaceAttendanceModule({ plant, me }) {
         ${engine !== 'running' ? html`
           <div style="font-size:13px;color:var(--slate-600);margin-bottom:12px">Mount a tablet/phone at the gate, open this page, and press start. Each worker looks at the camera to punch — first look of the day = IN, next = OUT.</div>
           <label style="display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--slate-600);margin-bottom:12px;cursor:pointer">
-            <input type="checkbox" checked=${liveness} onChange=${e => setLiveness(e.target.checked)} /> Require a blink (anti-photo) — recommended
+            <input type="checkbox" checked=${liveness} onChange=${e => setLiveness(e.target.checked)} /> Require one head movement (anti-photo) — recommended
           </label><br/>
           <button class="btn" style="font-size:16px;padding:12px 28px" disabled=${engine==='loading'} onClick=${startKiosk}>${engine==='loading' ? '⏳ Loading face engine…' : '▶ Start kiosk'}</button>
           ${kerr && html`<div class="alert error" style="margin-top:12px;text-align:left">${kerr}</div>`}
         ` : html`
           <div style="position:relative;max-width:520px;margin:0 auto">
             <video ref=${videoRef} playsinline muted style="width:100%;border-radius:12px;background:#000;transform:scaleX(-1)"></video>
-            <div style="position:absolute;left:50%;top:47%;transform:translate(-50%,-50%);width:52%;aspect-ratio:3/4;border:3px dashed rgba(255,255,255,.55);border-radius:50%;pointer-events:none"></div>
+            <canvas ref=${overlayRef} style="position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;border-radius:12px"></canvas>
+            <div style="position:absolute;left:50%;top:47%;transform:translate(-50%,-50%);width:52%;aspect-ratio:3/4;border:2px dashed rgba(255,255,255,.28);border-radius:50%;pointer-events:none"></div>
             ${!result && html`<div style="position:absolute;left:0;right:0;bottom:10px;text-align:center">
               <span style=${'display:inline-block;background:rgba(15,23,42,.72);color:#fff;font-size:14px;font-weight:600;padding:6px 16px;border-radius:999px'}>${st.t}</span>
             </div>`}
@@ -16352,7 +16384,7 @@ function FaceAttendanceModule({ plant, me }) {
               <div style="font-size:14px;margin-top:4px;padding:0 16px;text-align:center">${result.message}</div>
             </div>`}
           </div>
-          <div style="font-size:12px;color:var(--slate-500);margin-top:10px">Watching ${enrolledList().length} enrolled worker(s)${liveness?' · blink to confirm':''}</div>
+          <div style="font-size:12px;color:var(--slate-500);margin-top:10px">Watching ${enrolledList().length} enrolled worker(s)${liveness?' · one head movement confirms':''}</div>
           <div style="display:flex;gap:8px;justify-content:center;margin-top:10px">
             <button class="btn ghost small" onClick=${() => { setPinErr(''); setPinVal(''); setPinPad(true); }}>🔢 Can't recognise? Enter PIN</button>
             <button class="btn ghost small" onClick=${stopKiosk}>■ Stop</button>
@@ -16373,7 +16405,7 @@ function FaceAttendanceModule({ plant, me }) {
 
       <div style="font-size:11px;color:var(--slate-500);margin-top:10px;padding:10px 12px;background:var(--slate-50);border-radius:8px;line-height:1.5">
         🔒 <b>Privacy:</b> face data is a mathematical descriptor stored only for this plant, matched on this device — no images are uploaded. Delete anyone's enrollment anytime under People.
-        <br/>✅ <b>Reliability:</b> multi-angle enrollment, a wrong-person guard, blink liveness (anti-photo) and a PIN fallback so nobody is ever stuck. For maximum integrity keep a supervisor at the gate.
+        <br/>✅ <b>Reliability:</b> multi-angle enrollment, a wrong-person guard, single-movement liveness (anti-photo) and a PIN fallback so nobody is ever stuck. For maximum integrity keep a supervisor at the gate.
       </div>
     ` : html`
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
