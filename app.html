@@ -16119,7 +16119,17 @@ async function faceDetect(faceapi, video) {
   return await faceapi.detectSingleFace(video, opts).withFaceLandmarks(true).withFaceDescriptor();
 }
 function faceDistance(a, b) { let s = 0; for (let i = 0; i < 128; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); }
+const FACE_MATCH_MARGIN = 0.05;   // best match must beat 2nd-best by this — blocks wrong-person punches
+// Eye-aspect-ratio for blink-based liveness (defeats a held-up photo).
+function eyeEAR(e) { const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y); const w = d(e[0], e[3]) || 1; return (d(e[1], e[5]) + d(e[2], e[4])) / (2 * w); }
+function faceEAR(landmarks) { try { return (eyeEAR(landmarks.getLeftEye()) + eyeEAR(landmarks.getRightEye())) / 2; } catch (_) { return null; } }
 
+const KIOSK_STATUS = {
+  look:   { t: 'Look at the camera', c: 'var(--slate-500)' },
+  unknown:{ t: 'Face not recognised — line up in the frame', c: 'var(--amber-600)' },
+  blink:  { t: '👁 Blink to confirm', c: 'var(--teal-600)' },
+  recog:  { t: 'Recognising…', c: 'var(--teal-600)' },
+};
 function FaceAttendanceModule({ plant, me }) {
   const [view, setView] = useState('kiosk');       // kiosk | people
   const [enroll, setEnroll] = useState({});         // user_id -> enrollment row
@@ -16129,11 +16139,18 @@ function FaceAttendanceModule({ plant, me }) {
   // kiosk state
   const [engine, setEngine] = useState('idle');     // idle | loading | running
   const [result, setResult] = useState(null);       // { ok, name, message }
+  const [status, setStatus] = useState('look');
+  const [liveness, setLiveness] = useState(true);
   const [kerr, setKerr] = useState('');
+  const [pinPad, setPinPad] = useState(false);
+  const [pinVal, setPinVal] = useState('');
+  const [pinErr, setPinErr] = useState('');
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const runningRef = useRef(false);
   const cooldownRef = useRef({});
+  const livRef = useRef({ open: false, closed: false, cand: null });
+  const busyRef = useRef(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -16154,43 +16171,63 @@ function FaceAttendanceModule({ plant, me }) {
   useEffect(() => () => stopCamera(), []);
 
   const enrolledList = () => Object.values(enroll).filter(e => e.consent && Array.isArray(e.descriptors) && e.descriptors.length);
+  const nameOf = (uid) => (users.find(u => u.id === uid) || {}).full_name || 'Worker';
+
+  // Best match across everyone's samples, with a 2nd-best margin so two similar
+  // faces never cause a wrong-person punch.
   const bestMatch = (desc) => {
-    let best = null;
+    const per = [];
     for (const e of enrolledList()) {
-      for (const d of e.descriptors) {
-        const dist = faceDistance(desc, d);
-        if (dist < FACE_MATCH_THRESHOLD && (!best || dist < best.dist)) best = { user_id: e.user_id, dist };
-      }
+      let mn = Infinity;
+      for (const d of e.descriptors) { const dist = faceDistance(desc, d); if (dist < mn) mn = dist; }
+      per.push({ user_id: e.user_id, dist: mn });
     }
-    if (best) best.name = (users.find(u => u.id === best.user_id) || {}).full_name || 'Worker';
-    return best;
+    per.sort((a, b) => a.dist - b.dist);
+    const top = per[0], second = per[1];
+    if (!top || top.dist >= FACE_MATCH_THRESHOLD) return { state: 'unknown' };
+    if (second && (second.dist - top.dist) < FACE_MATCH_MARGIN) return { state: 'unknown' }; // too close to call
+    return { state: 'ok', user_id: top.user_id, name: nameOf(top.user_id), dist: top.dist };
   };
 
-  const punch = async (userId) => {
+  const punch = async (userId, via) => {
+    busyRef.current = true;
     try {
       const { data, error } = await sb.rpc('attendance_kiosk_punch', { p_plant_id: plant.id, p_user_id: userId, p_dir: null });
       if (error) throw error;
-      setResult({ ok: !!data?.success, name: data?.name || '', message: data?.success ? data.message : (data?.error || 'Failed') });
-    } catch (e) { setResult({ ok: false, name: '', message: e.message || 'Punch failed' }); }
-    setTimeout(() => setResult(null), 3500);
+      setResult({ ok: !!data?.success, name: data?.name || nameOf(userId), message: (data?.success ? data.message : (data?.error || 'Failed')) + (via ? ' · ' + via : '') });
+    } catch (e) { setResult({ ok: false, name: nameOf(userId), message: e.message || 'Punch failed' }); }
+    livRef.current = { open: false, closed: false, cand: null };
+    setTimeout(() => { setResult(null); busyRef.current = false; }, 3200);
   };
 
   const tick = async (faceapi) => {
     if (!runningRef.current) return;
     const v = videoRef.current;
     try {
-      if (v && v.videoWidth) {
+      if (v && v.videoWidth && !busyRef.current && !pinPad) {
         const det = await faceDetect(faceapi, v);
-        if (det && det.descriptor) {
-          const match = bestMatch(det.descriptor);
-          if (match && Date.now() > (cooldownRef.current[match.user_id] || 0)) {
-            cooldownRef.current[match.user_id] = Date.now() + 12000;
-            await punch(match.user_id);
+        const L = livRef.current;
+        if (!det || !det.descriptor) { setStatus('look'); L.open = false; L.closed = false; L.cand = null; }
+        else {
+          const m = bestMatch(det.descriptor);
+          if (m.state !== 'ok') { setStatus('unknown'); }
+          else if (Date.now() <= (cooldownRef.current[m.user_id] || 0)) { setStatus('recog'); }
+          else {
+            if (L.cand !== m.user_id) { L.cand = m.user_id; L.open = false; L.closed = false; } // reset on person change
+            if (!liveness) { cooldownRef.current[m.user_id] = Date.now() + 12000; await punch(m.user_id); }
+            else {
+              const ear = faceEAR(det.landmarks);
+              if (ear != null) {
+                if (ear > 0.26) { if (L.closed) { cooldownRef.current[m.user_id] = Date.now() + 12000; await punch(m.user_id); } else L.open = true; }
+                else if (ear < 0.19 && L.open) L.closed = true;
+              }
+              setStatus('blink');
+            }
           }
         }
       }
     } catch (_) {}
-    if (runningRef.current) setTimeout(() => tick(faceapi), 850);
+    if (runningRef.current) setTimeout(() => tick(faceapi), 430);
   };
 
   const startKiosk = async () => {
@@ -16201,13 +16238,23 @@ function FaceAttendanceModule({ plant, me }) {
     catch (e) { setKerr(e.message); setEngine('idle'); return; }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
-      streamRef.current = stream; runningRef.current = true; setEngine('running');
+      streamRef.current = stream; runningRef.current = true; setEngine('running'); livRef.current = { open: false, closed: false, cand: null };
       setTimeout(() => { const v = videoRef.current; if (v) { v.srcObject = stream; v.play().catch(() => {}); } tick(faceapi); }, 120);
     } catch (e) { setKerr('Camera permission denied — allow the camera and retry.'); setEngine('idle'); }
   };
-  const stopKiosk = () => { stopCamera(); setEngine('idle'); setResult(null); };
+  const stopKiosk = () => { stopCamera(); setEngine('idle'); setResult(null); setPinPad(false); };
+
+  // PIN fallback — never leave a worker stuck if the camera won't recognise them.
+  const submitPin = async () => {
+    setPinErr('');
+    const hit = Object.values(enroll).find(e => e.pin && String(e.pin) === pinVal.trim());
+    if (!hit) { setPinErr('No worker has that PIN'); return; }
+    setPinPad(false); setPinVal('');
+    await punch(hit.user_id, 'PIN');
+  };
 
   const delEnroll = async (userId) => { if (!confirm('Delete this face enrollment?')) return; await sb.from('attendance_face_enrollments').delete().eq('plant_id', plant.id).eq('user_id', userId); refresh(); };
+  const st = KIOSK_STATUS[status] || KIOSK_STATUS.look;
 
   return html`
     <div class="page-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
@@ -16222,24 +16269,46 @@ function FaceAttendanceModule({ plant, me }) {
       <div class="card" style="text-align:center;padding:16px">
         ${engine !== 'running' ? html`
           <div style="font-size:13px;color:var(--slate-600);margin-bottom:12px">Mount a tablet/phone at the gate, open this page, and press start. Each worker looks at the camera to punch — first look of the day = IN, next = OUT.</div>
+          <label style="display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--slate-600);margin-bottom:12px;cursor:pointer">
+            <input type="checkbox" checked=${liveness} onChange=${e => setLiveness(e.target.checked)} /> Require a blink (anti-photo) — recommended
+          </label><br/>
           <button class="btn" style="font-size:16px;padding:12px 28px" disabled=${engine==='loading'} onClick=${startKiosk}>${engine==='loading' ? '⏳ Loading face engine…' : '▶ Start kiosk'}</button>
           ${kerr && html`<div class="alert error" style="margin-top:12px;text-align:left">${kerr}</div>`}
         ` : html`
           <div style="position:relative;max-width:520px;margin:0 auto">
             <video ref=${videoRef} playsinline muted style="width:100%;border-radius:12px;background:#000;transform:scaleX(-1)"></video>
-            ${result && html`<div style=${'position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:12px;background:' + (result.ok ? 'rgba(5,150,105,.85)' : 'rgba(225,29,72,.85)') + ';color:#fff'}>
+            <div style="position:absolute;left:50%;top:47%;transform:translate(-50%,-50%);width:52%;aspect-ratio:3/4;border:3px dashed rgba(255,255,255,.55);border-radius:50%;pointer-events:none"></div>
+            ${!result && html`<div style="position:absolute;left:0;right:0;bottom:10px;text-align:center">
+              <span style=${'display:inline-block;background:rgba(15,23,42,.72);color:#fff;font-size:14px;font-weight:600;padding:6px 16px;border-radius:999px'}>${st.t}</span>
+            </div>`}
+            ${result && html`<div style=${'position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:12px;background:' + (result.ok ? 'rgba(5,150,105,.88)' : 'rgba(225,29,72,.88)') + ';color:#fff'}>
               <div style="font-size:40px">${result.ok ? '✓' : '✕'}</div>
               <div style="font-size:22px;font-weight:800">${result.name || ''}</div>
               <div style="font-size:14px;margin-top:4px;padding:0 16px;text-align:center">${result.message}</div>
             </div>`}
           </div>
-          <div style="font-size:12px;color:var(--slate-500);margin-top:10px">Watching ${enrolledList().length} enrolled worker(s)… look straight at the camera.</div>
-          <button class="btn ghost" style="margin-top:10px" onClick=${stopKiosk}>■ Stop</button>
+          <div style="font-size:12px;color:var(--slate-500);margin-top:10px">Watching ${enrolledList().length} enrolled worker(s)${liveness?' · blink to confirm':''}</div>
+          <div style="display:flex;gap:8px;justify-content:center;margin-top:10px">
+            <button class="btn ghost small" onClick=${() => { setPinErr(''); setPinVal(''); setPinPad(true); }}>🔢 Can't recognise? Enter PIN</button>
+            <button class="btn ghost small" onClick=${stopKiosk}>■ Stop</button>
+          </div>
         `}
       </div>
+
+      ${pinPad && html`<div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) setPinPad(false); }}>
+        <div class="modal" style="max-width:300px;text-align:center">
+          <div class="modal-header"><div class="modal-title">Enter your PIN</div><button class="close-btn" onClick=${() => setPinPad(false)}>×</button></div>
+          ${pinErr && html`<div class="alert error">${pinErr}</div>`}
+          <div class="num" style="font-size:30px;letter-spacing:8px;height:42px;font-weight:700;color:var(--teal-700)">${pinVal.replace(/./g,'•')||'—'}</div>
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:12px 0">
+            ${['1','2','3','4','5','6','7','8','9','⌫','0','✓'].map(k => html`<button key=${k} class="btn ${k==='✓'?'':'ghost'}" style="font-size:18px;padding:12px 0" onClick=${() => { if(k==='⌫') setPinVal(p=>p.slice(0,-1)); else if(k==='✓') submitPin(); else if(pinVal.length<6) setPinVal(p=>p+k); }}>${k}</button>`)}
+          </div>
+        </div>
+      </div>`}
+
       <div style="font-size:11px;color:var(--slate-500);margin-top:10px;padding:10px 12px;background:var(--slate-50);border-radius:8px;line-height:1.5">
-        🔒 <b>Privacy:</b> face data is a mathematical descriptor stored only for this plant, used solely for attendance, and only for workers who consented. It is matched on this device — no images are uploaded. Delete anyone's enrollment anytime under People.
-        <br/>⚠ <b>Note:</b> recognition is convenient but not spoof-proof (a printed photo can fool it). Use it with a supervisor present at the gate, or keep GPS+QR punch for high-integrity needs.
+        🔒 <b>Privacy:</b> face data is a mathematical descriptor stored only for this plant, matched on this device — no images are uploaded. Delete anyone's enrollment anytime under People.
+        <br/>✅ <b>Reliability:</b> multi-angle enrollment, a wrong-person guard, blink liveness (anti-photo) and a PIN fallback so nobody is ever stuck. For maximum integrity keep a supervisor at the gate.
       </div>
     ` : html`
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
@@ -16247,7 +16316,7 @@ function FaceAttendanceModule({ plant, me }) {
           ${users.map(u => { const e = enroll[u.id]; const done = e && e.consent && (e.descriptors||[]).length; return html`<div key=${u.id} style="display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--slate-100)">
             <div style="flex:1;min-width:0">
               <div style="font-size:14px;font-weight:600">${u.full_name}</div>
-              <div style="font-size:11px;color:var(--slate-500)">${roleLabel ? roleLabel(u.role) : u.role}${done ? ' · enrolled' : e && !e.consent ? ' · consent pending' : ''}</div>
+              <div style="font-size:11px;color:var(--slate-500)">${roleLabel ? roleLabel(u.role) : u.role}${done ? ' · ' + (e.descriptors.length) + ' sample' + (e.descriptors.length===1?'':'s') + (e.pin?' · PIN set':'') : e && !e.consent ? ' · consent pending' : ''}</div>
             </div>
             ${done ? html`<span class="badge emerald">✓ face</span>` : html`<span class="badge slate">not enrolled</span>`}
             <button class="btn small" onClick=${() => setEnrollFor(u)}>${done ? 'Re-enroll' : 'Enroll'}</button>
@@ -16256,23 +16325,35 @@ function FaceAttendanceModule({ plant, me }) {
         </div>`}
     `}
 
-    ${enrollFor && html`<${FaceEnrollModal} plant=${plant} me=${me} user=${enrollFor} onClose=${() => setEnrollFor(null)} onSaved=${() => { setEnrollFor(null); refresh(); }} />`}
+    ${enrollFor && html`<${FaceEnrollModal} plant=${plant} me=${me} user=${enrollFor} existing=${enroll[enrollFor.id]} onClose=${() => setEnrollFor(null)} onSaved=${() => { setEnrollFor(null); refresh(); }} />`}
   `;
 }
 
 // Capture a worker's face descriptor (with explicit consent) and store it.
-function FaceEnrollModal({ plant, me, user, onClose, onSaved }) {
-  const [phase, setPhase] = useState('start');   // start | camera | captured
-  const [desc, setDesc] = useState(null);
+// Enroll captures THREE samples at slightly different angles so the kiosk still
+// recognises the worker under real light/pose variation, and lets them set an
+// optional PIN as a fallback for when the camera can't get a clean match.
+const ENROLL_STEPS = [
+  { t: 'Look straight ahead', hint: 'Face the camera square-on.' },
+  { t: 'Turn slightly LEFT',  hint: 'A small turn — keep both eyes visible.' },
+  { t: 'Turn slightly RIGHT', hint: 'A small turn the other way.' },
+];
+function FaceEnrollModal({ plant, me, user, existing, onClose, onSaved }) {
+  const [phase, setPhase] = useState('start');   // start | camera | review
+  const [samples, setSamples] = useState([]);    // captured 128-d descriptors
+  const [step, setStep] = useState(0);           // which ENROLL_STEP we're on
   const [consent, setConsent] = useState(false);
+  const [pin, setPin] = useState(existing?.pin || '');
   const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const [snap, setSnap] = useState(false);       // brief flash after a capture
   const videoRef = useRef(null); const streamRef = useRef(null); const faceRef = useRef(null);
+  const hadFace = existing && Array.isArray(existing.descriptors) && existing.descriptors.length > 0;
 
   const stop = () => { try { streamRef.current?.getTracks().forEach(t => t.stop()); } catch (_) {} streamRef.current = null; };
   useEffect(() => () => stop(), []);
 
   const openCam = async () => {
-    setErr(''); setPhase('camera');
+    setErr(''); setSamples([]); setStep(0); setPhase('camera');
     try { faceRef.current = await loadFaceApi(); }
     catch (e) { setErr(e.message); setPhase('start'); return; }
     try {
@@ -16288,43 +16369,65 @@ function FaceEnrollModal({ plant, me, user, onClose, onSaved }) {
     if (!v || !v.videoWidth) { setErr('Camera not ready'); return; }
     try {
       const det = await faceDetect(faceRef.current, v);
-      if (!det || !det.descriptor) { setErr('No face detected — look straight at the camera in good light.'); return; }
-      setDesc(Array.from(det.descriptor)); stop(); setPhase('captured');
+      if (!det || !det.descriptor) { setErr('No face detected — hold steady, look at the camera in good light.'); return; }
+      const next = [...samples, Array.from(det.descriptor)];
+      setSnap(true); setTimeout(() => setSnap(false), 180);
+      if (next.length >= ENROLL_STEPS.length) { setSamples(next); stop(); setPhase('review'); }
+      else { setSamples(next); setStep(next.length); }
     } catch (e) { setErr(e.message || 'Capture failed'); }
   };
 
   const save = async () => {
-    if (!desc) { setErr('Capture a face first'); return; }
-    if (!consent) { setErr('Worker consent is required to store face data'); return; }
+    const cleanPin = pin.trim();
+    if (!hadFace && samples.length < ENROLL_STEPS.length) { setErr('Capture all three samples first'); return; }
+    if (cleanPin && !/^\d{4,6}$/.test(cleanPin)) { setErr('PIN must be 4–6 digits'); return; }
+    if (!consent && !hadFace) { setErr('Worker consent is required to store face data'); return; }
     setBusy(true); setErr('');
-    const { error } = await sb.from('attendance_face_enrollments').upsert({
-      plant_id: plant.id, user_id: user.id, descriptors: [desc], consent: true, enrolled_by: me.id, updated_at: new Date().toISOString(),
-    }, { onConflict: 'plant_id,user_id' });
+    const row = {
+      plant_id: plant.id, user_id: user.id, consent: true, enrolled_by: me.id,
+      pin: cleanPin || null, updated_at: new Date().toISOString(),
+    };
+    if (samples.length >= ENROLL_STEPS.length) row.descriptors = samples;   // only overwrite face if re-captured
+    const { error } = await sb.from('attendance_face_enrollments').upsert(row, { onConflict: 'plant_id,user_id' });
     setBusy(false);
     if (error) { setErr(error.message); return; }
     showToast('✓ ' + user.full_name + ' enrolled'); onSaved();
   };
 
+  const cur = ENROLL_STEPS[Math.min(step, ENROLL_STEPS.length - 1)];
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) { stop(); onClose(); } }}>
       <div class="modal" style="max-width:460px">
         <div class="modal-header"><div class="modal-title">😀 Enroll · ${user.full_name}</div><button class="close-btn" onClick=${() => { stop(); onClose(); }}>×</button></div>
         ${err && html`<div class="alert error">${err}</div>`}
         ${phase === 'start' ? html`
-          <div style="font-size:13px;color:var(--slate-600);margin-bottom:12px">Capture this worker's face once. Good, even lighting and a straight-on look work best.</div>
-          <button class="btn" style="width:100%" onClick=${openCam}>📷 Open camera</button>
+          <div style="font-size:13px;color:var(--slate-600);margin-bottom:10px">We take <b>3 quick snaps</b> at slightly different angles so the gate recognises ${user.full_name.split(' ')[0]} reliably. Good, even light works best.</div>
+          ${hadFace && html`<div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);padding:10px;font-size:12px;color:var(--slate-700);margin-bottom:10px">✓ Face already enrolled (${existing.descriptors.length} sample${existing.descriptors.length===1?'':'s'})${existing.pin?' · PIN set':''}. Re-capture only if recognition is unreliable.</div>`}
+          <button class="btn" style="width:100%" onClick=${openCam}>📷 ${hadFace ? 'Re-capture face' : 'Open camera'}</button>
+          ${hadFace && html`<button class="btn ghost" style="width:100%;margin-top:8px" onClick=${() => setPhase('review')}>Just update PIN →</button>`}
         ` : phase === 'camera' ? html`
-          <video ref=${videoRef} playsinline muted style="width:100%;border-radius:10px;background:#000;transform:scaleX(-1)"></video>
-          <button class="btn" style="width:100%;margin-top:10px" onClick=${capture}>Capture face</button>
+          <div style="text-align:center;font-weight:600;font-size:15px;color:var(--slate-800)">${cur.t}</div>
+          <div style="text-align:center;font-size:12px;color:var(--slate-500);margin-bottom:8px">${cur.hint} · Snap ${samples.length + 1} of ${ENROLL_STEPS.length}</div>
+          <div style="position:relative">
+            <video ref=${videoRef} playsinline muted style="width:100%;border-radius:10px;background:#000;transform:scaleX(-1);${snap?'filter:brightness(2.2)':''};transition:filter .15s"></video>
+            <div style="position:absolute;left:50%;top:48%;transform:translate(-50%,-50%);width:150px;height:190px;border:2px dashed rgba(255,255,255,.85);border-radius:50%;pointer-events:none"></div>
+          </div>
+          <div style="display:flex;gap:5px;justify-content:center;margin:9px 0 4px">
+            ${ENROLL_STEPS.map((_, i) => html`<div style="width:34px;height:5px;border-radius:3px;background:${i < samples.length ? 'var(--emerald-500)' : 'var(--slate-200)'}"></div>`)}
+          </div>
+          <button class="btn" style="width:100%;margin-top:6px" onClick=${capture}>📸 Capture snap ${samples.length + 1}</button>
         ` : html`
-          <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);text-align:center;padding:14px"><div style="font-size:30px">✓</div><div style="font-size:13px;color:var(--slate-700)">Face captured</div></div>
+          <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);text-align:center;padding:14px"><div style="font-size:30px">✓</div><div style="font-size:13px;color:var(--slate-700)">${samples.length >= ENROLL_STEPS.length ? samples.length + ' face samples captured' : 'Face already enrolled'}</div></div>
+          <label style="display:block;margin:14px 0 4px;font-size:12px;font-weight:600;color:var(--slate-700)">Backup PIN (optional)</label>
+          <input inputmode="numeric" maxlength="6" value=${pin} onInput=${e => setPin(e.target.value.replace(/\D/g, ''))} placeholder="4–6 digits" style="width:100%;padding:9px 11px;border:1px solid var(--slate-300);border-radius:8px;font-size:15px;letter-spacing:3px;text-align:center" />
+          <div style="font-size:11px;color:var(--slate-500);margin-top:4px">If the camera can't get a clean match, ${user.full_name.split(' ')[0]} can punch with this PIN. Leave blank to skip.</div>
           <label style="display:flex;align-items:flex-start;gap:8px;margin:12px 0;font-size:12px;color:var(--slate-700);cursor:pointer">
-            <input type="checkbox" checked=${consent} onChange=${e => setConsent(e.target.checked)} style="margin-top:2px" />
+            <input type="checkbox" checked=${consent || hadFace} onChange=${e => setConsent(e.target.checked)} style="margin-top:2px" />
             <span>${user.full_name} <b>consents</b> to storing their face data for attendance. It's used only for punching, kept for this plant, and can be deleted anytime.</span>
           </label>
           <div style="display:flex;gap:8px">
-            <button class="btn ghost" style="flex:1" onClick=${() => { setDesc(null); openCam(); }}>Retake</button>
-            <button class="btn" style="flex:2" disabled=${busy || !consent} onClick=${save}>${busy ? 'Saving…' : 'Save enrollment'}</button>
+            <button class="btn ghost" style="flex:1" onClick=${openCam}>↺ Retake face</button>
+            <button class="btn" style="flex:2" disabled=${busy || (!consent && !hadFace)} onClick=${save}>${busy ? 'Saving…' : 'Save enrollment'}</button>
           </div>
         `}
       </div>
