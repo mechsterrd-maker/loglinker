@@ -2114,7 +2114,7 @@ const OPT_IN_TAB_KEYS = new Set(['self_attendance', 'attendance', 'attendance_se
 // opening the app with ?app=hr (persisted so it sticks across reloads inside the
 // wrapper); ?app=full clears it. It hard-limits every nav surface to the
 // workforce modules, so the SAME codebase ships as a focused HR app with no fork.
-const HR_APP_KEYS = new Set(['home', 'more', 'face_attendance', 'attendance', 'self_attendance', 'attendance_setup', 'people', 'petty_cash']);
+const HR_APP_KEYS = new Set(['home', 'more', 'face_attendance', 'attendance', 'self_attendance', 'attendance_setup', 'people', 'petty_cash', 'hr_payroll']);
 const APP_MODE = (() => {
   try {
     const q = new URLSearchParams(window.location.search).get('app');
@@ -2131,6 +2131,7 @@ const isHrApp = () => APP_MODE === 'hr';
 const TOP_TAB_META = {
   home:            { icon:'🏠', label:'Home',                       sub:'Dashboard & shortcuts' },
   face_attendance: { icon:'😀', label:'Face Attendance',            sub:'Gate kiosk — punch by face' },
+  hr_payroll:      { icon:'💰', label:'Salary & Payslips',          sub:'Monthly salary · WhatsApp payslips' },
   self_attendance: { icon:'📍', label:'Punch IN',                   sub:'Mark your own attendance' },
   attendance:      { icon:'🗓️', label:'Attendance Register',        sub:'Mark & review the team' },
   attendance_setup:{ icon:'⚙️', label:'Attendance / Payroll Setup', sub:'Shifts, holidays, payroll' },
@@ -3004,6 +3005,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'performance'}><${PerformanceDashboards} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'chat'}><${Chat} plant=${plant} me=${me} myPerms=${myPerms} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} navAction=${navAction} setTab=${setTab} /></${Page}>
       <${Page} active=${pageTab === 'people'}>${isHrApp() ? html`<${HrEmployees} plant=${plant} me=${me} />` : html`<${People} plant=${plant} me=${me} myPerms=${myPerms} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} />`}</${Page}>
+      ${isHrApp() ? html`<${Page} active=${pageTab === 'hr_payroll'}><${HrPayroll} plant=${plant} me=${me} /></${Page}>` : ''}
       <${Page} active=${pageTab === 'masters'}><${MastersHub} plant=${plant} me=${me} myPerms=${myPerms} setTab=${setTab} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${pageTab === 'calibration'}><${CalibrationModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -16197,11 +16199,11 @@ function HrHome({ plant, me, setTab }) {
       <div style="font-size:12px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:.5px;margin:4px 2px 8px">Quick actions</div>
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
         ${Action('🗓️', 'Attendance', 'attendance', 'teal')}
-        ${Action('📍', 'Punch IN', 'self_attendance', 'teal')}
+        ${Action('💰', 'Salary', 'hr_payroll', 'teal')}
         ${Action('👥', 'Employees', 'people', 'teal')}
-        ${Action('💰', 'Petty Cash', 'petty_cash', 'teal')}
+        ${Action('📍', 'Punch IN', 'self_attendance', 'teal')}
+        ${Action('🧾', 'Petty Cash', 'petty_cash', 'teal')}
         ${Action('⚙️', 'Setup', 'attendance_setup', 'teal')}
-        ${Action('📊', 'More', 'more', 'teal')}
       </div>
     </div>
   `;
@@ -16324,6 +16326,186 @@ function HrEmployeeModal({ plant, me, employee, onClose, onSaved, onEnroll }) {
           <button class="btn" style="flex:2" disabled=${busy} onClick=${save}>${busy ? 'Saving…' : (employee ? 'Save' : 'Save & enroll face')}</button>
         </div>
       </div>
+    </div>
+  `;
+}
+
+// =================================================================
+// HR SALARY & PAYSLIPS — monthly salary computed from attendance, an admin
+// report, and a one-tap "Send on WhatsApp" payslip per employee. Salary model is
+// deliberately simple & transparent: present / half / leave / week-off / holiday
+// are paid; absent and half-day-halves are the only deductions.
+// =================================================================
+function hrSalary(emp, rows, days) {
+  let present = 0, half = 0, leave = 0, absent = 0, off = 0;
+  for (const r of rows) {
+    if (r.status === 'present') present++;
+    else if (r.status === 'half_day') half++;
+    else if (r.status === 'leave') leave++;
+    else if (r.status === 'absent') absent++;
+    else if (r.status === 'week_off' || r.status === 'holiday') off++;
+  }
+  const salary = Number(emp.monthly_salary) || 0;
+  const perDay = days > 0 ? salary / days : 0;
+  const deductDays = absent + 0.5 * half;               // leave / week-off / holiday = paid
+  const payableDays = Math.max(0, days - deductDays);
+  const deductAmt = perDay * deductDays;
+  const net = Math.max(0, Math.round(salary - deductAmt));
+  const marked = present + half + leave + absent + off;
+  return { salary, days, present, half, leave, absent, off, perDay, deductDays, payableDays, deductAmt, net, marked };
+}
+const monthLabelOf = (ym) => { const [y, m] = ym.split('-').map(Number); return new Date(y, m - 1, 1).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' }); };
+const daysInMonthOf = (ym) => { const [y, m] = ym.split('-').map(Number); return new Date(y, m, 0).getDate(); };
+
+// Share a generated PDF: native share sheet (WhatsApp appears there, PDF attached)
+// when available, else download it + open the WhatsApp chat with a text note.
+async function shareOrDownloadPdf(doc, filename, waPhone, waText) {
+  const blob = doc.output('blob');
+  try {
+    const file = new File([blob], filename, { type: 'application/pdf' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: filename, text: waText || '' });
+      return;
+    }
+  } catch (_) { return; }   // user dismissed the share sheet
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url);
+  if (waPhone) {
+    const p = String(waPhone).replace(/\D/g, ''); const num = p.length === 10 ? '91' + p : p;
+    window.open('https://wa.me/' + num + '?text=' + encodeURIComponent(waText || ''), '_blank');
+  }
+}
+
+async function makePayslipPdf(plant, emp, calc, monthLabel) {
+  await ensureJsPDF();
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' }); const M = 14;
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(16); doc.setTextColor(13, 148, 136);
+  doc.text(plant?.name || 'Company', M, 18);
+  doc.setFontSize(12); doc.setTextColor(30, 41, 59);
+  doc.text('Payslip — ' + monthLabel, M, 26);
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(10); doc.setTextColor(71, 85, 105);
+  let y = 38; const line = (k, v) => { doc.text(k, M, y); doc.text(String(v), 80, y); y += 6; };
+  line('Employee', emp.full_name || '');
+  if (emp.employee_id) line('Emp ID', emp.employee_id);
+  if (emp.designation) line('Designation', emp.designation);
+  if (emp.date_of_joining) line('Joined', emp.date_of_joining);
+  y += 2;
+  doc.autoTable({
+    startY: y,
+    head: [['Description', 'Value']],
+    body: [
+      ['Monthly salary', rs(calc.salary)],
+      ['Days in month', String(calc.days)],
+      ['Present', String(calc.present)],
+      ['Half days', String(calc.half)],
+      ['Paid leave', String(calc.leave)],
+      ['Week-off / holiday', String(calc.off)],
+      ['Absent (unpaid)', String(calc.absent)],
+      ['Payable days', calc.payableDays.toFixed(1)],
+      ['Deduction', '- ' + rs(calc.deductAmt)],
+      ['NET PAYABLE', rs(calc.net)],
+    ],
+    styles: { fontSize: 10 }, headStyles: { fillColor: [13, 148, 136] }, theme: 'grid', margin: { left: M, right: M },
+    didParseCell: (d) => { if (d.row.index === 9) { d.cell.styles.fontStyle = 'bold'; d.cell.styles.fillColor = [236, 253, 245]; } },
+  });
+  y = (doc.lastAutoTable ? doc.lastAutoTable.finalY : y) + 12;
+  doc.setFontSize(8); doc.setTextColor(148, 163, 184);
+  doc.text('Computed from attendance · ' + new Date().toLocaleDateString('en-IN'), M, y);
+  return doc;
+}
+
+function HrPayroll({ plant, me }) {
+  const now = new Date();
+  const [month, setMonth] = useState(now.toISOString().slice(0, 7));
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState('');
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const days = daysInMonthOf(month);
+    const first = month + '-01'; const last = month + '-' + String(days).padStart(2, '0');
+    const [{ data: us }, { data: att }] = await Promise.all([
+      sb.from('users').select('id, full_name, phone, monthly_salary, employee_id, designation, date_of_joining')
+        .eq('plant_id', plant.id).neq('status', 'removed').order('full_name'),
+      sb.from('mcp_attendance').select('user_id, status').eq('plant_id', plant.id).gte('date', first).lte('date', last),
+    ]);
+    const byUser = {}; (att || []).forEach(r => (byUser[r.user_id] = byUser[r.user_id] || []).push(r));
+    const emps = (us || []).filter(u => u.id !== me.id);
+    setRows(emps.map(e => ({ emp: e, calc: hrSalary(e, byUser[e.id] || [], days) })));
+    setLoading(false);
+  }, [month, plant.id, me.id]);
+  useEffect(() => { load(); }, [load]);
+
+  const label = monthLabelOf(month);
+  const totalNet = rows.reduce((s, r) => s + r.calc.net, 0);
+  const withSalary = rows.filter(r => r.calc.salary > 0).length;
+
+  const downloadCsv = () => {
+    const head = ['Employee', 'Emp ID', 'Phone', 'Monthly salary', 'Present', 'Half', 'Leave', 'Absent', 'Week-off/Holiday', 'Payable days', 'Net payable'];
+    const data = rows.map(r => [r.emp.full_name || '', r.emp.employee_id || '', r.emp.phone || '', r.calc.salary, r.calc.present, r.calc.half, r.calc.leave, r.calc.absent, r.calc.off, r.calc.payableDays.toFixed(1), r.calc.net]);
+    const csv = [head, ...data].map(row => row.map(c => '"' + String(c).replace(/"/g, '""') + '"').join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'salary_' + month + '.csv'; a.click(); URL.revokeObjectURL(a.href);
+  };
+
+  const shareReport = async () => {
+    setBusy('report'); await ensureJsPDF(); const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: 'mm', format: 'a4' }); const M = 12;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.setTextColor(13, 148, 136);
+    doc.text((plant?.name || 'Company') + ' — Salary Report', M, 16);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(10); doc.setTextColor(71, 85, 105);
+    doc.text(label + '  ·  ' + rows.length + ' employees  ·  Total: ' + rs(totalNet), M, 22);
+    doc.autoTable({
+      startY: 27,
+      head: [['Employee', 'Salary', 'P', 'HD', 'L', 'A', 'Pay days', 'Net']],
+      body: rows.map(r => [r.emp.full_name || '', rs(r.calc.salary), r.calc.present, r.calc.half, r.calc.leave, r.calc.absent, r.calc.payableDays.toFixed(1), rs(r.calc.net)]),
+      styles: { fontSize: 8 }, headStyles: { fillColor: [13, 148, 136] }, theme: 'grid', margin: { left: M, right: M },
+    });
+    setBusy('');
+    await shareOrDownloadPdf(doc, 'salary_report_' + month + '.pdf', null, (plant?.name || 'Company') + ' salary report — ' + label + '. Total payout ' + rs(totalNet) + '.');
+  };
+
+  const sendPayslip = async (r) => {
+    setBusy(r.emp.id); const doc = await makePayslipPdf(plant, r.emp, r.calc, label); setBusy('');
+    const first = (r.emp.full_name || '').split(' ')[0];
+    await shareOrDownloadPdf(doc, 'payslip_' + (r.emp.full_name || 'employee').replace(/\s+/g, '_') + '_' + month + '.pdf',
+      r.emp.phone, 'Hi ' + first + ', please find your payslip for ' + label + '. Net payable: ' + rs(r.calc.net) + '.');
+  };
+
+  return html`
+    <div style="max-width:680px;margin:0 auto">
+      <div class="page-header"><h1>💰 Salary & Payslips</h1><div class="sub">Computed from attendance · one-tap payslips</div></div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+        <input type="month" value=${month} max=${now.toISOString().slice(0, 7)} onInput=${e => setMonth(e.target.value)} style="padding:8px 10px;border:1px solid var(--slate-300);border-radius:8px;font-size:14px" />
+        <button class="btn ghost small" onClick=${downloadCsv}>⬇ Excel/CSV</button>
+        <button class="btn small" disabled=${busy === 'report'} onClick=${shareReport}>${busy === 'report' ? '…' : '📤 Share report'}</button>
+      </div>
+
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` : html`
+        <div class="card" style="display:flex;gap:14px;justify-content:space-around;padding:12px;margin-bottom:12px;text-align:center">
+          <div><div style="font-size:18px;font-weight:800;color:var(--teal-700)">${rows.length}</div><div style="font-size:11px;color:var(--slate-500)">employees</div></div>
+          <div><div style="font-size:18px;font-weight:800;color:var(--emerald-700)">₹${totalNet.toLocaleString('en-IN')}</div><div style="font-size:11px;color:var(--slate-500)">total net payout</div></div>
+          <div><div style="font-size:18px;font-weight:800;color:var(--amber-700)">${rows.length - withSalary}</div><div style="font-size:11px;color:var(--slate-500)">no salary set</div></div>
+        </div>
+        <div class="card" style="padding:0;overflow:hidden">
+          ${rows.length === 0 ? html`<div style="padding:24px;text-align:center;color:var(--slate-500)">No employees yet.</div>` :
+            rows.map(r => html`<div key=${r.emp.id} style="display:flex;align-items:center;gap:10px;padding:11px 13px;border-bottom:1px solid var(--slate-100)">
+              <div style="flex:1;min-width:0">
+                <div style="font-size:14px;font-weight:600;color:var(--slate-800)">${r.emp.full_name}</div>
+                <div style="font-size:11px;color:var(--slate-500)">P ${r.calc.present} · A ${r.calc.absent} · HD ${r.calc.half} · L ${r.calc.leave} · ${r.calc.payableDays.toFixed(1)} pay days</div>
+              </div>
+              <div style="text-align:right">
+                <div style="font-size:14px;font-weight:800;color:${r.calc.salary > 0 ? 'var(--emerald-700)' : 'var(--slate-400)'}">${r.calc.salary > 0 ? '₹' + r.calc.net.toLocaleString('en-IN') : 'set salary'}</div>
+              </div>
+              <button class="btn small" disabled=${busy === r.emp.id || r.calc.salary <= 0} onClick=${() => sendPayslip(r)} title=${r.emp.phone ? 'Send to ' + r.emp.phone : 'No phone on file'}>${busy === r.emp.id ? '…' : '📤 Payslip'}</button>
+            </div>`)}
+        </div>
+        <div style="font-size:11px;color:var(--slate-500);margin-top:10px;padding:10px 12px;background:var(--slate-50);border-radius:8px;line-height:1.5">
+          "📤 Payslip" makes the PDF and opens your share sheet — pick <b>WhatsApp</b> → the employee. Fully-automatic monthly sending (1st, 10 AM) needs a WhatsApp Business API account; ready to switch on when you are.
+        </div>
+      `}
     </div>
   `;
 }
