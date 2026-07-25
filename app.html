@@ -16256,7 +16256,7 @@ function HrEmployees({ plant, me }) {
             <div style="width:38px;height:38px;border-radius:50%;background:var(--teal-50);color:var(--teal-700);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex-shrink:0">${(e.full_name || '?').slice(0, 1).toUpperCase()}</div>
             <div style="flex:1;min-width:0" onClick=${() => setEdit(e)}>
               <div style="font-size:14px;font-weight:600;color:var(--slate-800)">${e.full_name}${e.blood_group ? html`<span style="font-size:11px;color:var(--rose-600);font-weight:700;margin-left:6px">${e.blood_group}</span>` : ''}</div>
-              <div style="font-size:11.5px;color:var(--slate-500)">${e.phone || 'no phone'}${e.monthly_salary ? ' · ₹' + Number(e.monthly_salary).toLocaleString('en-IN') + '/mo' : ''}</div>
+              <div style="font-size:11.5px;color:var(--slate-500)">${e.phone || 'no phone'}${e.date_of_joining ? ' · joined ' + e.date_of_joining : ''}</div>
             </div>
             ${enrolled(e.id) ? html`<span class="badge emerald">✓ face</span>` : html`<span class="badge slate">no face</span>`}
             <button class="btn small ${enrolled(e.id) ? 'ghost' : ''}" onClick=${() => setEnrollFor(e)}>${enrolled(e.id) ? 'Re-enroll' : 'Enroll'}</button>
@@ -16270,10 +16270,8 @@ function HrEmployees({ plant, me }) {
 
 function HrEmployeeModal({ plant, me, employee, onClose, onSaved, onEnroll }) {
   const [f, setF] = useState({
-    full_name: employee?.full_name || '', phone: employee?.phone || '', designation: employee?.designation || '',
-    employee_id: employee?.employee_id || '', blood_group: employee?.blood_group || '',
-    date_of_joining: employee?.date_of_joining || '', monthly_salary: employee?.monthly_salary ?? '',
-    address: employee?.address || '',
+    full_name: employee?.full_name || '', phone: employee?.phone || '', blood_group: employee?.blood_group || '',
+    date_of_joining: employee?.date_of_joining || '', address: employee?.address || '',
   });
   const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
   const set = (k, v) => setF(p => ({ ...p, [k]: v }));
@@ -16281,11 +16279,11 @@ function HrEmployeeModal({ plant, me, employee, onClose, onSaved, onEnroll }) {
   const save = async () => {
     if (!f.full_name.trim()) { setErr('Name is required'); return; }
     setBusy(true); setErr('');
+    // Salary & designation are deliberately NOT here — they're confidential and
+    // set separately in Attendance → Payroll (mcp_payroll_config).
     const payload = {
-      full_name: f.full_name.trim(), phone: f.phone.trim() || null, designation: f.designation.trim() || null,
-      employee_id: f.employee_id.trim() || null, blood_group: f.blood_group || null,
-      date_of_joining: f.date_of_joining || null, monthly_salary: f.monthly_salary === '' ? null : Number(f.monthly_salary),
-      address: f.address.trim() || null,
+      full_name: f.full_name.trim(), phone: f.phone.trim() || null, blood_group: f.blood_group || null,
+      date_of_joining: f.date_of_joining || null, address: f.address.trim() || null,
     };
     let saved = employee;
     if (employee) {
@@ -16317,11 +16315,8 @@ function HrEmployeeModal({ plant, me, employee, onClose, onSaved, onEnroll }) {
           <div style="flex:1">${F('Blood group', html`<select value=${f.blood_group} onChange=${e => set('blood_group', e.target.value)} style="width:100%;padding:9px 11px;border:1px solid var(--slate-300);border-radius:8px;font-size:14px"><option value="">—</option>${BLOOD_GROUPS.filter(Boolean).map(b => html`<option value=${b}>${b}</option>`)}</select>`)}</div>
           <div style="flex:1">${F('Joining date', html`<input type="date" value=${f.date_of_joining} onInput=${e => set('date_of_joining', e.target.value)} style="width:100%;padding:9px 11px;border:1px solid var(--slate-300);border-radius:8px;font-size:14px" />`)}</div>
         </div>
-        <div style="display:flex;gap:10px">
-          <div style="flex:1">${F('Monthly salary (₹)', inp('monthly_salary', { type: 'number', min: '0', placeholder: 'e.g. 18000' }))}</div>
-          <div style="flex:1">${F('Emp. ID / designation', inp('designation', { placeholder: 'optional' }))}</div>
-        </div>
         ${F('Address', html`<textarea value=${f.address} onInput=${e => set('address', e.target.value)} rows="2" placeholder="optional" style="width:100%;padding:9px 11px;border:1px solid var(--slate-300);border-radius:8px;font-size:14px;resize:vertical"></textarea>`)}
+        <div style="font-size:11px;color:var(--slate-500);margin:2px 0 8px">💡 Salary &amp; designation are set separately (and privately) in <b>Attendance → Payroll</b>.</div>
         <div style="display:flex;gap:8px;margin-top:6px">
           <button class="btn ghost" style="flex:1" onClick=${onClose}>Cancel</button>
           <button class="btn" style="flex:2" disabled=${busy} onClick=${save}>${busy ? 'Saving…' : (employee ? 'Save' : 'Save & enroll face')}</button>
@@ -16427,14 +16422,16 @@ function HrPayroll({ plant, me }) {
     setLoading(true);
     const days = daysInMonthOf(month);
     const first = month + '-01'; const last = month + '-' + String(days).padStart(2, '0');
-    const [{ data: us }, { data: att }] = await Promise.all([
-      sb.from('users').select('id, full_name, phone, monthly_salary, employee_id, designation, date_of_joining')
+    const [{ data: us }, { data: att }, { data: cfg }] = await Promise.all([
+      sb.from('users').select('id, full_name, phone, employee_id, designation, date_of_joining')
         .eq('plant_id', plant.id).neq('status', 'removed').order('full_name'),
       sb.from('mcp_attendance').select('user_id, status').eq('plant_id', plant.id).gte('date', first).lte('date', last),
+      sb.from('mcp_payroll_config').select('user_id, monthly_salary').eq('plant_id', plant.id),   // salary lives in Payroll setup
     ]);
     const byUser = {}; (att || []).forEach(r => (byUser[r.user_id] = byUser[r.user_id] || []).push(r));
+    const salBy = {}; (cfg || []).forEach(c => { salBy[c.user_id] = c.monthly_salary; });
     const emps = (us || []).filter(u => u.id !== me.id);
-    setRows(emps.map(e => ({ emp: e, calc: hrSalary(e, byUser[e.id] || [], days) })));
+    setRows(emps.map(e => { const emp = { ...e, monthly_salary: salBy[e.id] ?? null }; return { emp, calc: hrSalary(emp, byUser[e.id] || [], days) }; }));
     setLoading(false);
   }, [month, plant.id, me.id]);
   useEffect(() => { load(); }, [load]);
@@ -16504,7 +16501,7 @@ function HrPayroll({ plant, me }) {
             </div>`)}
         </div>
         <div style="font-size:11px;color:var(--slate-500);margin-top:10px;padding:10px 12px;background:var(--slate-50);border-radius:8px;line-height:1.5">
-          "📤 Payslip" makes the PDF and opens your share sheet — pick <b>WhatsApp</b> → the employee. Fully-automatic monthly sending (1st, 10 AM) needs a WhatsApp Business API account; ready to switch on when you are.
+          Salary comes from <b>Attendance → Payroll</b> (private). "📤 Payslip" makes the PDF and opens your share sheet — pick <b>WhatsApp</b> → the employee. Fully-automatic monthly sending (1st, 10 AM) needs a WhatsApp Business API account; ready to switch on when you are.
         </div>
       `}
     </div>
