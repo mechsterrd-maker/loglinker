@@ -16118,6 +16118,12 @@ async function faceDetect(faceapi, video) {
   const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
   return await faceapi.detectSingleFace(video, opts).withFaceLandmarks(true).withFaceDescriptor();
 }
+// Landmarks only — no 128-d descriptor. Much lighter, so we can sample eyes fast
+// enough to actually catch the short "closed" frame of a blink.
+async function faceLandmarksOnly(faceapi, video) {
+  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 });
+  return await faceapi.detectSingleFace(video, opts).withFaceLandmarks(true);
+}
 function faceDistance(a, b) { let s = 0; for (let i = 0; i < 128; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); }
 const FACE_MATCH_MARGIN = 0.05;   // best match must beat 2nd-best by this — blocks wrong-person punches
 // Eye-aspect-ratio for blink-based liveness (defeats a held-up photo).
@@ -16128,6 +16134,7 @@ const KIOSK_STATUS = {
   look:   { t: 'Look at the camera', c: 'var(--slate-500)' },
   unknown:{ t: 'Face not recognised — line up in the frame', c: 'var(--amber-600)' },
   blink:  { t: '👁 Blink to confirm', c: 'var(--teal-600)' },
+  hold:   { t: '✓ Blink detected…', c: 'var(--teal-600)' },
   recog:  { t: 'Recognising…', c: 'var(--teal-600)' },
 };
 function FaceAttendanceModule({ plant, me }) {
@@ -16149,7 +16156,7 @@ function FaceAttendanceModule({ plant, me }) {
   const streamRef = useRef(null);
   const runningRef = useRef(false);
   const cooldownRef = useRef({});
-  const livRef = useRef({ open: false, closed: false, cand: null });
+  const lockRef = useRef({ uid: null, base: 0, n: 0, armed: false, lost: 0, t0: 0 });
   const busyRef = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -16189,6 +16196,8 @@ function FaceAttendanceModule({ plant, me }) {
     return { state: 'ok', user_id: top.user_id, name: nameOf(top.user_id), dist: top.dist };
   };
 
+  const resetLock = () => { lockRef.current = { uid: null, base: 0, n: 0, armed: false, lost: 0, t0: 0 }; };
+
   const punch = async (userId, via) => {
     busyRef.current = true;
     try {
@@ -16196,38 +16205,69 @@ function FaceAttendanceModule({ plant, me }) {
       if (error) throw error;
       setResult({ ok: !!data?.success, name: data?.name || nameOf(userId), message: (data?.success ? data.message : (data?.error || 'Failed')) + (via ? ' · ' + via : '') });
     } catch (e) { setResult({ ok: false, name: nameOf(userId), message: e.message || 'Punch failed' }); }
-    livRef.current = { open: false, closed: false, cand: null };
+    resetLock();
     setTimeout(() => { setResult(null); busyRef.current = false; }, 3200);
   };
 
+  // Two-phase loop. SCAN: heavy detect (with descriptor) recognises a face. Once a
+  // worker is locked and liveness is on, LIVE: fast landmark-only sampling watches
+  // the eyes with an ADAPTIVE baseline (a relative dip, not a fixed number) so a
+  // real blink registers on any face/camera — a static photo never dips, so it's
+  // rejected. On a completed blink we take ONE more descriptor frame to re-confirm
+  // it's still the same person before punching (keeps the wrong-person guard).
   const tick = async (faceapi) => {
     if (!runningRef.current) return;
+    let next = 350;
     const v = videoRef.current;
     try {
       if (v && v.videoWidth && !busyRef.current && !pinPad) {
-        const det = await faceDetect(faceapi, v);
-        const L = livRef.current;
-        if (!det || !det.descriptor) { setStatus('look'); L.open = false; L.closed = false; L.cand = null; }
-        else {
-          const m = bestMatch(det.descriptor);
-          if (m.state !== 'ok') { setStatus('unknown'); }
-          else if (Date.now() <= (cooldownRef.current[m.user_id] || 0)) { setStatus('recog'); }
+        const Lk = lockRef.current;
+        if (!Lk.uid) {
+          // ---- SCAN ----
+          const det = await faceDetect(faceapi, v);
+          if (!det || !det.descriptor) { setStatus('look'); }
           else {
-            if (L.cand !== m.user_id) { L.cand = m.user_id; L.open = false; L.closed = false; } // reset on person change
-            if (!liveness) { cooldownRef.current[m.user_id] = Date.now() + 12000; await punch(m.user_id); }
+            const m = bestMatch(det.descriptor);
+            if (m.state !== 'ok') setStatus('unknown');
+            else if (Date.now() <= (cooldownRef.current[m.user_id] || 0)) setStatus('recog');
+            else if (!liveness) { cooldownRef.current[m.user_id] = Date.now() + 12000; await punch(m.user_id); }
             else {
+              const ear = faceEAR(det.landmarks) || 0;
+              lockRef.current = { uid: m.user_id, base: ear, n: 1, armed: false, lost: 0, t0: Date.now() };
+              setStatus('hold'); next = 90;
+            }
+          }
+        } else {
+          // ---- LIVE (blink watch) ----
+          next = 90;
+          if (Date.now() - Lk.t0 > 9000) { resetLock(); setStatus('look'); }   // give up, back to scan
+          else {
+            const det = await faceLandmarksOnly(faceapi, v);
+            if (!det) { Lk.lost++; if (Lk.lost > 8) { resetLock(); setStatus('look'); } }
+            else {
+              Lk.lost = 0;
               const ear = faceEAR(det.landmarks);
               if (ear != null) {
-                if (ear > 0.26) { if (L.closed) { cooldownRef.current[m.user_id] = Date.now() + 12000; await punch(m.user_id); } else L.open = true; }
-                else if (ear < 0.19 && L.open) L.closed = true;
+                Lk.n++; if (ear > Lk.base) Lk.base = ear;                        // running max = eyes-open baseline
+                const base = Lk.base || 0.3;
+                const closeT = Math.max(0.15, base * 0.72);
+                const openT = base * 0.88;
+                if (!Lk.armed) { setStatus('blink'); if (Lk.n >= 3 && ear < closeT) Lk.armed = true; }
+                else if (ear > openT) {
+                  // blink done → re-confirm identity on a descriptor frame, then punch
+                  const uid = Lk.uid; resetLock(); setStatus('recog');
+                  const conf = await faceDetect(faceapi, v);
+                  const m2 = conf && conf.descriptor ? bestMatch(conf.descriptor) : { state: 'unknown' };
+                  if (m2.state === 'ok' && m2.user_id === uid) { cooldownRef.current[uid] = Date.now() + 12000; await punch(uid); }
+                  else setStatus('unknown');
+                } else setStatus('hold');
               }
-              setStatus('blink');
             }
           }
         }
       }
     } catch (_) {}
-    if (runningRef.current) setTimeout(() => tick(faceapi), 430);
+    if (runningRef.current) setTimeout(() => tick(faceapi), next);
   };
 
   const startKiosk = async () => {
@@ -16238,7 +16278,7 @@ function FaceAttendanceModule({ plant, me }) {
     catch (e) { setKerr(e.message); setEngine('idle'); return; }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
-      streamRef.current = stream; runningRef.current = true; setEngine('running'); livRef.current = { open: false, closed: false, cand: null };
+      streamRef.current = stream; runningRef.current = true; setEngine('running'); resetLock();
       setTimeout(() => { const v = videoRef.current; if (v) { v.srcObject = stream; v.play().catch(() => {}); } tick(faceapi); }, 120);
     } catch (e) { setKerr('Camera permission denied — allow the camera and retry.'); setEngine('idle'); }
   };
