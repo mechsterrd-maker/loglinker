@@ -1639,7 +1639,7 @@ function App() {
   const [user, setUser] = useState(null);
   const [plant, setPlant] = useState(null);
   const [me, setMe] = useState(null);
-  const [tab, _setTab] = useState(() => DEEP_LINK?.tab || (window.location.hash || '').replace(/^#/, '') || (isHrApp() ? 'face_attendance' : 'home'));
+  const [tab, _setTab] = useState(() => DEEP_LINK?.tab || (window.location.hash || '').replace(/^#/, '') || 'home');
   // Keep the current page in the URL hash so a refresh restores it (instead of
   // dropping back to Home), and so the phone/Android back button moves between
   // pages instead of exiting the app.
@@ -2114,7 +2114,7 @@ const OPT_IN_TAB_KEYS = new Set(['self_attendance', 'attendance', 'attendance_se
 // opening the app with ?app=hr (persisted so it sticks across reloads inside the
 // wrapper); ?app=full clears it. It hard-limits every nav surface to the
 // workforce modules, so the SAME codebase ships as a focused HR app with no fork.
-const HR_APP_KEYS = new Set(['home', 'more', 'face_attendance', 'attendance', 'self_attendance', 'attendance_setup', 'people', 'training', 'petty_cash']);
+const HR_APP_KEYS = new Set(['home', 'more', 'face_attendance', 'attendance', 'self_attendance', 'attendance_setup', 'people', 'petty_cash']);
 const APP_MODE = (() => {
   try {
     const q = new URLSearchParams(window.location.search).get('app');
@@ -2927,7 +2927,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
   const fab = isFab(plant);
   // Primary mobile tabs (the rest live behind "More"). Fabrication swaps the
   // PDC Production tab for Projects.
-  const mobilePrimaryKeys = isHrApp() ? ['face_attendance','attendance','people','self_attendance'] : (fab ? ['home','projects','quality','chat'] : ['home','production','quality','chat']);
+  const mobilePrimaryKeys = isHrApp() ? ['home','face_attendance','attendance','people'] : (fab ? ['home','projects','quality','chat'] : ['home','production','quality','chat']);
 
   // RBAC page-render gate. When enforced, a tab the user can't view renders an
   // Access-denied card instead of the module. We redirect the page switch to a
@@ -2987,7 +2987,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <input type="file" accept="image/*,application/pdf" ref=${billPickRef} onChange=${onBillPicked} style="display:none" />
       ${shareRouterOpen && shareFile && html`<${ShareRouterModal} plant=${plant} me=${me} file=${shareFile} onClose=${() => setShareRouterOpen(false)} onRoute=${handleShareRoute} />`}
 
-      <${Page} active=${pageTab === 'home'}><${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} myPerms=${myPerms} /></${Page}>
+      <${Page} active=${pageTab === 'home'}>${isHrApp() ? html`<${HrHome} plant=${plant} me=${me} setTab=${setTab} />` : html`<${Home} plant=${plant} me=${me} activeUnit=${activeUnit} setTab=${setTab} go=${go} reload=${reload} myPerms=${myPerms} />`}</${Page}>
       <${Page} active=${pageTab === 'production'}><${Production} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'attendance'}><${AttendanceModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'self_attendance'}><${SelfAttendancePage} plant=${plant} me=${me} reload=${reload} /></${Page}>
@@ -3065,10 +3065,10 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
           let mobileTabs;
           if (isHrApp()) {
             mobileTabs = [
+              { key:'home',            icon:'home',     label:'Home' },
               { key:'face_attendance', icon:'face',     label:'Face' },
               { key:'attendance',      icon:'calendar', label:'Attendance' },
               { key:'people',          icon:'people',   label:'Team' },
-              { key:'self_attendance', icon:'home',     label:'Punch IN' },
             ];
           } else if (enabled) {
             mobileTabs = allMobile.filter(t => enabled.has(t.key)).slice(0, 4);
@@ -16117,6 +16117,94 @@ function pcINR(n) {
   if (a >= 1e7) return '₹' + (n / 1e7).toFixed(2) + ' Cr';
   if (a >= 1e5) return '₹' + (n / 1e5).toFixed(2) + ' L';
   return '₹' + fmtNum(Math.round(n));
+}
+
+// =================================================================
+// HR HOME — the landing screen for the standalone HR / Attendance app (?app=hr).
+// Replaces the factory dashboard with an at-a-glance "today" board (present /
+// yet-to-punch / on-leave / late / headcount), a big Open-Kiosk button, and
+// friendly shortcuts. Reads live attendance for the IST calendar day.
+// =================================================================
+function HrHome({ plant, me, setTab }) {
+  const [s, setS] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const lateAfter = localStorage.getItem('llk_late_after') || '09:30';
+  const istDate = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const [{ data: us }, { data: att }] = await Promise.all([
+      sb.from('users').select('id').eq('plant_id', plant.id),
+      sb.from('mcp_attendance').select('user_id, status, in_time').eq('plant_id', plant.id).eq('date', istDate),
+    ]);
+    const head = (us || []).length;
+    let present = 0, leave = 0, off = 0, late = 0;
+    for (const r of (att || [])) {
+      if (r.status === 'present' || r.status === 'half_day') { present++; if (r.in_time && String(r.in_time).slice(0, 5) > lateAfter) late++; }
+      else if (r.status === 'leave') leave++;
+      else if (r.status === 'week_off' || r.status === 'holiday') off++;
+    }
+    const yetToPunch = Math.max(0, head - present - leave - off);
+    setS({ head, present, leave, off, late, yetToPunch });
+    setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { load(); }, [load]);
+
+  const hour = new Date().getHours();
+  const greet = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+  const first = (me?.full_name || '').split(' ')[0] || '';
+  const dateLabel = new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' });
+
+  const Stat = (num, label, color) => html`<div class="card" style="padding:12px 10px;text-align:center;border-color:var(--${color}-200);background:var(--${color}-50)">
+    <div style="font-size:26px;font-weight:800;line-height:1;color:var(--${color}-700)">${num}</div>
+    <div style="font-size:11px;color:var(--slate-600);margin-top:5px;font-weight:600">${label}</div>
+  </div>`;
+  const Action = (icon, label, key, color) => html`<button onClick=${() => setTab(key)}
+    style="display:flex;flex-direction:column;align-items:center;gap:6px;padding:14px 6px;border:1px solid var(--slate-200);background:#fff;border-radius:14px;cursor:pointer">
+    <span style="font-size:24px">${icon}</span><span style="font-size:12px;font-weight:600;color:var(--slate-700)">${label}</span>
+  </button>`;
+
+  return html`
+    <div style="max-width:640px;margin:0 auto">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:14px">
+        <div>
+          <div style="font-size:20px;font-weight:800;color:var(--slate-800)">${greet}${first ? ', ' + first : ''} 👋</div>
+          <div style="font-size:12.5px;color:var(--slate-500)">${plant?.name || 'Your company'} · ${dateLabel}</div>
+        </div>
+        <button class="btn ghost small" onClick=${load} title="Refresh">↻</button>
+      </div>
+
+      <button onClick=${() => setTab('face_attendance')} style="width:100%;border:none;cursor:pointer;border-radius:18px;padding:20px;margin-bottom:16px;background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:#fff;text-align:left;box-shadow:0 8px 24px rgba(13,148,136,.28)">
+        <div style="font-size:34px;line-height:1">😀</div>
+        <div style="font-size:18px;font-weight:800;margin-top:6px">Open Face Attendance Kiosk</div>
+        <div style="font-size:12.5px;opacity:.92;margin-top:2px">Mount at the gate — staff punch IN/OUT by face</div>
+      </button>
+
+      <div style="font-size:12px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:.5px;margin:4px 2px 8px">Today</div>
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` : html`
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px">
+          ${Stat(s.present, 'Present', 'emerald')}
+          ${Stat(s.yetToPunch, 'Yet to punch', 'amber')}
+          ${Stat(s.leave, 'On leave', 'slate')}
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:18px">
+          ${Stat(s.late, 'Late (after ' + lateAfter + ')', 'rose')}
+          ${Stat(s.off, 'Week-off / holiday', 'slate')}
+          ${Stat(s.head, 'Total staff', 'teal')}
+        </div>
+      `}
+
+      <div style="font-size:12px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:.5px;margin:4px 2px 8px">Quick actions</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
+        ${Action('🗓️', 'Attendance', 'attendance', 'teal')}
+        ${Action('📍', 'Punch IN', 'self_attendance', 'teal')}
+        ${Action('👥', 'Employees', 'people', 'teal')}
+        ${Action('💰', 'Petty Cash', 'petty_cash', 'teal')}
+        ${Action('⚙️', 'Setup', 'attendance_setup', 'teal')}
+        ${Action('📊', 'More', 'more', 'teal')}
+      </div>
+    </div>
+  `;
 }
 
 // =================================================================
