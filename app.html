@@ -1812,12 +1812,16 @@ function App() {
       setMe(userRow);
       // RBAC Phase 1: fetch my permissions. Non-blocking — if the RPC ever fails
       // we fall back to the legacy users.role behavior so the app never bricks.
+      let permsVal = { rbac_enforced: false, permissions: [], roles: [] };
       try {
         const { data: perms } = await sb.rpc('my_permissions');
-        setMyPerms(perms || { rbac_enforced: false, permissions: [], roles: [] });
-      } catch (_e) {
-        setMyPerms({ rbac_enforced: false, permissions: [], roles: [] });
-      }
+        if (perms) permsVal = perms;
+      } catch (_e) {}
+      setMyPerms(permsVal);
+      // Cache the last good boot so the app (and the offline kiosk) can start with
+      // no internet — the auth session already persists locally; the plant/profile
+      // did not until now.
+      try { localStorage.setItem('llk_boot_' + u.id, JSON.stringify({ me: userRow, plant: plantRow, perms: permsVal })); } catch (_) {}
       // Clear URL query params on successful load, but KEEP the #page hash so a
       // refresh stays on the current page.
       if (window.location.search) {
@@ -1828,6 +1832,17 @@ function App() {
       // to the onboarding chooser — an existing user must never be able to
       // accidentally start a new plant. Show a Retry screen instead.
       console.warn('[Loglinkr] loadProfile failed:', e);
+      // Offline / transient failure → boot from the last good cache so the app and
+      // the offline kiosk still work. Only show Retry if there's no cache at all.
+      try {
+        const c = JSON.parse(localStorage.getItem('llk_boot_' + u.id) || 'null');
+        if (c && c.plant && c.me) {
+          setPlant(c.plant); setMe(c.me);
+          setMyPerms(c.perms || { rbac_enforced: false, permissions: [], roles: [] });
+          setProfileErr(false);
+          return;
+        }
+      } catch (_) {}
       setProfileErr(true);
     } finally {
       setProfileLoading(false);
