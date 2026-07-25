@@ -16794,6 +16794,34 @@ const isNetworkErr = (e) => {
   return e?.name === 'TypeError' || m.includes('failed to fetch') || m.includes('networkerror') || m.includes('fetch') || m.includes('network') || m.includes('timeout');
 };
 
+// On-device voice confirmation (Web Speech API — runs offline, no server). Speaks
+// the worker's name aloud when they punch, so the gate gives audible feedback.
+function pickTtsVoice() {
+  try {
+    const vs = window.speechSynthesis ? window.speechSynthesis.getVoices() : [];
+    if (!vs || !vs.length) return null;
+    return vs.find(v => /en[-_]IN/i.test(v.lang)) || vs.find(v => /^en/i.test(v.lang)) || vs[0];
+  } catch (_) { return null; }
+}
+function speakKiosk(text) {
+  try {
+    if (!window.speechSynthesis || !text) return;
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    const v = pickTtsVoice(); if (v) u.voice = v;
+    u.rate = 1.05; u.pitch = 1; u.volume = 1;
+    window.speechSynthesis.speak(u);
+  } catch (_) {}
+}
+// Friendly spoken line for a punch result.
+function punchSpeech(name, dir, offline) {
+  const first = (name || '').split(' ')[0] || 'Worker';
+  if (offline) return first + ', saved';
+  if (dir === 'out') return first + ', checked out. Goodbye';
+  if (dir === 'in') return first + ', welcome';
+  return first + ', already marked';
+}
+
 function FaceAttendanceModule({ plant, me }) {
   const [view, setView] = useState('kiosk');       // kiosk | people
   const [enroll, setEnroll] = useState({});         // user_id -> enrollment row
@@ -16811,6 +16839,8 @@ function FaceAttendanceModule({ plant, me }) {
   const [pinErr, setPinErr] = useState('');
   const [pending, setPending] = useState(loadPunchQueue().length);   // queued offline punches
   const [online, setOnline] = useState(typeof navigator === 'undefined' ? true : navigator.onLine);
+  const [voice, setVoice] = useState(() => { try { return localStorage.getItem('llk_kiosk_voice') !== '0'; } catch (_) { return true; } });
+  const voiceRef = useRef(voice); voiceRef.current = voice;
   const syncingRef = useRef(false);
   const videoRef = useRef(null);
   const streamRef = useRef(null);
@@ -16909,6 +16939,7 @@ function FaceAttendanceModule({ plant, me }) {
     q.push({ user_id: userId, plant_id: plant.id, at: new Date().toISOString() });
     savePunchQueue(q); setPending(q.length);
     setResult({ ok: true, offline: true, name: nameOf(userId), message: 'Saved offline ✓ — will sync' + (via ? ' · ' + via : '') });
+    if (voiceRef.current) speakKiosk(punchSpeech(nameOf(userId), null, true));
   };
 
   const punch = async (userId, via, learnDesc, learnDist) => {
@@ -16920,6 +16951,7 @@ function FaceAttendanceModule({ plant, me }) {
         const { data, error } = await sb.rpc('attendance_kiosk_punch', { p_plant_id: plant.id, p_user_id: userId, p_dir: null });
         if (error) throw error;
         setResult({ ok: !!data?.success, name: data?.name || nameOf(userId), message: (data?.success ? data.message : (data?.error || 'Failed')) + (via ? ' · ' + via : '') });
+        if (voiceRef.current) speakKiosk(punchSpeech(data?.name || nameOf(userId), data?.success ? data.dir : null, false));
         // We're online and it was a confident, live face match → let the template adapt.
         if (learnDesc && learnDist != null && learnDist < FACE_LEARN_MAX) { try { await learnFace(userId, learnDesc); } catch (_) {} }
       } catch (e) {
@@ -17052,6 +17084,7 @@ function FaceAttendanceModule({ plant, me }) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
       streamRef.current = stream; runningRef.current = true; setEngine('running'); resetLock();
+      try { window.speechSynthesis && window.speechSynthesis.getVoices(); if (voiceRef.current) speakKiosk('Kiosk ready'); } catch (_) {}   // unlock TTS on this user gesture
       setTimeout(() => { const v = videoRef.current; if (v) { v.srcObject = stream; v.play().catch(() => {}); } tick(faceapi); }, 120);
     } catch (e) { setKerr('Camera permission denied — allow the camera and retry.'); setEngine('idle'); }
   };
@@ -17086,8 +17119,11 @@ function FaceAttendanceModule({ plant, me }) {
       <div class="card" style="text-align:center;padding:16px">
         ${engine !== 'running' ? html`
           <div style="font-size:13px;color:var(--slate-600);margin-bottom:12px">Mount a tablet/phone at the gate, open this page, and press start. Each worker looks at the camera to punch — first look of the day = IN, next = OUT.</div>
-          <label style="display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--slate-600);margin-bottom:12px;cursor:pointer">
+          <label style="display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--slate-600);margin-bottom:8px;cursor:pointer">
             <input type="checkbox" checked=${liveness} onChange=${e => setLiveness(e.target.checked)} /> Require one head movement (anti-photo) — recommended
+          </label><br/>
+          <label style="display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--slate-600);margin-bottom:12px;cursor:pointer">
+            <input type="checkbox" checked=${voice} onChange=${e => { setVoice(e.target.checked); try { localStorage.setItem('llk_kiosk_voice', e.target.checked ? '1' : '0'); } catch (_) {} if (e.target.checked) speakKiosk('Voice on'); }} /> 🔊 Speak the worker's name aloud
           </label><br/>
           <button class="btn" style="font-size:16px;padding:12px 28px" disabled=${engine==='loading'} onClick=${startKiosk}>${engine==='loading' ? '⏳ Loading face engine…' : '▶ Start kiosk'}</button>
           ${kerr && html`<div class="alert error" style="margin-top:12px;text-align:left">${kerr}</div>`}
