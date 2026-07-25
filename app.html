@@ -16160,7 +16160,7 @@ async function faceLandmarksOnly(faceapi, input) {
 }
 function faceDistance(a, b) { let s = 0; for (let i = 0; i < 128; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); }
 const FACE_MATCH_MARGIN = 0.05;   // best match must beat 2nd-best by this — blocks wrong-person punches
-const LIVE_MOVE = 0.12;           // head-movement (nose vs eye-mid, normalised) needed to pass liveness
+const LIVE_MOVE = 0.10;           // recent head-pose range (nose vs eye-mid, normalised) needed to pass liveness
 // Head-pose proxy: nose tip position relative to the eye midpoint, normalised by
 // inter-eye distance. ~0 looking straight; a turn moves yaw, a nod moves pitch.
 // A single deliberate movement is a big, clean signal — far more reliable than
@@ -16179,7 +16179,7 @@ function headPose(landmarks) {
 const KIOSK_STATUS = {
   look:   { t: 'Look at the camera', c: 'var(--slate-500)' },
   unknown:{ t: 'Face not recognised — line up in the frame', c: 'var(--amber-600)' },
-  move:   { t: '↔ Turn your head or nod to confirm', c: 'var(--teal-600)' },
+  move:   { t: '✔ Recognised — move slightly to confirm', c: 'var(--teal-600)' },
   recog:  { t: 'Recognising…', c: 'var(--teal-600)' },
 };
 function FaceAttendanceModule({ plant, me }) {
@@ -16201,7 +16201,7 @@ function FaceAttendanceModule({ plant, me }) {
   const streamRef = useRef(null);
   const runningRef = useRef(false);
   const cooldownRef = useRef({});
-  const lockRef = useRef({ uid: null, y0: 0, p0: 0, n: 0, lost: 0, t0: 0 });
+  const lockRef = useRef({ uid: null, yMin: 0, yMax: 0, pMin: 0, pMax: 0, seen: 0, poseInit: false, lostSince: 0, lastRecog: 0 });
   const busyRef = useRef(false);
   const canvRef = useRef(null);
   const overlayRef = useRef(null);
@@ -16243,7 +16243,8 @@ function FaceAttendanceModule({ plant, me }) {
     return { state: 'ok', user_id: top.user_id, name: nameOf(top.user_id), dist: top.dist };
   };
 
-  const resetLock = () => { lockRef.current = { uid: null, y0: 0, p0: 0, n: 0, lost: 0, t0: 0 }; };
+  const resetLock = () => { lockRef.current = { uid: null, yMin: 0, yMax: 0, pMin: 0, pMax: 0, seen: 0, poseInit: false, lostSince: 0, lastRecog: 0 }; };
+  const CLR_SCAN = 'rgba(245,158,11,.95)', CLR_LOCK = 'rgba(20,184,166,.98)', CLR_OK = 'rgba(16,185,129,.98)';
 
   // Draw the tracking wireframe (box + landmark dots) over the mirrored video so
   // the worker sees the system lock onto their face instantly.
@@ -16285,48 +16286,62 @@ function FaceAttendanceModule({ plant, me }) {
   // it's still the same person before punching (keeps the wrong-person guard).
   const tick = async (faceapi) => {
     if (!runningRef.current) return;
-    let next = 0;   // scan back-to-back; live phase drops to ~40ms below
+    let next = 40;   // ~25fps tracking; recognition frames pace themselves via await
     const v = videoRef.current;
     try {
       if (v && v.videoWidth && !busyRef.current && !pinPad) {
+        // ONE sticky-lock loop. Identity is refreshed with a fingerprint every
+        // ~450ms; in between we track landmarks fast (~25fps) so the wireframe
+        // stays locked and keeps recognising WHILE the head moves — a brief miss
+        // or a turned face never drops the lock. Liveness is the 3D head-pose
+        // RANGE (nose vs eye-midpoint) building up over the lock: a real head
+        // produces it with the smallest natural movement; a flat photo — held or
+        // waved — is planar and can't, so it never confirms.
         const frame = prepFrame(v, canvRef.current || (canvRef.current = document.createElement('canvas')));
         const Lk = lockRef.current;
-        if (!Lk.uid) {
-          // ---- SCAN ----  heavy detect + fingerprint to recognise who it is
-          const det = await faceDetect(faceapi, frame);
-          if (!det || !det.descriptor) { setStatus('look'); drawFace(null); }
-          else {
-            const m = bestMatch(det.descriptor);
-            if (m.state !== 'ok') { setStatus('unknown'); drawFace(det, 'rgba(245,158,11,.95)'); }
-            else if (Date.now() <= (cooldownRef.current[m.user_id] || 0)) { setStatus('recog'); drawFace(det, 'rgba(16,185,129,.95)'); }
-            else if (!liveness) { drawFace(det, 'rgba(16,185,129,.95)'); cooldownRef.current[m.user_id] = Date.now() + 12000; await punch(m.user_id); }
-            else {
-              const hp = headPose(det.landmarks) || { yaw: 0, pitch: 0 };
-              lockRef.current = { uid: m.user_id, y0: hp.yaw, p0: hp.pitch, n: 1, lost: 0, t0: Date.now() };
-              setStatus('move'); drawFace(det, 'rgba(20,184,166,.98)'); next = 40;
-            }
-          }
+        const now = Date.now();
+        const needRecog = !Lk.uid || (now - Lk.lastRecog > 450);
+        const det = needRecog ? await faceDetect(faceapi, frame) : await faceLandmarksOnly(faceapi, frame);
+        if (needRecog) Lk.lastRecog = now;
+
+        if (!det) {
+          if (!Lk.lostSince) Lk.lostSince = now;
+          if (now - Lk.lostSince > 1200) resetLock();      // truly gone → release
+          setStatus('look'); drawFace(null);
         } else {
-          // ---- LIVE ----  fast landmark-only watch for one head movement; identity already locked
-          next = 40;
-          if (Date.now() - Lk.t0 > 12000) { resetLock(); setStatus('look'); drawFace(null); }   // give up, back to scan
-          else {
-            const det = await faceLandmarksOnly(faceapi, frame);
-            if (!det) { Lk.lost++; drawFace(null); if (Lk.lost > 12) { resetLock(); setStatus('look'); } }
+          Lk.lostSince = 0;
+          let blocked = false;
+          if (needRecog && det.descriptor) {               // identity (re)check — never drops an existing lock
+            const m = bestMatch(det.descriptor);
+            if (m.state === 'ok') {
+              if (Lk.uid !== m.user_id) { resetLock(); lockRef.current.uid = m.user_id; lockRef.current.lastRecog = now; }
+            } else if (!Lk.uid) { setStatus('unknown'); drawFace(det, CLR_SCAN); blocked = true; }
+          }
+          if (!blocked) {
+            const L = lockRef.current;
+            if (!L.uid) { setStatus('look'); drawFace(det, CLR_SCAN); }
+            else if (now <= (cooldownRef.current[L.uid] || 0)) { setStatus('recog'); drawFace(det, CLR_OK); }
+            else if (!liveness) { drawFace(det, CLR_OK); cooldownRef.current[L.uid] = now + 12000; await punch(L.uid); }
             else {
-              Lk.lost = 0;
               const hp = headPose(det.landmarks);
               if (hp) {
-                Lk.n++;
-                if (Lk.n <= 1) { Lk.y0 = hp.yaw; Lk.p0 = hp.pitch; setStatus('move'); drawFace(det, 'rgba(20,184,166,.98)'); }
+                if (!L.poseInit) { L.yMin = L.yMax = hp.yaw; L.pMin = L.pMax = hp.pitch; L.poseInit = true; }
                 else {
-                  const dev = Math.hypot(hp.yaw - Lk.y0, hp.pitch - Lk.p0);
-                  if (dev > LIVE_MOVE) {
-                    const uid = Lk.uid; cooldownRef.current[uid] = Date.now() + 12000; resetLock();
-                    drawFace(det, 'rgba(16,185,129,.98)'); await punch(uid);
-                  } else { setStatus('move'); drawFace(det, 'rgba(20,184,166,.98)'); }
+                  // forget old extremes (recent ~1.5s window) then widen with the current pose,
+                  // so a real movement spikes the range instantly but a still photo's slow
+                  // landmark noise can never accumulate enough to pass.
+                  L.yMin += (hp.yaw - L.yMin) * 0.03; L.yMax += (hp.yaw - L.yMax) * 0.03;
+                  L.pMin += (hp.pitch - L.pMin) * 0.03; L.pMax += (hp.pitch - L.pMax) * 0.03;
+                  if (hp.yaw < L.yMin) L.yMin = hp.yaw; if (hp.yaw > L.yMax) L.yMax = hp.yaw;
+                  if (hp.pitch < L.pMin) L.pMin = hp.pitch; if (hp.pitch > L.pMax) L.pMax = hp.pitch;
                 }
-              }
+                L.seen++;
+                const moved = (L.yMax - L.yMin) > LIVE_MOVE || (L.pMax - L.pMin) > LIVE_MOVE;
+                if (L.seen >= 3 && moved) {
+                  const uid = L.uid; cooldownRef.current[uid] = now + 12000; resetLock();
+                  drawFace(det, CLR_OK); await punch(uid);
+                } else { setStatus('move'); drawFace(det, CLR_LOCK); }
+              } else drawFace(det, CLR_LOCK);
             }
           }
         }
@@ -16414,7 +16429,7 @@ function FaceAttendanceModule({ plant, me }) {
 
       <div style="font-size:11px;color:var(--slate-500);margin-top:10px;padding:10px 12px;background:var(--slate-50);border-radius:8px;line-height:1.5">
         🔒 <b>Privacy:</b> face data is a mathematical descriptor stored only for this plant, matched on this device — no images are uploaded. Delete anyone's enrollment anytime under People.
-        <br/>✅ <b>Reliability:</b> multi-angle enrollment, a wrong-person guard, single-movement liveness (anti-photo) and a PIN fallback so nobody is ever stuck. For maximum integrity keep a supervisor at the gate.
+        <br/>✅ <b>Anti-proxy:</b> the lock stays on the face while it moves and reads real 3D head motion (nose depth vs the eyes) — a flat printed or on-screen photo is planar and can't produce it, held still or waved. It confirms on the smallest natural movement. (A replayed video of a moving person can't be beaten by any camera-only app — for that keep a supervisor at the gate; PIN + audit are there too.)
       </div>
     ` : html`
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
