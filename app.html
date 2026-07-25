@@ -8908,7 +8908,6 @@ function OperatorModal({ plant, units, editTarget, onClose, onSaved }) {
         if (error) throw error;
       } else {
         const { error } = await sb.from('users').insert({
-          id: crypto.randomUUID(),
           plant_id: plant.id,
           role: 'operator',
           ...payload,
@@ -16290,9 +16289,13 @@ function HrEmployeeModal({ plant, me, employee, onClose, onSaved, onEnroll }) {
       const { error } = await sb.from('users').update(payload).eq('id', employee.id);
       if (error) { setBusy(false); setErr(error.message); return; }
     } else {
-      const { data, error } = await sb.from('users').insert({ id: crypto.randomUUID(), plant_id: plant.id, role: 'operator', login_enabled: false, status: 'active', ...payload }).select().single();
-      if (error) { setBusy(false); setErr(error.message); return; }
-      saved = data;
+      // A new employee needs an auth account (users.id -> auth.users). The edge
+      // function mints it server-side (they can never log in) + writes the profile.
+      const { data, error } = await sb.functions.invoke('hr-create-employee', { body: { plant_id: plant.id, ...payload } });
+      let res = data, msg = '';
+      if (error) { try { res = await error.context.json(); } catch (_) { msg = error.message; } }
+      if (!res || !res.ok) { setBusy(false); setErr((res && res.error) || msg || 'Could not add employee'); return; }
+      saved = res.user;
     }
     setBusy(false);
     showToast('✓ ' + f.full_name + ' saved');
