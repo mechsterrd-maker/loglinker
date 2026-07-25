@@ -16140,8 +16140,17 @@ function prepFrame(video, canvas) {
   return canvas;
 }
 async function faceDetect(faceapi, input) {
-  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 });
+  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.3 });
   return await faceapi.detectSingleFace(input, opts).withFaceLandmarks(true).withFaceDescriptor();
+}
+// One-time warm-up: run the full pipeline on a blank frame so tfjs compiles its
+// shaders now (during "Loading…") instead of stalling the FIRST real recognition.
+async function warmUpFace(faceapi) {
+  try {
+    const c = document.createElement('canvas'); c.width = 224; c.height = 224;
+    const ctx = c.getContext('2d'); ctx.fillStyle = '#808080'; ctx.fillRect(0, 0, 224, 224);
+    await faceapi.detectSingleFace(c, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.3 })).withFaceLandmarks(true).withFaceDescriptor();
+  } catch (_) {}
 }
 // Landmarks only — no 128-d descriptor. Much lighter, so we can sample eyes fast
 // enough to actually catch the short "closed" frame of a blink.
@@ -16151,7 +16160,7 @@ async function faceLandmarksOnly(faceapi, input) {
 }
 function faceDistance(a, b) { let s = 0; for (let i = 0; i < 128; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); }
 const FACE_MATCH_MARGIN = 0.05;   // best match must beat 2nd-best by this — blocks wrong-person punches
-const LIVE_MOVE = 0.14;           // head-movement (nose vs eye-mid, normalised) needed to pass liveness
+const LIVE_MOVE = 0.12;           // head-movement (nose vs eye-mid, normalised) needed to pass liveness
 // Head-pose proxy: nose tip position relative to the eye midpoint, normalised by
 // inter-eye distance. ~0 looking straight; a turn moves yaw, a nod moves pitch.
 // A single deliberate movement is a big, clean signal — far more reliable than
@@ -16276,7 +16285,7 @@ function FaceAttendanceModule({ plant, me }) {
   // it's still the same person before punching (keeps the wrong-person guard).
   const tick = async (faceapi) => {
     if (!runningRef.current) return;
-    let next = 150;
+    let next = 0;   // scan back-to-back; live phase drops to ~40ms below
     const v = videoRef.current;
     try {
       if (v && v.videoWidth && !busyRef.current && !pinPad) {
@@ -16294,12 +16303,12 @@ function FaceAttendanceModule({ plant, me }) {
             else {
               const hp = headPose(det.landmarks) || { yaw: 0, pitch: 0 };
               lockRef.current = { uid: m.user_id, y0: hp.yaw, p0: hp.pitch, n: 1, lost: 0, t0: Date.now() };
-              setStatus('move'); drawFace(det, 'rgba(20,184,166,.98)'); next = 70;
+              setStatus('move'); drawFace(det, 'rgba(20,184,166,.98)'); next = 40;
             }
           }
         } else {
           // ---- LIVE ----  fast landmark-only watch for one head movement; identity already locked
-          next = 70;
+          next = 40;
           if (Date.now() - Lk.t0 > 12000) { resetLock(); setStatus('look'); drawFace(null); }   // give up, back to scan
           else {
             const det = await faceLandmarksOnly(faceapi, frame);
@@ -16309,7 +16318,7 @@ function FaceAttendanceModule({ plant, me }) {
               const hp = headPose(det.landmarks);
               if (hp) {
                 Lk.n++;
-                if (Lk.n <= 2) { Lk.y0 = hp.yaw; Lk.p0 = hp.pitch; setStatus('move'); drawFace(det, 'rgba(20,184,166,.98)'); }
+                if (Lk.n <= 1) { Lk.y0 = hp.yaw; Lk.p0 = hp.pitch; setStatus('move'); drawFace(det, 'rgba(20,184,166,.98)'); }
                 else {
                   const dev = Math.hypot(hp.yaw - Lk.y0, hp.pitch - Lk.p0);
                   if (dev > LIVE_MOVE) {
@@ -16330,7 +16339,7 @@ function FaceAttendanceModule({ plant, me }) {
     setKerr(''); setEngine('loading');
     if (!enrolledList().length) { setKerr('No workers enrolled yet — enrol faces under the People tab first.'); setEngine('idle'); return; }
     let faceapi;
-    try { faceapi = await loadFaceApi(); }
+    try { faceapi = await loadFaceApi(); await warmUpFace(faceapi); }
     catch (e) { setKerr(e.message); setEngine('idle'); return; }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
