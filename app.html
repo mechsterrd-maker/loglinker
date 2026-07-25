@@ -2114,23 +2114,24 @@ const OPT_IN_TAB_KEYS = new Set(['self_attendance', 'attendance', 'attendance_se
 // every nav surface to the workforce modules, so the SAME codebase ships as a
 // focused HR app with no fork.
 //
-// CRITICAL: HR-only mode must NEVER hijack the full plant app in a normal browser.
-// So the persisted flag is honoured ONLY when running as an installed / standalone
-// app (the HR APK is a full-screen TWA; a browser tab is not standalone). A plain
-// browser tab always gets the FULL app, even if the flag was set on this device.
-// ?app=hr forces HR for the current page load (preview) and persists only inside
-// the installed app; ?app=full clears the flag everywhere.
+// CRITICAL: HR-only mode must NEVER hijack the full plant app. A Trusted Web
+// Activity (the HR APK) SHARES Chrome's localStorage with the installed PWA and
+// browser for the same domain — so a localStorage flag leaks the HR view into the
+// full app. sessionStorage, by contrast, is scoped to each app INSTANCE (the APK,
+// the PWA and each browser tab are separate contexts) and is never shared. The HR
+// APK launches with ?app=hr, so every cold start re-derives HR; sessionStorage
+// keeps it across in-app refreshes. The full-app PWA/browser never set it → full.
 const HR_APP_KEYS = new Set(['home', 'more', 'face_attendance', 'attendance', 'self_attendance', 'attendance_setup', 'people', 'petty_cash', 'hr_payroll']);
 const APP_MODE = (() => {
   try {
+    // Purge the old GLOBAL flag that leaked between the APK and the PWA (auto-unsticks affected devices).
+    try { localStorage.removeItem('llk_app_mode'); } catch (_) {}
     const q = new URLSearchParams(window.location.search).get('app');   // 'hr' | 'full' | null
-    const standalone =
-      (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
-      window.navigator.standalone === true ||
-      (document.referrer || '').indexOf('android-app://') === 0;
-    if (q === 'full') { try { localStorage.removeItem('llk_app_mode'); } catch (_) {} return 'full'; }
-    if (q === 'hr') { if (standalone) { try { localStorage.setItem('llk_app_mode', 'hr'); } catch (_) {} } return 'hr'; }
-    return (standalone && localStorage.getItem('llk_app_mode') === 'hr') ? 'hr' : 'full';
+    if (q === 'full') { try { sessionStorage.removeItem('llk_app_mode'); } catch (_) {} return 'full'; }
+    if (q === 'hr') { try { sessionStorage.setItem('llk_app_mode', 'hr'); } catch (_) {} return 'hr'; }
+    let flag = 'full';
+    try { flag = sessionStorage.getItem('llk_app_mode') || 'full'; } catch (_) {}
+    return flag === 'hr' ? 'hr' : 'full';
   } catch (_) { return 'full'; }
 })();
 const isHrApp = () => APP_MODE === 'hr';
