@@ -16114,15 +16114,40 @@ function loadFaceApi() {
   });
   return _faceReady;
 }
-async function faceDetect(faceapi, video) {
-  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
-  return await faceapi.detectSingleFace(video, opts).withFaceLandmarks(true).withFaceDescriptor();
+// Draw the frame onto a canvas and auto-brighten it when the scene is dark, so a
+// shadowed/backlit face still detects. face-api reads pixels off the element we
+// pass, so pre-processing here is what actually reaches the detector.
+function prepFrame(video, canvas) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return video;
+  const w = 320, h = Math.max(1, Math.round(w * vh / vw));
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.filter = 'none';
+  ctx.drawImage(video, 0, 0, w, h);
+  let lum = 130;
+  try {
+    const d = ctx.getImageData(0, 0, w, h).data; let s = 0, n = 0;
+    for (let i = 0; i < d.length; i += 60) { s += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]; n++; }
+    lum = s / Math.max(1, n);
+  } catch (_) {}
+  if (lum < 115) {                                   // dark scene → boost brightness + a little contrast
+    const bright = Math.min(2.4, 125 / Math.max(28, lum));
+    ctx.filter = 'brightness(' + bright.toFixed(2) + ') contrast(1.18)';
+    ctx.drawImage(video, 0, 0, w, h);
+    ctx.filter = 'none';
+  }
+  return canvas;
+}
+async function faceDetect(faceapi, input) {
+  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 });
+  return await faceapi.detectSingleFace(input, opts).withFaceLandmarks(true).withFaceDescriptor();
 }
 // Landmarks only — no 128-d descriptor. Much lighter, so we can sample eyes fast
 // enough to actually catch the short "closed" frame of a blink.
-async function faceLandmarksOnly(faceapi, video) {
-  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 });
-  return await faceapi.detectSingleFace(video, opts).withFaceLandmarks(true);
+async function faceLandmarksOnly(faceapi, input) {
+  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.3 });
+  return await faceapi.detectSingleFace(input, opts).withFaceLandmarks(true);
 }
 function faceDistance(a, b) { let s = 0; for (let i = 0; i < 128; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); }
 const FACE_MATCH_MARGIN = 0.05;   // best match must beat 2nd-best by this — blocks wrong-person punches
@@ -16158,6 +16183,7 @@ function FaceAttendanceModule({ plant, me }) {
   const cooldownRef = useRef({});
   const lockRef = useRef({ uid: null, base: 0, n: 0, armed: false, lost: 0, t0: 0 });
   const busyRef = useRef(false);
+  const canvRef = useRef(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -16217,14 +16243,15 @@ function FaceAttendanceModule({ plant, me }) {
   // it's still the same person before punching (keeps the wrong-person guard).
   const tick = async (faceapi) => {
     if (!runningRef.current) return;
-    let next = 350;
+    let next = 150;
     const v = videoRef.current;
     try {
       if (v && v.videoWidth && !busyRef.current && !pinPad) {
+        const frame = prepFrame(v, canvRef.current || (canvRef.current = document.createElement('canvas')));
         const Lk = lockRef.current;
         if (!Lk.uid) {
-          // ---- SCAN ----
-          const det = await faceDetect(faceapi, v);
+          // ---- SCAN ----  heavy detect + fingerprint to recognise who it is
+          const det = await faceDetect(faceapi, frame);
           if (!det || !det.descriptor) { setStatus('look'); }
           else {
             const m = bestMatch(det.descriptor);
@@ -16234,32 +16261,30 @@ function FaceAttendanceModule({ plant, me }) {
             else {
               const ear = faceEAR(det.landmarks) || 0;
               lockRef.current = { uid: m.user_id, base: ear, n: 1, armed: false, lost: 0, t0: Date.now() };
-              setStatus('hold'); next = 90;
+              setStatus('blink'); next = 70;
             }
           }
         } else {
-          // ---- LIVE (blink watch) ----
-          next = 90;
-          if (Date.now() - Lk.t0 > 9000) { resetLock(); setStatus('look'); }   // give up, back to scan
+          // ---- LIVE ----  fast landmark-only blink watch; identity already locked
+          next = 70;
+          if (Date.now() - Lk.t0 > 10000) { resetLock(); setStatus('look'); }   // give up, back to scan
           else {
-            const det = await faceLandmarksOnly(faceapi, v);
-            if (!det) { Lk.lost++; if (Lk.lost > 8) { resetLock(); setStatus('look'); } }
+            const det = await faceLandmarksOnly(faceapi, frame);
+            if (!det) { Lk.lost++; if (Lk.lost > 10) { resetLock(); setStatus('look'); } }
             else {
               Lk.lost = 0;
               const ear = faceEAR(det.landmarks);
               if (ear != null) {
-                Lk.n++; if (ear > Lk.base) Lk.base = ear;                        // running max = eyes-open baseline
+                Lk.n++;
+                Lk.base = Lk.base > 0 ? Math.max(ear, Lk.base * 0.985) : ear;    // decaying running-max baseline
                 const base = Lk.base || 0.3;
-                const closeT = Math.max(0.15, base * 0.72);
-                const openT = base * 0.88;
-                if (!Lk.armed) { setStatus('blink'); if (Lk.n >= 3 && ear < closeT) Lk.armed = true; }
+                const closeT = Math.max(0.16, base * 0.75);
+                const openT = base * 0.85;
+                if (!Lk.armed) { setStatus('blink'); if (Lk.n >= 2 && ear < closeT) Lk.armed = true; }
                 else if (ear > openT) {
-                  // blink done → re-confirm identity on a descriptor frame, then punch
-                  const uid = Lk.uid; resetLock(); setStatus('recog');
-                  const conf = await faceDetect(faceapi, v);
-                  const m2 = conf && conf.descriptor ? bestMatch(conf.descriptor) : { state: 'unknown' };
-                  if (m2.state === 'ok' && m2.user_id === uid) { cooldownRef.current[uid] = Date.now() + 12000; await punch(uid); }
-                  else setStatus('unknown');
+                  // blink complete → punch straight away (identity already verified at lock)
+                  const uid = Lk.uid; cooldownRef.current[uid] = Date.now() + 12000; resetLock();
+                  await punch(uid);
                 } else setStatus('hold');
               }
             }
@@ -16386,7 +16411,7 @@ function FaceEnrollModal({ plant, me, user, existing, onClose, onSaved }) {
   const [pin, setPin] = useState(existing?.pin || '');
   const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
   const [snap, setSnap] = useState(false);       // brief flash after a capture
-  const videoRef = useRef(null); const streamRef = useRef(null); const faceRef = useRef(null);
+  const videoRef = useRef(null); const streamRef = useRef(null); const faceRef = useRef(null); const capCanvRef = useRef(null);
   const hadFace = existing && Array.isArray(existing.descriptors) && existing.descriptors.length > 0;
 
   const stop = () => { try { streamRef.current?.getTracks().forEach(t => t.stop()); } catch (_) {} streamRef.current = null; };
@@ -16408,7 +16433,8 @@ function FaceEnrollModal({ plant, me, user, existing, onClose, onSaved }) {
     const v = videoRef.current;
     if (!v || !v.videoWidth) { setErr('Camera not ready'); return; }
     try {
-      const det = await faceDetect(faceRef.current, v);
+      const frame = prepFrame(v, capCanvRef.current || (capCanvRef.current = document.createElement('canvas')));
+      const det = await faceDetect(faceRef.current, frame);
       if (!det || !det.descriptor) { setErr('No face detected — hold steady, look at the camera in good light.'); return; }
       const next = [...samples, Array.from(det.descriptor)];
       setSnap(true); setTimeout(() => setSnap(false), 180);
