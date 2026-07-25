@@ -16101,7 +16101,14 @@ function loadFaceApi() {
       try {
         // Force the GPU (WebGL) backend — tfjs otherwise silently falls back to
         // CPU on some mobile webviews, which makes each recognition 5-10x slower.
-        try { if (f.tf && f.tf.setBackend) { await f.tf.setBackend('webgl'); await f.tf.ready(); } } catch (_) {}
+        // Half-precision (F16) textures roughly halve inference time on mobile
+        // GPUs with no meaningful accuracy loss for face matching.
+        try {
+          if (f.tf) {
+            if (f.tf.env) { try { f.tf.env().set('WEBGL_FORCE_F16_TEXTURES', true); f.tf.env().set('WEBGL_PACK', true); } catch (_) {} }
+            if (f.tf.setBackend) { await f.tf.setBackend('webgl'); await f.tf.ready(); }
+          }
+        } catch (_) {}
         await f.nets.tinyFaceDetector.loadFromUri(FACEAPI_MODELS);
         await f.nets.faceLandmark68TinyNet.loadFromUri(FACEAPI_MODELS);
         await f.nets.faceRecognitionNet.loadFromUri(FACEAPI_MODELS);
@@ -16143,7 +16150,7 @@ function prepFrame(video, canvas) {
   return canvas;
 }
 async function faceDetect(faceapi, input) {
-  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.3 });
+  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 160, scoreThreshold: 0.3 });
   return await faceapi.detectSingleFace(input, opts).withFaceLandmarks(true).withFaceDescriptor();
 }
 // One-time warm-up: run the full pipeline on a blank frame so tfjs compiles its
@@ -16152,13 +16159,13 @@ async function warmUpFace(faceapi) {
   try {
     const c = document.createElement('canvas'); c.width = 224; c.height = 224;
     const ctx = c.getContext('2d'); ctx.fillStyle = '#808080'; ctx.fillRect(0, 0, 224, 224);
-    await faceapi.detectSingleFace(c, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.3 })).withFaceLandmarks(true).withFaceDescriptor();
+    await faceapi.detectSingleFace(c, new faceapi.TinyFaceDetectorOptions({ inputSize: 160, scoreThreshold: 0.3 })).withFaceLandmarks(true).withFaceDescriptor();
   } catch (_) {}
 }
 // Landmarks only — no 128-d descriptor. Much lighter, so we can sample eyes fast
 // enough to actually catch the short "closed" frame of a blink.
 async function faceLandmarksOnly(faceapi, input) {
-  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.3 });
+  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 160, scoreThreshold: 0.3 });
   return await faceapi.detectSingleFace(input, opts).withFaceLandmarks(true);
 }
 function faceDistance(a, b) { let s = 0; for (let i = 0; i < 128; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); }
@@ -16289,7 +16296,7 @@ function FaceAttendanceModule({ plant, me }) {
   // it's still the same person before punching (keeps the wrong-person guard).
   const tick = async (faceapi) => {
     if (!runningRef.current) return;
-    let next = 40;   // ~25fps tracking; recognition frames pace themselves via await
+    let next = 12;   // near back-to-back; inference itself paces the loop, so this recognises ASAP
     const v = videoRef.current;
     try {
       if (v && v.videoWidth && !busyRef.current && !pinPad) {
