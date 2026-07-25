@@ -15975,41 +15975,104 @@ function PayrollModule({ plant, me }) {
   `;
 }
 
+const DED_KINDS = [{ v: 'fixed', t: 'Fixed ₹' }, { v: 'pct_basic', t: '% of Basic' }, { v: 'pct_gross', t: '% of Gross' }];
 function PayrollConfigModal({ plant, employee, config, onClose, onSaved }) {
+  const [structured, setStructured] = useState(!!(config?.components?.earnings?.length));
   const [salary, setSalary] = useState(config?.monthly_salary ?? '');
-  const [start, setStart] = useState((config?.shift_start || '09:00').slice(0,5));
-  const [end, setEnd] = useState((config?.shift_end || '17:30').slice(0,5));
+  const [earnings, setEarnings] = useState(
+    config?.components?.earnings?.length
+      ? config.components.earnings.map(e => ({ label: e.label, amount: String(e.amount ?? '') }))
+      : [{ label: 'Basic', amount: String(config?.monthly_salary ?? '') }]);
+  const [deductions, setDeductions] = useState(
+    (config?.components?.deductions || []).map(d => ({ label: d.label, kind: d.kind || 'fixed', value: String(d.value ?? ''), maxGross: d.maxGross ? String(d.maxGross) : '' })));
+  const [start, setStart] = useState((config?.shift_start || '09:00').slice(0, 5));
+  const [end, setEnd] = useState((config?.shift_end || '17:30').slice(0, 5));
   const [mult, setMult] = useState(config?.ot_multiplier ?? 1.5);
   const [perm, setPerm] = useState(config?.permission_hours ?? 0);
   const [leave, setLeave] = useState(config?.paid_leave_days ?? 0);
   const [busy, setBusy] = useState(false);
 
-  // Derived shift hours for the live hint (e.g. 9:00–17:30 → 8.5h).
-  const toH = (t) => { const [h,m] = String(t).split(':').map(Number); return (h||0)+(m||0)/60; };
-  let shiftH = toH(end) - toH(start); if (shiftH<=0) shiftH += 24; shiftH = Math.round(shiftH*100)/100;
+  const toH = (t) => { const [h, m] = String(t).split(':').map(Number); return (h || 0) + (m || 0) / 60; };
+  let shiftH = toH(end) - toH(start); if (shiftH <= 0) shiftH += 24; shiftH = Math.round(shiftH * 100) / 100;
+  const gross = earnings.reduce((s, e) => s + (Number(e.amount) || 0), 0);
+
+  const setE = (i, k, v) => setEarnings(a => a.map((x, j) => j === i ? { ...x, [k]: v } : x));
+  const setD = (i, k, v) => setDeductions(a => a.map((x, j) => j === i ? { ...x, [k]: v } : x));
+  const rmE = (i) => setEarnings(a => a.filter((_, j) => j !== i));
+  const rmD = (i) => setDeductions(a => a.filter((_, j) => j !== i));
+  const addPreset = (p) => setDeductions(a => [...a, p]);
 
   const save = async () => {
     setBusy(true);
     try {
-      const { error } = await sb.from('mcp_payroll_config').upsert({
+      const payload = {
         plant_id: plant.id, user_id: employee.id,
-        monthly_salary: Number(salary)||0,
-        shift_start: start || null, shift_end: end || null,
-        shift_hours: shiftH,
-        ot_multiplier: Number(mult)||1.5,
-        permission_hours: Number(perm)||0,
-        paid_leave_days: Number(leave)||0,
+        shift_start: start || null, shift_end: end || null, shift_hours: shiftH,
+        ot_multiplier: Number(mult) || 1.5, permission_hours: Number(perm) || 0, paid_leave_days: Number(leave) || 0,
         updated_at: new Date().toISOString(),
-      }, { onConflict: 'plant_id,user_id' });
+      };
+      if (structured) {
+        const earn = earnings.filter(e => (e.label || '').trim()).map(e => ({ label: e.label.trim(), amount: Number(e.amount) || 0 }));
+        const ded = deductions.filter(d => (d.label || '').trim()).map(d => {
+          const o = { label: d.label.trim(), kind: d.kind, value: Number(d.value) || 0 };
+          if ((d.kind === 'pct_basic' || d.kind === 'pct_gross') && Number(d.maxGross)) o.maxGross = Number(d.maxGross);
+          return o;
+        });
+        payload.components = { earnings: earn, deductions: ded };
+        payload.monthly_salary = earn.reduce((s, e) => s + e.amount, 0);   // keep flat consumers working
+      } else {
+        payload.components = null;
+        payload.monthly_salary = Number(salary) || 0;
+      }
+      const { error } = await sb.from('mcp_payroll_config').upsert(payload, { onConflict: 'plant_id,user_id' });
       if (error) throw error;
       showToast('✓ Pay saved'); onSaved();
     } catch (e) { alert('Save failed: ' + e.message); } finally { setBusy(false); }
   };
+
+  const inp = (val, on, ph, type) => html`<input type=${type || 'text'} value=${val} onInput=${e => on(e.target.value)} placeholder=${ph || ''} style="width:100%;padding:8px 9px;border:1px solid var(--slate-300);border-radius:7px;font-size:13px" />`;
+
   return html`
-    <div class="modal-backdrop active" onClick=${e => { if (e.target===e.currentTarget) onClose(); }}>
-      <div class="modal">
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:520px">
         <div class="modal-header"><div class="modal-title">Pay · ${employee.full_name}</div><button class="close-btn" onClick=${onClose}>×</button></div>
-        <div class="field"><label>Monthly salary (₹)</label><input type="number" min=${0} value=${salary} onChange=${e => setSalary(e.target.value)} placeholder="e.g. 18000" /></div>
+
+        <div style="display:flex;gap:6px;background:var(--slate-100);border-radius:9px;padding:3px;margin-bottom:12px">
+          <button class="btn small ${structured ? 'ghost' : ''}" style="flex:1" onClick=${() => setStructured(false)}>Flat salary</button>
+          <button class="btn small ${structured ? '' : 'ghost'}" style="flex:1" onClick=${() => setStructured(true)}>Detailed (Basic + PF…)</button>
+        </div>
+
+        ${!structured ? html`
+          <div class="field"><label>Monthly salary (₹)</label><input type="number" min=${0} value=${salary} onChange=${e => setSalary(e.target.value)} placeholder="e.g. 18000" /></div>
+        ` : html`
+          <div style="font-size:12px;font-weight:700;color:var(--slate-700);margin-bottom:6px">Earnings</div>
+          ${earnings.map((e, i) => html`<div key=${'e' + i} style="display:flex;gap:6px;margin-bottom:6px;align-items:center">
+            <div style="flex:1.4">${inp(e.label, v => setE(i, 'label', v), 'e.g. Basic / HRA')}</div>
+            <div style="flex:1">${inp(e.amount, v => setE(i, 'amount', v), '₹', 'number')}</div>
+            <button class="btn small ghost" style="color:var(--rose-600);padding:6px 9px" onClick=${() => rmE(i)}>✕</button>
+          </div>`)}
+          <button class="btn small ghost" onClick=${() => setEarnings(a => [...a, { label: '', amount: '' }])}>+ Add earning</button>
+          <div style="text-align:right;font-size:12px;font-weight:700;color:var(--slate-700);margin:6px 2px">Gross = ₹${gross.toLocaleString('en-IN')}</div>
+
+          <div style="font-size:12px;font-weight:700;color:var(--slate-700);margin:10px 0 6px">Deductions</div>
+          ${deductions.map((d, i) => html`<div key=${'d' + i} style="display:flex;gap:6px;margin-bottom:6px;align-items:center;flex-wrap:wrap">
+            <div style="flex:1.2;min-width:90px">${inp(d.label, v => setD(i, 'label', v), 'e.g. PF')}</div>
+            <select value=${d.kind} onChange=${ev => setD(i, 'kind', ev.target.value)} style="padding:8px 6px;border:1px solid var(--slate-300);border-radius:7px;font-size:12px">${DED_KINDS.map(k => html`<option value=${k.v}>${k.t}</option>`)}</select>
+            <div style="width:64px">${inp(d.value, v => setD(i, 'value', v), d.kind === 'fixed' ? '₹' : '%', 'number')}</div>
+            ${(d.kind === 'pct_basic' || d.kind === 'pct_gross') ? html`<div style="width:78px">${inp(d.maxGross, v => setD(i, 'maxGross', v), 'cap gross', 'number')}</div>` : ''}
+            <button class="btn small ghost" style="color:var(--rose-600);padding:6px 9px" onClick=${() => rmD(i)}>✕</button>
+          </div>`)}
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">
+            <button class="btn small ghost" onClick=${() => addPreset({ label: 'PF', kind: 'pct_basic', value: '12', maxGross: '' })}>+ PF 12%</button>
+            <button class="btn small ghost" onClick=${() => addPreset({ label: 'ESI', kind: 'pct_gross', value: '0.75', maxGross: '21000' })}>+ ESI</button>
+            <button class="btn small ghost" onClick=${() => addPreset({ label: 'Prof. Tax', kind: 'fixed', value: '200', maxGross: '' })}>+ P.Tax</button>
+            <button class="btn small ghost" onClick=${() => addPreset({ label: 'Advance', kind: 'fixed', value: '', maxGross: '' })}>+ Advance</button>
+            <button class="btn small ghost" onClick=${() => addPreset({ label: '', kind: 'fixed', value: '', maxGross: '' })}>+ Custom</button>
+          </div>
+          <div style="font-size:11px;color:var(--slate-500);margin:8px 0 2px">PF/ESI % apply on the earned (post-absence) amount. "cap gross" auto-skips the line above that gross (ESI ≤ ₹21,000). Loss-of-pay for absents is added automatically.</div>
+        `}
+
+        <div style="border-top:1px solid var(--slate-100);margin:12px 0 10px"></div>
         <div class="field-row">
           <div class="field"><label>Shift start</label><input type="time" value=${start} onChange=${e => setStart(e.target.value)} /></div>
           <div class="field"><label>Shift end</label><input type="time" value=${end} onChange=${e => setEnd(e.target.value)} /></div>
@@ -16026,8 +16089,7 @@ function PayrollConfigModal({ plant, employee, config, onClose, onSaved }) {
           <div class="field"><label>Permission allowance (hrs/mo)</label><input type="number" min=${0} step="0.5" value=${perm} onChange=${e => setPerm(e.target.value)} /></div>
           <div class="field"><label>Paid leave (days/mo)</label><input type="number" min=${0} step="0.5" value=${leave} onChange=${e => setLeave(e.target.value)} /></div>
         </div>
-        <div style="font-size:11px;color:var(--slate-500);margin:-4px 0 10px">Short-time up to the permission hours and leave up to the paid-leave days are <strong>not deducted</strong>.</div>
-        <button class="btn" disabled=${busy} onClick=${save}>${busy?'Saving…':'Save pay'}</button>
+        <button class="btn" style="width:100%" disabled=${busy} onClick=${save}>${busy ? 'Saving…' : 'Save pay'}</button>
       </div>
     </div>
   `;
@@ -16365,6 +16427,74 @@ function hrSalary(emp, rows, days) {
   const marked = present + half + leave + absent + off;
   return { salary, days, present, half, leave, absent, off, perDay, deductDays, payableDays, deductAmt, net, marked };
 }
+function countStatuses(rows) {
+  let present = 0, half = 0, leave = 0, absent = 0, off = 0;
+  for (const r of (rows || [])) {
+    if (r.status === 'present') present++;
+    else if (r.status === 'half_day') half++;
+    else if (r.status === 'leave') leave++;
+    else if (r.status === 'absent') absent++;
+    else if (r.status === 'week_off' || r.status === 'holiday') off++;
+  }
+  return { present, half, leave, absent, off };
+}
+
+// Full payslip computation. cfg = mcp_payroll_config row (monthly_salary + optional
+// components). Flat when there are no components. Earnings are shown at their full
+// monthly value; loss-of-pay + statutory/other lines are deductions. Percentage
+// deductions (PF/ESI) are computed on the EARNED (post-LOP) basic/gross; a maxGross
+// cap makes ESI auto-skip above the wage limit. Net = gross − total deductions.
+function computePayslip(cfg, counts, days) {
+  const comp = cfg && cfg.components;
+  const structured = comp && Array.isArray(comp.earnings) && comp.earnings.length > 0;
+  const earnings = structured
+    ? comp.earnings.map(e => ({ label: e.label || 'Earning', amount: Number(e.amount) || 0 }))
+    : [{ label: 'Basic', amount: Number(cfg && cfg.monthly_salary) || 0 }];
+  const gross = earnings.reduce((s, e) => s + e.amount, 0);
+  const basic = (earnings.find(e => /basic/i.test(e.label)) || earnings[0] || { amount: 0 }).amount;
+  const { present = 0, half = 0, leave = 0, absent = 0, off = 0 } = counts || {};
+  const deductDays = absent + 0.5 * half;                 // leave / week-off / holiday = paid
+  const payableDays = Math.max(0, days - deductDays);
+  const factor = days > 0 ? payableDays / days : 0;
+  const lop = days > 0 ? gross * deductDays / days : 0;
+  const earnedBasic = basic * factor;
+  const earnedGross = gross - lop;
+  const dedLines = [];
+  if (deductDays > 0) dedLines.push({ label: 'Loss of pay (' + (deductDays % 1 ? deductDays.toFixed(1) : deductDays) + 'd)', amount: Math.round(lop) });
+  const comps = structured && Array.isArray(comp.deductions) ? comp.deductions : [];
+  for (const d of comps) {
+    const val = Number(d.value) || 0;
+    let amt = 0;
+    if (d.maxGross && gross > Number(d.maxGross)) amt = 0;
+    else if (d.kind === 'pct_basic') amt = earnedBasic * val / 100;
+    else if (d.kind === 'pct_gross') amt = earnedGross * val / 100;
+    else amt = val;
+    amt = Math.round(amt);
+    if (amt > 0) dedLines.push({ label: d.label || 'Deduction', amount: amt });
+  }
+  const totalDed = dedLines.reduce((s, d) => s + d.amount, 0);
+  const net = Math.max(0, Math.round(gross - totalDed));
+  return { structured, earnings, gross, basic, present, half, leave, absent, off, days, deductDays, payableDays, lop: Math.round(lop), earnedGross: Math.round(earnedGross), dedLines, totalDed, net };
+}
+
+// Indian-format amount in words (rupees only).
+function amountInWords(num) {
+  num = Math.round(Number(num) || 0);
+  if (num === 0) return 'Zero Rupees only';
+  const ones = ['', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten', 'Eleven', 'Twelve', 'Thirteen', 'Fourteen', 'Fifteen', 'Sixteen', 'Seventeen', 'Eighteen', 'Nineteen'];
+  const tens = ['', '', 'Twenty', 'Thirty', 'Forty', 'Fifty', 'Sixty', 'Seventy', 'Eighty', 'Ninety'];
+  const two = (n) => n < 20 ? ones[n] : tens[Math.floor(n / 10)] + (n % 10 ? ' ' + ones[n % 10] : '');
+  const three = (n) => (n >= 100 ? ones[Math.floor(n / 100)] + ' Hundred' + (n % 100 ? ' ' + two(n % 100) : '') : two(n));
+  let out = '';
+  const crore = Math.floor(num / 10000000); num %= 10000000;
+  const lakh = Math.floor(num / 100000); num %= 100000;
+  const thousand = Math.floor(num / 1000); num %= 1000;
+  if (crore) out += three(crore) + ' Crore ';
+  if (lakh) out += two(lakh) + ' Lakh ';
+  if (thousand) out += two(thousand) + ' Thousand ';
+  if (num) out += three(num) + ' ';
+  return out.trim() + ' Rupees only';
+}
 const monthLabelOf = (ym) => { const [y, m] = ym.split('-').map(Number); return new Date(y, m - 1, 1).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' }); };
 const daysInMonthOf = (ym) => { const [y, m] = ym.split('-').map(Number); return new Date(y, m, 0).getDate(); };
 
@@ -16387,42 +16517,63 @@ async function shareOrDownloadPdf(doc, filename, waPhone, waText) {
   }
 }
 
+// Professional payslip: header, employee + attendance blocks, two columns
+// (Earnings | Deductions), net pay with amount in words. `calc` = computePayslip().
 async function makePayslipPdf(plant, emp, calc, monthLabel) {
   await ensureJsPDF();
   const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({ unit: 'mm', format: 'a4' }); const M = 14;
-  doc.setFont('helvetica', 'bold'); doc.setFontSize(16); doc.setTextColor(13, 148, 136);
-  doc.text(plant?.name || 'Company', M, 18);
-  doc.setFontSize(12); doc.setTextColor(30, 41, 59);
-  doc.text('Payslip — ' + monthLabel, M, 26);
-  doc.setFont('helvetica', 'normal'); doc.setFontSize(10); doc.setTextColor(71, 85, 105);
-  let y = 38; const line = (k, v) => { doc.text(k, M, y); doc.text(String(v), 80, y); y += 6; };
-  line('Employee', emp.full_name || '');
-  if (emp.employee_id) line('Emp ID', emp.employee_id);
-  if (emp.designation) line('Designation', emp.designation);
-  if (emp.date_of_joining) line('Joined', emp.date_of_joining);
-  y += 2;
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  const M = 14, PW = 210, teal = [13, 148, 136], ink = [30, 41, 59], mute = [100, 116, 139];
+
+  // Header band
+  doc.setFillColor(13, 148, 136); doc.rect(0, 0, PW, 30, 'F');
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(17); doc.setTextColor(255, 255, 255);
+  doc.text(plant?.name || 'Company', M, 14);
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(10);
+  doc.text('Payslip for ' + monthLabel, M, 22);
+  doc.setFontSize(9); doc.text('Salary Slip', PW - M, 14, { align: 'right' });
+
+  // Employee + attendance details (two info columns)
+  let y = 40;
+  doc.setFontSize(9.5); doc.setTextColor.apply(doc, ink);
+  const kv = (x, k, v) => { doc.setFont('helvetica', 'normal'); doc.setTextColor.apply(doc, mute); doc.text(k, x, y); doc.setFont('helvetica', 'bold'); doc.setTextColor.apply(doc, ink); doc.text(String(v || '-'), x + 26, y); };
+  kv(M, 'Employee', emp.full_name || ''); kv(PW / 2, 'Emp ID', emp.employee_id || '-'); y += 6;
+  kv(M, 'Designation', emp.designation || '-'); kv(PW / 2, 'Joined', emp.date_of_joining || '-'); y += 6;
+  kv(M, 'Paid days', calc.payableDays.toFixed(1) + ' / ' + calc.days); kv(PW / 2, 'Present/Absent', calc.present + ' / ' + calc.absent); y += 6;
+  kv(M, 'Half / Leave', calc.half + ' / ' + calc.leave); kv(PW / 2, 'Week-off/Hol', String(calc.off)); y += 8;
+
+  // Two-column table: earnings | deductions
+  const earnBody = calc.earnings.map(e => [e.label, rs(e.amount)]);
+  const dedBody = calc.dedLines.length ? calc.dedLines.map(d => [d.label, rs(d.amount)]) : [['—', rs(0)]];
+  const rowsN = Math.max(earnBody.length, dedBody.length);
+  while (earnBody.length < rowsN) earnBody.push(['', '']);
+  while (dedBody.length < rowsN) dedBody.push(['', '']);
+  const body = earnBody.map((e, i) => [e[0], e[1], dedBody[i][0], dedBody[i][1]]);
   doc.autoTable({
     startY: y,
-    head: [['Description', 'Value']],
-    body: [
-      ['Monthly salary', rs(calc.salary)],
-      ['Days in month', String(calc.days)],
-      ['Present', String(calc.present)],
-      ['Half days', String(calc.half)],
-      ['Paid leave', String(calc.leave)],
-      ['Week-off / holiday', String(calc.off)],
-      ['Absent (unpaid)', String(calc.absent)],
-      ['Payable days', calc.payableDays.toFixed(1)],
-      ['Deduction', '- ' + rs(calc.deductAmt)],
-      ['NET PAYABLE', rs(calc.net)],
-    ],
-    styles: { fontSize: 10 }, headStyles: { fillColor: [13, 148, 136] }, theme: 'grid', margin: { left: M, right: M },
-    didParseCell: (d) => { if (d.row.index === 9) { d.cell.styles.fontStyle = 'bold'; d.cell.styles.fillColor = [236, 253, 245]; } },
+    head: [['Earnings', 'Amount', 'Deductions', 'Amount']],
+    body,
+    foot: [['Gross Earnings', rs(calc.gross), 'Total Deductions', rs(calc.totalDed)]],
+    styles: { fontSize: 9.5, cellPadding: 2.4 },
+    headStyles: { fillColor: teal, textColor: 255, halign: 'left' },
+    footStyles: { fillColor: [241, 245, 249], textColor: ink, fontStyle: 'bold' },
+    columnStyles: { 1: { halign: 'right' }, 3: { halign: 'right' } },
+    theme: 'grid', margin: { left: M, right: M },
   });
-  y = (doc.lastAutoTable ? doc.lastAutoTable.finalY : y) + 12;
-  doc.setFontSize(8); doc.setTextColor(148, 163, 184);
-  doc.text('Computed from attendance · ' + new Date().toLocaleDateString('en-IN'), M, y);
+  y = (doc.lastAutoTable ? doc.lastAutoTable.finalY : y) + 8;
+
+  // Net pay strip
+  doc.setFillColor(236, 253, 245); doc.setDrawColor(153, 246, 228);
+  doc.roundedRect(M, y, PW - 2 * M, 16, 2, 2, 'FD');
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(12); doc.setTextColor.apply(doc, [13, 118, 110]);
+  doc.text('NET PAY', M + 4, y + 10);
+  doc.setFontSize(14); doc.text(rs(calc.net), PW - M - 4, y + 10, { align: 'right' });
+  y += 22;
+  doc.setFont('helvetica', 'italic'); doc.setFontSize(9); doc.setTextColor.apply(doc, ink);
+  doc.text('In words: ' + amountInWords(calc.net), M, y); y += 10;
+
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(7.5); doc.setTextColor.apply(doc, mute);
+  doc.text('Computed from attendance on ' + new Date().toLocaleDateString('en-IN') + '. Computer-generated payslip — no signature required.', M, 285);
   return doc;
 }
 
@@ -16441,23 +16592,23 @@ function HrPayroll({ plant, me }) {
       sb.from('users').select('id, full_name, phone, employee_id, designation, date_of_joining')
         .eq('plant_id', plant.id).neq('status', 'removed').order('full_name'),
       sb.from('mcp_attendance').select('user_id, status').eq('plant_id', plant.id).gte('date', first).lte('date', last),
-      sb.from('mcp_payroll_config').select('user_id, monthly_salary').eq('plant_id', plant.id),   // salary lives in Payroll setup
+      sb.from('mcp_payroll_config').select('user_id, monthly_salary, components').eq('plant_id', plant.id),   // salary + optional structure live in Payroll setup
     ]);
     const byUser = {}; (att || []).forEach(r => (byUser[r.user_id] = byUser[r.user_id] || []).push(r));
-    const salBy = {}; (cfg || []).forEach(c => { salBy[c.user_id] = c.monthly_salary; });
+    const cfgBy = {}; (cfg || []).forEach(c => { cfgBy[c.user_id] = c; });
     const emps = (us || []).filter(u => u.id !== me.id);
-    setRows(emps.map(e => { const emp = { ...e, monthly_salary: salBy[e.id] ?? null }; return { emp, calc: hrSalary(emp, byUser[e.id] || [], days) }; }));
+    setRows(emps.map(e => ({ emp: e, calc: computePayslip(cfgBy[e.id] || {}, countStatuses(byUser[e.id] || []), days) })));
     setLoading(false);
   }, [month, plant.id, me.id]);
   useEffect(() => { load(); }, [load]);
 
   const label = monthLabelOf(month);
   const totalNet = rows.reduce((s, r) => s + r.calc.net, 0);
-  const withSalary = rows.filter(r => r.calc.salary > 0).length;
+  const withSalary = rows.filter(r => r.calc.gross > 0).length;
 
   const downloadCsv = () => {
     const head = ['Employee', 'Emp ID', 'Phone', 'Monthly salary', 'Present', 'Half', 'Leave', 'Absent', 'Week-off/Holiday', 'Payable days', 'Net payable'];
-    const data = rows.map(r => [r.emp.full_name || '', r.emp.employee_id || '', r.emp.phone || '', r.calc.salary, r.calc.present, r.calc.half, r.calc.leave, r.calc.absent, r.calc.off, r.calc.payableDays.toFixed(1), r.calc.net]);
+    const data = rows.map(r => [r.emp.full_name || '', r.emp.employee_id || '', r.emp.phone || '', r.calc.gross, r.calc.present, r.calc.half, r.calc.leave, r.calc.absent, r.calc.off, r.calc.payableDays.toFixed(1), r.calc.net]);
     const csv = [head, ...data].map(row => row.map(c => '"' + String(c).replace(/"/g, '""') + '"').join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'salary_' + month + '.csv'; a.click(); URL.revokeObjectURL(a.href);
@@ -16473,7 +16624,7 @@ function HrPayroll({ plant, me }) {
     doc.autoTable({
       startY: 27,
       head: [['Employee', 'Salary', 'P', 'HD', 'L', 'A', 'Pay days', 'Net']],
-      body: rows.map(r => [r.emp.full_name || '', rs(r.calc.salary), r.calc.present, r.calc.half, r.calc.leave, r.calc.absent, r.calc.payableDays.toFixed(1), rs(r.calc.net)]),
+      body: rows.map(r => [r.emp.full_name || '', rs(r.calc.gross), r.calc.present, r.calc.half, r.calc.leave, r.calc.absent, r.calc.payableDays.toFixed(1), rs(r.calc.net)]),
       styles: { fontSize: 8 }, headStyles: { fillColor: [13, 148, 136] }, theme: 'grid', margin: { left: M, right: M },
     });
     setBusy('');
@@ -16510,9 +16661,9 @@ function HrPayroll({ plant, me }) {
                 <div style="font-size:11px;color:var(--slate-500)">P ${r.calc.present} · A ${r.calc.absent} · HD ${r.calc.half} · L ${r.calc.leave} · ${r.calc.payableDays.toFixed(1)} pay days</div>
               </div>
               <div style="text-align:right">
-                <div style="font-size:14px;font-weight:800;color:${r.calc.salary > 0 ? 'var(--emerald-700)' : 'var(--slate-400)'}">${r.calc.salary > 0 ? '₹' + r.calc.net.toLocaleString('en-IN') : 'set salary'}</div>
+                <div style="font-size:14px;font-weight:800;color:${r.calc.gross > 0 ? 'var(--emerald-700)' : 'var(--slate-400)'}">${r.calc.gross > 0 ? '₹' + r.calc.net.toLocaleString('en-IN') : 'set salary'}</div>
               </div>
-              <button class="btn small" disabled=${busy === r.emp.id || r.calc.salary <= 0} onClick=${() => sendPayslip(r)} title=${r.emp.phone ? 'Send to ' + r.emp.phone : 'No phone on file'}>${busy === r.emp.id ? '…' : '📤 Payslip'}</button>
+              <button class="btn small" disabled=${busy === r.emp.id || r.calc.gross <= 0} onClick=${() => sendPayslip(r)} title=${r.emp.phone ? 'Send to ' + r.emp.phone : 'No phone on file'}>${busy === r.emp.id ? '…' : '📤 Payslip'}</button>
             </div>`)}
         </div>
         <div style="font-size:11px;color:var(--slate-500);margin-top:10px;padding:10px 12px;background:var(--slate-50);border-radius:8px;line-height:1.5">
