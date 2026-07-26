@@ -254,6 +254,12 @@ html[data-hr-dark] .hr-lite{--slate-50:#f8fafc;--slate-100:#f1f5f9;--slate-200:#
 html[data-hr-dark] .hr-lite .card,html[data-hr-dark] .hr-lite .list-item,html[data-hr-dark] .hr-lite .modal,html[data-hr-dark] .hr-lite .topbar{background:#fff}
 html[data-hr-dark] .hr-lite .field input:not([type=checkbox]):not([type=radio]),html[data-hr-dark] .hr-lite .field select,html[data-hr-dark] .hr-lite .field textarea,html[data-hr-dark] .hr-lite input,html[data-hr-dark] .hr-lite select,html[data-hr-dark] .hr-lite textarea{background:#fff;color:#0f172a;border-color:var(--slate-200)}
 html[data-hr-dark] .hr-lite .badge{background:var(--slate-100);color:var(--slate-700)}
+/* Readable text-selection highlight in dark mode (default can be dark-on-dark). */
+html[data-hr-dark] ::selection{background:#0a84ff;color:#fff}
+html[data-hr-dark] ::-moz-selection{background:#0a84ff;color:#fff}
+html[data-hr-dark] .hr-lite ::selection{background:#cfe6ff;color:#0f172a}
+/* Secondary/hint text that was too dim on dark cards. */
+html[data-hr-dark] .card-title,html[data-hr-dark] .field label{color:var(--hrink)}
 .ios-themebtn{width:34px;height:34px;border-radius:50%;border:none;background:var(--hrcard);color:var(--hrink);font-size:16px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
 /* Cutting Planner animations: cuts draw left→right, bars fade in one at a time, stat numbers tick */
 @keyframes cutDrawIn{from{transform:scaleX(0);opacity:0.4}to{transform:scaleX(1);opacity:1}}
@@ -16001,7 +16007,9 @@ function PayrollModule({ plant, me }) {
       else if (r.status==='on_duty') odOT += Math.max(0, h - shift);     // on duty → OT only beyond shift, never short
       else normalDelta += (h - shift);                                    // net vs shift, settled monthly
     }
-    const otHours = Math.max(0, normalDelta) + sundayHolidayOT + odOT;
+    // Some staff aren't eligible for overtime — extra hours are simply unpaid.
+    const otEligible = cfg.components ? (cfg.components.ot_eligible !== false) : (cfg.ot_eligible !== false);
+    const otHours = otEligible ? (Math.max(0, normalDelta) + sundayHolidayOT + odOT) : 0;
     const shortHours = Math.max(0, -normalDelta);
     const billableShort = Math.max(0, shortHours - permAllow);           // after permission allowance
     const lopLeave = Math.max(0, leaveDays - leaveAllow);                 // leave beyond allowance
@@ -16104,9 +16112,14 @@ function PayrollConfigModal({ plant, employee, config, onClose, onSaved }) {
     (config?.components?.deductions || []).map(d => ({ label: d.label, kind: d.kind || 'fixed', value: String(d.value ?? ''), maxGross: d.maxGross ? String(d.maxGross) : '' })));
   const [start, setStart] = useState((config?.shift_start || '09:00').slice(0, 5));
   const [end, setEnd] = useState((config?.shift_end || '17:30').slice(0, 5));
+  const [otEligible, setOtEligible] = useState(config?.components ? (config.components.ot_eligible !== false) : (config?.ot_eligible !== false));
   const [mult, setMult] = useState(config?.ot_multiplier ?? 1.5);
   const [perm, setPerm] = useState(config?.permission_hours ?? 0);
   const [leave, setLeave] = useState(config?.paid_leave_days ?? 0);
+  const bonusInit = config?.components?.attendance_bonus || null;
+  const [bonusOn, setBonusOn] = useState(!!(bonusInit && Number(bonusInit.value)));
+  const [bonusType, setBonusType] = useState(bonusInit?.type || 'fixed');
+  const [bonusValue, setBonusValue] = useState(bonusInit ? String(bonusInit.value ?? '') : '');
   const [busy, setBusy] = useState(false);
 
   const toH = (t) => { const [h, m] = String(t).split(':').map(Number); return (h || 0) + (m || 0) / 60; };
@@ -16128,6 +16141,10 @@ function PayrollConfigModal({ plant, employee, config, onClose, onSaved }) {
         ot_multiplier: Number(mult) || 1.5, permission_hours: Number(perm) || 0, paid_leave_days: Number(leave) || 0,
         updated_at: new Date().toISOString(),
       };
+      // ot_eligible + attendance_bonus live in components so they persist for both
+      // flat and detailed salaries (no schema change needed).
+      const extras = { ot_eligible: otEligible };
+      if (bonusOn && Number(bonusValue)) extras.attendance_bonus = { type: bonusType, value: Number(bonusValue) };
       if (structured) {
         const earn = earnings.filter(e => (e.label || '').trim()).map(e => ({ label: e.label.trim(), amount: Number(e.amount) || 0 }));
         const ded = deductions.filter(d => (d.label || '').trim()).map(d => {
@@ -16135,10 +16152,10 @@ function PayrollConfigModal({ plant, employee, config, onClose, onSaved }) {
           if ((d.kind === 'pct_basic' || d.kind === 'pct_gross') && Number(d.maxGross)) o.maxGross = Number(d.maxGross);
           return o;
         });
-        payload.components = { earnings: earn, deductions: ded };
+        payload.components = { earnings: earn, deductions: ded, ...extras };
         payload.monthly_salary = earn.reduce((s, e) => s + e.amount, 0);   // keep flat consumers working
       } else {
-        payload.components = null;
+        payload.components = extras;   // no earnings → computePayslip stays in flat mode
         payload.monthly_salary = Number(salary) || 0;
       }
       const { error } = await sb.from('mcp_payroll_config').upsert(payload, { onConflict: 'plant_id,user_id' });
@@ -16195,17 +16212,58 @@ function PayrollConfigModal({ plant, employee, config, onClose, onSaved }) {
           <div class="field"><label>Shift end</label><input type="time" value=${end} onChange=${e => setEnd(e.target.value)} /></div>
         </div>
         <div style="font-size:11px;color:var(--slate-500);margin:-4px 0 8px">Shift = <strong>${shiftH} h/day</strong>. Working more is OT; less is short-time.</div>
-        <div class="field"><label>OT multiplier</label>
-          <select value=${mult} onChange=${e => setMult(e.target.value)}>
-            <option value=${1}>1× (same rate)</option>
-            <option value=${1.5}>1.5×</option>
-            <option value=${2}>2×</option>
-          </select>
+        <div class="field">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600">
+            <input type="checkbox" checked=${otEligible} onChange=${e => setOtEligible(e.target.checked)} style="width:auto" /> Eligible for overtime (OT)
+          </label>
+          ${otEligible ? html`
+            <label style="font-size:12px;color:var(--slate-600);margin:8px 0 3px;display:block">OT rate</label>
+            <select value=${mult} onChange=${e => setMult(e.target.value)}>
+              <option value=${1}>1× (same hourly rate)</option>
+              <option value=${1.5}>1.5×</option>
+              <option value=${2}>2×</option>
+            </select>
+          ` : html`<div style="font-size:11px;color:var(--slate-500);margin-top:5px">No overtime — extra hours worked are unpaid for this employee.</div>`}
         </div>
         <div class="field-row">
           <div class="field"><label>Permission allowance (hrs/mo)</label><input type="number" min=${0} step="0.5" value=${perm} onChange=${e => setPerm(e.target.value)} /></div>
           <div class="field"><label>Paid leave (days/mo)</label><input type="number" min=${0} step="0.5" value=${leave} onChange=${e => setLeave(e.target.value)} /></div>
         </div>
+
+        <div style="border-top:1px solid var(--slate-100);margin:12px 0 10px"></div>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600;font-size:14px">
+          <input type="checkbox" checked=${bonusOn} onChange=${e => setBonusOn(e.target.checked)} style="width:auto" /> 🎯 Attendance bonus
+        </label>
+        <div style="font-size:11px;color:var(--slate-500);margin:3px 0 8px">Paid only when the employee has <b>no absent / half days</b> that month.</div>
+        ${bonusOn ? html`<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+          <select value=${bonusType} onChange=${e => setBonusType(e.target.value)} style="padding:9px 8px;border:1px solid var(--slate-300);border-radius:7px;font-size:13px">
+            <option value="fixed">Fixed ₹</option>
+            <option value="pct">% of salary</option>
+          </select>
+          <div style="flex:1">${inp(bonusValue, setBonusValue, bonusType === 'fixed' ? 'e.g. 1000' : 'e.g. 5', 'number')}</div>
+        </div>` : ''}
+
+        ${(() => {
+          const sal = structured ? gross : (Number(salary) || 0);
+          if (!sal) return html`<div style="font-size:11px;color:var(--slate-400);margin:10px 0 4px">Enter a salary to see an example calculation.</div>`;
+          const pcfg = { monthly_salary: sal, components: {
+            ...(structured ? {
+              earnings: earnings.map(e => ({ label: e.label, amount: Number(e.amount) || 0 })),
+              deductions: deductions.filter(d => (d.label || '').trim()).map(d => { const o = { label: d.label, kind: d.kind, value: Number(d.value) || 0 }; if ((d.kind === 'pct_basic' || d.kind === 'pct_gross') && Number(d.maxGross)) o.maxGross = Number(d.maxGross); return o; }),
+            } : {}),
+            ...(bonusOn && Number(bonusValue) ? { attendance_bonus: { type: bonusType, value: Number(bonusValue) } } : {}),
+          } };
+          const full = computePayslip(pcfg, { present: 30, half: 0, leave: 0, absent: 0, off: 0 }, 30);
+          const abs2 = computePayslip(pcfg, { present: 28, half: 0, leave: 0, absent: 2, off: 0 }, 30);
+          const m = (n) => '₹' + Math.round(n).toLocaleString('en-IN');
+          return html`<div style="background:var(--slate-50);border:1px solid var(--slate-200);border-radius:10px;padding:10px 12px;margin:12px 0 4px">
+            <div style="font-size:12px;font-weight:700;color:var(--slate-700);margin-bottom:6px">📊 Example net pay (30-day month)</div>
+            <div style="display:flex;justify-content:space-between;font-size:13px;padding:3px 0"><span style="color:var(--slate-600)">Full attendance</span><b style="color:var(--emerald-700)">${m(full.net)}</b></div>
+            <div style="display:flex;justify-content:space-between;font-size:13px;padding:3px 0;border-top:1px dashed var(--slate-200)"><span style="color:var(--slate-600)">With 2 days absent</span><b style="color:var(--slate-800)">${m(abs2.net)}</b></div>
+            ${full.bonus > 0 ? html`<div style="font-size:11px;color:var(--emerald-700);margin-top:5px">✓ Full attendance includes ${m(full.bonus)} attendance bonus (lost with any absence)</div>` : ''}
+            <div style="font-size:10.5px;color:var(--slate-500);margin-top:5px">Leave within the allowance is paid; absent days reduce pay. Actual OT is added from punched hours.</div>
+          </div>`;
+        })()}
         <button class="btn" style="width:100%" disabled=${busy} onClick=${save}>${busy ? 'Saving…' : 'Save pay'}</button>
       </div>
     </div>
@@ -16637,8 +16695,16 @@ function computePayslip(cfg, counts, days) {
     if (amt > 0) dedLines.push({ label: d.label || 'Deduction', amount: amt });
   }
   const totalDed = dedLines.reduce((s, d) => s + d.amount, 0);
-  const net = Math.max(0, Math.round(gross - totalDed));
-  return { structured, earnings, gross, basic, present, half, leave, absent, off, days, deductDays, payableDays, lop: Math.round(lop), earnedGross: Math.round(earnedGross), dedLines, totalDed, net };
+  // Attendance bonus — a flat reward paid ONLY on full attendance (no absent/half
+  // days this month). Fixed ₹ or % of gross. Not prorated and not subject to LOP/PF.
+  let bonus = 0;
+  const ab = comp && comp.attendance_bonus;
+  if (ab && Number(ab.value) && deductDays === 0) {
+    bonus = ab.type === 'pct' ? Math.round(gross * Number(ab.value) / 100) : Math.round(Number(ab.value));
+  }
+  const outEarnings = bonus > 0 ? [...earnings, { label: 'Attendance bonus', amount: bonus }] : earnings;
+  const net = Math.max(0, Math.round(gross - totalDed)) + bonus;
+  return { structured, earnings: outEarnings, gross: gross + bonus, basic, present, half, leave, absent, off, days, deductDays, payableDays, lop: Math.round(lop), earnedGross: Math.round(earnedGross), dedLines, totalDed, bonus, net };
 }
 
 // Indian-format amount in words (rupees only).
@@ -16779,8 +16845,8 @@ function HrPayroll({ plant, me }) {
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'salary_' + month + '.csv'; a.click(); URL.revokeObjectURL(a.href);
   };
 
-  const shareReport = async () => {
-    setBusy('report'); await ensureJsPDF(); const { jsPDF } = window.jspdf;
+  const buildReportDoc = async () => {
+    await ensureJsPDF(); const { jsPDF } = window.jspdf;
     const doc = new jsPDF({ unit: 'mm', format: 'a4' }); const M = 12;
     doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.setTextColor(13, 148, 136);
     doc.text((plant?.name || 'Company') + ' — Salary Report', M, 16);
@@ -16792,8 +16858,26 @@ function HrPayroll({ plant, me }) {
       body: rows.map(r => [r.emp.full_name || '', rs(r.calc.gross), r.calc.present, r.calc.half, r.calc.leave, r.calc.absent, r.calc.payableDays.toFixed(1), rs(r.calc.net)]),
       styles: { fontSize: 8 }, headStyles: { fillColor: [13, 148, 136] }, theme: 'grid', margin: { left: M, right: M },
     });
-    setBusy('');
-    await shareOrDownloadPdf(doc, 'salary_report_' + month + '.pdf', null, (plant?.name || 'Company') + ' salary report — ' + label + '. Total payout ' + rs(totalNet) + '.');
+    return doc;
+  };
+  const reportName = () => 'salary_report_' + month + '.pdf';
+  const reportNote = () => (plant?.name || 'Company') + ' salary report — ' + label + '. Total payout ' + rs(totalNet) + '.';
+
+  const shareReport = async () => { setBusy('report'); const doc = await buildReportDoc(); setBusy(''); await shareOrDownloadPdf(doc, reportName(), null, reportNote()); };
+  const downloadReportPdf = async () => { setBusy('pdf'); const doc = await buildReportDoc(); setBusy(''); doc.save(reportName()); };
+  const emailReport = async () => {
+    // Attach the PDF via the share sheet (Gmail/Mail appear there); also prime a
+    // mailto so a plain email with the summary works even without native share.
+    setBusy('email'); const doc = await buildReportDoc(); setBusy('');
+    const subject = (plant?.name || 'Company') + ' — Salary Report ' + label;
+    const bodyLines = rows.map(r => '• ' + (r.emp.full_name || '') + ': ' + rs(r.calc.net)).join('\n');
+    const body = reportNote() + '\n\n' + bodyLines + '\n\n(Detailed PDF attached / downloaded.)';
+    try {
+      const blob = doc.output('blob'); const file = new File([blob], reportName(), { type: 'application/pdf' });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: subject, text: body }); return; }
+    } catch (_) { return; }
+    doc.save(reportName());
+    window.location.href = 'mailto:?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
   };
 
   const sendPayslip = async (r) => {
@@ -16806,10 +16890,13 @@ function HrPayroll({ plant, me }) {
   return html`
     <div style="max-width:680px;margin:0 auto">
       <div class="page-header"><h1>💰 Salary & Payslips</h1><div class="sub">Computed from attendance · one-tap payslips</div></div>
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
-        <input type="month" value=${month} max=${now.toISOString().slice(0, 7)} onInput=${e => setMonth(e.target.value)} style="padding:8px 10px;border:1px solid var(--slate-300);border-radius:8px;font-size:14px" />
-        <button class="btn ghost small" onClick=${downloadCsv}>⬇ Excel/CSV</button>
-        <button class="btn small" disabled=${busy === 'report'} onClick=${shareReport}>${busy === 'report' ? '…' : '📤 Share report'}</button>
+      <input type="month" value=${month} max=${now.toISOString().slice(0, 7)} onInput=${e => setMonth(e.target.value)} style="padding:8px 10px;border:1px solid var(--slate-300);border-radius:8px;font-size:14px;margin-bottom:10px" />
+      <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:.4px;margin:0 2px 6px">Salary report</div>
+      <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:14px">
+        <button class="btn small" disabled=${busy === 'report'} onClick=${shareReport}>${busy === 'report' ? '…' : '📤 Share / WhatsApp'}</button>
+        <button class="btn small" disabled=${busy === 'email'} onClick=${emailReport}>${busy === 'email' ? '…' : '📧 Email report'}</button>
+        <button class="btn ghost small" disabled=${busy === 'pdf'} onClick=${downloadReportPdf}>${busy === 'pdf' ? '…' : '⬇ Download PDF'}</button>
+        <button class="btn ghost small" onClick=${downloadCsv}>⬇ Excel / CSV</button>
       </div>
 
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` : html`
