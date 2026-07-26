@@ -2225,7 +2225,7 @@ const OPT_IN_TAB_KEYS = new Set(['self_attendance', 'attendance', 'attendance_se
 // the PWA and each browser tab are separate contexts) and is never shared. The HR
 // APK launches with ?app=hr, so every cold start re-derives HR; sessionStorage
 // keeps it across in-app refreshes. The full-app PWA/browser never set it → full.
-const HR_APP_KEYS = new Set(['home', 'more', 'face_attendance', 'attendance', 'self_attendance', 'attendance_setup', 'people', 'petty_cash', 'hr_payroll']);
+const HR_APP_KEYS = new Set(['home', 'more', 'face_attendance', 'attendance', 'self_attendance', 'attendance_setup', 'people', 'petty_cash', 'hr_payroll', 'shift_planner']);
 const APP_MODE = (() => {
   try {
     // Purge the old GLOBAL flag that leaked between the APK and the PWA (auto-unsticks affected devices).
@@ -3140,6 +3140,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'chat'}><${Chat} plant=${plant} me=${me} myPerms=${myPerms} user=${user} onUnreadChange=${recalcUnread} deepLinkGroupId=${DEEP_LINK?.group} navAction=${navAction} setTab=${setTab} /></${Page}>
       <${Page} active=${pageTab === 'people'}>${isHrApp() ? html`<${HrEmployees} plant=${plant} me=${me} />` : html`<${People} plant=${plant} me=${me} myPerms=${myPerms} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} />`}</${Page}>
       ${isHrApp() ? html`<${Page} active=${pageTab === 'hr_payroll'}><${HrPayroll} plant=${plant} me=${me} /></${Page}>` : ''}
+      ${isHrApp() ? html`<${Page} active=${pageTab === 'shift_planner'}><div class="hr-lite"><${ShiftPlanner} plant=${plant} me=${me} /></div></${Page}>` : ''}
       <${Page} active=${pageTab === 'masters'}><${MastersHub} plant=${plant} me=${me} myPerms=${myPerms} setTab=${setTab} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'iatf'}><${IatfDashboard} plant=${plant} me=${me} setTab=${setTab} /></${Page}>
       <${Page} active=${pageTab === 'calibration'}><${CalibrationModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -16499,8 +16500,8 @@ function HrHome({ plant, me, setTab }) {
         ${Action('🗓️', 'Attendance', 'attendance')}
         ${Action('💰', 'Salary', 'hr_payroll')}
         ${Action('👥', 'Employees', 'people')}
+        ${Action('🔄', 'Shifts', 'shift_planner')}
         ${Action('📍', 'Punch IN', 'self_attendance')}
-        ${Action('🧾', 'Petty Cash', 'petty_cash')}
         ${Action('⚙️', 'Setup', 'attendance_setup')}
       </div>
     </div>
@@ -16807,6 +16808,206 @@ async function makePayslipPdf(plant, emp, calc, monthLabel) {
   doc.setFont('helvetica', 'normal'); doc.setFontSize(7.5); doc.setTextColor.apply(doc, mute);
   doc.text('Computed from attendance on ' + new Date().toLocaleDateString('en-IN') + '. Computer-generated payslip — no signature required.', M, 285);
   return doc;
+}
+
+// =================================================================
+// SHIFT PLANNER — define reusable shift templates (name + timing) and allocate
+// each employee a shift per day on a weekly grid. Copy last week, share the
+// roster to WhatsApp in one tap. Rotational shifts = just reassign each week.
+// =================================================================
+const _dstr = (d) => d.toISOString().slice(0, 10);
+const shTodayStr = () => _dstr(new Date(Date.now() + 5.5 * 3600 * 1000));
+const shAddDays = (s, n) => { const d = new Date(s + 'T00:00:00'); d.setDate(d.getDate() + n); return _dstr(d); };
+const shMonday = (s) => { const d = new Date(s + 'T00:00:00'); const wd = (d.getDay() + 6) % 7; return shAddDays(s, -wd); };
+const shWeek = (mon) => Array.from({ length: 7 }, (_, i) => shAddDays(mon, i));
+const shHM = (t) => String(t || '').slice(0, 5);
+const shDayLbl = (d) => new Date(d + 'T00:00:00').toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric' });
+const SHIFT_PRESETS = [
+  { name: 'General', start_time: '09:00', end_time: '17:30', color: '#0a84ff' },
+  { name: 'Morning', start_time: '06:00', end_time: '14:00', color: '#f59e0b' },
+  { name: 'Evening', start_time: '14:00', end_time: '22:00', color: '#7c3aed' },
+  { name: 'Night', start_time: '22:00', end_time: '06:00', color: '#334155' },
+];
+
+function ShiftPlanner({ plant, me }) {
+  const [emps, setEmps] = useState([]);
+  const [templates, setTemplates] = useState([]);
+  const [assign, setAssign] = useState({});          // `${uid}|${date}` -> {template_id, is_off}
+  const [weekStart, setWeekStart] = useState(() => shMonday(shTodayStr()));
+  const [loading, setLoading] = useState(true);
+  const [picker, setPicker] = useState(null);        // { uid, name, date }
+  const [manageOpen, setManageOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const dates = useMemo(() => shWeek(weekStart), [weekStart]);
+  const tplById = useMemo(() => { const m = {}; templates.forEach(t => m[t.id] = t); return m; }, [templates]);
+
+  const loadStatic = useCallback(async () => {
+    const [{ data: us }, { data: tp }] = await Promise.all([
+      sb.from('users').select('id, full_name').eq('plant_id', plant.id).eq('status', 'active').order('full_name'),
+      sb.from('mcp_shift_templates').select('*').eq('plant_id', plant.id).eq('active', true).order('sort').order('start_time'),
+    ]);
+    setEmps((us || []).filter(u => u.id !== me.id));
+    setTemplates(tp || []);
+  }, [plant.id, me.id]);
+
+  const loadWeek = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('mcp_shift_assignments').select('user_id, date, template_id, is_off')
+      .eq('plant_id', plant.id).gte('date', dates[0]).lte('date', dates[6]);
+    const m = {}; (data || []).forEach(r => { m[r.user_id + '|' + r.date] = { template_id: r.template_id, is_off: r.is_off }; });
+    setAssign(m); setLoading(false);
+  }, [plant.id, dates]);
+
+  useEffect(() => { loadStatic(); }, [loadStatic]);
+  useEffect(() => { loadWeek(); }, [loadWeek]);
+
+  const setCell = async (uid, date, val) => {
+    const key = uid + '|' + date;
+    setAssign(a => { const n = { ...a }; if (!val) delete n[key]; else n[key] = val; return n; });
+    setPicker(null);
+    if (!val) await sb.from('mcp_shift_assignments').delete().eq('plant_id', plant.id).eq('user_id', uid).eq('date', date);
+    else await sb.from('mcp_shift_assignments').upsert({ plant_id: plant.id, user_id: uid, date, template_id: val.template_id || null, is_off: !!val.is_off, updated_at: new Date().toISOString() }, { onConflict: 'plant_id,user_id,date' });
+  };
+
+  const copyLastWeek = async () => {
+    if (!confirm('Copy last week’s shifts into this week? Existing entries this week are overwritten.')) return;
+    setBusy(true);
+    const { data } = await sb.from('mcp_shift_assignments').select('user_id, date, template_id, is_off')
+      .eq('plant_id', plant.id).gte('date', shAddDays(weekStart, -7)).lte('date', shAddDays(weekStart, -1));
+    const rows = (data || []).map(r => ({ plant_id: plant.id, user_id: r.user_id, date: shAddDays(r.date, 7), template_id: r.template_id, is_off: r.is_off, updated_at: new Date().toISOString() }));
+    if (rows.length) await sb.from('mcp_shift_assignments').upsert(rows, { onConflict: 'plant_id,user_id,date' });
+    await loadWeek(); setBusy(false);
+    showToast(rows.length ? '✓ Copied ' + rows.length + ' shifts' : 'Last week was empty');
+  };
+
+  const shareRoster = async () => {
+    let msg = '*' + (plant?.name || 'Company') + ' — Shift Roster*\n' + shDayLbl(dates[0]) + ' – ' + shDayLbl(dates[6]) + '\n';
+    for (const e of emps) {
+      const parts = dates.map(d => {
+        const c = assign[e.id + '|' + d]; if (!c) return null;
+        const day = shDayLbl(d).split(' ')[0];
+        if (c.is_off) return day + ' Off';
+        const t = tplById[c.template_id]; return t ? day + ' ' + t.name : null;
+      }).filter(Boolean);
+      if (parts.length) msg += '\n*' + e.full_name + '*\n' + parts.join(' · ') + '\n';
+    }
+    if (templates.length) msg += '\nShift timings:\n' + templates.map(t => '• ' + t.name + ' ' + shHM(t.start_time) + '–' + shHM(t.end_time)).join('\n');
+    try { if (navigator.share) { await navigator.share({ title: 'Shift Roster', text: msg }); return; } } catch (_) { return; }
+    window.open('https://wa.me/?text=' + encodeURIComponent(msg), '_blank');
+  };
+
+  const cellView = (uid, date) => {
+    const c = assign[uid + '|' + date];
+    if (!c) return html`<span style="color:var(--slate-300);font-size:16px">＋</span>`;
+    if (c.is_off) return html`<span style="font-size:11px;font-weight:700;color:var(--slate-500)">Off</span>`;
+    const t = tplById[c.template_id];
+    if (!t) return html`<span style="color:var(--slate-300)">–</span>`;
+    return html`<span style="font-size:10.5px;font-weight:700;color:#fff;background:${t.color || '#0a84ff'};padding:3px 6px;border-radius:6px;white-space:nowrap">${t.name}</span>`;
+  };
+
+  return html`
+    <div style="max-width:920px;margin:0 auto">
+      <div class="page-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+        <div><h1>🔄 Shift Planner</h1><div class="sub">Weekly roster · tap a cell to assign</div></div>
+        <button class="btn small ghost" onClick=${() => setManageOpen(true)}>⚙ Shifts</button>
+      </div>
+
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+        <button class="btn small ghost" onClick=${() => setWeekStart(w => shAddDays(w, -7))}>‹ Prev</button>
+        <div style="font-size:13px;font-weight:700;color:var(--slate-700);flex:1;text-align:center;min-width:130px">${shDayLbl(dates[0])} – ${shDayLbl(dates[6])}</div>
+        <button class="btn small ghost" onClick=${() => setWeekStart(w => shAddDays(w, 7))}>Next ›</button>
+        <button class="btn small ghost" onClick=${() => setWeekStart(shMonday(shTodayStr()))}>This week</button>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+        <button class="btn small" disabled=${busy} onClick=${shareRoster}>📤 Share roster (WhatsApp)</button>
+        <button class="btn small ghost" disabled=${busy} onClick=${copyLastWeek}>⧉ Copy last week</button>
+      </div>
+
+      ${templates.length === 0 ? html`
+        <div class="card" style="text-align:center;padding:22px">
+          <div style="font-size:14px;font-weight:600;margin-bottom:4px">No shifts defined yet</div>
+          <div style="font-size:12px;color:var(--slate-500);margin-bottom:12px">Add your shift timings (e.g. General 09:00–17:30, Night 22:00–06:00) — then assign them on the grid.</div>
+          <button class="btn" onClick=${() => setManageOpen(true)}>＋ Add shifts</button>
+        </div>
+      ` : loading ? html`<div class="loader"><div class="spinner"></div></div>` : html`
+        <div class="card" style="padding:0;overflow-x:auto">
+          <table style="border-collapse:collapse;width:100%;min-width:640px">
+            <thead><tr style="background:var(--slate-50)">
+              <th style="position:sticky;left:0;background:var(--slate-50);text-align:left;padding:8px 10px;font-size:11px;color:var(--slate-500);z-index:2;min-width:120px">Employee</th>
+              ${dates.map(d => html`<th key=${d} style="padding:8px 6px;font-size:10.5px;color:${d === shTodayStr() ? 'var(--teal-700)' : 'var(--slate-500)'};font-weight:700;min-width:70px">${shDayLbl(d)}</th>`)}
+            </tr></thead>
+            <tbody>
+              ${emps.map(e => html`<tr key=${e.id} style="border-top:1px solid var(--slate-100)">
+                <td style="position:sticky;left:0;background:#fff;padding:8px 10px;font-size:12.5px;font-weight:600;color:var(--slate-800);z-index:1;min-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px">${e.full_name}</td>
+                ${dates.map(d => html`<td key=${d} style="padding:4px;text-align:center">
+                  <button onClick=${() => setPicker({ uid: e.id, name: e.full_name, date: d })} style="width:100%;min-height:32px;border:1px dashed var(--slate-200);background:none;border-radius:8px;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:4px">${cellView(e.id, d)}</button>
+                </td>`)}
+              </tr>`)}
+            </tbody>
+          </table>
+        </div>
+        <div style="font-size:11px;color:var(--slate-500);margin-top:8px;display:flex;gap:10px;flex-wrap:wrap">
+          ${templates.map(t => html`<span key=${t.id} style="display:inline-flex;align-items:center;gap:4px"><span style="width:10px;height:10px;border-radius:3px;background:${t.color || '#0a84ff'};display:inline-block"></span>${t.name} ${shHM(t.start_time)}–${shHM(t.end_time)}</span>`)}
+        </div>
+      `}
+
+      ${picker && html`<div class="llk-sheet-back" onClick=${ev => { if (ev.target === ev.currentTarget) setPicker(null); }}>
+        <div class="llk-sheet">
+          <div class="grip"></div>
+          <div style="padding:4px 18px 10px"><div style="font-size:15px;font-weight:800;color:var(--slate-800)">${picker.name}</div><div style="font-size:12px;color:var(--slate-500)">${shDayLbl(picker.date)}</div></div>
+          <div style="padding:0 14px 14px;display:flex;flex-direction:column;gap:8px">
+            ${templates.map(t => html`<button key=${t.id} class="btn" style="background:${t.color || '#0a84ff'};justify-content:flex-start" onClick=${() => setCell(picker.uid, picker.date, { template_id: t.id })}>${t.name} · ${shHM(t.start_time)}–${shHM(t.end_time)}</button>`)}
+            <button class="btn ghost" onClick=${() => setCell(picker.uid, picker.date, { is_off: true })}>🌙 Week-off</button>
+            <button class="btn ghost" style="color:var(--rose-600)" onClick=${() => setCell(picker.uid, picker.date, null)}>Clear</button>
+          </div>
+        </div>
+      </div>`}
+
+      ${manageOpen && html`<${ShiftTemplatesModal} plant=${plant} templates=${templates} onClose=${() => setManageOpen(false)} onChanged=${() => { loadStatic(); }} />`}
+    </div>
+  `;
+}
+
+function ShiftTemplatesModal({ plant, templates, onClose, onChanged }) {
+  const [f, setF] = useState({ name: '', start_time: '09:00', end_time: '17:30', color: '#0a84ff' });
+  const [busy, setBusy] = useState(false);
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+
+  const add = async () => {
+    if (!f.name.trim()) { alert('Give the shift a name'); return; }
+    setBusy(true);
+    const { error } = await sb.from('mcp_shift_templates').insert({ plant_id: plant.id, name: f.name.trim(), start_time: f.start_time, end_time: f.end_time, color: f.color, sort: templates.length });
+    setBusy(false);
+    if (error) { alert(error.message); return; }
+    setF({ name: '', start_time: '09:00', end_time: '17:30', color: '#0a84ff' }); onChanged();
+  };
+  const addPreset = async (p) => { setBusy(true); await sb.from('mcp_shift_templates').insert({ plant_id: plant.id, ...p, sort: templates.length }); setBusy(false); onChanged(); };
+  const remove = async (id) => { if (!confirm('Remove this shift? Past roster entries keep their timing.')) return; await sb.from('mcp_shift_templates').update({ active: false }).eq('id', id); onChanged(); };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:460px">
+        <div class="modal-header"><div class="modal-title">Shifts</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${templates.length === 0 ? html`<div style="font-size:12px;color:var(--slate-500);margin-bottom:10px">Quick add: ${SHIFT_PRESETS.map(p => html`<button key=${p.name} class="btn small ghost" style="margin:2px" onClick=${() => addPreset(p)}>＋ ${p.name}</button>`)}</div>` :
+          html`<div style="margin-bottom:12px">${templates.map(t => html`<div key=${t.id} style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--slate-100)">
+            <span style="width:12px;height:12px;border-radius:4px;background:${t.color || '#0a84ff'}"></span>
+            <div style="flex:1"><div style="font-size:13px;font-weight:600;color:var(--slate-800)">${t.name}</div><div style="font-size:11px;color:var(--slate-500)">${shHM(t.start_time)}–${shHM(t.end_time)}</div></div>
+            <button class="btn small ghost" style="color:var(--rose-600)" onClick=${() => remove(t.id)}>Remove</button>
+          </div>`)}</div>`}
+        <div style="border-top:1px solid var(--slate-100);padding-top:10px">
+          <div style="font-size:12px;font-weight:700;color:var(--slate-700);margin-bottom:6px">Add a shift</div>
+          <div class="field"><label>Name</label><input value=${f.name} onInput=${e => set('name', e.target.value)} placeholder="e.g. Morning / General / Night" /></div>
+          <div class="field-row">
+            <div class="field"><label>Start</label><input type="time" value=${f.start_time} onChange=${e => set('start_time', e.target.value)} /></div>
+            <div class="field"><label>End</label><input type="time" value=${f.end_time} onChange=${e => set('end_time', e.target.value)} /></div>
+            <div class="field" style="max-width:70px"><label>Colour</label><input type="color" value=${f.color} onChange=${e => set('color', e.target.value)} style="padding:2px;height:38px" /></div>
+          </div>
+          <button class="btn" style="width:100%" disabled=${busy} onClick=${add}>${busy ? 'Saving…' : '＋ Add shift'}</button>
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function HrPayroll({ plant, me }) {
