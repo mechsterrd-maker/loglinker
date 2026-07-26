@@ -1,9 +1,9 @@
 // sw.js — Loglinkr Service Worker
 // Handles: PWA install, offline shell, Web Push notifications, click routing
 
-const CACHE_NAME = 'loglinkr-v15';
+const CACHE_NAME = 'loglinkr-v16';
 const SHARE_CACHE = 'loglinkr-share';
-const APP_SHELL = ['/app'];
+const APP_SHELL = ['/app', '/assets/kiosk-face-1.jpg', '/assets/kiosk-face-2.jpg'];
 // CDN hosts whose assets (Preact/htm, jsPDF, face-api script + face models) must
 // be cached so the app boots AND face recognition works with no internet. These
 // URLs are version-pinned, so cache-first can never serve something stale.
