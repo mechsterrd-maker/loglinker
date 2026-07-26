@@ -182,6 +182,17 @@ body{
 .modal{background:white;width:100%;max-width:520px;border-radius:18px;padding:20px 18px;max-height:calc(100vh - 32px);overflow-y:auto;-webkit-overflow-scrolling:touch;animation:fadeInUp 0.22s ease;margin:auto;box-shadow:0 20px 60px rgba(15,23,42,0.25)}
 @keyframes fadeInUp{from{opacity:0;transform:translateY(8px) scale(0.98)}to{opacity:1;transform:translateY(0) scale(1)}}
 @keyframes slideUp{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+/* HR home: tappable stat tiles + a slide-up detail sheet */
+@keyframes llkSheetUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
+@keyframes llkBackIn{from{opacity:0}to{opacity:1}}
+@keyframes llkRowIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.llk-tile{cursor:pointer;transition:transform .12s ease,box-shadow .15s ease;-webkit-tap-highlight-color:transparent}
+.llk-tile:active{transform:scale(.95)}
+.llk-tile:hover{box-shadow:0 6px 18px rgba(15,23,42,.10)}
+.llk-sheet-back{position:fixed;inset:0;z-index:200;background:rgba(15,23,42,.45);backdrop-filter:blur(3px);display:flex;align-items:flex-end;justify-content:center;animation:llkBackIn .2s ease}
+.llk-sheet{width:100%;max-width:640px;background:#fff;border-radius:20px 20px 0 0;max-height:78vh;overflow-y:auto;animation:llkSheetUp .32s cubic-bezier(.22,1,.36,1);padding-bottom:8px}
+.llk-sheet .grip{width:40px;height:4px;background:var(--slate-300);border-radius:3px;margin:10px auto 4px}
+.llk-sheet .row{animation:llkRowIn .34s ease both}
 /* Cutting Planner animations: cuts draw left→right, bars fade in one at a time, stat numbers tick */
 @keyframes cutDrawIn{from{transform:scaleX(0);opacity:0.4}to{transform:scaleX(1);opacity:1}}
 @keyframes barFadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
@@ -16227,24 +16238,32 @@ function pcINR(n) {
 function HrHome({ plant, me, setTab }) {
   const [s, setS] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [sheet, setSheet] = useState(null);      // { title, color, people:[{name, sub}] }
   const lateAfter = localStorage.getItem('llk_late_after') || '09:30';
   const istDate = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
 
   const load = useCallback(async () => {
     setLoading(true);
     const [{ data: us }, { data: att }] = await Promise.all([
-      sb.from('users').select('id').eq('plant_id', plant.id),
-      sb.from('mcp_attendance').select('user_id, status, in_time').eq('plant_id', plant.id).eq('date', istDate),
+      sb.from('users').select('id, full_name').eq('plant_id', plant.id).eq('status', 'active').order('full_name'),
+      sb.from('mcp_attendance').select('user_id, status, in_time, out_time').eq('plant_id', plant.id).eq('date', istDate),
     ]);
-    const head = (us || []).length;
-    let present = 0, leave = 0, off = 0, late = 0;
-    for (const r of (att || [])) {
-      if (r.status === 'present' || r.status === 'half_day') { present++; if (r.in_time && String(r.in_time).slice(0, 5) > lateAfter) late++; }
-      else if (r.status === 'leave') leave++;
-      else if (r.status === 'week_off' || r.status === 'holiday') off++;
+    const users = us || [];
+    const byId = {}; (att || []).forEach(r => { byId[r.user_id] = r; });
+    const hm = (t) => t ? String(t).slice(0, 5) : '';
+    // Build the per-category people lists (used by the tap-to-open sheets).
+    const present = [], yetToPunch = [], leave = [], off = [], late = [];
+    for (const u of users) {
+      const r = byId[u.id];
+      if (r && (r.status === 'present' || r.status === 'half_day')) {
+        const isLate = r.in_time && hm(r.in_time) > lateAfter;
+        present.push({ name: u.full_name, sub: 'IN ' + hm(r.in_time) + (r.out_time ? ' · OUT ' + hm(r.out_time) : '') + (r.status === 'half_day' ? ' · half-day' : '') });
+        if (isLate) late.push({ name: u.full_name, sub: 'IN ' + hm(r.in_time) + ' (after ' + lateAfter + ')' });
+      } else if (r && r.status === 'leave') { leave.push({ name: u.full_name, sub: 'On leave' }); }
+      else if (r && (r.status === 'week_off' || r.status === 'holiday')) { off.push({ name: u.full_name, sub: r.status === 'holiday' ? 'Holiday' : 'Week-off' }); }
+      else { yetToPunch.push({ name: u.full_name, sub: r && r.status === 'absent' ? 'Marked absent' : 'Not punched yet' }); }
     }
-    const yetToPunch = Math.max(0, head - present - leave - off);
-    setS({ head, present, leave, off, late, yetToPunch });
+    setS({ head: users.length, present, yetToPunch, leave, off, late });
     setLoading(false);
   }, [plant.id]);
   useEffect(() => { load(); }, [load]);
@@ -16254,12 +16273,14 @@ function HrHome({ plant, me, setTab }) {
   const first = (me?.full_name || '').split(' ')[0] || '';
   const dateLabel = new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' });
 
-  const Stat = (num, label, color) => html`<div class="card" style="padding:12px 10px;text-align:center;border-color:var(--${color}-200);background:var(--${color}-50)">
-    <div style="font-size:26px;font-weight:800;line-height:1;color:var(--${color}-700)">${num}</div>
-    <div style="font-size:11px;color:var(--slate-600);margin-top:5px;font-weight:600">${label}</div>
+  const open = (title, color, people) => setSheet({ title, color, people });
+  const Stat = (people, label, color, title) => html`<div class="card llk-tile" onClick=${() => open(title || label, color, people)}
+    style="padding:12px 10px;text-align:center;border-color:var(--${color}-200);background:var(--${color}-50)">
+    <div style="font-size:26px;font-weight:800;line-height:1;color:var(--${color}-700)">${people.length}</div>
+    <div style="font-size:11px;color:var(--slate-600);margin-top:5px;font-weight:600">${label} <span style="opacity:.5">›</span></div>
   </div>`;
-  const Action = (icon, label, key, color) => html`<button onClick=${() => setTab(key)}
-    style="display:flex;flex-direction:column;align-items:center;gap:6px;padding:14px 6px;border:1px solid var(--slate-200);background:#fff;border-radius:14px;cursor:pointer">
+  const Action = (icon, label, key, color) => html`<button class="llk-tile" onClick=${() => setTab(key)}
+    style="display:flex;flex-direction:column;align-items:center;gap:6px;padding:14px 6px;border:1px solid var(--slate-200);background:#fff;border-radius:14px">
     <span style="font-size:24px">${icon}</span><span style="font-size:12px;font-weight:600;color:var(--slate-700)">${label}</span>
   </button>`;
 
@@ -16273,13 +16294,13 @@ function HrHome({ plant, me, setTab }) {
         <button class="btn ghost small" onClick=${load} title="Refresh">↻</button>
       </div>
 
-      <button onClick=${() => setTab('face_attendance')} style="width:100%;border:none;cursor:pointer;border-radius:18px;padding:20px;margin-bottom:16px;background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:#fff;text-align:left;box-shadow:0 8px 24px rgba(13,148,136,.28)">
+      <button onClick=${() => setTab('face_attendance')} class="llk-tile" style="width:100%;border:none;border-radius:18px;padding:20px;margin-bottom:16px;background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:#fff;text-align:left;box-shadow:0 8px 24px rgba(13,148,136,.28)">
         <div style="font-size:34px;line-height:1">😀</div>
         <div style="font-size:18px;font-weight:800;margin-top:6px">Open Face Attendance Kiosk</div>
         <div style="font-size:12.5px;opacity:.92;margin-top:2px">Mount at the gate — staff punch IN/OUT by face</div>
       </button>
 
-      <div style="font-size:12px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:.5px;margin:4px 2px 8px">Today</div>
+      <div style="font-size:12px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:.5px;margin:4px 2px 8px">Today · tap to see who</div>
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` : html`
         <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px">
           ${Stat(s.present, 'Present', 'emerald')}
@@ -16287,11 +16308,26 @@ function HrHome({ plant, me, setTab }) {
           ${Stat(s.leave, 'On leave', 'slate')}
         </div>
         <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:18px">
-          ${Stat(s.late, 'Late (after ' + lateAfter + ')', 'rose')}
+          ${Stat(s.late, 'Late', 'rose', 'Late (after ' + lateAfter + ')')}
           ${Stat(s.off, 'Week-off / holiday', 'slate')}
-          ${Stat(s.head, 'Total staff', 'teal')}
+          <div class="card" style="padding:12px 10px;text-align:center;border-color:var(--teal-200);background:var(--teal-50)"><div style="font-size:26px;font-weight:800;line-height:1;color:var(--teal-700)">${s.head}</div><div style="font-size:11px;color:var(--slate-600);margin-top:5px;font-weight:600">Total staff</div></div>
         </div>
       `}
+
+      ${sheet && html`<div class="llk-sheet-back" onClick=${e => { if (e.target === e.currentTarget) setSheet(null); }}>
+        <div class="llk-sheet">
+          <div class="grip"></div>
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 18px 10px;position:sticky;top:0;background:#fff;border-bottom:1px solid var(--slate-100)">
+            <div style="font-size:16px;font-weight:800;color:var(--slate-800)">${sheet.title} · ${sheet.people.length}</div>
+            <button class="btn ghost small" onClick=${() => setSheet(null)}>Close</button>
+          </div>
+          ${sheet.people.length === 0 ? html`<div style="padding:34px;text-align:center;color:var(--slate-400)">Nobody here today.</div>` :
+            html`<div style="padding:6px 12px 4px">${sheet.people.map((p, i) => html`<div class="row" key=${p.name + i} style="display:flex;align-items:center;gap:11px;padding:10px 8px;border-bottom:1px solid var(--slate-100);animation-delay:${Math.min(i * 30, 300)}ms">
+              <div style="width:36px;height:36px;border-radius:50%;background:var(--${sheet.color}-100);color:var(--${sheet.color}-700);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;flex:none">${(p.name || '?').slice(0, 1).toUpperCase()}</div>
+              <div style="flex:1;min-width:0"><div style="font-size:14px;font-weight:600;color:var(--slate-800)">${p.name}</div><div style="font-size:11.5px;color:var(--slate-500)">${p.sub}</div></div>
+            </div>`)}</div>`}
+        </div>
+      </div>`}
 
       <div style="font-size:12px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:.5px;margin:4px 2px 8px">Quick actions</div>
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
