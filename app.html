@@ -76,6 +76,19 @@ body{
 .auth-tabs{display:flex;gap:4px;background:var(--slate-100);border-radius:10px;padding:4px;margin-bottom:24px}
 .auth-tab{flex:1;padding:8px;border-radius:7px;font-size:13px;font-weight:500;text-align:center;cursor:pointer;border:none;background:transparent;color:var(--slate-600);font-family:inherit}
 .auth-tab.active{background:white;color:var(--slate-900);box-shadow:0 1px 2px rgba(0,0,0,0.05)}
+/* Redesigned auth: high-contrast segmented toggle + Google + trial framing */
+.auth-seg{display:flex;gap:6px;background:var(--slate-100);border-radius:13px;padding:5px;margin-bottom:22px}
+.auth-seg button{flex:1;padding:12px;border-radius:9px;font-size:14.5px;font-weight:700;border:none;cursor:pointer;font-family:inherit;color:var(--slate-500);background:transparent;transition:all .15s}
+.auth-seg button.on{background:var(--teal-600);color:#fff;box-shadow:0 5px 14px rgba(13,148,136,.30)}
+.gbtn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:12px;border:1px solid var(--slate-300);border-radius:11px;background:#fff;font-size:15px;font-weight:600;color:var(--slate-800);cursor:pointer;font-family:inherit}
+.gbtn:hover{background:var(--slate-50)}
+.gbtn svg{width:18px;height:18px;flex:none}
+.auth-or{display:flex;align-items:center;gap:12px;color:var(--slate-400);font-size:12px;margin:16px 0;font-weight:600}
+.auth-or::before,.auth-or::after{content:'';flex:1;height:1px;background:var(--slate-200)}
+.auth-switch{text-align:center;font-size:13px;color:var(--slate-500);margin-top:20px}
+.auth-switch button{background:none;border:none;color:var(--teal-600);font-weight:700;cursor:pointer;font-family:inherit;font-size:13px;padding:0}
+.trial-note{text-align:center;font-size:12px;color:var(--slate-500);margin-top:14px;display:flex;gap:14px;justify-content:center;flex-wrap:wrap;font-weight:600}
+.trial-banner{background:linear-gradient(90deg,#ecfdf5,#eff6ff);border:1px solid #bbf7d0;border-radius:12px;padding:11px 14px;font-size:13px;color:#0f5132;font-weight:600;text-align:center;margin-bottom:20px}
 
 /* ================= FORM ================= */
 .field{margin-bottom:14px}
@@ -1194,6 +1207,18 @@ function AuthScreen({ onAuth, pendingInviteCode }) {
     }
   };
 
+  // Google sign-in. Requires the Google provider to be enabled in Supabase
+  // (Auth → Providers → Google) with a Google Cloud OAuth client. Once enabled,
+  // this redirects to Google and back to the current URL (keeps ?app=hr).
+  const signInGoogle = async () => {
+    setError(''); setLoading(true);
+    try {
+      const { error } = await sb.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: window.location.href } });
+      if (error) setError(error.message.includes('provider is not enabled') ? 'Google sign-in isn’t switched on yet. Use email for now.' : error.message);
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+  const GoogleIcon = html`<svg viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3c-1.6 4.7-6.1 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.5 6.5 29.5 4.5 24 4.5 13.2 4.5 4.5 13.2 4.5 24S13.2 43.5 24 43.5 43.5 34.8 43.5 24c0-1.2-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.5 6.5 29.5 4.5 24 4.5 16.3 4.5 9.7 8.9 6.3 14.7z"/><path fill="#4CAF50" d="M24 43.5c5.4 0 10.3-1.8 13.9-5l-6.4-5.4C29.5 34.7 26.9 35.5 24 35.5c-5.2 0-9.6-3.3-11.2-7.9l-6.5 5C9.6 39 16.2 43.5 24 43.5z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.1-4.1 5.4l6.4 5.4C41.4 36.5 43.5 30.8 43.5 24c0-1.2-.1-2.4.1-3.5z"/></svg>`;
+
   return html`
     <div class="auth-screen">
       <div class="auth-logo">
@@ -1214,21 +1239,34 @@ function AuthScreen({ onAuth, pendingInviteCode }) {
         </div>
       `}
 
-      <h1>${mode === 'login' ? 'Welcome back' : (hasInvite ? 'Join your plant' : 'Create your account')}</h1>
-      <p class="sub">${mode === 'login' ? 'Run your plant. From your phone.' : (hasInvite ? 'Sign up with your details below.' : 'Set up your plant in 5 minutes.')}</p>
+      ${mode === 'login' ? html`
+        <h1>Welcome back</h1>
+        <p class="sub">Log in to your account.</p>
+      ` : hasInvite ? html`
+        <h1>Join your plant</h1>
+        <p class="sub">Sign up with your details below.</p>
+      ` : html`
+        <h1>Start free</h1>
+        <p class="sub">Face Attendance &amp; HR — set up in 5 minutes.</p>
+      `}
 
-      <div class="auth-tabs">
-        <button class=${'auth-tab' + (mode === 'login' ? ' active' : '')} onClick=${() => setMode('login')}>Login</button>
-        <button class=${'auth-tab' + (mode === 'signup' ? ' active' : '')} onClick=${() => setMode('signup')}>Sign up</button>
+      ${mode === 'signup' && !hasInvite && html`<div class="trial-banner">🎉 45-day free trial · no credit card · cancel anytime</div>`}
+
+      <div class="auth-seg">
+        <button class=${mode === 'login' ? 'on' : ''} onClick=${() => { setMode('login'); setError(''); setSuccess(''); }}>Log in</button>
+        <button class=${mode === 'signup' ? 'on' : ''} onClick=${() => { setMode('signup'); setError(''); setSuccess(''); }}>Sign up</button>
       </div>
 
       ${error && html`<div class="alert error">${error}</div>`}
       ${success && html`<div class="alert success">${success}</div>`}
 
+      <button type="button" class="gbtn" disabled=${loading} onClick=${signInGoogle}>${GoogleIcon}<span>Continue with Google</span></button>
+      <div class="auth-or">or with email</div>
+
       <form onSubmit=${submit}>
         <div class="field">
           <label>Email</label>
-          <input type="email" required value=${email} onChange=${e => setEmail(e.target.value)} placeholder="you@plant.com" autoComplete="email" />
+          <input type="email" required value=${email} onChange=${e => setEmail(e.target.value)} placeholder="you@company.com" autoComplete="email" />
         </div>
         <div class="field">
           <label>Password</label>
@@ -1242,8 +1280,16 @@ function AuthScreen({ onAuth, pendingInviteCode }) {
             </button>
           </div>
         </div>
-        <button class="btn" type="submit" disabled=${loading}>${loading ? 'Working…' : (mode === 'login' ? 'Log in' : 'Create account')}</button>
+        <button class="btn" type="submit" disabled=${loading} style=${mode === 'signup' && !hasInvite ? 'background:var(--emerald-600)' : ''}>${loading ? 'Working…' : (mode === 'login' ? 'Log in' : (hasInvite ? 'Create account' : 'Start 45-day free trial'))}</button>
       </form>
+
+      ${mode === 'signup' && !hasInvite && html`<div class="trial-note"><span>✅ No card</span><span>🔒 Private</span><span>⚡ 5-min setup</span></div>`}
+
+      <div class="auth-switch">
+        ${mode === 'login'
+          ? html`New to LogLinkr? <button type="button" onClick=${() => { setMode('signup'); setError(''); setSuccess(''); }}>Start your free trial →</button>`
+          : html`Already have an account? <button type="button" onClick=${() => { setMode('login'); setError(''); setSuccess(''); }}>Log in →</button>`}
+      </div>
     </div>
   `;
 }
