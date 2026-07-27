@@ -1929,6 +1929,9 @@ function App() {
   // a new plant" during the gap and create a duplicate. Starts true (we resolve on mount).
   const [profileLoading, setProfileLoading] = useState(true);
   const [profileErr, setProfileErr] = useState(false);
+  // Re-render when the kiosk lock is toggled (lock/unlock dispatch an event).
+  const [, bumpKioskLock] = useState(0);
+  useEffect(() => { const f = () => bumpKioskLock(v => v + 1); window.addEventListener('llk-kiosk-lock-changed', f); return () => window.removeEventListener('llk-kiosk-lock-changed', f); }, []);
   // RBAC Phase 1: my permissions in the current plant. Set after loadProfile.
   // Shape: { plant_id, rbac_enforced, roles:[{id,slug,display_name}],
   //          permissions:[{module_key, action, filter}] }
@@ -2286,6 +2289,10 @@ function App() {
     </div>`;
   }
 
+  // Gate device locked to the kiosk → render ONLY the Face Kiosk (no Shell, no
+  // tabs, no other modules). Exit needs the unlock PIN.
+  if (isKioskLocked()) return html`<${KioskLockScreen} plant=${plant} me=${me} />`;
+
   // When previewing a role, the whole app renders from the role's synthetic
   // perms instead of the admin's real ones. Owner's real access is untouched.
   const effectivePerms = previewRole ? previewRole.perms : myPerms;
@@ -2293,6 +2300,34 @@ function App() {
     <${Shell} user=${user} plant=${plant} me=${me} myPerms=${effectivePerms} tab=${tab} setTab=${setTab} logout=${logout} reload=${() => loadProfile(user)} accessibleUnits=${accessibleUnits} activeUnit=${activeUnit} switchUnit=${switchUnit} />
     ${previewRole && html`<${PreviewBanner} role=${previewRole} />`}
     <${PostLoginInstallPrompt} />
+  `;
+}
+
+// Locked gate device: only the Face Kiosk, nothing else. A small lock button
+// opens a PIN prompt to leave kiosk mode.
+function KioskLockScreen({ plant, me }) {
+  const [ask, setAsk] = useState(false);
+  const [pin, setPin] = useState('');
+  const [err, setErr] = useState('');
+  const tryUnlock = () => { if (unlockKiosk(pin)) { showToast('✓ Kiosk unlocked'); } else { setErr('Wrong PIN'); setPin(''); } };
+  return html`
+    <div style="min-height:100vh;position:relative">
+      <div class="page" style="display:block;max-width:720px">
+        <${FaceAttendanceModule} plant=${plant} me=${me} locked=${true} />
+      </div>
+      <button onClick=${() => { setAsk(true); setErr(''); setPin(''); }} title="Exit kiosk (PIN)"
+        style="position:fixed;bottom:16px;right:16px;z-index:60;width:46px;height:46px;border-radius:50%;border:none;background:rgba(15,23,42,.55);color:#fff;font-size:19px;cursor:pointer;box-shadow:0 6px 16px rgba(0,0,0,.25)">🔒</button>
+      ${ask && html`<div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) setAsk(false); }}>
+        <div class="modal" style="max-width:320px;text-align:center">
+          <div class="modal-header"><div class="modal-title">Exit kiosk mode</div><button class="close-btn" onClick=${() => setAsk(false)}>×</button></div>
+          <p style="font-size:13px;color:var(--slate-500);margin-bottom:12px">Enter the unlock PIN to leave kiosk mode.</p>
+          ${err && html`<div class="alert error" style="margin-bottom:10px">${err}</div>`}
+          <input type="tel" inputmode="numeric" value=${pin} onInput=${e => setPin(e.target.value.replace(/\D/g, ''))} maxLength=${6}
+            placeholder="PIN" style="width:100%;text-align:center;letter-spacing:6px;font-size:20px;padding:10px;border:1px solid var(--slate-300);border-radius:10px;margin-bottom:12px" />
+          <button class="btn" style="width:100%" onClick=${tryUnlock} disabled=${pin.length < 4}>Unlock</button>
+        </div>
+      </div>`}
+    </div>
   `;
 }
 
@@ -2441,6 +2476,21 @@ const APP_MODE = (() => {
 let _plantAppMode = null;   // 'hr' | 'full' | null(unknown)
 function setPlantAppMode(m) { _plantAppMode = (m === 'hr') ? 'hr' : (m ? 'full' : null); try { applyHrTheme(); } catch (_) {} }
 const isHrApp = () => _plantAppMode ? (_plantAppMode === 'hr') : (APP_MODE === 'hr');
+
+// Kiosk lock — a device left at the gate can be locked to the Face Kiosk ONLY
+// (no Home / Attendance / Salary / Employees / More). Device-local; leaving
+// kiosk mode needs the unlock PIN set when locking.
+function isKioskLocked() { try { return localStorage.getItem('llk_kiosk_lock_on') === '1'; } catch (_) { return false; } }
+function lockKiosk(pin) {
+  try { localStorage.setItem('llk_kiosk_lock_on', '1'); localStorage.setItem('llk_kiosk_lock_pin', String(pin || '')); } catch (_) {}
+  try { window.dispatchEvent(new Event('llk-kiosk-lock-changed')); } catch (_) {}
+}
+function unlockKiosk(pin) {
+  try { if (String(pin) !== (localStorage.getItem('llk_kiosk_lock_pin') || '')) return false;
+    localStorage.removeItem('llk_kiosk_lock_on'); localStorage.removeItem('llk_kiosk_lock_pin'); } catch (_) { return false; }
+  try { window.dispatchEvent(new Event('llk-kiosk-lock-changed')); } catch (_) {}
+  return true;
+}
 
 // HR app appearance: 'light' | 'dark' | 'auto' (auto follows the device). Applied
 // by toggling data-hr-dark on <html>; scoped CSS vars restyle every HR screen. The
@@ -17483,7 +17533,7 @@ function punchSpeech(name, dir, offline) {
   return first + ', already marked';
 }
 
-function FaceAttendanceModule({ plant, me }) {
+function FaceAttendanceModule({ plant, me, locked }) {
   const [view, setView] = useState('kiosk');       // kiosk | people
   const [enroll, setEnroll] = useState({});         // user_id -> enrollment row
   const [users, setUsers] = useState([]);
@@ -17781,7 +17831,9 @@ function FaceAttendanceModule({ plant, me }) {
       <div><h1>😀 Face Attendance</h1><div class="sub">Gate kiosk · identifies workers by face & punches IN/OUT</div></div>
       <div style="display:flex;gap:5px">
         <button class="btn small ${view==='kiosk'?'':'ghost'}" onClick=${() => { setView('kiosk'); }}>Kiosk</button>
-        <button class="btn small ${view==='people'?'':'ghost'}" onClick=${() => { stopKiosk(); setView('people'); }}>People · ${enrolledList().length}</button>
+        ${locked
+          ? html`<span style="font-size:11px;font-weight:700;color:var(--slate-500);align-self:center">🔒 Locked to kiosk</span>`
+          : html`<button class="btn small ${view==='people'?'':'ghost'}" onClick=${() => { stopKiosk(); setView('people'); }}>People · ${enrolledList().length}</button>`}
       </div>
     </div>
 
@@ -17817,6 +17869,16 @@ function FaceAttendanceModule({ plant, me }) {
           <button class="btn" style="font-size:16px;padding:12px 28px" disabled=${engine==='loading'} onClick=${startKiosk}>${engine==='loading' ? '⏳ Loading face engine…' : '▶ Start kiosk'}</button>
           ${(() => { let n = 0; try { const c = JSON.parse(localStorage.getItem('llk_kiosk_cache_' + plant.id) || 'null'); n = c && c.users ? c.users.length : 0; } catch (_) {} return html`<div style="margin-top:10px;font-size:12px;font-weight:600;color:${n ? 'var(--emerald-700)' : 'var(--amber-700)'}">${n ? '✓ Offline-ready — ' + n + ' workers cached on this device' : '⚠ Open once online to enable offline use'}</div>`; })()}
           ${kerr && html`<div class="alert error" style="margin-top:12px;text-align:left">${kerr}</div>`}
+          ${!locked && me && (me.role === 'admin' || me.role === 'plant_head') && html`<div style="margin-top:18px;border-top:1px solid var(--slate-100);padding-top:14px">
+            <button class="btn ghost small" onClick=${() => {
+              const p1 = (prompt('Set a 4–6 digit PIN to lock THIS device to the kiosk only. You will need it to exit kiosk mode.') || '').replace(/\D/g, '');
+              if (p1.length < 4) { if (p1) alert('PIN must be at least 4 digits.'); return; }
+              const p2 = (prompt('Re-enter the PIN to confirm.') || '').replace(/\D/g, '');
+              if (p1 !== p2) { alert('PINs did not match.'); return; }
+              lockKiosk(p1);
+            }}>🔒 Lock this device to kiosk only</button>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:6px;max-width:340px;margin-left:auto;margin-right:auto">For the tablet/phone kept at the gate. Hides Home, Attendance, Salary, Employees &amp; More — only the kiosk stays. Exit needs the PIN.</div>
+          </div>`}
         ` : html`
           <div style="position:relative;max-width:520px;margin:0 auto">
             <video ref=${videoRef} playsinline muted style="width:100%;border-radius:12px;background:#000;transform:scaleX(-1)"></video>
