@@ -1409,6 +1409,128 @@ function FounderAdminPanel({ me, onClose, logout }) {
   `;
 }
 
+// ============= HR BUSINESS SETUP =============
+// Fresh, HR-only onboarding overlay shown after Google/email signup in ?app=hr.
+// Creates a pre-approved company on a 45-day trial via create_hr_plant_and_signup.
+// The full plant app keeps its own Wizard — this never touches that path.
+const HR_BIZ_TYPES = [
+  { v: 'manufacturing', t: 'Manufacturing / Factory' },
+  { v: 'engineering_fabrication', t: 'Engineering / Fabrication' },
+  { v: 'auto_components', t: 'Auto Components' },
+  { v: 'automobile_service', t: 'Automobile Service / Garage' },
+  { v: 'textiles_garment', t: 'Textiles / Garments' },
+  { v: 'food_processing', t: 'Food Processing' },
+  { v: 'restaurant_cafe', t: 'Restaurant / Café / Cloud Kitchen' },
+  { v: 'hotel_resort', t: 'Hotel / Resort / Lodge' },
+  { v: 'catering', t: 'Catering / Events' },
+  { v: 'retail_shop', t: 'Retail Shop / Store' },
+  { v: 'supermarket', t: 'Supermarket / Grocery' },
+  { v: 'wholesale_distribution', t: 'Wholesale / Distribution' },
+  { v: 'ecommerce', t: 'E-commerce / Online seller' },
+  { v: 'construction', t: 'Construction / Contractor' },
+  { v: 'real_estate', t: 'Real Estate' },
+  { v: 'logistics_transport', t: 'Logistics / Transport / Fleet' },
+  { v: 'warehouse', t: 'Warehouse / Godown' },
+  { v: 'courier', t: 'Courier / Delivery' },
+  { v: 'healthcare_clinic', t: 'Clinic / Diagnostic centre' },
+  { v: 'hospital', t: 'Hospital / Nursing home' },
+  { v: 'pharmacy', t: 'Pharmacy / Medical store' },
+  { v: 'pharma_manufacturing', t: 'Pharma Manufacturing' },
+  { v: 'education_school', t: 'School' },
+  { v: 'college_institute', t: 'College / Institute' },
+  { v: 'coaching_center', t: 'Coaching / Training centre' },
+  { v: 'it_software', t: 'IT / Software' },
+  { v: 'bpo_callcenter', t: 'BPO / Call centre' },
+  { v: 'salon_spa', t: 'Salon / Spa / Beauty' },
+  { v: 'gym_fitness', t: 'Gym / Fitness' },
+  { v: 'security_services', t: 'Security Services' },
+  { v: 'facility_housekeeping', t: 'Facility / Housekeeping' },
+  { v: 'jewellery', t: 'Jewellery' },
+  { v: 'printing_packaging', t: 'Printing / Packaging' },
+  { v: 'electronics', t: 'Electronics / Electricals' },
+  { v: 'plastics', t: 'Plastics / Moulding' },
+  { v: 'chemicals', t: 'Chemicals' },
+  { v: 'furniture', t: 'Furniture / Interiors' },
+  { v: 'agriculture_farm', t: 'Agriculture / Farm' },
+  { v: 'dairy_poultry', t: 'Dairy / Poultry' },
+  { v: 'petrol_pump', t: 'Petrol Pump' },
+  { v: 'ngo_trust', t: 'NGO / Trust' },
+  { v: 'other', t: 'Other (type your own)' },
+];
+const HR_EMP_RANGES = [
+  { v: 10, t: '1–10' }, { v: 25, t: '11–25' }, { v: 50, t: '26–50' },
+  { v: 100, t: '51–100' }, { v: 200, t: '101–200' }, { v: 500, t: '201–500' }, { v: 1000, t: '500+' },
+];
+
+function HrSetup({ user, onDone }) {
+  const [f, setF] = useState({ name: '', gstin: '', type: '', typeCustom: '', emp: '', yourName: user.email ? user.email.split('@')[0] : '', phone: '' });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr('');
+    if (!f.name.trim()) return setErr('Enter your business name');
+    if (!f.gstin.trim()) return setErr('GSTIN is required');
+    if (!f.type) return setErr('Pick your business type');
+    if (f.type === 'other' && !f.typeCustom.trim()) return setErr('Type your business type');
+    if (!f.emp) return setErr('Select number of employees');
+    setBusy(true);
+    try {
+      const { data, error } = await sb.rpc('create_hr_plant_and_signup', {
+        p_plant_name: f.name.trim(),
+        p_gstin: f.gstin.trim().toUpperCase(),
+        p_business_type: f.type,
+        p_business_type_custom: f.type === 'other' ? f.typeCustom.trim() : null,
+        p_employee_count: Number(f.emp) || null,
+        p_full_name: f.yourName.trim() || null,
+        p_phone: f.phone ? normalizePhone(f.phone) : null,
+      });
+      if (error) throw error;
+      if (!data?.success) throw new Error(data?.error || 'Could not create your company');
+      showToast('✓ Company created — 45-day free trial started');
+      onDone();
+    } catch (ex) { setErr(ex.message || 'Something went wrong'); } finally { setBusy(false); }
+  };
+
+  const logoutBtn = async () => { await sb.auth.signOut(); location.reload(); };
+
+  return html`
+    <div class="auth-screen" style="max-width:480px">
+      <div class="auth-logo"><div class="logo-mark">L</div><div style="font-size:24px;font-weight:700">LogLinkr</div></div>
+      <h1 style="font-size:26px">Set up your business</h1>
+      <p class="sub">One-time setup · your 45-day free trial starts now.</p>
+      <div class="trial-banner">🎉 Face Attendance &amp; HR — free for 45 days, no card</div>
+      ${err && html`<div class="alert error">${err}</div>`}
+      <form onSubmit=${submit}>
+        <div class="field"><label>Business name *</label>
+          <input value=${f.name} onInput=${e => set('name', e.target.value)} placeholder="e.g. Sri Krishna Industries" /></div>
+        <div class="field"><label>GSTIN *</label>
+          <input value=${f.gstin} onInput=${e => set('gstin', e.target.value.toUpperCase())} placeholder="e.g. 33ABCDE1234F1Z5" maxLength=${15} style="text-transform:uppercase" />
+          <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Required. Your 15-character GST number.</div></div>
+        <div class="field"><label>Business type *</label>
+          <select value=${f.type} onChange=${e => set('type', e.target.value)}>
+            <option value="" disabled>Select your business type…</option>
+            ${HR_BIZ_TYPES.map(b => html`<option key=${b.v} value=${b.v}>${b.t}</option>`)}
+          </select></div>
+        ${f.type === 'other' && html`<div class="field"><label>Tell us your business type *</label>
+          <input value=${f.typeCustom} onInput=${e => set('typeCustom', e.target.value)} placeholder="Type your industry / business" /></div>`}
+        <div class="field"><label>Number of employees *</label>
+          <select value=${f.emp} onChange=${e => set('emp', e.target.value)}>
+            <option value="" disabled>Select…</option>
+            ${HR_EMP_RANGES.map(r => html`<option key=${r.v} value=${r.v}>${r.t}</option>`)}
+          </select></div>
+        <div class="field"><label>Your name</label>
+          <input value=${f.yourName} onInput=${e => set('yourName', e.target.value)} placeholder="Admin name" /></div>
+        <div class="field"><label>Your WhatsApp number <span style="font-weight:400;color:var(--slate-400)">(optional)</span></label>
+          <input value=${f.phone} onInput=${e => set('phone', e.target.value)} placeholder="10-digit mobile" inputmode="numeric" /></div>
+        <button class="btn" type="submit" disabled=${busy} style="background:var(--emerald-600)">${busy ? 'Creating…' : 'Create & start free trial'}</button>
+      </form>
+      <div class="auth-switch"><button type="button" onClick=${logoutBtn}>← Sign out</button></div>
+    </div>
+  `;
+}
+
 // ============= WIZARD =============
 function Wizard({ user, pendingInvite, onDone }) {
   // If invite detected, jump straight to join path with code prefilled
@@ -2066,7 +2188,12 @@ function App() {
           <button class="btn ghost" style="width:100%" onClick=${async () => { await sb.auth.signOut(); location.reload(); }}>Sign out</button>
         </div>
       </div>`;
-    // Confirmed: a genuinely new user with no plant → onboarding chooser.
+    // Confirmed: a genuinely new user with no plant → onboarding.
+    // HR app (?app=hr) gets the fresh HR-only business setup; the full plant app
+    // keeps its existing Wizard untouched.
+    if (isHrApp() && !pendingInvite) {
+      return html`<${HrSetup} user=${user} onDone=${() => loadProfile(user)} />`;
+    }
     return html`<${Wizard} user=${user} pendingInvite=${pendingInvite} onDone=${(p) => loadProfile(user)} />`;
   }
   // Founder admin panel — only the platform owner sees it. Toggled via the
