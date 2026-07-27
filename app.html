@@ -10,6 +10,18 @@
 <meta name="theme-color" content="#0d9488">
 <link rel="manifest" href="/manifest.json">
 <script>
+  // Canonical domain. OAuth (PKCE) stores its state/verifier per-origin, so a
+  // sign-in must START and FINISH on the same host. The app is reachable on
+  // loglinkr.com / app.loglinkr.com / www.loglinkr.com — send the first two to
+  // www BEFORE anything (auth, Supabase) loads, so Google sign-in completes.
+  (function () {
+    try {
+      var h = location.hostname;
+      if (h === 'loglinkr.com' || h === 'app.loglinkr.com') {
+        location.replace('https://www.loglinkr.com' + location.pathname + location.search + location.hash);
+      }
+    } catch (_) {}
+  })();
   // Capture the PWA install prompt as EARLY as possible. Chrome/Edge can fire
   // 'beforeinstallprompt' during page load — before the deferred module script
   // runs — so registering the listener here (a synchronous head script) is the
@@ -1213,7 +1225,10 @@ function AuthScreen({ onAuth, pendingInviteCode }) {
   const signInGoogle = async () => {
     setError(''); setLoading(true);
     try {
-      const { error } = await sb.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: window.location.href } });
+      // Always return to the canonical host (www) on the same path/mode, so the
+      // PKCE state saved here matches on the way back.
+      const returnTo = 'https://www.loglinkr.com' + window.location.pathname + (isHrApp() ? '?app=hr' : '');
+      const { error } = await sb.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: returnTo } });
       if (error) setError(error.message.includes('provider is not enabled') ? 'Google sign-in isn’t switched on yet. Use email for now.' : error.message);
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
