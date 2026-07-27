@@ -368,17 +368,22 @@ function Console({ me }) {
   const [filter, setFilter] = useState('all'); // all | paying | suspended
   const [sel, setSel] = useState(null);
   const [err, setErr] = useState('');
+  const [ana, setAna] = useState(null);      // growth analytics
+  const [anaDays, setAnaDays] = useState(30);
 
   const load = async () => {
-    const [o, p] = await Promise.all([
+    const [o, p, a] = await Promise.all([
       sb.rpc('admin_list_orgs'),
       sb.from('plans').select('*').eq('is_active', true).order('sort_order'),
+      sb.rpc('founder_analytics', { p_days: anaDays }),
     ]);
     if (o.error) { setErr(o.error.message); setOrgs([]); return; }
     setOrgs(o.data || []);
     setPlans(p.data || []);
+    if (a && a.data && !a.data.error) setAna(a.data);
     if (sel) setSel((o.data || []).find(x => x.id === sel.id) || null);
   };
+  useEffect(() => { if (orgs !== null) sb.rpc('founder_analytics', { p_days: anaDays }).then(({ data }) => { if (data && !data.error) setAna(data); }); }, [anaDays]);
   useEffect(() => { load(); }, []);
 
   const stats = useMemo(() => {
@@ -412,6 +417,57 @@ function Console({ me }) {
     <div class="wrap">
       ${err && html`<div class="alert err">${err}</div>`}
       ${orgs === null ? html`<div class="center"><div class="spin"></div></div>` : html`
+        ${(() => {
+          const A = ana || {}; const E = A.events || {};
+          const visits = E.page_view || 0, dl = E.apk_download || 0, tc = E.trial_click || 0;
+          const uniq = A.unique_visitors || 0, comp30 = A.companies_range || 0, trialing = A.trialing || 0, paying = A.paying || 0;
+          const pct = (a, b) => b > 0 ? Math.round(a / b * 100) + '%' : '—';
+          const funnel = [['Visits', visits, ''], ['Trial clicks', tc, pct(tc, visits)], ['New companies', comp30, pct(comp30, tc)], ['Paying', paying, pct(paying, comp30)]];
+          return html`
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+              <div class="section-h" style="margin:0">📈 Growth · last ${anaDays} days${ana ? '' : ' · loading…'}</div>
+              <div class="seg">${[7, 30, 90].map(d => html`<button class=${anaDays === d ? 'on' : ''} onClick=${() => setAnaDays(d)}>${d}d</button>`)}</div>
+            </div>
+            <div class="stat-grid">
+              <div class="stat"><div class="n">${num(visits)}</div><div class="l">Website visits</div></div>
+              <div class="stat"><div class="n">${num(uniq)}</div><div class="l">Unique visitors</div></div>
+              <div class="stat"><div class="n">${num(dl)}</div><div class="l">App downloads</div></div>
+              <div class="stat"><div class="n">${num(tc)}</div><div class="l">Trial clicks</div></div>
+              <div class="stat"><div class="n">${num(comp30)}</div><div class="l">New companies</div></div>
+              <div class="stat"><div class="n">${num(trialing)}</div><div class="l">On trial now</div></div>
+              <div class="stat"><div class="n" style="color:var(--emerald-700)">${num(paying)}</div><div class="l">Paying now</div></div>
+            </div>
+            <div class="card" style="margin-bottom:14px">
+              <div class="section-h" style="margin-bottom:12px">Conversion funnel</div>
+              <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;text-align:center">
+                ${funnel.map(([l, v, p]) => html`<div style="background:var(--slate-100);border-radius:10px;padding:12px 6px">
+                  <div style="font-size:20px;font-weight:800;color:var(--slate-900)">${num(v)}</div>
+                  <div style="font-size:11px;color:var(--slate-500);font-weight:600;margin-top:2px">${l}</div>
+                  ${p ? html`<div style="font-size:10px;color:var(--teal-700);font-weight:700;margin-top:3px">${p}</div>` : ''}
+                </div>`)}
+              </div>
+            </div>
+            <div class="card" style="margin-bottom:18px;overflow-x:auto">
+              <div class="section-h" style="margin-bottom:8px">Daily activity</div>
+              <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:440px">
+                <thead><tr style="color:var(--slate-500);font-size:10px;text-transform:uppercase;letter-spacing:.04em">
+                  <th style="text-align:left;padding:6px 8px">Date</th><th style="text-align:right;padding:6px 8px">Visits</th><th style="text-align:right;padding:6px 8px">Downloads</th><th style="text-align:right;padding:6px 8px">Trial clicks</th><th style="text-align:right;padding:6px 8px">New cos.</th>
+                </tr></thead>
+                <tbody>
+                  ${(A.daily || []).slice(0, 14).map(d => html`<tr style="border-top:1px solid var(--slate-100)">
+                    <td style="padding:6px 8px;font-weight:600">${d.dt}</td>
+                    <td style="text-align:right;padding:6px 8px">${num(d.visits)}</td>
+                    <td style="text-align:right;padding:6px 8px">${num(d.downloads)}</td>
+                    <td style="text-align:right;padding:6px 8px">${num(d.trials)}</td>
+                    <td style="text-align:right;padding:6px 8px;color:var(--emerald-700);font-weight:600">${num((A.signups_by_day || {})[d.dt] || 0)}</td>
+                  </tr>`)}
+                  ${(A.daily || []).length === 0 ? html`<tr><td colspan="5" style="padding:16px;text-align:center;color:var(--slate-400)">No activity yet — this fills in as your Meta ads drive visits.</td></tr>` : ''}
+                </tbody>
+              </table>
+            </div>
+            <div class="section-h">Companies</div>
+          `;
+        })()}
         <div class="stat-grid">
           <div class="stat"><div class="n">${stats.total}</div><div class="l">Companies</div></div>
           <div class="stat"><div class="n">${stats.paying}</div><div class="l">Paying</div></div>
