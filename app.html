@@ -2079,6 +2079,7 @@ function App() {
       // loaders. Otherwise loaders fetch with a null active unit (unitScope becomes
       // a no-op) and a multi-unit manager sees every unit's data until a refetch.
       await loadUnits();
+      setPlantAppMode(plantRow.app_mode);   // plant's mode wins over the URL flag
       setPlant(plantRow);
       setMe(userRow);
       // RBAC Phase 1: fetch my permissions. Non-blocking — if the RPC ever fails
@@ -2108,6 +2109,7 @@ function App() {
       try {
         const c = JSON.parse(localStorage.getItem('llk_boot_' + u.id) || 'null');
         if (c && c.plant && c.me) {
+          setPlantAppMode(c.plant.app_mode);
           setPlant(c.plant); setMe(c.me);
           setMyPerms(c.perms || { rbac_enforced: false, permissions: [], roles: [] });
           setProfileErr(false);
@@ -2433,7 +2435,12 @@ const APP_MODE = (() => {
     return flag === 'hr' ? 'hr' : 'full';
   } catch (_) { return 'full'; }
 })();
-const isHrApp = () => APP_MODE === 'hr';
+// Once a plant is loaded, ITS app_mode is authoritative — so an existing full
+// plant is never forced into HR (even if the URL had ?app=hr), and an HR company
+// always gets the HR app. Before a plant loads (signup/auth), the URL flag decides.
+let _plantAppMode = null;   // 'hr' | 'full' | null(unknown)
+function setPlantAppMode(m) { _plantAppMode = (m === 'hr') ? 'hr' : (m ? 'full' : null); try { applyHrTheme(); } catch (_) {} }
+const isHrApp = () => _plantAppMode ? (_plantAppMode === 'hr') : (APP_MODE === 'hr');
 
 // HR app appearance: 'light' | 'dark' | 'auto' (auto follows the device). Applied
 // by toggling data-hr-dark on <html>; scoped CSS vars restyle every HR screen. The
