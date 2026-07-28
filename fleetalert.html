@@ -184,11 +184,17 @@
   const MAR_YAWN       = 0.55;   // mouth-aspect-ratio above this = mouth wide open (yawn)
   const YAWN_MS        = 500;    // mouth wide this long => count a yawn
   const HEAD_DOWN_RATIO= 0.74;   // pitch proxy below base*this = head tilted down (look-away)
-  const NOFACE_GRACE   = 1400;   // ms without a face before "no driver" (avoids flicker)
+  const REOPEN_MS      = 200;    // eyes must read OPEN this long to cancel a closure countdown (debounce)
+  const DROOP_RATIO    = 1.35;   // earThresh .. earThresh*this = eyelids half-shut (drooping)
+  const DROOP_MS       = 900;    // drooping this long => drowsy
+  const NOD_DROP       = 0.82;   // pitch below base*this = a downward head bob (nod)
+  const NOD_WINDOW_MS  = 9000;   // >=2 nods within this window => nodding off (drowsy)
+  const NOFACE_GRACE   = 1200;   // ms without a face before "no driver" (avoids flicker)
 
   let stream=null, running=false, raf=null, detTimer=null;
   let earOpen=0.30, earThresh=EAR_FALLBACK, pitchBase=0;
   let closedSince=0, alarmOn=false, microCount=0, yawnCount=0, yawnActive=false, yawnCounted=false, yawnSince=0;
+  let earEma=0, openSince=0, droopSince=0, nods=[], nodLow=false;
   let perclosBuf=[]; // {t, closed}
   let sessionStart=0, lastFace=0, lastDetOk=0, frames=0, fpsT=0;
 
@@ -288,7 +294,7 @@
       res = await faceapi.detectSingleFace(video, opts()).withFaceLandmarks();
     }catch(_){}
     handle(res);
-    if(running) detTimer=setTimeout(detectOnce, 90); // ~11 detections/sec
+    if(running) detTimer=setTimeout(detectOnce, 45); // sample as fast as the GPU allows
   }
 
   const octx=overlay.getContext('2d');
@@ -300,13 +306,17 @@
     const now=performance.now();
     octx.clearRect(0,0,overlay.width,overlay.height);
     if(!res){
-      if(now-lastFace>NOFACE_GRACE){ setState('noface'); if(alarmOn) stopAlarm(); }
+      // Brief detection dropout: KEEP any closure countdown (and the alarm) running —
+      // a dropped/blurred frame must not silently cancel a micro-sleep in progress.
+      if(now-lastFace>NOFACE_GRACE){ setState('noface'); if(alarmOn) stopAlarm(); closedSince=0; openSince=0; droopSince=0; }
       return;
     }
     lastFace=now; lastDetOk=now;
     const lm=res.landmarks;
     const le=lm.getLeftEye(), re=lm.getRightEye(), mo=lm.getMouth();
-    const ear=(eyeAR(le)+eyeAR(re))/2;
+    const earRaw=(eyeAR(le)+eyeAR(re))/2;
+    earEma = earEma ? earEma*0.45 + earRaw*0.55 : earRaw;   // light smoothing removes landmark jitter
+    const ear=earEma;
     const mar=mouthAR(mo);
     const pitch=headPitch(lm);
     const headDown = pitchBase>0 && pitch < pitchBase*HEAD_DOWN_RATIO;
@@ -324,6 +334,7 @@
     // driver being asleep, so they're gated out. Head-UP + eyes-closed is the real
     // micro-sleep we must catch (a driver can doze with the head still upright).
     const eyesClosed = ear < earThresh;
+    const drooping   = !eyesClosed && ear < earThresh*DROOP_RATIO;   // eyelids half-shut
     const realClosure = eyesClosed && !yawning && !headDown;
 
     // rolling PERCLOS (genuine closures only)
@@ -331,14 +342,33 @@
     while(perclosBuf.length && now-perclosBuf[0].t>PERCLOS_WIN_MS) perclosBuf.shift();
     const perc = perclosBuf.length ? perclosBuf.filter(p=>p.closed).length/perclosBuf.length : 0;
 
-    if(realClosure){ if(!closedSince) closedSince=now; }
-    else { closedSince=0; }
+    // Debounced closure timer: eyes must read OPEN for a sustained REOPEN_MS before the
+    // countdown is cancelled — one stray 'open' frame can't reset a micro-sleep.
+    if(realClosure){ if(!closedSince) closedSince=now; openSince=0; }
+    else if(closedSince){
+      if(!openSince) openSince=now;
+      if(now-openSince>=REOPEN_MS){ closedSince=0; openSince=0; }
+    }
     const closedFor = closedSince ? now-closedSince : 0;
+
+    // Sustained drooping (partial closure) => drowsy
+    if(drooping && !yawning && !headDown){ if(!droopSince) droopSince=now; } else droopSince=0;
+    const droopFor = droopSince ? now-droopSince : 0;
+
+    // Nodding-off: count discrete downward head bobs (with hysteresis so a steady
+    // look-down counts once, not continuously); >=2 bobs in the window => drowsy.
+    if(pitchBase>0){
+      const low = pitch < pitchBase*NOD_DROP;
+      if(low && !nodLow){ nods.push(now); nodLow=true; }
+      else if(!low && pitch > pitchBase*(NOD_DROP+0.08)) nodLow=false;
+    }
+    while(nods.length && now-nods[0]>NOD_WINDOW_MS) nods.shift();
+    const nodding = nods.length>=2;
 
     // state machine
     let state='alert';
     if(closedFor>=MICROSLEEP_MS){ state='sleep'; }
-    else if(closedFor>=DROWSY_MS || perc>=PERCLOS_DROWSY){ state='drowsy'; }
+    else if(closedFor>=DROWSY_MS || perc>=PERCLOS_DROWSY || droopFor>=DROOP_MS || nodding){ state='drowsy'; }
     else if(yawning){ state='yawn'; }
     else if(headDown){ state='down'; }
     setState(state, {ear,perc,closedFor});
