@@ -177,7 +177,7 @@
   const EAR_RATIO      = 0.62;   // closed threshold = this fraction of the open-eye baseline
   const EAR_MIN        = 0.15, EAR_MAX = 0.24; // clamp for the adaptive closed threshold
   const EAR_FALLBACK   = 0.20;   // used only if calibration was too weak
-  const MICROSLEEP_MS  = 2500;   // eyes genuinely closed this long => ALARM (strict ~3s)
+  const MICROSLEEP_MS  = 2800;   // eyes genuinely closed this long => ALARM immediately (~3s micro-sleep)
   const DROWSY_MS      = 1200;   // eyes closed this long => early drowsy warning
   const PERCLOS_WIN_MS = 60000;  // rolling window for PERCLOS
   const PERCLOS_DROWSY = 0.28;   // sustained eyes-closed fraction over the minute => fatigued
@@ -195,36 +195,56 @@
   const video=$('video'), overlay=$('overlay');
 
   // ---------------- audio alarm ----------------
-  let actx=null, osc=null, gain=null, lfo=null, lfoGain=null;
+  let actx=null, oscs=[], master=null, lfo=null, lfoGain=null, vibTimer=null;
   function ensureAudio(){
     if(actx) return;
     const AC = window.AudioContext||window.webkitAudioContext;
     actx = new AC();
   }
+  // A deliberately harsh, piercing, LOUD siren: three detuned oscillators (incl. a
+  // square wave) + a fast wailing LFO, slammed through a brick-wall compressor for
+  // maximum perceived loudness, rising in pitch the longer the eyes stay shut, plus
+  // relentless phone vibration. Meant to jolt a dozing driver awake instantly.
   function startAlarm(){
     if(alarmOn) return; alarmOn=true;
     ensureAudio(); if(actx.state==='suspended') actx.resume();
-    osc=actx.createOscillator(); gain=actx.createGain();
+    const t=actx.currentTime;
+    master=actx.createGain();
+    const comp=actx.createDynamicsCompressor();
+    comp.threshold.value=-28; comp.knee.value=0; comp.ratio.value=20; comp.attack.value=0.002; comp.release.value=0.08;
+    master.gain.setValueAtTime(0.0001,t);
+    master.gain.exponentialRampToValueAtTime(1.0,t+0.06);            // slam on, no ramp-in delay
+    master.connect(comp); comp.connect(actx.destination);
+    // fast wail applied to every oscillator's pitch
     lfo=actx.createOscillator(); lfoGain=actx.createGain();
-    osc.type='sawtooth'; osc.frequency.value=760;
-    lfo.type='sine'; lfo.frequency.value=7; lfoGain.gain.value=260; // wail
-    lfo.connect(lfoGain); lfoGain.connect(osc.frequency);
-    gain.gain.setValueAtTime(0.0001, actx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.9, actx.currentTime+0.12); // loud fast
-    osc.connect(gain); gain.connect(actx.destination);
-    osc.start(); lfo.start();
-    try{ if(navigator.vibrate) navigator.vibrate([400,120,400,120,600]); }catch(_){}
+    lfo.type='sine'; lfo.frequency.value=9; lfoGain.gain.value=380;
+    lfo.connect(lfoGain);
+    oscs=[];
+    [ ['sawtooth',760,0.9], ['sawtooth',1140,0.85], ['square',1520,0.5] ].forEach(([type,f,g])=>{
+      const o=actx.createOscillator(); o.type=type;
+      o.frequency.setValueAtTime(f,t);
+      o.frequency.linearRampToValueAtTime(f*1.35, t+4);              // escalate: pitch climbs over 4s
+      lfoGain.connect(o.frequency);
+      const og=actx.createGain(); og.gain.value=g;
+      o.connect(og); og.connect(master); o.start(t); oscs.push(o);
+    });
+    lfo.start(t);
+    const buzz=()=>{ try{ if(navigator.vibrate) navigator.vibrate([600,140,600,140,600,140]); }catch(_){} };
+    buzz(); vibTimer=setInterval(buzz, 2200);                         // keep buzzing until eyes reopen
   }
   function stopAlarm(){
     if(!alarmOn) return; alarmOn=false;
     try{
-      gain.gain.cancelScheduledValues(actx.currentTime);
-      gain.gain.setValueAtTime(gain.gain.value, actx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime+0.15);
-      osc.stop(actx.currentTime+0.2); lfo.stop(actx.currentTime+0.2);
+      const t=actx.currentTime;
+      master.gain.cancelScheduledValues(t);
+      master.gain.setValueAtTime(master.gain.value, t);
+      master.gain.exponentialRampToValueAtTime(0.0001, t+0.12);
+      oscs.forEach(o=>{ try{ o.stop(t+0.16); }catch(_){} });
+      try{ lfo.stop(t+0.16); }catch(_){}
     }catch(_){}
+    if(vibTimer){ clearInterval(vibTimer); vibTimer=null; }
     try{ if(navigator.vibrate) navigator.vibrate(0); }catch(_){}
-    osc=lfo=gain=lfoGain=null;
+    oscs=[]; lfo=lfoGain=master=null;
   }
 
   // ---------------- geometry ----------------
