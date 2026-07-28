@@ -174,19 +174,21 @@
   const $ = id => document.getElementById(id);
 
   // ---- tuning ----
-  const EAR_RATIO      = 0.72;   // fraction of open-eye baseline that counts as "closed"
-  const EAR_FALLBACK   = 0.21;   // absolute closed threshold if calibration is weak
-  const MICROSLEEP_MS  = 1100;   // eyes-closed this long => alarm (micro-sleep)
-  const DROWSY_MS      = 500;    // eyes-closed this long => early drowsy warning
+  const EAR_RATIO      = 0.62;   // closed threshold = this fraction of the open-eye baseline
+  const EAR_MIN        = 0.15, EAR_MAX = 0.24; // clamp for the adaptive closed threshold
+  const EAR_FALLBACK   = 0.20;   // used only if calibration was too weak
+  const MICROSLEEP_MS  = 2500;   // eyes genuinely closed this long => ALARM (strict ~3s)
+  const DROWSY_MS      = 1200;   // eyes closed this long => early drowsy warning
   const PERCLOS_WIN_MS = 60000;  // rolling window for PERCLOS
-  const PERCLOS_DROWSY = 0.20;   // >20% eyes-closed over the minute => fatigued
-  const MAR_YAWN       = 0.62;   // mouth-aspect-ratio threshold for a yawn
-  const YAWN_MS        = 600;    // mouth open this long => count a yawn
+  const PERCLOS_DROWSY = 0.28;   // sustained eyes-closed fraction over the minute => fatigued
+  const MAR_YAWN       = 0.55;   // mouth-aspect-ratio above this = mouth wide open (yawn)
+  const YAWN_MS        = 500;    // mouth wide this long => count a yawn
+  const HEAD_DOWN_RATIO= 0.74;   // pitch proxy below base*this = head tilted down (look-away)
   const NOFACE_GRACE   = 1400;   // ms without a face before "no driver" (avoids flicker)
 
   let stream=null, running=false, raf=null, detTimer=null;
-  let earOpen=0.30, earThresh=EAR_FALLBACK;
-  let closedSince=0, alarmOn=false, microCount=0, yawnCount=0, yawnActive=false, yawnSince=0;
+  let earOpen=0.30, earThresh=EAR_FALLBACK, pitchBase=0;
+  let closedSince=0, alarmOn=false, microCount=0, yawnCount=0, yawnActive=false, yawnCounted=false, yawnSince=0;
   let perclosBuf=[]; // {t, closed}
   let sessionStart=0, lastFace=0, lastDetOk=0, frames=0, fpsT=0;
 
@@ -234,6 +236,12 @@
     // top-center 51 -> idx3, bottom-center 57 -> idx9, corners 48->0, 54->6
     return dist(m[3],m[9])/(dist(m[0],m[6])+1e-6);
   }
+  function headPitch(lm){ // proxy: eye-line -> chin distance over face width; smaller => looking down
+    const jaw=lm.getJawOutline(), le=lm.getLeftEye(), re=lm.getRightEye();
+    const eyeMidY=(le[0].y+le[3].y+re[0].y+re[3].y)/4;
+    const chin=jaw[8], w=dist(jaw[0],jaw[16])||1;   // cheek-to-cheek: horizontal, so pitch-stable
+    return (chin.y-eyeMidY)/w;
+  }
 
   // ---------------- model ----------------
   async function loadModels(){
@@ -241,7 +249,7 @@
     const f=window.faceapi;
     try{ if(f.tf){ if(f.tf.setBackend){ await f.tf.setBackend('webgl'); await f.tf.ready(); } } }catch(_){}
     await f.nets.tinyFaceDetector.loadFromUri(MODELS);
-    await f.nets.faceLandmark68TinyNet.loadFromUri(MODELS);
+    await f.nets.faceLandmark68Net.loadFromUri(MODELS);   // FULL model: tracks eyelids far better than tiny (real eye closure now registers)
   }
 
   // ---------------- camera ----------------
@@ -257,7 +265,7 @@
     if(!running) return;
     let res=null;
     try{
-      res = await faceapi.detectSingleFace(video, opts()).withFaceLandmarks(true);
+      res = await faceapi.detectSingleFace(video, opts()).withFaceLandmarks();
     }catch(_){}
     handle(res);
     if(running) detTimer=setTimeout(detectOnce, 90); // ~11 detections/sec
@@ -280,29 +288,42 @@
     const le=lm.getLeftEye(), re=lm.getRightEye(), mo=lm.getMouth();
     const ear=(eyeAR(le)+eyeAR(re))/2;
     const mar=mouthAR(mo);
-    const closed = ear < earThresh;
+    const pitch=headPitch(lm);
+    const headDown = pitchBase>0 && pitch < pitchBase*HEAD_DOWN_RATIO;
 
-    // rolling PERCLOS
-    perclosBuf.push({t:now, closed});
+    // yawn: mouth held wide open. It's a fatigue SIGN we count & warn on — but it must
+    // NOT fire the alarm (a yawn squints the eyes, which would otherwise look like closure).
+    let yawning=false;
+    if(mar>MAR_YAWN){ yawning=true;
+      if(!yawnActive){ yawnSince=now; yawnActive=true; }
+      else if(now-yawnSince>YAWN_MS && !yawnCounted){ yawnCount++; yawnCounted=true; $('sYawn').textContent=yawnCount; }
+    } else { yawnActive=false; yawnCounted=false; }
+
+    // A GENUINE eye closure = eyes shut AND not mid-yawn AND head not tilted down.
+    // Yawning and head-down both foreshorten/squint the eyes and drop EAR without the
+    // driver being asleep, so they're gated out. Head-UP + eyes-closed is the real
+    // micro-sleep we must catch (a driver can doze with the head still upright).
+    const eyesClosed = ear < earThresh;
+    const realClosure = eyesClosed && !yawning && !headDown;
+
+    // rolling PERCLOS (genuine closures only)
+    perclosBuf.push({t:now, closed:realClosure});
     while(perclosBuf.length && now-perclosBuf[0].t>PERCLOS_WIN_MS) perclosBuf.shift();
     const perc = perclosBuf.length ? perclosBuf.filter(p=>p.closed).length/perclosBuf.length : 0;
 
-    // yawn
-    if(mar>MAR_YAWN){ if(!yawnActive){ yawnSince=now; yawnActive=true; } else if(now-yawnSince>YAWN_MS){ yawnCount++; $('sYawn').textContent=yawnCount; yawnActive=false; } }
-    else yawnActive=false;
-
-    // eye-closure timing
-    if(closed){ if(!closedSince) closedSince=now; }
-    else { if(closedSince && alarmOn){ /* just reopened */ } closedSince=0; }
+    if(realClosure){ if(!closedSince) closedSince=now; }
+    else { closedSince=0; }
     const closedFor = closedSince ? now-closedSince : 0;
 
     // state machine
     let state='alert';
     if(closedFor>=MICROSLEEP_MS){ state='sleep'; }
     else if(closedFor>=DROWSY_MS || perc>=PERCLOS_DROWSY){ state='drowsy'; }
+    else if(yawning){ state='yawn'; }
+    else if(headDown){ state='down'; }
     setState(state, {ear,perc,closedFor});
 
-    // alarm control
+    // ALARM — only on a genuine sustained eye closure (never on a yawn or head-down)
     if(state==='sleep'){ if(!alarmOn){ startAlarm(); microCount++; $('sMicro').textContent=microCount; } }
     else if(alarmOn){ stopAlarm(); }
 
@@ -339,6 +360,8 @@
     if(s==='alert'){ badge.textContent='Alert'; ic.textContent='✅'; pill.textContent='Monitoring'; }
     else if(s==='drowsy'){ app.classList.add('state-drowsy'); badge.textContent='Drowsy — wake up'; ic.textContent='⚠️'; pill.textContent='Fatigue rising'; }
     else if(s==='sleep'){ app.classList.add('state-sleep'); badge.textContent='WAKE UP!'; ic.textContent='🚨'; pill.textContent='MICRO-SLEEP'; }
+    else if(s==='yawn'){ app.classList.add('state-drowsy'); badge.textContent='Yawning — take a break'; ic.textContent='🥱'; pill.textContent='Fatigue sign'; }
+    else if(s==='down'){ app.classList.add('state-noface'); badge.textContent='Head down / looking away'; ic.textContent='📵'; pill.textContent='Eyes on the road'; }
     else if(s==='noface'){ app.classList.add('state-noface'); badge.textContent='No driver in view'; ic.textContent='👤'; pill.textContent='Aim at driver'; }
   }
 
@@ -347,23 +370,24 @@
     $('startScreen').classList.add('hidden');
     $('calibScreen').classList.remove('hidden');
     const arc=$('calibArc'), num=$('calibNum'), hint=$('calibHint'), C=276.5;
-    const samples=[]; const T=3200; const t0=performance.now();
+    const samples=[]; const pitchSamples=[]; const T=3200; const t0=performance.now();
     let faceSeen=false;
     return new Promise(resolve=>{
       const tick=async()=>{
         const el=performance.now()-t0; const p=Math.min(1,el/T);
         arc.setAttribute('stroke-dashoffset', C*(1-p));
         num.textContent=Math.max(1,Math.ceil((T-el)/1000));
-        let r=null; try{ r=await faceapi.detectSingleFace(video,opts()).withFaceLandmarks(true); }catch(_){}
+        let r=null; try{ r=await faceapi.detectSingleFace(video,opts()).withFaceLandmarks(); }catch(_){}
         if(r){ faceSeen=true; hint.textContent='Great — hold still'; hint.style.color='var(--ok)';
-          const lm=r.landmarks; samples.push((eyeAR(lm.getLeftEye())+eyeAR(lm.getRightEye()))/2); }
+          const lm=r.landmarks; samples.push((eyeAR(lm.getLeftEye())+eyeAR(lm.getRightEye()))/2); pitchSamples.push(headPitch(lm)); }
         else if(!faceSeen){ hint.textContent='Bring your face into view…'; hint.style.color='var(--warn)'; }
         if(p<1){ requestAnimationFrame(tick); }
         else{
           if(samples.length>=5){ samples.sort((a,b)=>a-b);
-            earOpen=samples[Math.floor(samples.length*0.6)]; // robust "open" estimate
-            earThresh=Math.max(EAR_FALLBACK*0.8, Math.min(EAR_FALLBACK+0.02, earOpen*EAR_RATIO));
+            earOpen=samples[Math.floor(samples.length*0.5)]; // median open-eye EAR
+            earThresh=Math.max(EAR_MIN, Math.min(EAR_MAX, earOpen*EAR_RATIO));
           } else { earThresh=EAR_FALLBACK; }
+          if(pitchSamples.length>=5){ pitchSamples.sort((a,b)=>a-b); pitchBase=pitchSamples[Math.floor(pitchSamples.length*0.5)]; }
           resolve();
         }
       };
