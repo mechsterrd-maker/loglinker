@@ -68,7 +68,9 @@ Copy the structure of `blog/face-recognition-attendance-system-guide/index.html`
   face attendance, automatic payroll, WhatsApp payslips, ₹99/mo start, 45-day free trial),
   but lead with genuine help, not a sales pitch.
 - **Internal links:** link to `/blog` and at least one of `/?stay=1#pricing`,
-  `/?stay=1#features`, or a related existing post in `blog/posts.json`.
+  `/?stay=1#features`, or a related existing post in `blog/posts.json`. For salary,
+  payroll or payslip topics, also link to the free tools `/tools/salary-calculator`
+  and/or `/tools/payslip-generator` (they convert well).
 
 ### CONVERSION — the goal of every post is downloads / free-trial starts
 Write to help first, but always give the ready-to-act reader an obvious next step:

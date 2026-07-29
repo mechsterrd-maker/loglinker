@@ -27,6 +27,7 @@ const NAV = `<nav><div class="wrap">
     <a href="/?stay=1#features">Features</a>
     <a href="/?stay=1#how">How it works</a>
     <a href="/?stay=1#pricing">Pricing</a>
+    <a href="/tools">Free Tools</a>
     <a href="/blog">Blog</a>
   </div>
   <div class="nav-cta"><a class="btn btn-p" href="/app?app=hr">Start Free</a></div>
@@ -91,7 +92,7 @@ ${FOOTER}
 writeFileSync(join(here, 'index.html'), indexHtml);
 
 /* ---------- sitemap.xml ---------- */
-const staticPages = ['/', '/install', '/loglinkr-overview', '/whats-new', '/blog'];
+const staticPages = ['/', '/install', '/loglinkr-overview', '/whats-new', '/blog', '/tools', '/tools/salary-calculator', '/tools/payslip-generator'];
 const urls = [
   ...staticPages.map((u) => ({ loc: SITE + u, lastmod: posts[0] ? posts[0].date : '2026-07-29' })),
   ...posts.map((p) => ({ loc: `${SITE}/blog/${p.slug}`, lastmod: p.date })),
