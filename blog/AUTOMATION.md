@@ -23,8 +23,22 @@ Editing this file changes how future posts are written — no other change neede
 7. **Rebuild:** run `node blog/build.mjs` (regenerates `blog/index.html`, `sitemap.xml`,
    `robots.txt`). Confirm it prints a success line with the new post count.
 8. **Publish:** commit and push to `main`. Vercel auto-deploys within ~30 seconds.
-9. **Report:** state which post was published and its live URL
-   (`https://loglinkr.com/blog/<slug>`).
+9. **Notify search engines (IndexNow):** run
+   `node blog/ping-indexnow.mjs https://loglinkr.com/blog/<slug>`
+   to instantly tell Bing/Yandex about the new post. This is best-effort and must
+   never block publishing. (Google is handled automatically by the sitemap — see below.)
+10. **Report:** state which post was published and its live URL
+    (`https://loglinkr.com/blog/<slug>`).
+
+## How indexing works (already set up)
+
+- **Google:** the site is verified in Google Search Console and `sitemap.xml` is submitted
+  there once. Because `blog/build.mjs` rewrites `sitemap.xml` (with a fresh `lastmod`) on
+  every run, Google re-crawls the sitemap and indexes new posts on its own — no per-post
+  action needed. Do NOT use Google's Indexing API for these posts (it is only sanctioned for
+  job/livestream pages and can cause problems).
+- **Bing / Yandex:** handled instantly by the IndexNow ping in step 9.
+- The root file `<key>.txt` is the IndexNow verification key — never delete or rename it.
 
 ## TEMPLATE RULES (match the existing post exactly)
 
