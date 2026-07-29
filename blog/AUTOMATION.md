@@ -44,7 +44,9 @@ Editing this file changes how future posts are written — no other change neede
 
 Copy the structure of `blog/face-recognition-attendance-system-guide/index.html`. Every post MUST have:
 
-- The **same `<head>`**: fonts, `blog.css`, a unique `<title>` (≤ 60 chars, include the
+- The **same `<head>`**: the analytics line `<script src="/ga.js"></script>` right after
+  the viewport meta tag (required — this is the Google Analytics tag; every page must have
+  it exactly once), fonts, `blog.css`, a unique `<title>` (≤ 60 chars, include the
   keyword), a unique meta description, canonical URL
   `https://loglinkr.com/blog/<slug>`, and Open Graph + Twitter tags.
 - **Two JSON-LD blocks**: an `Article` block (with today's `datePublished`/`dateModified`)
