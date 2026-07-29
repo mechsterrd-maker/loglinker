@@ -66,9 +66,29 @@ Copy the structure of `blog/face-recognition-attendance-system-guide/index.html`
   AND a general global audience — avoid jargon; explain any term you use.
 - **Product tie-in:** mention LogLinkr naturally where relevant (no hardware, phone-based
   face attendance, automatic payroll, WhatsApp payslips, ₹99/mo start, 45-day free trial),
-  but lead with genuine help, not a sales pitch. ~80% helpful / 20% product.
+  but lead with genuine help, not a sales pitch.
 - **Internal links:** link to `/blog` and at least one of `/?stay=1#pricing`,
   `/?stay=1#features`, or a related existing post in `blog/posts.json`.
+
+### CONVERSION — the goal of every post is downloads / free-trial starts
+Write to help first, but always give the ready-to-act reader an obvious next step:
+- **Two calls-to-action minimum.** One inline CTA button after the intro / first main
+  section, and the `.cta-band` at the end. Both link to `/app?app=hr`. Button copy:
+  "Start free — no card, no hardware" or "Try LogLinkr free for 45 days".
+- **Lead the hook with the payoff:** set up in 5 minutes, no biometric machine, just a
+  phone, free 45-day trial, ₹99/mo after. Repeat these benefits where natural.
+- **Handle buying objections in the FAQ** (make at least 2 of the FAQs objection-busters):
+  "Is it really free to start?", "Do I need any hardware/biometric machine?", "How long
+  to set up?", "Is my staff's face data safe?", "What does it cost after the trial?".
+- **Commercial posts** (keywords with best/free/app/download/alternative/vs, or an
+  industry name) → ~65% helpful / 35% product, include a benefit-led comparison table
+  where LogLinkr wins on cost/hardware/setup/payroll, and be a little more direct.
+  **Authority posts** (payroll/compliance/how-to) → ~80% helpful / 20% product, softer CTA.
+- **Never** fabricate reviews, ratings, download counts, or competitor faults. If naming a
+  competitor (e.g. an "alternative" post), be fair and factual; win on LogLinkr's real
+  strengths (face + payroll in one, no hardware, WhatsApp payslips, price, 5-min setup).
+- Inline CTA button markup to reuse:
+  `<p style="text-align:center;margin:30px 0"><a class="btn btn-p" href="/app?app=hr">Start free — no card, no hardware →</a></p>`
 - **Facts:** LogLinkr = face-recognition attendance + automatic payroll for SMBs.
   Plans: ₹99/mo (up to 50 employees, launch offer; regular ₹199), ₹399/mo (up to 200).
   Prices exclude 18% GST. 45-day free trial, no credit card. Runs on any Android device.
