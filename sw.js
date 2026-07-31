@@ -1,7 +1,7 @@
 // sw.js — Loglinkr Service Worker
 // Handles: PWA install, offline shell, Web Push notifications, click routing
 
-const CACHE_NAME = 'loglinkr-v16';
+const CACHE_NAME = 'loglinkr-v17';
 const SHARE_CACHE = 'loglinkr-share';
 const APP_SHELL = ['/app', '/assets/kiosk-face-1.jpg', '/assets/kiosk-face-2.jpg'];
 // CDN hosts whose assets (Preact/htm, jsPDF, face-api script + face models) must
