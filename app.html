@@ -10,15 +10,16 @@
 <meta name="theme-color" content="#0d9488">
 <link rel="manifest" href="/manifest.json">
 <script>
-  // Canonical domain. OAuth (PKCE) stores its state/verifier per-origin, so a
-  // sign-in must START and FINISH on the same host. The app is reachable on
-  // loglinkr.com / app.loglinkr.com / www.loglinkr.com — send the first two to
-  // www BEFORE anything (auth, Supabase) loads, so Google sign-in completes.
+  // Canonical domain = the apex (loglinkr.com), which is the Vercel PRIMARY domain
+  // (Vercel 308-redirects www -> apex). We must canonicalise the SAME direction —
+  // forcing www here instead fought Vercel's redirect and caused an endless
+  // refresh loop on the sign-in page (apex ->JS-> www ->Vercel-> apex -> ...).
+  // OAuth (PKCE) stores its verifier per-origin, so start & finish must share a host.
   (function () {
     try {
       var h = location.hostname;
-      if (h === 'loglinkr.com' || h === 'app.loglinkr.com') {
-        location.replace('https://www.loglinkr.com' + location.pathname + location.search + location.hash);
+      if (h === 'www.loglinkr.com' || h === 'app.loglinkr.com') {
+        location.replace('https://loglinkr.com' + location.pathname + location.search + location.hash);
       }
     } catch (_) {}
   })();
@@ -1225,9 +1226,10 @@ function AuthScreen({ onAuth, pendingInviteCode }) {
   const signInGoogle = async () => {
     setError(''); setLoading(true);
     try {
-      // Always return to the canonical host (www) on the same path/mode, so the
-      // PKCE state saved here matches on the way back.
-      const returnTo = 'https://www.loglinkr.com' + window.location.pathname + (isHrApp() ? '?app=hr' : '');
+      // Return to the SAME origin the user is on (already canonicalised to the apex
+      // in the head script), so the PKCE verifier saved here — keyed per-origin —
+      // matches on the way back. Hard-coding a different host breaks the exchange.
+      const returnTo = window.location.origin + window.location.pathname + (isHrApp() ? '?app=hr' : '');
       const { error } = await sb.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: returnTo } });
       if (error) setError(error.message.includes('provider is not enabled') ? 'Google sign-in isn’t switched on yet. Use email for now.' : error.message);
     } catch (err) { setError(err.message); } finally { setLoading(false); }
