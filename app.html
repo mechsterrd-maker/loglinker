@@ -2379,6 +2379,7 @@ const MORE_GROUPS = [
     icon: '📥',
     sub: 'Floor operations · used every day',
     items: [
+      { key:'ppc',           icon:'🗓', label:'Production Planning',   mfg:true, sub:'Plan work per stage per day · assign operators · track planned vs actual (PDC → CNC → dispatch)' },
       { key:'tpm',           icon:'🛠', label:'TPM Daily Checks',     sub:'30-sec machine checks · oil, coolant, leaks, guards' },
       { key:'maintenance',   icon:'🔧', label:'Maintenance',          sub:'Breakdowns log, machine status' },
       { key:'cutting',       icon:'✂️', label:'Cutting Planner',      sub:'1D cutting optimisation for rods, tubes, bars · auto layout with kerf · waste %' },
@@ -3176,6 +3177,419 @@ function AssistantPanel({ plant, me, setTab, onClose }) {
   `;
 }
 
+// =================================================================
+// PRODUCTION PLANNING & CONTROL (PPC) — plan work per stage per day,
+// assign operators, and track planned-vs-actual output. Plant-scoped +
+// unit-isolated like the rest of the app. Line (editable per plant):
+// PDC → Fettling → Shot blasting → CNC/VMC → Final inspection → Dispatch.
+// =================================================================
+const PPC_DEFAULT_STAGES = [
+  { name: 'PDC (Casting)',    seq: 1, cadence: 'weekly' },
+  { name: 'Fettling',         seq: 2, cadence: 'weekly' },
+  { name: 'Shot Blasting',    seq: 3, cadence: 'daily'  },
+  { name: 'CNC / VMC',        seq: 4, cadence: 'weekly' },
+  { name: 'Final Inspection', seq: 5, cadence: 'daily'  },
+  { name: 'Dispatch',         seq: 6, cadence: 'daily'  },
+];
+const PPC_STATUS = ['planned', 'in_progress', 'done', 'hold'];
+const ppcISO = (d) => { const x = new Date(d); x.setHours(0,0,0,0); return `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,'0')}-${String(x.getDate()).padStart(2,'0')}`; };
+const ppcAddDays = (iso, n) => { const x = new Date(iso + 'T00:00:00'); x.setDate(x.getDate()+n); return ppcISO(x); };
+const ppcMonday = (iso) => { const x = new Date(iso + 'T00:00:00'); const g = (x.getDay()+6)%7; x.setDate(x.getDate()-g); return ppcISO(x); };
+const ppcMonthStart = (iso) => iso.slice(0,7) + '-01';
+const ppcDayName = (iso) => new Date(iso+'T00:00:00').toLocaleDateString('en-IN',{weekday:'short'});
+const ppcDayShort = (iso) => new Date(iso+'T00:00:00').toLocaleDateString('en-IN',{day:'2-digit',month:'short'});
+
+function PpcModule({ plant, me, activeUnit }) {
+  const [view, setView] = useState('daily');
+  const [loading, setLoading] = useState(true);
+  const [stages, setStages] = useState([]);
+  const [parts, setParts] = useState([]);
+  const [operators, setOperators] = useState([]);
+  const [monthPlan, setMonthPlan] = useState([]);
+  const [plans, setPlans] = useState([]);
+  const [outputs, setOutputs] = useState([]);
+  const today = ppcISO(new Date());
+  const [day, setDay] = useState(today);
+  const [weekAnchor, setWeekAnchor] = useState(ppcMonday(today));
+  const [month, setMonth] = useState(ppcMonthStart(today));
+  const [jobModal, setJobModal] = useState(null);
+  const [outModal, setOutModal] = useState(null);
+  const [opModal, setOpModal] = useState(null);
+  const [partModal, setPartModal] = useState(null);
+  const [tgtModal, setTgtModal] = useState(null);
+
+  const u = activeUnit?.unit_id;
+  const scope = (q) => u ? q.or(`unit_id.eq.${u},unit_id.is.null`) : q;
+
+  const refresh = useCallback(async () => {
+    try {
+      const from = ppcAddDays(today, -10), to = ppcAddDays(today, 21);
+      const [st, pt, op, mp, pl] = await Promise.all([
+        scope(sb.from('ppc_stages').select('*')).eq('active', true).order('seq'),
+        scope(sb.from('ppc_parts').select('*')).eq('active', true).order('name'),
+        scope(sb.from('ppc_operators').select('*')).eq('active', true).order('name'),
+        scope(sb.from('ppc_month_plan').select('*, ppc_parts(name,code,uom)')).eq('month', month),
+        scope(sb.from('ppc_plan').select('*, ppc_stages(name,cadence,seq), ppc_parts(name,code,uom)')).gte('plan_date', from).lte('plan_date', to).order('plan_date'),
+      ]);
+      let stageRows = st.data || [];
+      if (stageRows.length === 0) {
+        await sb.from('ppc_stages').insert(PPC_DEFAULT_STAGES.map(s => ({ ...s, plant_id: plant.id, created_by: me.id })));
+        const re = await scope(sb.from('ppc_stages').select('*')).eq('active', true).order('seq');
+        stageRows = re.data || [];
+      }
+      setStages(stageRows);
+      setParts(pt.data || []);
+      setOperators(op.data || []);
+      setMonthPlan(mp.data || []);
+      const planRows = pl.data || [];
+      setPlans(planRows);
+      const ids = planRows.map(p => p.id);
+      if (ids.length) { const ou = await sb.from('ppc_output').select('*').in('plan_id', ids); setOutputs(ou.data || []); }
+      else setOutputs([]);
+    } catch (e) { console.warn('[PPC] load failed', e); }
+    finally { setLoading(false); }
+  }, [u, month]);
+  useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
+
+  const opName = (id) => (operators.find(o => o.id === id) || {}).name || '—';
+  const partLabel = (p) => p ? (p.code ? p.code + ' · ' : '') + p.name : '';
+  const doneFor = (planId) => outputs.filter(o => o.plan_id === planId).reduce((a,o)=>a+Number(o.ok_qty||0),0);
+  const rejFor = (planId) => outputs.filter(o => o.plan_id === planId).reduce((a,o)=>a+Number(o.reject_qty||0),0);
+  const jobsFor = (stageId, date) => plans.filter(p => p.stage_id === stageId && p.plan_date === date);
+  const weeklyStages = stages.filter(s => s.cadence === 'weekly');
+  const dailyStages = stages.filter(s => s.cadence === 'daily');
+  const weekDays = Array.from({length:7}, (_,i) => ppcAddDays(weekAnchor, i));
+
+  const renderBoard = (boardStages, date) => html`
+    <div>
+      ${boardStages.length === 0 && html`<div class="empty"><div class="icon">🗂</div>No stages in this group yet.</div>`}
+      ${boardStages.map(s => {
+        const jobs = jobsFor(s.id, date);
+        const planned = jobs.reduce((a,j)=>a+Number(j.planned_qty||0),0);
+        const done = jobs.reduce((a,j)=>a+doneFor(j.id),0);
+        return html`
+          <div class="card" style="margin-bottom:12px">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+              <div class="list-item-title">${s.name}</div>
+              <span class="badge ${s.cadence==='weekly'?'amber':'emerald'}">${s.cadence}</span>
+              <div style="margin-left:auto;font-size:12px;color:var(--slate-500,#64748b)">${fmtNum(done)}/${fmtNum(planned)} ${planned?'done':''}</div>
+            </div>
+            ${jobs.length === 0 && html`<div style="font-size:13px;color:var(--slate-400,#94a3b8);padding:2px 0 6px">No jobs planned.</div>`}
+            ${jobs.map(j => html`
+              <div class="list-item" onClick=${() => setJobModal({ stage:s, date, job:j })}>
+                <div class="list-item-row">
+                  <div class="list-item-main">
+                    <div class="list-item-title">${partLabel(j.ppc_parts) || 'Job'} · ${fmtNum(j.planned_qty)} ${j.ppc_parts?.uom||'pcs'}</div>
+                    <div class="list-item-sub">${j.machine ? '🛠 '+j.machine+' · ' : ''}${(j.operator_ids||[]).map(opName).join(', ') || 'no operator'}${j.setting_note ? ' · ⚙️ '+j.setting_note : ''}</div>
+                  </div>
+                  <div class="list-item-meta">
+                    <span class="badge ${j.status==='done'?'emerald':'amber'}">${j.status.replace('_',' ')}</span>
+                    <div style="font-size:12px;margin-top:4px;color:var(--slate-500,#64748b)">${fmtNum(doneFor(j.id))} done</div>
+                  </div>
+                </div>
+              </div>`)}
+            <button class="btn small ghost" style="margin-top:8px" onClick=${() => setJobModal({ stage:s, date })}>+ Add job</button>
+          </div>`;
+      })}
+    </div>`;
+
+  const dailyView = html`
+    <div>
+      <div class="field-row" style="margin-bottom:12px;align-items:center;gap:6px">
+        <button class="btn small ghost" onClick=${()=>setDay(ppcAddDays(day,-1))}>‹</button>
+        <input type="date" value=${day} onChange=${e=>setDay(e.target.value)} style="flex:1"/>
+        <button class="btn small ghost" onClick=${()=>setDay(ppcAddDays(day,1))}>›</button>
+        <button class="btn small ${day===today?'':'ghost'}" onClick=${()=>setDay(today)}>Today</button>
+      </div>
+      <div class="section-h">Daily-planned stages · ${ppcDayShort(day)} (${ppcDayName(day)})</div>
+      ${renderBoard(dailyStages, day)}
+    </div>`;
+
+  const weeklyView = html`
+    <div>
+      <div class="field-row" style="margin-bottom:10px;align-items:center;gap:6px">
+        <button class="btn small ghost" onClick=${()=>setWeekAnchor(ppcAddDays(weekAnchor,-7))}>‹ Prev</button>
+        <div style="flex:1;text-align:center;font-weight:600">${ppcDayShort(weekAnchor)} – ${ppcDayShort(ppcAddDays(weekAnchor,6))}</div>
+        <button class="btn small ghost" onClick=${()=>setWeekAnchor(ppcAddDays(weekAnchor,7))}>Next ›</button>
+      </div>
+      <div style="display:flex;gap:6px;overflow-x:auto;margin-bottom:12px">
+        ${weekDays.map(d => html`
+          <button class="btn small ${d===day?'':'ghost'}" style="flex:1;min-width:46px;flex-direction:column;padding:6px 4px" onClick=${()=>setDay(d)}>
+            <div style="font-size:10px">${ppcDayName(d)}</div><div>${d.slice(8)}</div>
+          </button>`)}
+      </div>
+      <div class="section-h">Weekly-planned stages · ${ppcDayShort(day)}</div>
+      ${renderBoard(weeklyStages, day)}
+    </div>`;
+
+  const monthlyView = html`
+    <div>
+      <div class="field-row" style="margin-bottom:12px;align-items:center;gap:6px">
+        <input type="month" value=${month.slice(0,7)} onChange=${e=>setMonth(e.target.value+'-01')} style="flex:1"/>
+        <button class="btn small" onClick=${()=>setPartModal({})}>+ Part</button>
+      </div>
+      ${parts.length === 0 && html`<div class="empty"><div class="icon">🔩</div>Add the parts you make, then set each part's monthly target.</div>`}
+      ${parts.map(pt => {
+        const mp = monthPlan.find(m => m.part_id === pt.id);
+        const target = mp ? Number(mp.target_qty) : 0;
+        const wd = mp ? mp.working_days : 26;
+        const daily = target ? Math.ceil(target / Math.max(1,wd)) : 0;
+        return html`
+          <div class="list-item" onClick=${()=>setTgtModal({ part:pt, row:mp })}>
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${partLabel(pt)}</div>
+                <div class="list-item-sub">${target?`Target ${fmtNum(target)} ${pt.uom} · ${wd} days → ${fmtNum(daily)}/day`:'No target set for this month'}</div>
+              </div>
+              <div class="list-item-meta"><span class="badge ${target?'amber':''}">${target?fmtNum(daily)+'/day':'set target'}</span></div>
+            </div>
+          </div>`;
+      })}
+    </div>`;
+
+  const operatorsView = html`
+    <div>
+      <div class="field-row" style="margin-bottom:12px;align-items:center">
+        <div style="flex:1;font-size:13px;color:var(--slate-500,#64748b)">${operators.length} operators · load shown for ${ppcDayShort(day)}</div>
+        <button class="btn small" onClick=${()=>setOpModal({})}>+ Operator</button>
+      </div>
+      ${operators.length===0 && html`<div class="empty"><div class="icon">👷</div>Add your floor operators to assign them to jobs.</div>`}
+      ${operators.map(o => {
+        const load = plans.filter(p => p.plan_date===day && (p.operator_ids||[]).includes(o.id)).length;
+        return html`
+          <div class="list-item" onClick=${()=>setOpModal({ op:o })}>
+            <div class="list-item-row">
+              <div class="list-item-main"><div class="list-item-title">${o.name}</div><div class="list-item-sub">${o.skill||'—'}</div></div>
+              <div class="list-item-meta"><span class="badge ${load?'amber':''}">${load} job${load===1?'':'s'}</span></div>
+            </div>
+          </div>`;
+      })}
+    </div>`;
+
+  const dayJobs = plans.filter(p => p.plan_date === day).sort((a,b)=>(a.ppc_stages?.seq||0)-(b.ppc_stages?.seq||0));
+  const totPlanned = dayJobs.reduce((a,j)=>a+Number(j.planned_qty||0),0);
+  const totDone = dayJobs.reduce((a,j)=>a+doneFor(j.id),0);
+  const totRej = dayJobs.reduce((a,j)=>a+rejFor(j.id),0);
+  const trackingView = html`
+    <div>
+      <div class="field-row" style="margin-bottom:12px;align-items:center;gap:6px">
+        <button class="btn small ghost" onClick=${()=>setDay(ppcAddDays(day,-1))}>‹</button>
+        <input type="date" value=${day} onChange=${e=>setDay(e.target.value)} style="flex:1"/>
+        <button class="btn small ghost" onClick=${()=>setDay(ppcAddDays(day,1))}>›</button>
+        <button class="btn small ${day===today?'':'ghost'}" onClick=${()=>setDay(today)}>Today</button>
+      </div>
+      <div class="stat-grid" style="margin-bottom:12px">
+        <div class="stat teal"><div class="stat-num">${fmtNum(totDone)}</div><div class="stat-label">Done</div></div>
+        <div class="stat amber"><div class="stat-num">${fmtNum(totPlanned)}</div><div class="stat-label">Planned</div></div>
+        <div class="stat rose"><div class="stat-num">${fmtNum(totRej)}</div><div class="stat-label">Rejected</div></div>
+      </div>
+      ${dayJobs.length===0 && html`<div class="empty"><div class="icon">📋</div>No jobs on ${ppcDayShort(day)}. Plan work in the Daily or Weekly tab.</div>`}
+      ${dayJobs.map(j => {
+        const done = doneFor(j.id), planned = Number(j.planned_qty||0);
+        const pct = planned ? Math.min(100, Math.round(done/planned*100)) : 0;
+        return html`
+          <div class="card" style="margin-bottom:10px">
+            <div class="list-item-row">
+              <div class="list-item-main">
+                <div class="list-item-title">${j.ppc_stages?.name} · ${partLabel(j.ppc_parts)||'—'}</div>
+                <div class="list-item-sub">${fmtNum(done)}/${fmtNum(planned)} ${j.ppc_parts?.uom||'pcs'} · ${pct}%${rejFor(j.id)?' · '+fmtNum(rejFor(j.id))+' rej':''}</div>
+              </div>
+              <button class="btn small" onClick=${()=>setOutModal({ job:j })}>Log</button>
+            </div>
+            <div style="height:6px;background:var(--slate-100,#f1f5f9);border-radius:99px;margin-top:8px;overflow:hidden"><div style="height:100%;width:${pct}%;background:var(--teal-500,#0d9488)"></div></div>
+          </div>`;
+      })}
+    </div>`;
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+  const tabs = [['daily','📆 Daily'],['weekly','🗓 Weekly'],['monthly','📅 Monthly'],['track','📊 Tracking'],['ops','👷 Operators']];
+  return html`
+    <div class="page">
+      <div class="page-header"><div><h1>Production Planning</h1><div class="sub">${plant.name} · plan per stage, assign operators, track output</div></div></div>
+      <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto">
+        ${tabs.map(([k,l]) => html`<button class="auth-tab ${view===k?'active':''}" onClick=${()=>setView(k)}>${l}</button>`)}
+      </div>
+      ${view==='daily' && dailyView}
+      ${view==='weekly' && weeklyView}
+      ${view==='monthly' && monthlyView}
+      ${view==='track' && trackingView}
+      ${view==='ops' && operatorsView}
+      ${jobModal && html`<${PpcJobModal} plant=${plant} me=${me} parts=${parts} operators=${operators} ctx=${jobModal} onClose=${()=>setJobModal(null)} onSaved=${()=>{setJobModal(null);refresh();}} />`}
+      ${outModal && html`<${PpcOutputModal} plant=${plant} me=${me} operators=${operators} job=${outModal.job} onClose=${()=>setOutModal(null)} onSaved=${()=>{setOutModal(null);refresh();}} />`}
+      ${opModal && html`<${PpcOperatorModal} plant=${plant} me=${me} op=${opModal.op} onClose=${()=>setOpModal(null)} onSaved=${()=>{setOpModal(null);refresh();}} />`}
+      ${partModal && html`<${PpcPartModal} plant=${plant} me=${me} part=${partModal.part} onClose=${()=>setPartModal(null)} onSaved=${()=>{setPartModal(null);refresh();}} />`}
+      ${tgtModal && html`<${PpcTargetModal} plant=${plant} me=${me} month=${month} part=${tgtModal.part} row=${tgtModal.row} onClose=${()=>setTgtModal(null)} onSaved=${()=>{setTgtModal(null);refresh();}} />`}
+    </div>`;
+}
+
+function PpcJobModal({ plant, me, parts, operators, ctx, onClose, onSaved }) {
+  const j = ctx.job || {};
+  const [partId, setPartId] = useState(j.part_id || '');
+  const [qty, setQty] = useState(j.planned_qty ?? '');
+  const [machine, setMachine] = useState(j.machine || '');
+  const [setNote, setSetNote] = useState(j.setting_note || '');
+  const [ops, setOps] = useState(j.operator_ids || []);
+  const [status, setStatus] = useState(j.status || 'planned');
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const toggleOp = (id) => setOps(p => p.includes(id) ? p.filter(x=>x!==id) : [...p, id]);
+  const save = async () => {
+    setBusy(true); setErr('');
+    const payload = { part_id: partId||null, planned_qty: Number(qty)||0, machine: machine.trim()||null, setting_note: setNote.trim()||null, operator_ids: ops, status, updated_at: new Date().toISOString() };
+    let error;
+    if (j.id) ({ error } = await sb.from('ppc_plan').update(payload).eq('id', j.id));
+    else ({ error } = await sb.from('ppc_plan').insert({ ...payload, plant_id: plant.id, created_by: me.id, plan_date: ctx.date, stage_id: ctx.stage.id }));
+    if (error) { setErr(error.message); setBusy(false); } else { showToast(j.id?'Job updated':'Job planned'); onSaved(); }
+  };
+  const del = async () => { if(!confirm('Delete this job?'))return; await sb.from('ppc_plan').delete().eq('id', j.id); showToast('Deleted'); onSaved(); };
+  return html`
+    <div class="modal-backdrop active" onClick=${e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">${ctx.stage.name} · ${ppcDayShort(ctx.date)}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field"><label>Part</label>
+          <select value=${partId} onChange=${e=>setPartId(e.target.value)}>
+            <option value="">— select part —</option>
+            ${parts.map(p=>html`<option value=${p.id}>${p.code?p.code+' · ':''}${p.name}</option>`)}
+          </select>
+        </div>
+        <div class="field-row">
+          <div class="field" style="flex:1"><label>Planned qty</label><input type="number" inputmode="numeric" value=${qty} onInput=${e=>setQty(e.target.value)}/></div>
+          <div class="field" style="flex:1"><label>Machine / Die</label><input value=${machine} onInput=${e=>setMachine(e.target.value)} placeholder="e.g. VMC-2"/></div>
+        </div>
+        <div class="field"><label>Setting / note (emergency changes)</label><input value=${setNote} onInput=${e=>setSetNote(e.target.value)} placeholder="e.g. changed offset / die temp"/></div>
+        <div class="field"><label>Operators</label>
+          <div style="display:flex;flex-wrap:wrap;gap:6px">
+            ${operators.length===0 && html`<span style="font-size:12px;color:var(--slate-400,#94a3b8)">No operators yet — add them in the Operators tab.</span>`}
+            ${operators.map(o=>html`<button type="button" class="btn small ${ops.includes(o.id)?'':'ghost'}" onClick=${()=>toggleOp(o.id)}>${o.name}</button>`)}
+          </div>
+        </div>
+        <div class="field"><label>Status</label>
+          <select value=${status} onChange=${e=>setStatus(e.target.value)}>${PPC_STATUS.map(s=>html`<option value=${s}>${s.replace('_',' ')}</option>`)}</select>
+        </div>
+        <div class="field-row" style="margin-top:8px;gap:8px">
+          ${j.id && html`<button class="btn ghost" onClick=${del} style="color:var(--rose-600,#e11d48)">Delete</button>`}
+          <button class="btn" style="flex:1" disabled=${busy} onClick=${save}>${busy?'Saving…':(j.id?'Update job':'Plan job')}</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function PpcOutputModal({ plant, me, operators, job, onClose, onSaved }) {
+  const assigned = operators.filter(o => (job.operator_ids||[]).includes(o.id));
+  const list = assigned.length ? assigned : operators;
+  const [opId, setOpId] = useState(list[0]?.id || '');
+  const [ok, setOk] = useState(''); const [rej, setRej] = useState(''); const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const save = async () => {
+    setBusy(true); setErr('');
+    const { error } = await sb.from('ppc_output').insert({ plant_id: plant.id, created_by: me.id, plan_id: job.id, operator_id: opId||null, log_date: job.plan_date, ok_qty: Number(ok)||0, reject_qty: Number(rej)||0, note: note.trim()||null });
+    if (error) { setErr(error.message); setBusy(false); } else { showToast('Output logged'); onSaved(); }
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">Log output · ${job.ppc_stages?.name||''}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="alert info">${partLabelG(job.ppc_parts)||'Job'} · planned ${fmtNum(job.planned_qty)}</div>
+        <div class="field"><label>Operator</label>
+          <select value=${opId} onChange=${e=>setOpId(e.target.value)}><option value="">—</option>${list.map(o=>html`<option value=${o.id}>${o.name}</option>`)}</select>
+        </div>
+        <div class="field-row">
+          <div class="field" style="flex:1"><label>OK qty</label><input type="number" inputmode="numeric" value=${ok} onInput=${e=>setOk(e.target.value)}/></div>
+          <div class="field" style="flex:1"><label>Reject qty</label><input type="number" inputmode="numeric" value=${rej} onInput=${e=>setRej(e.target.value)}/></div>
+        </div>
+        <div class="field"><label>Note</label><input value=${note} onInput=${e=>setNote(e.target.value)}/></div>
+        <button class="btn" style="width:100%;margin-top:8px" disabled=${busy} onClick=${save}>${busy?'Saving…':'Save output'}</button>
+      </div>
+    </div>`;
+}
+
+function PpcOperatorModal({ plant, me, op, onClose, onSaved }) {
+  const [name, setName] = useState(op?.name || '');
+  const [skill, setSkill] = useState(op?.skill || '');
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const save = async () => {
+    if (!name.trim()) { setErr('Name is required'); return; }
+    setBusy(true); setErr('');
+    let error;
+    if (op?.id) ({ error } = await sb.from('ppc_operators').update({ name: name.trim(), skill: skill.trim()||null }).eq('id', op.id));
+    else ({ error } = await sb.from('ppc_operators').insert({ plant_id: plant.id, created_by: me.id, name: name.trim(), skill: skill.trim()||null }));
+    if (error) { setErr(error.message); setBusy(false); } else { showToast('Saved'); onSaved(); }
+  };
+  const del = async () => { if(!confirm('Remove this operator?'))return; await sb.from('ppc_operators').update({active:false}).eq('id', op.id); showToast('Removed'); onSaved(); };
+  return html`
+    <div class="modal-backdrop active" onClick=${e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">${op?.id?'Edit operator':'Add operator'}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field"><label>Name</label><input value=${name} onInput=${e=>setName(e.target.value)}/></div>
+        <div class="field"><label>Skill / stage (optional)</label><input value=${skill} onInput=${e=>setSkill(e.target.value)} placeholder="e.g. CNC, Fettling"/></div>
+        <div class="field-row" style="margin-top:8px;gap:8px">
+          ${op?.id && html`<button class="btn ghost" onClick=${del} style="color:var(--rose-600,#e11d48)">Remove</button>`}
+          <button class="btn" style="flex:1" disabled=${busy} onClick=${save}>${busy?'Saving…':'Save'}</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function PpcPartModal({ plant, me, part, onClose, onSaved }) {
+  const [code, setCode] = useState(part?.code || '');
+  const [name, setName] = useState(part?.name || '');
+  const [uom, setUom] = useState(part?.uom || 'pcs');
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const save = async () => {
+    if (!name.trim()) { setErr('Part name is required'); return; }
+    setBusy(true); setErr('');
+    let error;
+    if (part?.id) ({ error } = await sb.from('ppc_parts').update({ code: code.trim()||null, name: name.trim(), uom: uom.trim()||'pcs' }).eq('id', part.id));
+    else ({ error } = await sb.from('ppc_parts').insert({ plant_id: plant.id, created_by: me.id, code: code.trim()||null, name: name.trim(), uom: uom.trim()||'pcs' }));
+    if (error) { setErr(error.message); setBusy(false); } else { showToast('Saved'); onSaved(); }
+  };
+  return html`
+    <div class="modal-backdrop active" onClick=${e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">${part?.id?'Edit part':'Add part'}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field-row">
+          <div class="field" style="flex:0 0 38%"><label>Code</label><input value=${code} onInput=${e=>setCode(e.target.value)} placeholder="opt."/></div>
+          <div class="field" style="flex:1"><label>Part name</label><input value=${name} onInput=${e=>setName(e.target.value)}/></div>
+        </div>
+        <div class="field"><label>Unit (uom)</label><input value=${uom} onInput=${e=>setUom(e.target.value)}/></div>
+        <button class="btn" style="width:100%;margin-top:8px" disabled=${busy} onClick=${save}>${busy?'Saving…':'Save'}</button>
+      </div>
+    </div>`;
+}
+
+function PpcTargetModal({ plant, me, month, part, row, onClose, onSaved }) {
+  const [target, setTarget] = useState(row?.target_qty ?? '');
+  const [wd, setWd] = useState(row?.working_days ?? 26);
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const save = async () => {
+    setBusy(true); setErr('');
+    let error;
+    if (row?.id) ({ error } = await sb.from('ppc_month_plan').update({ target_qty: Number(target)||0, working_days: Number(wd)||26, updated_at:new Date().toISOString() }).eq('id', row.id));
+    else ({ error } = await sb.from('ppc_month_plan').insert({ plant_id: plant.id, created_by: me.id, part_id: part.id, month, target_qty: Number(target)||0, working_days: Number(wd)||26 }));
+    if (error) { setErr(error.message); setBusy(false); } else { showToast('Target set'); onSaved(); }
+  };
+  const daily = Number(target) ? Math.ceil(Number(target)/Math.max(1,Number(wd))) : 0;
+  return html`
+    <div class="modal-backdrop active" onClick=${e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">Monthly target · ${part?.name||''}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field-row">
+          <div class="field" style="flex:1"><label>Monthly target</label><input type="number" inputmode="numeric" value=${target} onInput=${e=>setTarget(e.target.value)}/></div>
+          <div class="field" style="flex:1"><label>Working days</label><input type="number" inputmode="numeric" value=${wd} onInput=${e=>setWd(e.target.value)}/></div>
+        </div>
+        <div class="alert info">Daily supply target ≈ <strong>${fmtNum(daily)}</strong> ${part?.uom||'pcs'}/day</div>
+        <button class="btn" style="width:100%;margin-top:8px" disabled=${busy} onClick=${save}>${busy?'Saving…':'Save target'}</button>
+      </div>
+    </div>`;
+}
+// Shared part label helper (module-scope, used by PPC modals)
+function partLabelG(p){ return p ? (p.code ? p.code + ' · ' : '') + (p.name||'') : ''; }
+
 function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessibleUnits, activeUnit, switchUnit }) {
   const initials = (me.full_name || user.email).split(' ').map(s => s[0]).join('').slice(0,2).toUpperCase();
   const [unreadCount, setUnreadCount] = useState(0);
@@ -3449,6 +3863,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'machine_prod'}><${MachineProductionModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'petty_cash'}><${PettyCashModule} plant=${plant} me=${me} activeUnit=${activeUnit} navAction=${navAction} /></${Page}>
+      <${Page} active=${pageTab === 'ppc'}><${PpcModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
       <${Page} active=${denied}><${AccessDenied} moduleKey=${tab} /></${Page}>
 
@@ -9528,6 +9943,7 @@ const RBAC_MODULES = [
   { key:'people', label:'People', group:'core' },
   { key:'masters', label:'Masters', group:'core' },
   { key:'production', label:'Production', group:'ops' },
+  { key:'ppc', label:'Production Planning (PPC)', group:'ops' },
   { key:'quality', label:'Quality', group:'ops' },
   { key:'maintenance', label:'Maintenance', group:'ops' },
   { key:'stocks', label:'Stocks', group:'ops' },
