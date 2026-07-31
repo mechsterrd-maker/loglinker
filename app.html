@@ -17,9 +17,24 @@
   // OAuth (PKCE) stores its verifier per-origin, so start & finish must share a host.
   (function () {
     try {
+      var n = +(sessionStorage.getItem('llk_rdr') || 0);
+      if (n > 4) {
+        // We've bounced hosts too many times — a stale cached redirect is trapping
+        // the tab. Stop redirecting and SELF-HEAL: drop the service worker + all
+        // caches so the next load fetches fresh HTML and the loop ends by itself.
+        sessionStorage.removeItem('llk_rdr');
+        if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations)
+          navigator.serviceWorker.getRegistrations().then(function (rs) { rs.forEach(function (r) { r.unregister(); }); }).catch(function () {});
+        if (window.caches && caches.keys)
+          caches.keys().then(function (ks) { ks.forEach(function (k) { caches.delete(k); }); }).catch(function () {});
+        return;
+      }
       var h = location.hostname;
       if (h === 'www.loglinkr.com' || h === 'app.loglinkr.com') {
+        sessionStorage.setItem('llk_rdr', n + 1);
         location.replace('https://loglinkr.com' + location.pathname + location.search + location.hash);
+      } else {
+        sessionStorage.removeItem('llk_rdr');   // reached the canonical host cleanly
       }
     } catch (_) {}
   })();
@@ -766,13 +781,15 @@ if (typeof window !== 'undefined') {
 // Service worker registration (PWA + push)
 let swRegistration = null;
 if ('serviceWorker' in navigator) {
-  // When a new service worker takes control, reload once so the fresh app shell loads.
-  let swReloaded = false;
+  // When a new service worker takes control, reload once so the fresh app shell
+  // loads — but guard with sessionStorage so a repeatedly-activating worker can
+  // never trap the tab in an infinite reload. The flag auto-clears after the page
+  // has been stable a few seconds, so genuine future updates still reload once.
   navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if (swReloaded) return;
-    swReloaded = true;
+    try { if (sessionStorage.getItem('llk_swreload') === '1') return; sessionStorage.setItem('llk_swreload', '1'); } catch (_) {}
     window.location.reload();
   });
+  setTimeout(() => { try { sessionStorage.removeItem('llk_swreload'); } catch (_) {} }, 8000);
   navigator.serviceWorker.register('/sw.js').then(reg => {
     swRegistration = reg;
     reg.update().catch(() => {});          // force an immediate update check on load
