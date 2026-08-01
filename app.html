@@ -37493,8 +37493,133 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       }
     `}
 
+    ${['dc_out','invoice_out','dc_out_returnable'].includes(doc.doc_type) && html`<${BillScheduleMapping} plant=${plant} me=${me} doc=${doc} onChanged=${refresh} />`}
+
     ${paymentModal && html`<${PaymentModal} plant=${plant} me=${me} doc=${doc} balance=${balance} onClose=${() => setPaymentModal(false)} onSaved=${() => { setPaymentModal(false); refresh(); }} />`}
     ${grnModal && html`<${GrnReceptionModal} plant=${plant} me=${me} doc=${doc} onClose=${() => setGrnModal(false)} onSaved=${() => { setGrnModal(false); refresh(); }} />`}
+  `;
+}
+
+// ============= BILL → SCHEDULE ITEM MAPPING =============
+// On an outward bill (DC / Invoice), list every line item and let the user credit
+// each to a schedule line. Auto-matched items show a ✓; unmatched items get a
+// schedule-line picker + Record. Recording remembers the mapping (item name →
+// part) so next month's bill auto-matches. Records carry source_doc_id so they
+// stay linked to (and are cleaned up with) the bill.
+function BillScheduleMapping({ plant, me, doc, onChanged }) {
+  const items = Array.isArray(doc.items) ? doc.items : [];
+  const [supplies, setSupplies] = useState([]);
+  const [lines, setLines] = useState([]);
+  const [customerId, setCustomerId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [picks, setPicks] = useState({});
+  const [busy, setBusy] = useState({});
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const { data: sup } = await sb.from('mcp_sched_supplies')
+      .select('id, schedule_line_id, supplied_qty, customer_id, mcp_sched_lines(part_name_raw, mcp_sched_schedules(schedule_month))')
+      .eq('source_doc_id', doc.id);
+    const sups = sup || [];
+    setSupplies(sups);
+    let cid = sups[0]?.customer_id || null;
+    if (!cid) {
+      const { data: al } = await sb.from('mcp_sched_customer_aliases').select('customer_id, alias_name, alias_gstin').eq('plant_id', plant.id);
+      const nm = (doc.vendor_name_raw || '').toLowerCase().trim();
+      const gs = (doc.vendor_gstin_raw || '').toUpperCase().trim();
+      const hit = (al || []).find(a => (a.alias_gstin && gs && a.alias_gstin.toUpperCase() === gs) || (a.alias_name && a.alias_name.toLowerCase() === nm));
+      cid = hit?.customer_id || null;
+    }
+    setCustomerId(cid);
+    if (cid) {
+      const { data: ln } = await sb.from('mcp_sched_lines')
+        .select('id, part_name_raw, planned_qty, required_by_date, schedule_id, mcp_sched_schedules!inner(schedule_month, customer_id, status), supplies:mcp_sched_supplies(supplied_qty)')
+        .eq('plant_id', plant.id)
+        .eq('mcp_sched_schedules.customer_id', cid)
+        .in('mcp_sched_schedules.status', ['active','open']);
+      setLines(ln || []);
+    } else setLines([]);
+    setLoading(false);
+  }, [doc.id]);
+  useEffect(() => { load(); }, [load]);
+
+  const remaining = (l) => Number(l.planned_qty || 0) - (l.supplies || []).reduce((a,s)=>a+Number(s.supplied_qty||0),0);
+  const candLines = [...lines].filter(l => remaining(l) > 0).sort((a,b)=>(a.required_by_date||'').localeCompare(b.required_by_date||''));
+  const lineLabel = (l) => {
+    const mon = new Date(l.mcp_sched_schedules.schedule_month).toLocaleDateString('en-IN',{month:'short',year:'2-digit'});
+    const dt = l.required_by_date ? ' · ' + new Date(l.required_by_date).toLocaleDateString('en-IN',{day:'2-digit',month:'short'}) : '';
+    return `${l.part_name_raw} · ${mon}${dt} · ${fmtNum(remaining(l))} left`;
+  };
+
+  // greedy qty match: each item -> at most one of this doc's supplies
+  const used = new Set();
+  const status = items.map(it => {
+    const q = Number(it.qty) || 0;
+    const s = supplies.find(x => !used.has(x.id) && Number(x.supplied_qty) === q);
+    if (s) { used.add(s.id); return { matched: true, supply: s }; }
+    return { matched: false };
+  });
+
+  const rec = async (idx, it) => {
+    const lineId = picks[idx];
+    if (!lineId) { showToast('Pick a schedule line first'); return; }
+    const line = lines.find(l => l.id === lineId);
+    setBusy(b => ({ ...b, [idx]: true }));
+    const { error } = await sb.from('mcp_sched_supplies').insert({
+      plant_id: plant.id, schedule_line_id: lineId, schedule_id: line.schedule_id,
+      customer_id: customerId, supplied_qty: Number(it.qty) || 0,
+      dispatch_date: doc.doc_date || new Date().toISOString().slice(0,10),
+      invoice_number: doc.doc_type === 'invoice_out' ? doc.doc_number : null,
+      dc_number: (doc.doc_type === 'dc_out' || doc.doc_type === 'dc_out_returnable') ? doc.doc_number : null,
+      source_doc_id: doc.id, recorded_by: me.id,
+      notes: 'Mapped from bill item: ' + (it.name || ''),
+    });
+    if (error) { showToast(error.message); setBusy(b => ({ ...b, [idx]: false })); return; }
+    try { await sb.rpc('remember_item_alias', { p_plant_id: plant.id, p_customer_id: customerId, p_item_name: it.name || '', p_part_name: line.part_name_raw }); } catch (_) {}
+    showToast('Mapped ✓ · will auto-match next time');
+    setBusy(b => ({ ...b, [idx]: false }));
+    setPicks(p => { const n = { ...p }; delete n[idx]; return n; });
+    await load(); if (onChanged) onChanged();
+  };
+
+  const unmap = async (supplyId) => {
+    if (!confirm('Remove this mapping? The supply record will be deleted.')) return;
+    await sb.from('mcp_sched_supplies').delete().eq('id', supplyId);
+    await load(); if (onChanged) onChanged();
+  };
+
+  if (items.length === 0) return '';
+  const unmatchedCount = status.filter(s => !s.matched).length;
+  return html`
+    <div class="section-h">Map items → schedule ${unmatchedCount > 0 ? html`<span class="badge amber">${unmatchedCount} unmatched</span>` : html`<span class="badge emerald">all matched</span>`}</div>
+    ${loading ? html`<div class="empty"><div style="font-size:13px">Loading…</div></div>` :
+      !customerId ? html`<div class="alert info">This bill isn't linked to a schedule customer yet. Open <b>Schedules → Bill mapping</b>, map the billing name to a customer, then come back here.</div>` :
+      html`<div>
+        ${items.map((it, idx) => {
+          const st = status[idx];
+          return html`
+            <div class="card" style="margin-bottom:8px" key=${idx}>
+              <div class="list-item-row">
+                <div class="list-item-main">
+                  <div class="list-item-title">${it.name || 'Item'} · ${fmtNum(it.qty)} ${it.uom || ''}</div>
+                  ${st.matched
+                    ? html`<div class="list-item-sub" style="color:var(--emerald-700)">✓ ${st.supply.mcp_sched_lines?.part_name_raw || 'matched'}${st.supply.mcp_sched_lines?.mcp_sched_schedules?.schedule_month ? ' · ' + new Date(st.supply.mcp_sched_lines.mcp_sched_schedules.schedule_month).toLocaleDateString('en-IN',{month:'short',year:'2-digit'}) : ''}</div>`
+                    : html`<div class="list-item-sub" style="color:var(--amber-700)">⚠ not matched — pick a schedule line below</div>`}
+                </div>
+                ${st.matched && html`<button class="btn small ghost" onClick=${()=>unmap(st.supply.id)}>Unmap</button>`}
+              </div>
+              ${!st.matched && html`
+                <div style="display:flex;gap:8px;margin-top:8px">
+                  <select style="flex:1" value=${picks[idx] || ''} onChange=${e=>setPicks(p=>({ ...p, [idx]: e.target.value }))}>
+                    <option value="">— pick schedule line —</option>
+                    ${candLines.map(l => html`<option value=${l.id}>${lineLabel(l)}</option>`)}
+                  </select>
+                  <button class="btn small" disabled=${!!busy[idx] || !picks[idx]} onClick=${()=>rec(idx, it)}>${busy[idx] ? '…' : 'Record'}</button>
+                </div>`}
+            </div>`;
+        })}
+        ${candLines.length === 0 && unmatchedCount > 0 && html`<div class="alert info">No open schedule lines left for this customer — every line is fully supplied, or there's no active schedule.</div>`}
+      </div>`}
   `;
 }
 
