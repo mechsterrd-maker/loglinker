@@ -40629,12 +40629,14 @@ function Schedules({ plant, me, activeUnit }) {
       <button class=${'auth-tab' + (view === 'plan_vs_supply' ? ' active' : '')} onClick=${() => setView('plan_vs_supply')}>📊 Plan vs Supply</button>
       <button class=${'auth-tab' + (view === 'customers' ? ' active' : '')} onClick=${() => setView('customers')}>Customers</button>
       <button class=${'auth-tab' + (view === 'lines' ? ' active' : '')} onClick=${() => setView('lines')}>📋 Lines</button>
+      <button class=${'auth-tab' + (view === 'itemmap' ? ' active' : '')} onClick=${() => setView('itemmap')}>🧩 Map Items</button>
       <button class=${'auth-tab' + (view === 'mapping' ? ' active' : '')} onClick=${() => setView('mapping')}>🔗 Bill Mapping</button>
     </div>
 
     ${view === 'schedules' ? html`<${SchedulesList} plant=${plant} me=${me} activeUnit=${activeUnit} onOpen=${setActiveSchedule} />` :
       view === 'plan_vs_supply' ? html`<${PlanVsSupplyView} plant=${plant} me=${me} activeUnit=${activeUnit} />` :
       view === 'lines' ? html`<${ScheduleLinesManagerView} plant=${plant} me=${me} activeUnit=${activeUnit} />` :
+      view === 'itemmap' ? html`<${ItemMapperView} plant=${plant} me=${me} activeUnit=${activeUnit} />` :
       view === 'mapping' ? html`<${BillMappingView} plant=${plant} me=${me} activeUnit=${activeUnit} />` :
       html`<${CustomersList} plant=${plant} me=${me} activeUnit=${activeUnit} onOpen=${setActiveCustomer} />`}
   `;
@@ -41947,6 +41949,150 @@ function CustomerDetail({ plant, me, customer: initialCustomer, onClose }) {
 //     re-fires the supply trigger on every doc carrying that name).
 //
 // Filters: All / Unmatched / Matched · plus free-text search.
+// ============= EASY ITEM MAPPER =============
+// One worklist of EVERY unmatched bill item across all outward bills. Each row
+// shows a one-tap suggested schedule line (best client-side guess) + a fallback
+// picker. Mapping records the supply (linked to the bill) and remembers the
+// item→part mapping so next month auto-matches.
+function ItemMapperView({ plant, me }) {
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+  const [linesByCust, setLinesByCust] = useState({});
+  const [busy, setBusy] = useState({});
+  const [picks, setPicks] = useState({});
+
+  const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const alpha = s => (s || '').toLowerCase().replace(/[^a-z]+/g, ' ').trim();
+  const monShort = m => m ? new Date(m).toLocaleDateString('en-IN', { month:'short', year:'2-digit' }) : '';
+
+  const suggest = (item, doc, custLines, aliasMap, cid) => {
+    const inorm = norm(item.name), ialpha = alpha(item.name);
+    const itoks = inorm.split(' ').filter(t => t.length >= 3);
+    const billMonth = (doc.doc_date || '').slice(0, 7);
+    const aliasTarget = aliasMap.get(cid + '|' + inorm);
+    let best = null, bestScore = -1;
+    for (const l of custLines) {
+      if (l._remaining <= 0) continue;
+      const lnorm = norm(l.part_name_raw), lalpha = alpha(l.part_name_raw);
+      const ltoks = lnorm.split(' ').filter(t => t.length >= 3);
+      const overlap = itoks.filter(t => ltoks.includes(t)).length;
+      let tier = null;
+      if (aliasTarget && lnorm === norm(aliasTarget)) tier = 0;
+      else if (ialpha.length >= 4 && lalpha.length >= 4 && (ialpha.includes(lalpha) || lalpha.includes(ialpha))) tier = 4;
+      else if (overlap >= 2) tier = 5;
+      if (tier === null) continue;
+      const sameMonth = billMonth && (l.mcp_sched_schedules?.schedule_month || '').slice(0, 7) === billMonth ? 1 : 0;
+      const score = sameMonth * 1000 + (10 - tier) * 50 + overlap * 5;
+      if (score > bestScore) { bestScore = score; best = l; }
+    }
+    return best;
+  };
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const { data: docs } = await sb.from('mcp_logistics_documents')
+      .select('id, doc_type, doc_number, doc_date, vendor_name_raw, vendor_gstin_raw, items, created_at')
+      .eq('plant_id', plant.id)
+      .in('doc_type', ['dc_out','invoice_out','dc_out_returnable'])
+      .order('created_at', { ascending: false })
+      .limit(150);
+    const docList = (docs || []).filter(d => Array.isArray(d.items) && d.items.length > 0);
+    const docIds = docList.map(d => d.id);
+    const supRes = docIds.length ? await sb.from('mcp_sched_supplies').select('id, source_doc_id, customer_id, supplied_qty').in('source_doc_id', docIds) : { data: [] };
+    const supByDoc = new Map();
+    (supRes.data || []).forEach(s => { if (!supByDoc.has(s.source_doc_id)) supByDoc.set(s.source_doc_id, []); supByDoc.get(s.source_doc_id).push(s); });
+    const { data: cAl } = await sb.from('mcp_sched_customer_aliases').select('customer_id, alias_name, alias_gstin').eq('plant_id', plant.id);
+    const resolveCust = (d) => {
+      const bySup = supByDoc.get(d.id)?.[0]?.customer_id; if (bySup) return bySup;
+      const nm = (d.vendor_name_raw || '').toLowerCase().trim(), gs = (d.vendor_gstin_raw || '').toUpperCase().trim();
+      const hit = (cAl || []).find(a => (a.alias_gstin && gs && a.alias_gstin.toUpperCase() === gs) || (a.alias_name && a.alias_name.toLowerCase() === nm));
+      return hit?.customer_id || null;
+    };
+    const { data: iAl } = await sb.from('mcp_sched_item_aliases').select('customer_id, external_norm, target_part_name').eq('plant_id', plant.id);
+    const aliasMap = new Map((iAl || []).map(a => [a.customer_id + '|' + a.external_norm, a.target_part_name]));
+
+    const custIds = new Set();
+    const pending = [];
+    for (const d of docList) {
+      const cid = resolveCust(d);
+      const sups = (supByDoc.get(d.id) || []);
+      const used = new Array(sups.length).fill(false);
+      d.items.forEach((it, idx) => {
+        const q = Number(it.qty) || 0;
+        const mi = sups.findIndex((s, i) => !used[i] && Number(s.supplied_qty) === q);
+        if (mi >= 0) { used[mi] = true; return; }
+        pending.push({ key: d.id + '|' + idx, doc: d, item: it, idx, cid });
+        if (cid) custIds.add(cid);
+      });
+    }
+    const lbc = {};
+    if (custIds.size) {
+      const { data: lns } = await sb.from('mcp_sched_lines')
+        .select('id, part_name_raw, planned_qty, required_by_date, schedule_id, mcp_sched_schedules!inner(schedule_month, customer_id, status), supplies:mcp_sched_supplies(supplied_qty)')
+        .eq('plant_id', plant.id)
+        .in('mcp_sched_schedules.customer_id', Array.from(custIds))
+        .in('mcp_sched_schedules.status', ['active','open']);
+      (lns || []).forEach(l => {
+        l._remaining = Number(l.planned_qty || 0) - (l.supplies || []).reduce((a, s) => a + Number(s.supplied_qty || 0), 0);
+        const cid = l.mcp_sched_schedules.customer_id;
+        (lbc[cid] = lbc[cid] || []).push(l);
+      });
+    }
+    pending.forEach(r => { r.suggest = r.cid ? suggest(r.item, r.doc, lbc[r.cid] || [], aliasMap, r.cid) : null; });
+    setRows(pending);
+    setLinesByCust(lbc);
+    setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { load(); }, [load]);
+
+  const doMap = async (r, lineId) => {
+    if (!lineId) { showToast('Pick a line'); return; }
+    const line = (linesByCust[r.cid] || []).find(l => l.id === lineId);
+    if (!line) return;
+    setBusy(b => ({ ...b, [r.key]: true }));
+    const d = r.doc, it = r.item;
+    const { error } = await sb.from('mcp_sched_supplies').insert({
+      plant_id: plant.id, schedule_line_id: lineId, schedule_id: line.schedule_id,
+      customer_id: r.cid, supplied_qty: Number(it.qty) || 0,
+      dispatch_date: d.doc_date || new Date().toISOString().slice(0, 10),
+      invoice_number: d.doc_type === 'invoice_out' ? d.doc_number : null,
+      dc_number: (d.doc_type === 'dc_out' || d.doc_type === 'dc_out_returnable') ? d.doc_number : null,
+      source_doc_id: d.id, recorded_by: me.id, notes: 'Mapped from bill item: ' + (it.name || ''),
+    });
+    if (error) { showToast(error.message); setBusy(b => ({ ...b, [r.key]: false })); return; }
+    try { await sb.rpc('remember_item_alias', { p_plant_id: plant.id, p_customer_id: r.cid, p_item_name: it.name || '', p_part_name: line.part_name_raw }); } catch (_) {}
+    showToast('Mapped ✓');
+    setRows(prev => prev.filter(x => x.key !== r.key));
+    setBusy(b => { const n = { ...b }; delete n[r.key]; return n; });
+  };
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+  if (rows.length === 0) return html`<div class="empty"><div class="icon">✅</div>All bill items are matched — nothing to map.</div>`;
+  return html`
+    <div class="alert info" style="margin-bottom:12px">${rows.length} unmatched item${rows.length > 1 ? 's' : ''} across your bills. Tap the suggested line to map — it's remembered for next time.</div>
+    ${rows.map(r => {
+      const cands = [...(linesByCust[r.cid] || [])].filter(l => l._remaining > 0).sort((a, b) => (a.required_by_date || '').localeCompare(b.required_by_date || ''));
+      return html`
+        <div class="card" style="margin-bottom:8px" key=${r.key}>
+          <div class="list-item-title">${r.item.name || 'Item'} · ${fmtNum(r.item.qty)} ${r.item.uom || ''}</div>
+          <div class="list-item-sub" style="margin-bottom:8px">${r.doc.doc_number ? '📄 ' + r.doc.doc_number + ' · ' : ''}${r.doc.doc_date || ''}${!r.cid ? ' · ⚠ customer not mapped' : ''}</div>
+          ${!r.cid ? html`<div class="alert info" style="font-size:12px">Map this bill's customer first in the <b>Bill Mapping</b> tab.</div>` :
+            cands.length === 0 ? html`<div class="alert info" style="font-size:12px">No open schedule lines left for this customer.</div>` :
+            html`<div style="display:flex;flex-direction:column;gap:8px">
+              ${r.suggest && html`<button class="btn small" style="justify-content:flex-start;text-align:left" disabled=${!!busy[r.key]} onClick=${() => doMap(r, r.suggest.id)}>✓ Map to <b style="margin:0 4px">${r.suggest.part_name_raw}</b> · ${monShort(r.suggest.mcp_sched_schedules.schedule_month)} (${fmtNum(r.suggest._remaining)} left)</button>`}
+              <div style="display:flex;gap:8px">
+                <select style="flex:1" value=${picks[r.key] || ''} onChange=${e => setPicks(p => ({ ...p, [r.key]: e.target.value }))}>
+                  <option value="">${r.suggest ? 'Other line…' : 'Pick a line…'}</option>
+                  ${cands.map(l => html`<option value=${l.id}>${l.part_name_raw} · ${monShort(l.mcp_sched_schedules.schedule_month)} · ${fmtNum(l._remaining)} left</option>`)}
+                </select>
+                <button class="btn small ghost" disabled=${!!busy[r.key] || !picks[r.key]} onClick=${() => doMap(r, picks[r.key])}>Map</button>
+              </div>
+            </div>`}
+        </div>`;
+    })}
+  `;
+}
+
 function BillMappingView({ plant, me }) {
   const [docs, setDocs] = useState([]);
   const [customers, setCustomers] = useState([]);
