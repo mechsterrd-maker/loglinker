@@ -2490,12 +2490,25 @@ const APP_MODE = (() => {
     return flag === 'hr' ? 'hr' : 'full';
   } catch (_) { return 'full'; }
 })();
+// Explicit in-app SWITCHER between the factory and HR/attendance views. Set only by
+// the switcher buttons (?view=hr | ?view=full), remembered per-tab. This WINS over the
+// plant's app_mode so a full plant can hop into the attendance app and back on demand.
+// It uses a DIFFERENT key from the landing/APK ?app=hr flag, so marketing links can
+// never silently force a view — only a deliberate switch does.
+const VIEW_OVERRIDE = (() => {
+  try {
+    const v = new URLSearchParams(window.location.search).get('view');   // 'hr' | 'full' | null
+    if (v === 'hr' || v === 'full') { try { sessionStorage.setItem('llk_view_override', v); } catch (_) {} return v; }
+    try { return sessionStorage.getItem('llk_view_override'); } catch (_) { return null; }
+  } catch (_) { return null; }
+})();
+function switchAppView(v) { location.href = window.location.origin + '/app?view=' + (v === 'hr' ? 'hr' : 'full'); }
 // Once a plant is loaded, ITS app_mode is authoritative — so an existing full
 // plant is never forced into HR (even if the URL had ?app=hr), and an HR company
-// always gets the HR app. Before a plant loads (signup/auth), the URL flag decides.
+// always gets the HR app. A deliberate ?view= switch overrides even that.
 let _plantAppMode = null;   // 'hr' | 'full' | null(unknown)
 function setPlantAppMode(m) { _plantAppMode = (m === 'hr') ? 'hr' : (m ? 'full' : null); try { applyHrTheme(); } catch (_) {} }
-const isHrApp = () => _plantAppMode ? (_plantAppMode === 'hr') : (APP_MODE === 'hr');
+const isHrApp = () => VIEW_OVERRIDE ? (VIEW_OVERRIDE === 'hr') : (_plantAppMode ? (_plantAppMode === 'hr') : (APP_MODE === 'hr'));
 
 // Kiosk lock — a device left at the gate can be locked to the Face Kiosk ONLY
 // (no Home / Attendance / Salary / Employees / More). Device-local; leaving
@@ -11890,6 +11903,13 @@ function More({ plant, me, myPerms, user, logout, setTab, activeUnit, accessible
   return html`
     <div class="page-header"><div><h1>More</h1><div class="sub">Modules, account, settings</div></div></div>
 
+    ${!isHrApp() && html`
+      <div class="card" onClick=${() => switchAppView('hr')} style="cursor:pointer;display:flex;align-items:center;gap:12px;margin-bottom:12px;border:1px solid var(--teal-200);background:var(--teal-50)">
+        <div style="font-size:24px">📋</div>
+        <div style="flex:1"><div style="font-weight:700;color:var(--teal-800)">Switch to Attendance app</div><div style="font-size:12px;color:var(--slate-600)">Face kiosk · attendance register · payroll</div></div>
+        <span style="font-size:18px;color:var(--teal-600)">›</span>
+      </div>`}
+
     ${(() => {
       // Whitelist plants (Starter Pack) list their top-level modules here, since
       // these tabs aren't in MORE_GROUPS and the bottom bar only fits four. RBAC:
@@ -17129,7 +17149,7 @@ function HrHome({ plant, me, setTab }) {
           <div class="ios-sub">${plant?.name || 'Your company'} · ${dateLabel}</div>
         </div>
         <div style="display:flex;gap:8px;flex:none">
-          ${plant && plant.app_mode !== 'hr' && html`<button class="ios-themebtn" onClick=${() => { location.href = '/app?app=full'; }} title="Open the factory app (production, quality, schedules…)" style="width:auto;padding:0 11px;font-size:12px;font-weight:700">🏭 Factory</button>`}
+          ${plant && plant.app_mode !== 'hr' && html`<button class="ios-themebtn" onClick=${() => switchAppView('full')} title="Open the factory app (production, quality, schedules…)" style="width:auto;padding:0 11px;font-size:12px;font-weight:700">🏭 Factory</button>`}
           <button class="ios-themebtn" onClick=${cycleTheme} title=${'Appearance: ' + theme}>${themeIcon}</button>
           <button class="ios-themebtn" onClick=${load} title="Refresh">↻</button>
         </div>
