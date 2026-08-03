@@ -43035,6 +43035,211 @@ function ScheduleAddModal({ plant, me, customers, parts, onClose, onSaved }) {
 }
 
 // ============= SCHEDULE DETAIL — date-first, 3 views =============
+// ============= SUPPLY PLANNER =============
+// Editable parts x delivery-date grid in the SAME layout as the customer schedule.
+// Each cell prefills with the demand (shown for reference) and holds the qty we plan
+// to supply; a per-part Balance (demand - planned) tracks the carry-over until the
+// month is fully planned. Export the plan as PDF / image / CSV to send the customer.
+const spFmtDay = (d) => d ? new Date(d).getDate() + ' ' + new Date(d).toLocaleString('en-IN',{month:'short'}) : '?';
+
+async function spShareOrDownload(blob, filename, mime) {
+  try {
+    if (navigator.canShare && navigator.share) {
+      const file = new File([blob], filename, { type: mime });
+      if (navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: filename }); return; }
+    }
+  } catch (_) {}
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+function spExportCSV(title, headers, rows) {
+  const esc = v => { v = String(v == null ? '' : v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+  const csv = title + '\n' + headers.map(esc).join(',') + '\n' + rows.map(r => r.map(esc).join(',')).join('\n');
+  spShareOrDownload(new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' }), 'supply-plan.csv', 'text/csv');
+}
+async function spExportPDF(title, subtitle, headers, rows) {
+  await ensureJsPDF(); const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'mm', format: 'a4', orientation: headers.length > 7 ? 'landscape' : 'portrait' });
+  doc.setFontSize(14); doc.text(title, 12, 15);
+  doc.setFontSize(9); doc.setTextColor(120); doc.text(subtitle, 12, 21); doc.setTextColor(0);
+  doc.autoTable({ head: [headers], body: rows, startY: 25,
+    styles: { fontSize: 7, cellPadding: 1.2, halign: 'center', lineWidth: 0.1, lineColor: [200,200,200] },
+    columnStyles: { 0: { halign: 'left', fontStyle: 'bold' } },
+    headStyles: { fillColor: [11, 31, 58], textColor: 255 }, margin: { left: 10, right: 10 } });
+  await spShareOrDownload(doc.output('blob'), 'supply-plan.pdf', 'application/pdf');
+}
+function spExportPNG(title, subtitle, headers, rows) {
+  const S = 2, pad = 12, cellH = 26, headerH = 30, titleH = 56;
+  const meas = document.createElement('canvas').getContext('2d');
+  meas.font = 'bold 13px Arial';
+  const colW = headers.map((h, i) => {
+    let w = meas.measureText(String(h)).width;
+    for (const r of rows) w = Math.max(w, meas.measureText(String(r[i] == null ? '' : r[i])).width);
+    return Math.ceil(Math.max(46, w + pad * 2));
+  });
+  const totalW = colW.reduce((a, b) => a + b, 0);
+  const totalH = titleH + headerH + rows.length * cellH + pad;
+  const c = document.createElement('canvas'); c.width = totalW * S; c.height = totalH * S;
+  const ctx = c.getContext('2d'); ctx.scale(S, S);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, totalW, totalH);
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#0f172a'; ctx.font = 'bold 18px Arial'; ctx.textAlign = 'left'; ctx.fillText(title, pad, 22);
+  ctx.fillStyle = '#64748b'; ctx.font = '12px Arial'; ctx.fillText(subtitle, pad, 42);
+  let y = titleH, x = 0;
+  ctx.fillStyle = '#0b1f3a'; ctx.fillRect(0, y, totalW, headerH);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 12px Arial'; ctx.textAlign = 'center';
+  headers.forEach((h, i) => { ctx.fillText(String(h), x + colW[i] / 2, y + headerH / 2); x += colW[i]; });
+  y += headerH;
+  rows.forEach((r, ri) => {
+    x = 0; ctx.fillStyle = ri % 2 ? '#f8fafc' : '#ffffff'; ctx.fillRect(0, y, totalW, cellH);
+    ctx.font = '12px Arial'; ctx.fillStyle = '#0f172a';
+    r.forEach((cell, ci) => {
+      ctx.textAlign = ci === 0 ? 'left' : 'center';
+      ctx.fillText(String(cell == null ? '' : cell), ci === 0 ? x + pad : x + colW[ci] / 2, y + cellH / 2);
+      x += colW[ci];
+    });
+    y += cellH;
+  });
+  ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 1;
+  x = 0; for (let i = 0; i <= colW.length; i++) { ctx.beginPath(); ctx.moveTo(x, titleH); ctx.lineTo(x, y); ctx.stroke(); if (i < colW.length) x += colW[i]; }
+  for (let yy = titleH; yy <= y; yy += (yy < titleH + headerH ? headerH : cellH)) { ctx.beginPath(); ctx.moveTo(0, yy); ctx.lineTo(totalW, yy); ctx.stroke(); }
+  c.toBlob(b => b && spShareOrDownload(b, 'supply-plan.png', 'image/png'), 'image/png');
+}
+
+function SupplyPlanGrid({ plant, me, schedule, onClose }) {
+  const [lines, setLines] = useState([]);
+  const [plan, setPlan] = useState({});      // line_id -> string
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [dirty, setDirty] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('mcp_sched_lines')
+      .select('id, part_name_raw, customer_part_number, delivery_date, planned_qty, supply_plan_qty, uom')
+      .eq('schedule_id', schedule.id).order('delivery_date');
+    const rows = data || [];
+    setLines(rows);
+    const p = {};
+    rows.forEach(l => { p[l.id] = (l.supply_plan_qty != null ? l.supply_plan_qty : l.planned_qty) ?? ''; });
+    setPlan(p);
+    setLoading(false);
+  }, [schedule.id]);
+  useEffect(() => { load(); }, [load]);
+
+  const dates = [...new Set(lines.map(l => l.delivery_date).filter(Boolean))].sort();
+  const partsMap = {};
+  for (const l of lines) {
+    const k = (l.part_name_raw || '?') + '|' + (l.customer_part_number || '');
+    if (!partsMap[k]) partsMap[k] = { name: l.part_name_raw || '?', cpn: l.customer_part_number || '', uom: l.uom || '', byDate: {} };
+    partsMap[k].byDate[l.delivery_date] = l;
+  }
+  const parts = Object.values(partsMap);
+  const val = (l) => { const v = plan[l?.id]; return v === '' || v == null ? 0 : Number(v) || 0; };
+
+  const setCell = (id, v) => { setPlan(p => ({ ...p, [id]: v })); setDirty(true); };
+  const resetToDemand = () => { const p = {}; lines.forEach(l => p[l.id] = l.planned_qty ?? ''); setPlan(p); setDirty(true); };
+
+  const save = async () => {
+    setBusy(true);
+    const changed = lines.filter(l => {
+      const nv = plan[l.id] === '' || plan[l.id] == null ? null : Number(plan[l.id]);
+      const cur = l.supply_plan_qty == null ? null : Number(l.supply_plan_qty);
+      return nv !== cur;
+    });
+    try { await Promise.all(changed.map(l => sb.from('mcp_sched_lines').update({ supply_plan_qty: plan[l.id] === '' || plan[l.id] == null ? null : Number(plan[l.id]) }).eq('id', l.id))); showToast('Supply plan saved'); setDirty(false); await load(); }
+    catch (e) { showToast(e.message); }
+    setBusy(false);
+  };
+
+  // export table
+  const buildExport = () => {
+    const headers = ['Part', ...dates.map(spFmtDay), 'Total'];
+    const rows = parts.map(p => {
+      const cells = dates.map(d => { const l = p.byDate[d]; return l ? (plan[l.id] === '' || plan[l.id] == null ? '' : fmtNum(Number(plan[l.id]))) : ''; });
+      const tot = dates.reduce((a, d) => a + val(p.byDate[d]), 0);
+      return [p.name + (p.cpn ? ' (' + p.cpn + ')' : ''), ...cells, fmtNum(tot)];
+    });
+    return { headers, rows };
+  };
+  const title = 'SUPPLY PLAN — ' + (schedule.customer?.name || '');
+  const subtitle = (plant.name || '') + '  ·  ' + new Date(schedule.schedule_month).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+  const doExport = async (fmt) => {
+    if (dirty) await save();
+    const { headers, rows } = buildExport();
+    if (fmt === 'csv') spExportCSV(title, headers, rows);
+    else if (fmt === 'pdf') await spExportPDF(title, subtitle, headers, rows);
+    else spExportPNG(title, subtitle, headers, rows);
+  };
+
+  if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+
+  const grand = { demand: 0, plan: 0 };
+  parts.forEach(p => dates.forEach(d => { const l = p.byDate[d]; if (l) { grand.demand += Number(l.planned_qty || 0); grand.plan += val(l); } }));
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn ghost small" style="padding:6px 10px" onClick=${onClose}>← Back</button>
+      <div style="flex:1;min-width:0"><h1 style="font-size:17px">📤 Supply Plan</h1><div class="sub">${schedule.customer?.name || ''} · ${new Date(schedule.schedule_month).toLocaleDateString('en-IN',{month:'long',year:'numeric'})}</div></div>
+      <button class="btn small" disabled=${busy || !dirty} onClick=${save}>${busy ? 'Saving…' : dirty ? 'Save' : 'Saved'}</button>
+    </div>
+
+    <div class="alert info" style="font-size:12px;margin-bottom:10px">Each cell is prefilled with the customer's <b>demand</b> (small grey number). Edit the big number to what you'll actually supply on that date. <b>Balance</b> = demand − planned; keep filling until it reaches 0.</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <button class="btn small ghost" onClick=${resetToDemand}>↺ Reset to demand</button>
+      <div style="flex:1"></div>
+      <button class="btn small" onClick=${() => doExport('pdf')}>PDF</button>
+      <button class="btn small" onClick=${() => doExport('png')}>Image</button>
+      <button class="btn small ghost" onClick=${() => doExport('csv')}>CSV</button>
+    </div>
+
+    <div style="overflow-x:auto;border:1px solid var(--line);border-radius:10px">
+      <table style="border-collapse:collapse;font-size:12px;min-width:100%">
+        <thead>
+          <tr style="background:var(--navy,#0b1f3a);color:#fff">
+            <th style="position:sticky;left:0;background:var(--navy,#0b1f3a);z-index:2;padding:8px 10px;text-align:left;min-width:120px">Part</th>
+            ${dates.map(d => html`<th style="padding:8px 6px;white-space:nowrap;min-width:76px">${spFmtDay(d)}</th>`)}
+            <th style="padding:8px 8px;min-width:88px">Balance</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${parts.map((p, pi) => {
+            let demandTot = 0, planTot = 0;
+            dates.forEach(d => { const l = p.byDate[d]; if (l) { demandTot += Number(l.planned_qty || 0); planTot += val(l); } });
+            const bal = demandTot - planTot;
+            return html`
+              <tr style="background:${pi % 2 ? 'var(--slate-50,#f8fafc)' : '#fff'}">
+                <td style="position:sticky;left:0;background:${pi % 2 ? '#f1f5f9' : '#fff'};z-index:1;padding:6px 10px;font-weight:600;border-right:1px solid var(--line)">
+                  ${p.name}${p.cpn ? html`<div style="font-size:10px;color:var(--slate-500);font-weight:400">${p.cpn}</div>` : ''}
+                </td>
+                ${dates.map(d => {
+                  const l = p.byDate[d];
+                  if (!l) return html`<td style="text-align:center;color:var(--slate-300)">·</td>`;
+                  return html`<td style="padding:3px 4px;text-align:center;border-right:1px solid var(--line-100,#eef2f7)">
+                    <div style="font-size:9px;color:var(--slate-400);line-height:1">req ${fmtNum(l.planned_qty)}</div>
+                    <input type="number" inputmode="numeric" value=${plan[l.id]} onInput=${e => setCell(l.id, e.target.value)}
+                      style="width:64px;padding:3px 4px;text-align:center;border:1px solid var(--line);border-radius:6px;font-size:12px;font-weight:600" />
+                  </td>`;
+                })}
+                <td style="text-align:center;padding:6px 8px;font-weight:700;color:${bal === 0 ? 'var(--emerald-600,#16a34a)' : bal > 0 ? 'var(--amber-600,#d97706)' : 'var(--rose-600,#e11d48)'}">
+                  ${bal === 0 ? '✓ 0' : (bal > 0 ? fmtNum(bal) + ' left' : '+' + fmtNum(-bal))}
+                </td>
+              </tr>`;
+          })}
+          <tr style="background:var(--slate-100,#f1f5f9);font-weight:700">
+            <td style="position:sticky;left:0;background:var(--slate-100,#f1f5f9);padding:8px 10px">TOTAL</td>
+            ${dates.map(d => { let t = 0; parts.forEach(p => { const l = p.byDate[d]; if (l) t += val(l); }); return html`<td style="text-align:center;padding:8px 4px">${t ? fmtNum(t) : ''}</td>`; })}
+            <td style="text-align:center;padding:8px 8px;color:${grand.demand - grand.plan === 0 ? 'var(--emerald-600,#16a34a)' : 'var(--amber-600,#d97706)'}">${grand.demand - grand.plan === 0 ? '✓' : fmtNum(grand.demand - grand.plan) + ' left'}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div style="font-size:12px;color:var(--slate-500);margin-top:10px">Planned total <b>${fmtNum(grand.plan)}</b> of <b>${fmtNum(grand.demand)}</b> demand. Save, then export PDF / Image / CSV to send the customer.</div>
+    <div style="height:40px"></div>
+  `;
+}
+
 function ScheduleDetail({ plant, me, schedule, onClose }) {
   const [view, setView] = useState('today');  // 'today' | 'week' | 'month'
   const [progress, setProgress] = useState([]);
@@ -43042,6 +43247,7 @@ function ScheduleDetail({ plant, me, schedule, onClose }) {
   const [loading, setLoading] = useState(true);
   const [supplyModal, setSupplyModal] = useState(null);  // null | line_object
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [showPlanner, setShowPlanner] = useState(false);
 
   const refresh = async () => {
     setLoading(true);
@@ -43071,6 +43277,7 @@ function ScheduleDetail({ plant, me, schedule, onClose }) {
   };
 
   if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
+  if (showPlanner) return html`<${SupplyPlanGrid} plant=${plant} me=${me} schedule=${schedule} onClose=${() => { setShowPlanner(false); refresh(); }} />`;
 
   const totalPlanned = progress.reduce((s, l) => s + parseFloat(l.planned_qty || 0), 0);
   const totalSupplied = progress.reduce((s, l) => s + parseFloat(l.supplied_qty || 0), 0);
@@ -43116,6 +43323,7 @@ function ScheduleDetail({ plant, me, schedule, onClose }) {
         <h1 style="font-size:18px">${schedule.customer?.name || schedule.customer_id}</h1>
         <div class="sub">${new Date(schedule.schedule_month).toLocaleDateString('en-IN', { month:'long', year:'numeric' })}${schedule.customer_ref ? ' · ' + schedule.customer_ref : ''}</div>
       </div>
+      <button class="btn small" onClick=${() => setShowPlanner(true)}>📤 Supply Plan</button>
       ${(me.role === 'plant_head' || me.role === 'admin') && html`<button class="btn small ghost" style="color:var(--rose-600)" onClick=${() => setConfirmDelete(true)}>🗑️</button>`}
     </div>
 
