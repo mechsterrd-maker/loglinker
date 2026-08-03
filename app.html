@@ -17129,6 +17129,7 @@ function HrHome({ plant, me, setTab }) {
           <div class="ios-sub">${plant?.name || 'Your company'} · ${dateLabel}</div>
         </div>
         <div style="display:flex;gap:8px;flex:none">
+          ${plant && plant.app_mode !== 'hr' && html`<button class="ios-themebtn" onClick=${() => { location.href = '/app?app=full'; }} title="Open the factory app (production, quality, schedules…)" style="width:auto;padding:0 11px;font-size:12px;font-weight:700">🏭 Factory</button>`}
           <button class="ios-themebtn" onClick=${cycleTheme} title=${'Appearance: ' + theme}>${themeIcon}</button>
           <button class="ios-themebtn" onClick=${load} title="Refresh">↻</button>
         </div>
@@ -43108,63 +43109,84 @@ function spExportPNG(title, subtitle, headers, rows) {
 }
 
 function SupplyPlanGrid({ plant, me, schedule, onClose }) {
+  const SEP = '§';
   const [lines, setLines] = useState([]);
-  const [plan, setPlan] = useState({});      // line_id -> string
+  const [plan, setPlan] = useState({});          // "name§cpn§date" -> string (supply qty)
+  const [existing, setExisting] = useState({});  // "name§cpn§date" -> plan row id (for deletes)
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const keyOf = (name, cpn, date) => (name || '?') + SEP + (cpn || '') + SEP + date;
 
   const load = useCallback(async () => {
     setLoading(true);
-    const { data } = await sb.from('mcp_sched_lines')
-      .select('id, part_name_raw, customer_part_number, delivery_date, planned_qty, supply_plan_qty, uom')
-      .eq('schedule_id', schedule.id).order('delivery_date');
-    const rows = data || [];
-    setLines(rows);
+    const [ld, pd] = await Promise.all([
+      sb.from('mcp_sched_lines').select('part_name_raw, customer_part_number, delivery_date, planned_qty, uom').eq('schedule_id', schedule.id).order('delivery_date'),
+      sb.from('mcp_sched_supply_plan').select('id, part_name_raw, customer_part_number, delivery_date, plan_qty').eq('schedule_id', schedule.id),
+    ]);
+    const dLines = (ld.data || []).filter(l => l.delivery_date);
+    setLines(dLines);
+    const planByKey = {}, exById = {};
+    (pd.data || []).forEach(r => { const k = keyOf(r.part_name_raw, r.customer_part_number, r.delivery_date); planByKey[k] = r.plan_qty; exById[k] = r.id; });
+    // prefill: saved plan → its value; else demand line → demand; else blank (still editable)
     const p = {};
-    rows.forEach(l => { p[l.id] = (l.supply_plan_qty != null ? l.supply_plan_qty : l.planned_qty) ?? ''; });
-    setPlan(p);
-    setLoading(false);
+    dLines.forEach(l => {
+      const k = keyOf(l.part_name_raw, l.customer_part_number || '', l.delivery_date);
+      p[k] = (k in planByKey) ? String(planByKey[k]) : (l.planned_qty != null ? String(l.planned_qty) : '');
+    });
+    // include saved-plan cells on dates that have no demand line
+    Object.keys(planByKey).forEach(k => { if (!(k in p)) p[k] = String(planByKey[k]); });
+    setPlan(p); setExisting(exById); setLoading(false);
   }, [schedule.id]);
   useEffect(() => { load(); }, [load]);
 
   const dates = [...new Set(lines.map(l => l.delivery_date).filter(Boolean))].sort();
   const partsMap = {};
   for (const l of lines) {
-    const k = (l.part_name_raw || '?') + '|' + (l.customer_part_number || '');
-    if (!partsMap[k]) partsMap[k] = { name: l.part_name_raw || '?', cpn: l.customer_part_number || '', uom: l.uom || '', byDate: {} };
-    partsMap[k].byDate[l.delivery_date] = l;
+    const k = (l.part_name_raw || '?') + SEP + (l.customer_part_number || '');
+    if (!partsMap[k]) partsMap[k] = { name: l.part_name_raw || '?', cpn: l.customer_part_number || '', uom: l.uom || '', demand: {} };
+    partsMap[k].demand[l.delivery_date] = Number(l.planned_qty || 0);
   }
   const parts = Object.values(partsMap);
-  const val = (l) => { const v = plan[l?.id]; return v === '' || v == null ? 0 : Number(v) || 0; };
+  const num = v => (v === '' || v == null) ? 0 : (Number(v) || 0);
 
-  const setCell = (id, v) => { setPlan(p => ({ ...p, [id]: v })); setDirty(true); };
-  const resetToDemand = () => { const p = {}; lines.forEach(l => p[l.id] = l.planned_qty ?? ''); setPlan(p); setDirty(true); };
+  const setCell = (name, cpn, date, v) => { setPlan(p => ({ ...p, [keyOf(name, cpn, date)]: v })); setDirty(true); };
+  const resetToDemand = () => {
+    const p = {};
+    parts.forEach(pt => dates.forEach(d => { const key = keyOf(pt.name, pt.cpn, d); p[key] = (d in pt.demand) ? String(pt.demand[d]) : ''; }));
+    setPlan(p); setDirty(true);
+  };
 
   const save = async () => {
     setBusy(true);
-    const changed = lines.filter(l => {
-      const nv = plan[l.id] === '' || plan[l.id] == null ? null : Number(plan[l.id]);
-      const cur = l.supply_plan_qty == null ? null : Number(l.supply_plan_qty);
-      return nv !== cur;
-    });
-    try { await Promise.all(changed.map(l => sb.from('mcp_sched_lines').update({ supply_plan_qty: plan[l.id] === '' || plan[l.id] == null ? null : Number(plan[l.id]) }).eq('id', l.id))); showToast('Supply plan saved'); setDirty(false); await load(); }
-    catch (e) { showToast(e.message); }
+    try {
+      const upserts = [], keepKeys = new Set();
+      parts.forEach(pt => dates.forEach(d => {
+        const key = keyOf(pt.name, pt.cpn, d);
+        const v = plan[key];
+        if (v === '' || v == null) return;
+        keepKeys.add(key);
+        upserts.push({ plant_id: plant.id, schedule_id: schedule.id, part_name_raw: pt.name, customer_part_number: pt.cpn || '', delivery_date: d, plan_qty: Number(v) || 0, created_by: me.id, updated_at: new Date().toISOString() });
+      }));
+      if (upserts.length) { const { error } = await sb.from('mcp_sched_supply_plan').upsert(upserts, { onConflict: 'schedule_id,part_name_raw,customer_part_number,delivery_date' }); if (error) throw error; }
+      const toDelete = Object.entries(existing).filter(([k]) => !keepKeys.has(k)).map(([, id]) => id);
+      if (toDelete.length) await sb.from('mcp_sched_supply_plan').delete().in('id', toDelete);
+      showToast('Supply plan saved'); setDirty(false); await load();
+    } catch (e) { showToast(e.message); }
     setBusy(false);
   };
 
-  // export table
+  const title = 'SUPPLY PLAN — ' + (schedule.customer?.name || '');
+  const subtitle = (plant.name || '') + '  ·  ' + new Date(schedule.schedule_month).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
   const buildExport = () => {
     const headers = ['Part', ...dates.map(spFmtDay), 'Total'];
-    const rows = parts.map(p => {
-      const cells = dates.map(d => { const l = p.byDate[d]; return l ? (plan[l.id] === '' || plan[l.id] == null ? '' : fmtNum(Number(plan[l.id]))) : ''; });
-      const tot = dates.reduce((a, d) => a + val(p.byDate[d]), 0);
-      return [p.name + (p.cpn ? ' (' + p.cpn + ')' : ''), ...cells, fmtNum(tot)];
+    const rows = parts.map(pt => {
+      const cells = dates.map(d => { const v = plan[keyOf(pt.name, pt.cpn, d)]; return (v === '' || v == null) ? '' : fmtNum(Number(v)); });
+      const tot = dates.reduce((a, d) => a + num(plan[keyOf(pt.name, pt.cpn, d)]), 0);
+      return [pt.name + (pt.cpn ? ' (' + pt.cpn + ')' : ''), ...cells, fmtNum(tot)];
     });
     return { headers, rows };
   };
-  const title = 'SUPPLY PLAN — ' + (schedule.customer?.name || '');
-  const subtitle = (plant.name || '') + '  ·  ' + new Date(schedule.schedule_month).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
   const doExport = async (fmt) => {
     if (dirty) await save();
     const { headers, rows } = buildExport();
@@ -43175,8 +43197,8 @@ function SupplyPlanGrid({ plant, me, schedule, onClose }) {
 
   if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
 
-  const grand = { demand: 0, plan: 0 };
-  parts.forEach(p => dates.forEach(d => { const l = p.byDate[d]; if (l) { grand.demand += Number(l.planned_qty || 0); grand.plan += val(l); } }));
+  let grandDemand = 0, grandPlan = 0;
+  parts.forEach(pt => dates.forEach(d => { grandDemand += (pt.demand[d] || 0); grandPlan += num(plan[keyOf(pt.name, pt.cpn, d)]); }));
 
   return html`
     <div class="page-header" style="display:flex;align-items:center;gap:10px">
@@ -43185,7 +43207,7 @@ function SupplyPlanGrid({ plant, me, schedule, onClose }) {
       <button class="btn small" disabled=${busy || !dirty} onClick=${save}>${busy ? 'Saving…' : dirty ? 'Save' : 'Saved'}</button>
     </div>
 
-    <div class="alert info" style="font-size:12px;margin-bottom:10px">Each cell is prefilled with the customer's <b>demand</b> (small grey number). Edit the big number to what you'll actually supply on that date. <b>Balance</b> = demand − planned; keep filling until it reaches 0.</div>
+    <div class="alert info" style="font-size:12px;margin-bottom:10px">Type what you'll supply in <b>every</b> cell — including the blank ones (dates the customer didn't ask, where you can add carry-over). Cells with a demand show it in grey ("req"). <b>Balance</b> = demand − planned; keep filling until it's ✓ 0.</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
       <button class="btn small ghost" onClick=${resetToDemand}>↺ Reset to demand</button>
       <div style="flex:1"></div>
@@ -43204,22 +43226,22 @@ function SupplyPlanGrid({ plant, me, schedule, onClose }) {
           </tr>
         </thead>
         <tbody>
-          ${parts.map((p, pi) => {
+          ${parts.map((pt, pi) => {
             let demandTot = 0, planTot = 0;
-            dates.forEach(d => { const l = p.byDate[d]; if (l) { demandTot += Number(l.planned_qty || 0); planTot += val(l); } });
+            dates.forEach(d => { demandTot += (pt.demand[d] || 0); planTot += num(plan[keyOf(pt.name, pt.cpn, d)]); });
             const bal = demandTot - planTot;
             return html`
               <tr style="background:${pi % 2 ? 'var(--slate-50,#f8fafc)' : '#fff'}">
                 <td style="position:sticky;left:0;background:${pi % 2 ? '#f1f5f9' : '#fff'};z-index:1;padding:6px 10px;font-weight:600;border-right:1px solid var(--line)">
-                  ${p.name}${p.cpn ? html`<div style="font-size:10px;color:var(--slate-500);font-weight:400">${p.cpn}</div>` : ''}
+                  ${pt.name}${pt.cpn ? html`<div style="font-size:10px;color:var(--slate-500);font-weight:400">${pt.cpn}</div>` : ''}
                 </td>
                 ${dates.map(d => {
-                  const l = p.byDate[d];
-                  if (!l) return html`<td style="text-align:center;color:var(--slate-300)">·</td>`;
+                  const key = keyOf(pt.name, pt.cpn, d);
+                  const hasDemand = d in pt.demand;
                   return html`<td style="padding:3px 4px;text-align:center;border-right:1px solid var(--line-100,#eef2f7)">
-                    <div style="font-size:9px;color:var(--slate-400);line-height:1">req ${fmtNum(l.planned_qty)}</div>
-                    <input type="number" inputmode="numeric" value=${plan[l.id]} onInput=${e => setCell(l.id, e.target.value)}
-                      style="width:64px;padding:3px 4px;text-align:center;border:1px solid var(--line);border-radius:6px;font-size:12px;font-weight:600" />
+                    <div style="font-size:9px;color:var(--slate-400);line-height:1;height:11px">${hasDemand ? 'req ' + fmtNum(pt.demand[d]) : ''}</div>
+                    <input type="number" inputmode="numeric" value=${plan[key] ?? ''} onInput=${e => setCell(pt.name, pt.cpn, d, e.target.value)}
+                      style="width:64px;padding:3px 4px;text-align:center;border:1px solid ${hasDemand ? 'var(--line)' : 'var(--line-100,#eef2f7)'};border-radius:6px;font-size:12px;font-weight:600;background:${hasDemand ? '#fff' : '#fcfdff'}" />
                   </td>`;
                 })}
                 <td style="text-align:center;padding:6px 8px;font-weight:700;color:${bal === 0 ? 'var(--emerald-600,#16a34a)' : bal > 0 ? 'var(--amber-600,#d97706)' : 'var(--rose-600,#e11d48)'}">
@@ -43229,13 +43251,13 @@ function SupplyPlanGrid({ plant, me, schedule, onClose }) {
           })}
           <tr style="background:var(--slate-100,#f1f5f9);font-weight:700">
             <td style="position:sticky;left:0;background:var(--slate-100,#f1f5f9);padding:8px 10px">TOTAL</td>
-            ${dates.map(d => { let t = 0; parts.forEach(p => { const l = p.byDate[d]; if (l) t += val(l); }); return html`<td style="text-align:center;padding:8px 4px">${t ? fmtNum(t) : ''}</td>`; })}
-            <td style="text-align:center;padding:8px 8px;color:${grand.demand - grand.plan === 0 ? 'var(--emerald-600,#16a34a)' : 'var(--amber-600,#d97706)'}">${grand.demand - grand.plan === 0 ? '✓' : fmtNum(grand.demand - grand.plan) + ' left'}</td>
+            ${dates.map(d => { let t = 0; parts.forEach(pt => { t += num(plan[keyOf(pt.name, pt.cpn, d)]); }); return html`<td style="text-align:center;padding:8px 4px">${t ? fmtNum(t) : ''}</td>`; })}
+            <td style="text-align:center;padding:8px 8px;color:${grandDemand - grandPlan === 0 ? 'var(--emerald-600,#16a34a)' : 'var(--amber-600,#d97706)'}">${grandDemand - grandPlan === 0 ? '✓' : fmtNum(grandDemand - grandPlan) + ' left'}</td>
           </tr>
         </tbody>
       </table>
     </div>
-    <div style="font-size:12px;color:var(--slate-500);margin-top:10px">Planned total <b>${fmtNum(grand.plan)}</b> of <b>${fmtNum(grand.demand)}</b> demand. Save, then export PDF / Image / CSV to send the customer.</div>
+    <div style="font-size:12px;color:var(--slate-500);margin-top:10px">Planned total <b>${fmtNum(grandPlan)}</b> of <b>${fmtNum(grandDemand)}</b> demand. Save, then export PDF / Image / CSV to send the customer.</div>
     <div style="height:40px"></div>
   `;
 }
