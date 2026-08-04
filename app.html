@@ -37535,6 +37535,8 @@ function BillScheduleMapping({ plant, me, doc, onChanged }) {
   const [loading, setLoading] = useState(true);
   const [picks, setPicks] = useState({});
   const [busy, setBusy] = useState({});
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiHints, setAiHints] = useState({});   // idx -> { confidence, reason }
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -37618,10 +37620,69 @@ function BillScheduleMapping({ plant, me, doc, onChanged }) {
     await load(); if (onChanged) onChanged();
   };
 
+  // Distinct schedule PARTS (name+part#) for the AI, earliest open line as the
+  // representative id, remaining summed across its delivery dates.
+  const aiCandidates = () => {
+    const byPart = new Map();
+    for (const l of candLines) {
+      const key = (l.part_name_raw || '') + '§' + (l.customer_part_number || '');
+      if (!byPart.has(key)) byPart.set(key, { line_id: l.id, part_name: l.part_name_raw, customer_part_number: l.customer_part_number || '', remaining: 0 });
+      byPart.get(key).remaining += remaining(l);
+    }
+    return [...byPart.values()];
+  };
+
+  // Ask the AI to propose a schedule part for each unmatched bill item. Writes
+  // nothing — only pre-fills the pickers + shows its reasoning for the user to confirm.
+  const aiSuggest = async () => {
+    setAiBusy(true);
+    try {
+      const reqItems = items.map(it => ({ name: it.name || '', customer_part_number: it.customer_part_number || it.part_no || '', qty: Number(it.qty) || 0 }));
+      const { data: { session } } = await sb.auth.getSession();
+      const r = await fetch(SUPABASE_URL + '/functions/v1/suggest-supply-matches', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(session ? { 'Authorization': 'Bearer ' + session.access_token, 'apikey': SUPABASE_ANON_KEY } : {}) },
+        body: JSON.stringify({ items: reqItems, candidates: aiCandidates() }),
+      });
+      const j = await r.json();
+      if (j.error) { showToast('AI: ' + j.error); setAiBusy(false); return; }
+      const nextPicks = {}, hints = {};
+      (j.matches || []).forEach(m => {
+        if (status[m.item_index] && status[m.item_index].matched) return;   // leave already-recorded lines alone
+        if (m.line_id) nextPicks[m.item_index] = m.line_id;
+        hints[m.item_index] = { confidence: m.confidence, reason: m.reason };
+      });
+      setPicks(p => ({ ...p, ...nextPicks }));
+      setAiHints(hints);
+      const n = Object.keys(nextPicks).length;
+      showToast(n ? ('🤖 ' + n + ' suggestion' + (n > 1 ? 's' : '') + ' ready — review & confirm') : '🤖 No confident match found');
+    } catch (e) { showToast('AI error: ' + e.message); }
+    setAiBusy(false);
+  };
+
+  const recAllSuggested = async () => {
+    for (let idx = 0; idx < items.length; idx++) {
+      if (status[idx] && status[idx].matched) continue;
+      if (picks[idx]) await rec(idx, items[idx]);
+    }
+    setAiHints({});
+  };
+
   if (items.length === 0) return '';
   const unmatchedCount = status.filter(s => !s.matched).length;
+  const suggestedCount = items.filter((_, idx) => !(status[idx] && status[idx].matched) && picks[idx] && aiHints[idx]).length;
+  const confBadge = (c) => c === 'high' ? 'emerald' : c === 'medium' ? 'amber' : 'slate';
   return html`
-    <div class="section-h">Map items → schedule ${unmatchedCount > 0 ? html`<span class="badge amber">${unmatchedCount} unmatched</span>` : html`<span class="badge emerald">all matched</span>`}</div>
+    <div class="section-h" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <span>Map items → schedule ${unmatchedCount > 0 ? html`<span class="badge amber">${unmatchedCount} unmatched</span>` : html`<span class="badge emerald">all matched</span>`}</span>
+      ${customerId && !loading && unmatchedCount > 0 && candLines.length > 0 && html`
+        <button class="btn small" style="margin-left:auto" disabled=${aiBusy} onClick=${aiSuggest}>${aiBusy ? '🤖 thinking…' : '🤖 AI suggest'}</button>`}
+    </div>
+    ${suggestedCount > 0 && html`
+      <div class="alert info" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span>🤖 ${suggestedCount} AI suggestion${suggestedCount > 1 ? 's' : ''} pre-filled below — review, then confirm.</span>
+        <button class="btn small" style="margin-left:auto" onClick=${recAllSuggested}>✓ Record all ${suggestedCount}</button>
+      </div>`}
     ${loading ? html`<div class="empty"><div style="font-size:13px">Loading…</div></div>` :
       !customerId ? html`<div class="alert info">This bill isn't linked to a schedule customer yet. Open <b>Schedules → Bill mapping</b>, map the billing name to a customer, then come back here.</div>` :
       html`<div>
@@ -37645,7 +37706,8 @@ function BillScheduleMapping({ plant, me, doc, onChanged }) {
                     ${orderedLines(it).map(l => html`<option value=${l.id}>${lineLabel(l)}</option>`)}
                   </select>
                   <button class="btn small" disabled=${!!busy[idx] || !picks[idx]} onClick=${()=>rec(idx, it)}>${busy[idx] ? '…' : 'Record'}</button>
-                </div>`}
+                </div>
+                ${aiHints[idx] && html`<div style="font-size:11px;margin-top:5px;color:var(--slate-600)">🤖 ${aiHints[idx].reason || (aiHints[idx].confidence === 'none' ? 'no confident match' : 'suggested')} <span class="badge ${confBadge(aiHints[idx].confidence)}" style="font-size:9px">${aiHints[idx].confidence}</span></div>`}`}
             </div>`;
         })}
         ${candLines.length === 0 && unmatchedCount > 0 && html`<div class="alert info">No open schedule lines left for this customer — every line is fully supplied, or there's no active schedule.</div>`}
