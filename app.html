@@ -3273,6 +3273,30 @@ function FettlingModule({ plant, me, activeUnit }) {
     if (!confirm('Remove this job from the list? Past entries keep their name & price.')) return;
     await sb.from('fettling_parts').update({ active: false }).eq('id', id); setParts(ps => ps.filter(p => p.id !== id));
   };
+  // One-tap seed: pull the distinct part names you already have on your schedules
+  // into the jobs list (deduped, skips ones already added). Price left blank to set.
+  const [importing, setImporting] = useState(false);
+  const importFromMaster = async () => {
+    setImporting(true);
+    try {
+      const { data } = await sb.from('mcp_sched_lines').select('part_name_raw').eq('plant_id', plant.id);
+      const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const seen = new Set(parts.map(p => norm(p.name)));
+      const toAdd = [];
+      for (const row of (data || [])) {
+        const nm = (row.part_name_raw || '').trim();
+        const k = norm(nm);
+        if (!nm || !k || seen.has(k)) continue;
+        seen.add(k); toAdd.push({ plant_id: plant.id, name: nm, created_by: me.id });
+      }
+      if (!toAdd.length) { showToast('Nothing new to import — jobs already cover your parts'); setImporting(false); return; }
+      const { error } = await sb.from('fettling_parts').insert(toAdd);
+      if (error) { showToast(error.message); setImporting(false); return; }
+      showToast('Imported ' + toAdd.length + ' parts — now set their ₹/pc');
+      await refresh();
+    } catch (e) { showToast('Import failed: ' + e.message); }
+    setImporting(false);
+  };
   // Assign a job to a log row: '__new__' opens the add-job modal; otherwise snapshot
   // the job's name + fixed rate onto the row (so a later price change won't rewrite it).
   const pickJob = async (row, jobId) => {
@@ -3356,7 +3380,7 @@ function FettlingModule({ plant, me, activeUnit }) {
         <div class="card" style="margin-bottom:12px">
           <div class="card-title">Fettling jobs & price</div>
           <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">Set the fixed ₹ per piece once here. It's used for payout automatically — you never type price on the daily plan.</div>
-          ${parts.length === 0 ? html`<div style="font-size:12px;color:var(--slate-500);padding:6px 0">No jobs yet — add the parts they fettle below.</div>` :
+          ${parts.length === 0 ? html`<div style="font-size:12px;color:var(--slate-500);padding:6px 0">No jobs yet. <b>Import from parts</b> pulls the parts already on your schedules, or add them one by one.</div>` :
             html`
             <div style="display:flex;font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase;letter-spacing:0.04em;padding:0 2px 4px"><div style="flex:1">Job / part</div><div style="width:90px;text-align:right">₹ / piece</div><div style="width:70px"></div></div>
             ${parts.map(p => html`
@@ -3365,7 +3389,10 @@ function FettlingModule({ plant, me, activeUnit }) {
                 <input type="number" value=${p.rate ?? ''} placeholder="—" onInput=${e => setParts(ps => ps.map(x => x.id === p.id ? { ...x, rate: e.target.value } : x))} onBlur=${e => setJobRate(p.id, e.target.value)} style="width:90px;border:1px solid var(--slate-200);border-radius:5px;padding:6px;font-size:13px;text-align:right" />
                 <button class="btn small ghost" style="color:var(--rose-600);width:70px" onClick=${() => removeJob(p.id)}>Remove</button>
               </div>`)}`}
-          <button class="btn small" style="margin-top:8px" onClick=${() => setJobModal({ forRow: null })}>+ New job</button>
+          <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+            <button class="btn small" onClick=${() => setJobModal({ forRow: null })}>+ New job</button>
+            <button class="btn small ghost" disabled=${importing} onClick=${importFromMaster}>${importing ? 'Importing…' : '⬇ Import from parts'}</button>
+          </div>
         </div>`}
 
       ${loading ? html`<div class="empty"><div style="font-size:13px">Loading…</div></div>` :
