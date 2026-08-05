@@ -1,4 +1,4 @@
-// prompt.ts — Loglinkr OCR extraction prompt (v23)
+// prompt.ts — Loglinkr OCR extraction prompt (v24)
 // Split into a STATIC system block (identical every call → prompt-cacheable at 0.1×
 // input cost) and a per-plant CONTEXT block that rides in the user message.
 
@@ -66,7 +66,12 @@ signature blocks, witness names, salesperson names, or email local-parts.
 
 LINE ITEMS — items[] contains ONLY real product DATA rows, never column headers,
 totals, tax rows, signature blocks, footers, or empty rows. For each row populate:
-  name, hsn, qty (number, never null on real line), uom, rate, amount, process.
+  name, customer_part_number, hsn, qty (number, never null on real line), uom,
+  rate, amount, process.
+  customer_part_number — the buyer's / customer's part number or drawing/part code
+    for the line ("Part No", "Customer Part No", "Cust P/N", "Drawing No", "Part
+    Code", e.g. "54S30053"). NOT the HSN/SAC tax code (which repeats across rows),
+    NOT the SL/serial number. null if none printed.
 
 QUANTITY ≠ MONETARY VALUE. Never treat 270 NOS as ₹270, never copy qty into
 total_value or taxable_value, never read missing rate as zero.
@@ -134,7 +139,7 @@ OUTPUT FORMAT — RETURN ONLY THIS JSON, NO PROSE, NO MARKDOWN FENCES:
   "taxable_value": number | null,
   "tax_amount": number | null,
   "total_value": number | null,
-  "items": [{"name":"...","hsn":null,"qty":0,"uom":null,"rate":null,"amount":null,"process":""}],
+  "items": [{"name":"...","customer_part_number":null,"hsn":null,"qty":0,"uom":null,"rate":null,"amount":null,"process":""}],
   "validation_note": "one short line, ≤20 words",
   "confidence": "high" | "medium" | "low",
   "flags": []

@@ -266,12 +266,24 @@ If the line-item table contains only headers and no data rows, items = [] (empty
 
 For each real DATA line, populate:
   name      — item description as printed (the data row, not the header above)
+  customer_part_number — the buyer's / customer's part number or drawing/part
+              code printed for that line. Look for a dedicated column such as
+              "Part No", "Part Number", "Customer Part No", "Cust P/N", "Buyer's
+              Part No", "Drawing No", "Part Code", "Material Code", or an
+              alphanumeric code printed under/beside the description (e.g.
+              "54S30053", "24S30111", "37764251"). This is NOT the HSN/SAC code
+              and NOT the serial/SL number. If no part number is printed → null.
   hsn       — HSN/SAC code if visible, else null
   qty       — number, never null on a real line
   uom       — unit of measure (NOS, KGS, MT, PCS, SET…), null if absent
   rate      — unit rate, null on a pure DC with no prices
   amount    — qty × rate, null on a pure DC
   process   — for jobwork rows: which operation (plating, heat-treat…); else ""
+
+PART NUMBER vs HSN — do not confuse. HSN/SAC is an 4–8 digit tax classification
+code, usually the SAME across many rows of one invoice (e.g. 84099941). The part
+number is UNIQUE per part and identifies the specific component. Put each in its
+own field; never copy HSN into customer_part_number.
 
 ═══════════════════════════════════════════════════════════
 QUANTITY ≠ MONETARY VALUE — never confuse these
@@ -403,7 +415,7 @@ OUTPUT FORMAT — RETURN ONLY THIS JSON, NO PROSE, NO MARKDOWN FENCES
   "tax_amount": number | null,
   "total_value": number | null,
   "items": [
-    {"name": "...", "hsn": null, "qty": 0, "uom": null, "rate": null, "amount": null, "process": ""}
+    {"name": "...", "customer_part_number": null, "hsn": null, "qty": 0, "uom": null, "rate": null, "amount": null, "process": ""}
   ],
   "validation_note": "show your work: who is seller, who is buyer, why you concluded direction",
   "confidence": "high" | "medium" | "low",
