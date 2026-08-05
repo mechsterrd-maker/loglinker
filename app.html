@@ -2380,6 +2380,7 @@ const MORE_GROUPS = [
     sub: 'Floor operations · used every day',
     items: [
       { key:'ppc',           icon:'🗓', label:'Production Planning',   mfg:true, sub:'Plan work per stage per day · assign operators · track planned vs actual (PDC → CNC → dispatch)' },
+      { key:'fettling',      icon:'🪓', label:'Fettling (contract)',  mfg:true, sub:'Daily plan & work done for the fettling contract workers · piece-rate payout' },
       { key:'tpm',           icon:'🛠', label:'TPM Daily Checks',     sub:'30-sec machine checks · oil, coolant, leaks, guards' },
       { key:'maintenance',   icon:'🔧', label:'Maintenance',          sub:'Breakdowns log, machine status' },
       { key:'cutting',       icon:'✂️', label:'Cutting Planner',      sub:'1D cutting optimisation for rods, tubes, bars · auto layout with kerf · waste %' },
@@ -3212,6 +3213,200 @@ const ppcMonthStart = (iso) => iso.slice(0,7) + '-01';
 const ppcDayName = (iso) => new Date(iso+'T00:00:00').toLocaleDateString('en-IN',{weekday:'short'});
 const ppcDayShort = (iso) => new Date(iso+'T00:00:00').toLocaleDateString('en-IN',{day:'2-digit',month:'short'});
 
+// ============= FETTLING (CONTRACT WORK) — simple daily plan & done =============
+// A deliberately small module for the handful of contract workers who fettle
+// castings: pick a day, give each worker their part+planned qty, and fill in what
+// they actually did. Optional piece-rate rolls up their contract payout. Backed by
+// fettling_workers + fettling_log.
+function FettlingModule({ plant, me, activeUnit }) {
+  const [loading, setLoading] = useState(true);
+  const [workers, setWorkers] = useState([]);
+  const [rows, setRows] = useState([]);           // fettling_log rows for `day`
+  const today = ppcISO(new Date());
+  const [day, setDay] = useState(today);
+  const [manage, setManage] = useState(false);
+  const [newWorker, setNewWorker] = useState('');
+  const [histRows, setHistRows] = useState(null); // month rows when history open
+
+  const u = activeUnit?.unit_id;
+  const scope = (q) => u ? q.or(`unit_id.eq.${u},unit_id.is.null`) : q;
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [w, l] = await Promise.all([
+        scope(sb.from('fettling_workers').select('*')).eq('active', true).order('created_at'),
+        scope(sb.from('fettling_log').select('*')).eq('work_date', day).order('created_at'),
+      ]);
+      setWorkers(w.data || []);
+      setRows(l.data || []);
+    } catch (e) { console.warn('[fettling] load failed', e); }
+    finally { setLoading(false); }
+  }, [u, day]);
+  useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
+
+  // ── workers ──
+  const addWorker = async () => {
+    const name = newWorker.trim(); if (!name) return;
+    const { error } = await sb.from('fettling_workers').insert({ plant_id: plant.id, name, created_by: me.id });
+    if (error) { showToast(error.message); return; }
+    setNewWorker(''); refresh();
+  };
+  const renameWorker = async (id, name) => { await sb.from('fettling_workers').update({ name }).eq('id', id); };
+  const removeWorker = async (id) => {
+    if (!confirm('Remove this worker from the list? Their past entries stay.')) return;
+    await sb.from('fettling_workers').update({ active: false }).eq('id', id); refresh();
+  };
+
+  // ── log rows ──
+  const addRow = async (workerId) => {
+    const { data, error } = await sb.from('fettling_log')
+      .insert({ plant_id: plant.id, work_date: day, worker_id: workerId, part_name: '', planned_qty: 0, done_qty: 0, created_by: me.id })
+      .select().single();
+    if (error) { showToast(error.message); return; }
+    setRows(r => [...r, data]);
+  };
+  const patchRow = (id, patch) => setRows(r => r.map(x => x.id === id ? { ...x, ...patch } : x));
+  const saveRow = async (row) => {
+    const clean = (v) => (v === '' || v == null) ? null : Number(v);
+    await sb.from('fettling_log').update({
+      part_name: row.part_name || '', planned_qty: Number(row.planned_qty) || 0,
+      done_qty: Number(row.done_qty) || 0, reject_qty: Number(row.reject_qty) || 0,
+      rate: clean(row.rate), notes: row.notes || null, updated_at: new Date().toISOString(),
+    }).eq('id', row.id);
+  };
+  const delRow = async (id) => { await sb.from('fettling_log').delete().eq('id', id); setRows(r => r.filter(x => x.id !== id)); };
+
+  const rowsFor = (wid) => rows.filter(r => r.worker_id === wid);
+  const sum = (arr, f) => arr.reduce((a, x) => a + (Number(f(x)) || 0), 0);
+  const earned = (r) => (Number(r.done_qty) || 0) * (Number(r.rate) || 0);
+  const anyRate = rows.some(r => r.rate != null && r.rate !== '');
+
+  const dayPlanned = sum(rows, r => r.planned_qty);
+  const dayDone = sum(rows, r => r.done_qty);
+  const dayEarned = sum(rows, earned);
+
+  const openHistory = async () => {
+    const m0 = ppcMonthStart(day), m1 = ppcAddDays(ppcISO(new Date(new Date(m0 + 'T00:00:00').getFullYear(), new Date(m0 + 'T00:00:00').getMonth() + 1, 1)), -1);
+    const { data } = await scope(sb.from('fettling_log').select('*')).gte('work_date', m0).lte('work_date', m1);
+    setHistRows(data || []);
+  };
+  const numInput = (val, on, onSave) => html`<input type="number" value=${val ?? ''} onInput=${e => on(e.target.value)} onBlur=${onSave} style="width:100%;border:1px solid var(--slate-200);border-radius:5px;padding:6px;font-size:13px;text-align:right" />`;
+
+  return html`
+    <div>
+      <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <div style="flex:1;min-width:140px"><h1 style="font-size:18px">🪓 Fettling</h1><div class="sub">Daily plan & work done · contract workers</div></div>
+        <button class="btn ghost small" onClick=${() => setDay(ppcAddDays(day, -1))}>←</button>
+        <input type="date" value=${day} onChange=${e => setDay(e.target.value || today)} style="border:1px solid var(--slate-200);border-radius:6px;padding:6px 8px;font-size:13px" />
+        <button class="btn ghost small" onClick=${() => setDay(ppcAddDays(day, 1))}>→</button>
+        ${day !== today && html`<button class="btn ghost small" onClick=${() => setDay(today)}>Today</button>`}
+        <button class="btn ghost small" onClick=${openHistory}>📊 Month</button>
+        <button class="btn ghost small" onClick=${() => setManage(m => !m)}>${manage ? 'Done' : '👥 Workers'}</button>
+      </div>
+
+      ${manage && html`
+        <div class="card" style="margin-bottom:12px">
+          <div class="card-title">Contract workers</div>
+          ${workers.length === 0 ? html`<div style="font-size:12px;color:var(--slate-500);padding:6px 0">No workers yet — add the fettling contractors below.</div>` :
+            workers.map(w => html`
+              <div key=${w.id} style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+                <input value=${w.name} onInput=${e => setWorkers(ws => ws.map(x => x.id === w.id ? { ...x, name: e.target.value } : x))} onBlur=${e => renameWorker(w.id, e.target.value.trim() || w.name)} style="flex:1;border:1px solid var(--slate-200);border-radius:5px;padding:6px 8px;font-size:13px" />
+                <button class="btn small ghost" style="color:var(--rose-600)" onClick=${() => removeWorker(w.id)}>Remove</button>
+              </div>`)}
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <input placeholder="New worker name" value=${newWorker} onInput=${e => setNewWorker(e.target.value)} onKeyDown=${e => e.key === 'Enter' && addWorker()} style="flex:1;border:1px solid var(--slate-200);border-radius:5px;padding:6px 8px;font-size:13px" />
+            <button class="btn small" onClick=${addWorker}>+ Add</button>
+          </div>
+        </div>`}
+
+      ${loading ? html`<div class="empty"><div style="font-size:13px">Loading…</div></div>` :
+        workers.length === 0 ? html`<div class="empty"><div class="icon">🪓</div>No contract workers yet.<div style="margin-top:8px"><button class="btn small" onClick=${() => setManage(true)}>👥 Add workers</button></div></div>` :
+        html`
+        <div class="card" style="display:flex;justify-content:space-around;text-align:center;margin-bottom:12px;padding:12px">
+          <div><div style="font-size:20px;font-weight:700">${fmtNum(dayPlanned)}</div><div style="font-size:11px;color:var(--slate-500)">Planned</div></div>
+          <div><div style="font-size:20px;font-weight:700;color:var(--emerald-600)">${fmtNum(dayDone)}</div><div style="font-size:11px;color:var(--slate-500)">Done</div></div>
+          ${anyRate && html`<div><div style="font-size:20px;font-weight:700">₹${fmtNum(dayEarned.toFixed(0))}</div><div style="font-size:11px;color:var(--slate-500)">Earned</div></div>`}
+        </div>
+
+        ${workers.map(w => {
+          const wr = rowsFor(w.id);
+          const wp = sum(wr, r => r.planned_qty), wd = sum(wr, r => r.done_qty), we = sum(wr, earned);
+          return html`
+            <div class="card" style="margin-bottom:10px" key=${w.id}>
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+                <div style="font-weight:700">${w.name}</div>
+                <div style="font-size:12px;color:var(--slate-600)">plan ${fmtNum(wp)} · <span style="color:var(--emerald-700)">done ${fmtNum(wd)}</span>${anyRate ? ' · ₹' + fmtNum(we.toFixed(0)) : ''}</div>
+              </div>
+              ${wr.length === 0 ? html`<div style="font-size:12px;color:var(--slate-400);padding:2px 0 8px">No task planned for this day.</div>` :
+                html`
+                <div style="overflow-x:auto">
+                  <table style="width:100%;border-collapse:collapse;font-size:12px;min-width:420px">
+                    <thead><tr style="color:var(--slate-500);text-align:right">
+                      <th style="text-align:left;padding:2px 4px">Part</th><th style="padding:2px 4px">Plan</th><th style="padding:2px 4px">Done</th><th style="padding:2px 4px">Rej</th><th style="padding:2px 4px">₹/pc</th><th></th>
+                    </tr></thead>
+                    <tbody>
+                      ${wr.map(r => html`
+                        <tr key=${r.id}>
+                          <td style="padding:3px 4px"><input value=${r.part_name || ''} placeholder="Part / casting" onInput=${e => patchRow(r.id, { part_name: e.target.value })} onBlur=${() => saveRow(rows.find(x => x.id === r.id))} style="width:100%;min-width:120px;border:1px solid var(--slate-200);border-radius:5px;padding:6px;font-size:13px" /></td>
+                          <td style="padding:3px 4px;width:70px">${numInput(r.planned_qty, v => patchRow(r.id, { planned_qty: v }), () => saveRow(rows.find(x => x.id === r.id)))}</td>
+                          <td style="padding:3px 4px;width:70px">${numInput(r.done_qty, v => patchRow(r.id, { done_qty: v }), () => saveRow(rows.find(x => x.id === r.id)))}</td>
+                          <td style="padding:3px 4px;width:60px">${numInput(r.reject_qty, v => patchRow(r.id, { reject_qty: v }), () => saveRow(rows.find(x => x.id === r.id)))}</td>
+                          <td style="padding:3px 4px;width:64px">${numInput(r.rate, v => patchRow(r.id, { rate: v }), () => saveRow(rows.find(x => x.id === r.id)))}</td>
+                          <td style="padding:3px 4px;text-align:right"><button class="btn small ghost" style="color:var(--rose-500);padding:4px 6px" onClick=${() => delRow(r.id)}>×</button></td>
+                        </tr>`)}
+                    </tbody>
+                  </table>
+                  <div style="text-align:right;font-size:10px;color:var(--slate-400);margin-top:2px">Changes save automatically</div>
+                </div>`}
+              <button class="btn small ghost" style="margin-top:8px" onClick=${() => addRow(w.id)}>+ Add task</button>
+            </div>`;
+        })}
+      `}
+
+      ${histRows != null && html`<${FettlingMonthModal} monthLabel=${new Date(day + 'T00:00:00').toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })} workers=${workers} rows=${histRows} onClose=${() => setHistRows(null)} />`}
+    </div>`;
+}
+
+function FettlingMonthModal({ monthLabel, workers, rows, onClose }) {
+  const sum = (arr, f) => arr.reduce((a, x) => a + (Number(f(x)) || 0), 0);
+  const perWorker = workers.map(w => {
+    const wr = rows.filter(r => r.worker_id === w.id);
+    return { name: w.name, planned: sum(wr, r => r.planned_qty), done: sum(wr, r => r.done_qty), reject: sum(wr, r => r.reject_qty), earned: sum(wr, r => (Number(r.done_qty) || 0) * (Number(r.rate) || 0)) };
+  });
+  const anyEarned = perWorker.some(p => p.earned > 0);
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">📊 ${monthLabel} · fettling</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;font-size:13px">
+            <thead><tr style="color:var(--slate-500);text-align:right;border-bottom:1px solid var(--slate-200)">
+              <th style="text-align:left;padding:6px 4px">Worker</th><th style="padding:6px 4px">Planned</th><th style="padding:6px 4px">Done</th><th style="padding:6px 4px">Reject</th>${anyEarned ? html`<th style="padding:6px 4px">Earned</th>` : ''}
+            </tr></thead>
+            <tbody>
+              ${perWorker.map(p => html`<tr style="text-align:right;border-bottom:1px solid var(--slate-100)">
+                <td style="text-align:left;padding:6px 4px;font-weight:600">${p.name}</td>
+                <td style="padding:6px 4px">${fmtNum(p.planned)}</td>
+                <td style="padding:6px 4px;color:var(--emerald-700)">${fmtNum(p.done)}</td>
+                <td style="padding:6px 4px;color:var(--rose-600)">${fmtNum(p.reject)}</td>
+                ${anyEarned ? html`<td style="padding:6px 4px">₹${fmtNum(p.earned.toFixed(0))}</td>` : ''}
+              </tr>`)}
+            </tbody>
+            <tfoot><tr style="text-align:right;font-weight:700;border-top:2px solid var(--slate-300)">
+              <td style="text-align:left;padding:6px 4px">Total</td>
+              <td style="padding:6px 4px">${fmtNum(sum(perWorker, p => p.planned))}</td>
+              <td style="padding:6px 4px;color:var(--emerald-700)">${fmtNum(sum(perWorker, p => p.done))}</td>
+              <td style="padding:6px 4px;color:var(--rose-600)">${fmtNum(sum(perWorker, p => p.reject))}</td>
+              ${anyEarned ? html`<td style="padding:6px 4px">₹${fmtNum(sum(perWorker, p => p.earned).toFixed(0))}</td>` : ''}
+            </tr></tfoot>
+          </table>
+        </div>
+      </div>
+    </div>`;
+}
+
 function PpcModule({ plant, me, activeUnit }) {
   const [view, setView] = useState('daily');
   const [loading, setLoading] = useState(true);
@@ -3877,6 +4072,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'supplier_chase'}><${SupplierChaseModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'petty_cash'}><${PettyCashModule} plant=${plant} me=${me} activeUnit=${activeUnit} navAction=${navAction} /></${Page}>
       <${Page} active=${pageTab === 'ppc'}><${PpcModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'fettling'}><${FettlingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
       <${Page} active=${denied}><${AccessDenied} moduleKey=${tab} /></${Page}>
 
@@ -9957,6 +10153,7 @@ const RBAC_MODULES = [
   { key:'masters', label:'Masters', group:'core' },
   { key:'production', label:'Production', group:'ops' },
   { key:'ppc', label:'Production Planning (PPC)', group:'ops' },
+  { key:'fettling', label:'Fettling (contract work)', group:'ops' },
   { key:'quality', label:'Quality', group:'ops' },
   { key:'maintenance', label:'Maintenance', group:'ops' },
   { key:'stocks', label:'Stocks', group:'ops' },
