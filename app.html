@@ -3268,6 +3268,7 @@ function FettlingModule({ plant, me, activeUnit }) {
 
   // ── jobs master (name + fixed piece price) ──
   const renameJob = async (id, name) => { await sb.from('fettling_parts').update({ name }).eq('id', id); setParts(ps => ps.map(p => p.id === id ? { ...p, name } : p)); };
+  const setJobPartNo = async (id, v) => { const pn = (v || '').trim() || null; await sb.from('fettling_parts').update({ part_number: pn }).eq('id', id); setParts(ps => ps.map(p => p.id === id ? { ...p, part_number: pn } : p)); };
   const setJobRate = async (id, v) => { const r = (v === '' || v == null) ? null : Number(v); await sb.from('fettling_parts').update({ rate: r }).eq('id', id); setParts(ps => ps.map(p => p.id === id ? { ...p, rate: r } : p)); };
   const removeJob = async (id) => {
     if (!confirm('Remove this job from the list? Past entries keep their name & price.')) return;
@@ -3279,15 +3280,18 @@ function FettlingModule({ plant, me, activeUnit }) {
   const importFromMaster = async () => {
     setImporting(true);
     try {
-      const { data } = await sb.from('mcp_sched_lines').select('part_name_raw').eq('plant_id', plant.id);
+      const { data } = await sb.from('mcp_sched_lines').select('part_name_raw, customer_part_number').eq('plant_id', plant.id);
       const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      const seen = new Set(parts.map(p => norm(p.name)));
+      // Key on name + part number, so distinct castings that share a name (several
+      // "IMF" variants) each become their own job.
+      const seen = new Set(parts.map(p => norm(p.name) + '§' + norm(p.part_number)));
       const toAdd = [];
       for (const row of (data || [])) {
         const nm = (row.part_name_raw || '').trim();
-        const k = norm(nm);
-        if (!nm || !k || seen.has(k)) continue;
-        seen.add(k); toAdd.push({ plant_id: plant.id, name: nm, created_by: me.id });
+        const cpn = (row.customer_part_number || '').trim();
+        const k = norm(nm) + '§' + norm(cpn);
+        if (!nm || (norm(nm) === '' && norm(cpn) === '') || seen.has(k)) continue;
+        seen.add(k); toAdd.push({ plant_id: plant.id, name: nm, part_number: cpn || null, created_by: me.id });
       }
       if (!toAdd.length) { showToast('Nothing new to import — jobs already cover your parts'); setImporting(false); return; }
       const { error } = await sb.from('fettling_parts').insert(toAdd);
@@ -3302,7 +3306,7 @@ function FettlingModule({ plant, me, activeUnit }) {
   const pickJob = async (row, jobId) => {
     if (jobId === '__new__') { setJobModal({ forRow: row.id }); return; }
     const job = parts.find(p => p.id === jobId);
-    const patch = { part_id: jobId || null, part_name: job ? job.name : '', rate: job ? job.rate : null };
+    const patch = { part_id: jobId || null, part_name: job ? job.name : '', part_number: job ? (job.part_number || null) : null, rate: job ? job.rate : null };
     patchRow(row.id, patch);
     await sb.from('fettling_log').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', row.id);
   };
@@ -3382,12 +3386,13 @@ function FettlingModule({ plant, me, activeUnit }) {
           <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">Set the fixed ₹ per piece once here. It's used for payout automatically — you never type price on the daily plan.</div>
           ${parts.length === 0 ? html`<div style="font-size:12px;color:var(--slate-500);padding:6px 0">No jobs yet. <b>Import from parts</b> pulls the parts already on your schedules, or add them one by one.</div>` :
             html`
-            <div style="display:flex;font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase;letter-spacing:0.04em;padding:0 2px 4px"><div style="flex:1">Job / part</div><div style="width:90px;text-align:right">₹ / piece</div><div style="width:70px"></div></div>
+            <div style="display:flex;gap:8px;font-size:10px;color:var(--slate-500);font-weight:700;text-transform:uppercase;letter-spacing:0.04em;padding:0 2px 4px"><div style="flex:1">Job / part</div><div style="width:110px">Part no.</div><div style="width:80px;text-align:right">₹ / piece</div><div style="width:62px"></div></div>
             ${parts.map(p => html`
               <div key=${p.id} style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
-                <input value=${p.name} onInput=${e => setParts(ps => ps.map(x => x.id === p.id ? { ...x, name: e.target.value } : x))} onBlur=${e => renameJob(p.id, e.target.value.trim() || p.name)} style="flex:1;border:1px solid var(--slate-200);border-radius:5px;padding:6px 8px;font-size:13px" />
-                <input type="number" value=${p.rate ?? ''} placeholder="—" onInput=${e => setParts(ps => ps.map(x => x.id === p.id ? { ...x, rate: e.target.value } : x))} onBlur=${e => setJobRate(p.id, e.target.value)} style="width:90px;border:1px solid var(--slate-200);border-radius:5px;padding:6px;font-size:13px;text-align:right" />
-                <button class="btn small ghost" style="color:var(--rose-600);width:70px" onClick=${() => removeJob(p.id)}>Remove</button>
+                <input value=${p.name} onInput=${e => setParts(ps => ps.map(x => x.id === p.id ? { ...x, name: e.target.value } : x))} onBlur=${e => renameJob(p.id, e.target.value.trim() || p.name)} style="flex:1;min-width:90px;border:1px solid var(--slate-200);border-radius:5px;padding:6px 8px;font-size:13px" />
+                <input value=${p.part_number || ''} placeholder="part no." onInput=${e => setParts(ps => ps.map(x => x.id === p.id ? { ...x, part_number: e.target.value } : x))} onBlur=${e => setJobPartNo(p.id, e.target.value)} style="width:110px;border:1px solid var(--slate-200);border-radius:5px;padding:6px;font-size:13px;font-family:monospace" />
+                <input type="number" value=${p.rate ?? ''} placeholder="—" onInput=${e => setParts(ps => ps.map(x => x.id === p.id ? { ...x, rate: e.target.value } : x))} onBlur=${e => setJobRate(p.id, e.target.value)} style="width:80px;border:1px solid var(--slate-200);border-radius:5px;padding:6px;font-size:13px;text-align:right" />
+                <button class="btn small ghost" style="color:var(--rose-600);width:62px;padding:4px 4px" onClick=${() => removeJob(p.id)}>✕</button>
               </div>`)}`}
           <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
             <button class="btn small" onClick=${() => setJobModal({ forRow: null })}>+ New job</button>
@@ -3430,14 +3435,14 @@ function FettlingModule({ plant, me, activeUnit }) {
                             ? html`
                               <td style="padding:3px 4px">
                                 <select value=${r.part_id || ''} onChange=${e => pickJob(r, e.target.value)} style="width:100%;min-width:150px;border:1px solid var(--slate-200);border-radius:5px;padding:6px;font-size:13px">
-                                  <option value="">${r.part_name && !r.part_id ? r.part_name + ' (untracked)' : '— pick job —'}</option>
-                                  ${parts.map(p => html`<option value=${p.id}>${p.name}${p.rate != null ? ' · ₹' + p.rate : ''}</option>`)}
+                                  <option value="">${r.part_name && !r.part_id ? r.part_name + (r.part_number ? ' #' + r.part_number : '') + ' (untracked)' : '— pick job —'}</option>
+                                  ${parts.map(p => html`<option value=${p.id}>${p.name}${p.part_number ? ' · #' + p.part_number : ''}${p.rate != null ? ' · ₹' + p.rate : ''}</option>`)}
                                   <option value="__new__">➕ New job…</option>
                                 </select>
                               </td>
                               <td style="padding:3px 4px;width:80px">${numInput(r.planned_qty, v => patchRow(r.id, { planned_qty: v }), saveThis(r.id))}</td>`
                             : html`
-                              <td style="padding:3px 4px"><div style="padding:6px 2px;font-size:13px;min-width:110px">${r.part_name || '—'}${r.rate != null ? html`<span style="color:var(--slate-400);font-size:11px"> · ₹${r.rate}/pc</span>` : ''}</div></td>
+                              <td style="padding:3px 4px"><div style="padding:6px 2px;font-size:13px;min-width:110px">${r.part_name || '—'}${r.part_number ? html`<span style="font-family:monospace;color:var(--slate-500);font-size:11px"> #${r.part_number}</span>` : ''}${r.rate != null ? html`<span style="color:var(--slate-400);font-size:11px"> · ₹${r.rate}/pc</span>` : ''}</div></td>
                               <td style="padding:3px 4px;width:56px;text-align:right;font-weight:600;color:var(--slate-500)">${fmtNum(r.planned_qty)}</td>
                               <td style="padding:3px 4px;width:70px">${numInput(r.done_qty, v => patchRow(r.id, { done_qty: v }), saveThis(r.id))}</td>
                               <td style="padding:3px 4px;width:60px">${numInput(r.reject_qty, v => patchRow(r.id, { reject_qty: v }), saveThis(r.id))}</td>`}
@@ -3458,7 +3463,7 @@ function FettlingModule({ plant, me, activeUnit }) {
         const forRow = jobModal.forRow;
         setJobModal(null);
         if (forRow) {
-          const patch = { part_id: job.id, part_name: job.name, rate: job.rate };
+          const patch = { part_id: job.id, part_name: job.name, part_number: job.part_number || null, rate: job.rate };
           patchRow(forRow, patch);
           await sb.from('fettling_log').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', forRow);
         }
@@ -3468,13 +3473,14 @@ function FettlingModule({ plant, me, activeUnit }) {
 
 function FettlingJobModal({ plant, me, onClose, onSaved }) {
   const [name, setName] = useState('');
+  const [partNo, setPartNo] = useState('');
   const [rate, setRate] = useState('');
   const [busy, setBusy] = useState(false);
   const save = async () => {
     const nm = name.trim(); if (!nm) return;
     setBusy(true);
     const { data, error } = await sb.from('fettling_parts')
-      .insert({ plant_id: plant.id, name: nm, rate: rate === '' ? null : Number(rate), created_by: me.id })
+      .insert({ plant_id: plant.id, name: nm, part_number: partNo.trim() || null, rate: rate === '' ? null : Number(rate), created_by: me.id })
       .select().single();
     setBusy(false);
     if (error) { showToast(error.message); return; }
@@ -3484,7 +3490,8 @@ function FettlingJobModal({ plant, me, onClose, onSaved }) {
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal">
         <div class="modal-header"><div class="modal-title">➕ New fettling job</div><button class="close-btn" onClick=${onClose}>×</button></div>
-        <div class="field"><label>Job / part name</label><input value=${name} onInput=${e => setName(e.target.value)} placeholder="e.g. Big Insert fettling" onKeyDown=${e => e.key === 'Enter' && save()} /></div>
+        <div class="field"><label>Job / part name</label><input value=${name} onInput=${e => setName(e.target.value)} placeholder="e.g. IMF" onKeyDown=${e => e.key === 'Enter' && save()} /></div>
+        <div class="field"><label>Part number — optional</label><input value=${partNo} onInput=${e => setPartNo(e.target.value)} placeholder="e.g. 54S30053" /></div>
         <div class="field"><label>Fixed price (₹ per piece) — optional</label><input type="number" value=${rate} onInput=${e => setRate(e.target.value)} placeholder="e.g. 2.50" /></div>
         <button class="btn" disabled=${busy || !name.trim()} onClick=${save}>${busy ? 'Saving…' : 'Add job'}</button>
       </div>
