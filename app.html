@@ -786,8 +786,21 @@ if ('serviceWorker' in navigator) {
   // never trap the tab in an infinite reload. The flag auto-clears after the page
   // has been stable a few seconds, so genuine future updates still reload once.
   navigator.serviceWorker.addEventListener('controllerchange', () => {
-    try { if (sessionStorage.getItem('llk_swreload') === '1') return; sessionStorage.setItem('llk_swreload', '1'); } catch (_) {}
-    window.location.reload();
+    // Never yank the page out from under an OPEN MODAL — a new deploy's SW
+    // (sw.js skipWaiting + clients.claim) claims control the instant it activates,
+    // and reloading then dumps a half-filled form. This is the "petty-cash bill
+    // upload pushes me out" bug: the file/camera picker backgrounds the app, a
+    // pending SW activates on return, and the reload wipes the expense modal.
+    // So defer the reload — poll until no modal is open, then reload once.
+    const reloadWhenSafe = () => {
+      if (typeof document !== 'undefined' && document.querySelector('.modal-backdrop.active')) {
+        setTimeout(reloadWhenSafe, 3000);
+        return;
+      }
+      try { if (sessionStorage.getItem('llk_swreload') === '1') return; sessionStorage.setItem('llk_swreload', '1'); } catch (_) {}
+      window.location.reload();
+    };
+    reloadWhenSafe();
   });
   setTimeout(() => { try { sessionStorage.removeItem('llk_swreload'); } catch (_) {} }, 8000);
   navigator.serviceWorker.register('/sw.js').then(reg => {
