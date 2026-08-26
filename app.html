@@ -37708,6 +37708,15 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
   const [grnModal, setGrnModal] = useState(false);
   const [grnReception, setGrnReception] = useState(null);
   const [editing, setEditing] = useState(isNew);
+  const [projects, setProjects] = useState([]);
+  const [savingItem, setSavingItem] = useState(null);
+  // Active/known projects, so each received material line can be assigned to a job.
+  useEffect(() => {
+    if (!plant?.id) return;
+    sb.from('mcp_projects').select('id, code, name, status')
+      .eq('plant_id', plant.id).neq('status', 'cancelled').order('name')
+      .then(({ data }) => setProjects(data || []));
+  }, [plant?.id]);
 
   const refresh = useCallback(async () => {
     if (isNew || !doc?.id) return;
@@ -37723,6 +37732,23 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
 
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
+
+  // Assign one line item of the document to a project (writes project_id + a
+  // display name onto that item in the items array). Safe on inward docs: the
+  // GRN trigger is idempotent and skips already-received receptions.
+  const assignItemProject = async (idx, projectId) => {
+    const proj = projects.find(p => p.id === projectId);
+    const cur = Array.isArray(doc.items) ? doc.items : [];
+    const next = cur.map((x, i) => i === idx
+      ? { ...x, project_id: projectId || null, project_name: proj ? ((proj.code ? proj.code + ' · ' : '') + proj.name) : null }
+      : x);
+    setSavingItem(idx);
+    const { error } = await sb.from('mcp_logistics_documents').update({ items: next }).eq('id', doc.id);
+    setSavingItem(null);
+    if (error) { showToast(error.message); return; }
+    setDoc(d => ({ ...d, items: next }));
+    showToast(projectId ? '🏗 Assigned to project' : 'Project cleared');
+  };
 
   if (isNew && editing) {
     return html`<${DocumentEditModal} plant=${plant} me=${me} doc=${null} vendors=${vendors} onClose=${onClose} onSaved=${(d) => { setDoc(d); setEditing(false); }} />`;
@@ -37850,6 +37876,14 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
             <div class="list-item-main">
               <div class="list-item-title">${it.name || it.item_name || '?'} ${(it.customer_part_number || it.part_no) && html`<span class="badge slate" style="margin-left:6px;font-family:monospace;font-size:10px">#${it.customer_part_number || it.part_no}</span>`}</div>
               <div class="list-item-sub">${it.qty || 0} ${it.uom || 'nos'} × ₹${fmtNum(it.rate || 0)} ${it.hsn ? '· HSN ' + it.hsn : ''} ${it.process ? '· ' + it.process : ''}</div>
+              <div style="display:flex;align-items:center;gap:6px;margin-top:6px;flex-wrap:wrap">
+                <span style="font-size:11px;color:${it.project_id ? 'var(--teal-700)' : 'var(--slate-400)'}">🏗 ${it.project_id ? 'Project' : 'Assign project'}</span>
+                <select value=${it.project_id || ''} disabled=${savingItem === i} onChange=${e => assignItemProject(i, e.target.value)} style="flex:1;min-width:150px;max-width:280px;font-size:12px;padding:5px 6px;border:1px solid ${it.project_id ? 'var(--teal-300)' : 'var(--slate-200)'};border-radius:5px;background:white">
+                  <option value="">— none —</option>
+                  ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+                </select>
+                ${savingItem === i && html`<span style="font-size:10px;color:var(--slate-400)">saving…</span>`}
+              </div>
             </div>
             ${it.amount && html`<span style="font-size:13px;font-weight:600">₹${fmtNum(it.amount)}</span>`}
           </div>
