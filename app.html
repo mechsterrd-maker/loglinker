@@ -25820,6 +25820,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
     eway_bill: '',
     po_reference: '',
     notes: '',
+    project_id: '',
     igst: false, // true if interstate (no SGST/CGST)
     // Each row can be a 'part' (PartPicker from mcp_pdc_parts) or a
     // 'stock' line (StockItemPicker from mcp_stocks_items). DC-out rows
@@ -25832,6 +25833,14 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  const [projects, setProjects] = useState([]);
+  // Load active projects so a DC can be issued against one (fabrication jobs).
+  useEffect(() => {
+    if (!plant?.id) return;
+    sb.from('mcp_projects').select('id, code, name, status')
+      .eq('plant_id', plant.id).neq('status', 'completed').neq('status', 'cancelled')
+      .order('name').then(({ data }) => setProjects(data || []));
+  }, [plant?.id]);
 
   const setItem = (i, patch) => setForm(f => ({ ...f, items: f.items.map((x, idx) => idx === i ? { ...x, ...patch } : x) }));
   const addItem = () => setForm(f => ({ ...f, items: [...f.items, { kind: 'part', part_id: '', stock_item_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }] }));
@@ -25881,6 +25890,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
         doc_type: isInvoice ? 'invoice_out' : (isReturnable ? 'dc_out_returnable' : 'dc_out'),
         doc_number: docNo,
         doc_date: form.doc_date,
+        project_id: form.project_id || null,
         // vendor_id FK -> mcp_logistics_vendors. Only set when the party is
         // really a vendor; for a customer keep it null and stash the lookup
         // id in raw_extraction.customer_id.
@@ -25900,7 +25910,8 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
           po_reference: form.po_reference || null,
           igst: form.igst,
           cgst_pct: form.cgst_pct, sgst_pct: form.sgst_pct, igst_pct: form.igst_pct,
-          customer: cust ? { name: cust.name, gstin: cust.gstin, address: cust.address, city: cust.city } : null,
+          customer: party ? { name: party.name, gstin: party.gstin, address: party.address, city: party.city } : null,
+          project_id: form.project_id || null,
         },
         status: 'approved',
         notes: form.notes || null,
@@ -25951,6 +25962,14 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
       <div class="field-row">
         <div class="field"><label>Vehicle no</label><input type="text" value=${form.vehicle_no} onChange=${e => setForm({...form, vehicle_no: e.target.value})} placeholder="TN-09-CD-1234" /></div>
         <div class="field"><label>E-way bill</label><input type="text" value=${form.eway_bill} onChange=${e => setForm({...form, eway_bill: e.target.value})} placeholder="if applicable" /></div>
+      </div>
+
+      <div class="field"><label>Project reference${projects.length === 0 ? ' (no active projects yet)' : ''}</label>
+        <select value=${form.project_id} onChange=${e => setForm({...form, project_id: e.target.value})}>
+          <option value="">— none —</option>
+          ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+        </select>
+        <div style="font-size:11px;color:var(--slate-500);margin-top:3px">Tag this ${isInvoice ? 'invoice' : 'challan'} to a project — it then shows under that project's documents.</div>
       </div>
 
       ${isInvoice && html`
