@@ -582,6 +582,11 @@ html[data-hr-dark] .card-title,html[data-hr-dark] .field label{color:var(--hrink
 }
 
 /* ================= FLO ASSISTANT ================= */
+.dfield{position:relative;display:flex;align-items:center;border:1px solid var(--slate-200);border-radius:8px;padding:8px 12px;background:#fff;font-size:13px;min-height:40px;box-sizing:border-box;width:100%}
+.dfield-txt{color:var(--slate-800)}
+.dfield-txt.ph{color:var(--slate-400)}
+.dfield::after{content:'📅';position:absolute;right:9px;top:50%;transform:translateY(-50%);pointer-events:none;font-size:12px;opacity:.55}
+.dfield input[type=date]{position:absolute;inset:0;width:100%;height:100%;opacity:0;border:0;margin:0;padding:0;cursor:pointer;font-size:16px}
 .flo-fab{position:fixed;right:18px;bottom:calc(20px + var(--safe-bottom));z-index:900;width:54px;height:54px;border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;color:#fff;background:linear-gradient(135deg,var(--teal-500),var(--teal-700));box-shadow:0 8px 24px rgba(13,148,136,0.4);transition:transform .15s}
 .flo-fab:hover{transform:scale(1.08)}
 @media (max-width:768px){.flo-fab{bottom:calc(76px + var(--safe-bottom))}}
@@ -933,6 +938,24 @@ const fmtDate = d => new Date(d).toLocaleString('en-GB', { day:'2-digit', month:
 // midday-safe suffix so the day never shifts across a timezone. en-GB → 26/08/2026.
 const fmtDMY = d => { if (!d) return '—'; const s = '' + d; const x = new Date(s.length === 10 ? s + 'T00:00:00' : s); return isNaN(x.getTime()) ? '—' : x.toLocaleDateString('en-GB', { day:'2-digit', month:'2-digit', year:'numeric' }); };
 const fmtNum = n => Number(n || 0).toLocaleString('en-IN');
+
+// Drop-in replacement for a native date input that ALWAYS shows the Indian
+// format (native date inputs follow the browser/OS locale, which is US on many
+// machines). A real date input sits invisibly on top so the OS calendar picker
+// still works and required/min/max validation is preserved; the visible text is
+// our formatted label (reuses fmtDMY → DD/MM/YYYY). Forwards value/onChange and
+// any extra attributes (required, min, max, …) so it swaps in without changes.
+function DateField(props) {
+  const { value, onChange, style, class: cls, className, ...rest } = props;
+  const disp = value ? fmtDMY(value) : '';
+  return html`
+    <div class=${'dfield ' + (cls || className || '')} style=${style || ''}>
+      <span class=${'dfield-txt' + (value ? '' : ' ph')}>${disp || 'Select date'}</span>
+      <input type="date" value=${value || ''} onChange=${onChange}
+        onClick=${e => { try { e.currentTarget.showPicker && e.currentTarget.showPicker(); } catch (_) {} }}
+        ...${rest} />
+    </div>`;
+}
 
 // Map a route-step / stage value to the candidate machine.category values
 // that can perform that operation. Used to filter machine dropdowns in
@@ -3442,7 +3465,7 @@ function RdcReturns({ plant, me, activeUnit }) {
             </div>
             ${isOpen(l) ? html`
               <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px;border-top:1px solid var(--slate-100);padding-top:10px">
-                <label style="font-size:11px;color:var(--slate-500)">Expected return<input type="date" value=${l.expected_return_date || ''} onChange=${e => setDue(l, e.target.value)} style="margin-left:6px;border:1px solid var(--slate-200);border-radius:5px;padding:4px 6px;font-size:12px" /></label>
+                <label style="font-size:11px;color:var(--slate-500)">Expected return<${DateField} value=${l.expected_return_date || ''} onChange=${e => setDue(l, e.target.value)} style="margin-left:6px;border:1px solid var(--slate-200);border-radius:5px;padding:4px 6px;font-size:12px" /></label>
                 <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
                   <input type="number" step="any" min=${0} value=${recv[l.id] ?? ''} placeholder=${'qty ' + fmtNum(pending(l))} onInput=${e => setRecv(r => ({ ...r, [l.id]: e.target.value }))} style="width:88px;border:1px solid var(--slate-200);border-radius:5px;padding:5px 6px;font-size:12px;text-align:right" />
                   <button class="btn small" disabled=${!!busy[l.id]} onClick=${() => doReceive(l)}>✓ Receive</button>
@@ -3596,7 +3619,7 @@ function FettlingModule({ plant, me, activeUnit }) {
       <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <div style="flex:1;min-width:140px"><h1 style="font-size:18px">🪓 Fettling</h1><div class="sub">Daily plan & work done · contract workers</div></div>
         <button class="btn ghost small" onClick=${() => setDay(ppcAddDays(day, -1))}>←</button>
-        <input type="date" value=${day} onChange=${e => setDay(e.target.value || today)} style="border:1px solid var(--slate-200);border-radius:6px;padding:6px 8px;font-size:13px" />
+        <${DateField} value=${day} onChange=${e => setDay(e.target.value || today)} style="border:1px solid var(--slate-200);border-radius:6px;padding:6px 8px;font-size:13px" />
         <button class="btn ghost small" onClick=${() => setDay(ppcAddDays(day, 1))}>→</button>
         ${day !== today && html`<button class="btn ghost small" onClick=${() => setDay(today)}>Today</button>`}
         <button class="btn ghost small" onClick=${openHistory}>📊 Month</button>
@@ -3880,7 +3903,7 @@ function PpcModule({ plant, me, activeUnit }) {
     <div>
       <div class="field-row" style="margin-bottom:12px;align-items:center;gap:6px">
         <button class="btn small ghost" onClick=${()=>setDay(ppcAddDays(day,-1))}>‹</button>
-        <input type="date" value=${day} onChange=${e=>setDay(e.target.value)} style="flex:1"/>
+        <${DateField} value=${day} onChange=${e=>setDay(e.target.value)} style="flex:1"/>
         <button class="btn small ghost" onClick=${()=>setDay(ppcAddDays(day,1))}>›</button>
         <button class="btn small ${day===today?'':'ghost'}" onClick=${()=>setDay(today)}>Today</button>
       </div>
@@ -3957,7 +3980,7 @@ function PpcModule({ plant, me, activeUnit }) {
     <div>
       <div class="field-row" style="margin-bottom:12px;align-items:center;gap:6px">
         <button class="btn small ghost" onClick=${()=>setDay(ppcAddDays(day,-1))}>‹</button>
-        <input type="date" value=${day} onChange=${e=>setDay(e.target.value)} style="flex:1"/>
+        <${DateField} value=${day} onChange=${e=>setDay(e.target.value)} style="flex:1"/>
         <button class="btn small ghost" onClick=${()=>setDay(ppcAddDays(day,1))}>›</button>
         <button class="btn small ${day===today?'':'ghost'}" onClick=${()=>setDay(today)}>Today</button>
       </div>
@@ -7921,7 +7944,7 @@ function ShotModal({ plant, me, units, shifts, machines, dies, parts, users, edi
         ${error && html`<div class="alert error">${error}</div>`}
         <form onSubmit=${submit}>
           <div class="field"><label>Shot date *${form.shot_date && form.shot_date !== new Date().toISOString().slice(0,10) ? html` <span style="font-weight:400;color:var(--amber-700);font-size:11px">· backdated</span>` : ''}</label>
-            <input type="date" required max=${new Date().toISOString().slice(0,10)} value=${form.shot_date} onChange=${e => setForm({...form, shot_date: e.target.value})} />
+            <${DateField} required max=${new Date().toISOString().slice(0,10)} value=${form.shot_date} onChange=${e => setForm({...form, shot_date: e.target.value})} />
           </div>
           <div class="field"><label>Shift *</label>
             <select required value=${form.shift_id} onChange=${e => setForm({...form, shift_id: e.target.value})}>
@@ -12860,7 +12883,7 @@ function InstrumentEditModal({ plant, me, row, onClose, onSaved }) {
           </div>
         </div>
         <div class="field-row">
-          <div class="field"><label>Last cal date</label><input type="date" value=${f.last_calibration_date} onChange=${e => setF({...f, last_calibration_date: e.target.value})} /></div>
+          <div class="field"><label>Last cal date</label><${DateField} value=${f.last_calibration_date} onChange=${e => setF({...f, last_calibration_date: e.target.value})} /></div>
           <div class="field"><label>Traceable to</label><input value=${f.traceable_to} onChange=${e => setF({...f, traceable_to: e.target.value})} placeholder="NABL Lab X" /></div>
         </div>
         <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
@@ -12917,7 +12940,7 @@ function CalibrationRecordModal({ plant, me, instrument, onClose, onSaved }) {
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
         <div class="field-row">
-          <div class="field"><label>Calibration date *</label><input type="date" value=${f.calibration_date} onChange=${e => setF({...f, calibration_date: e.target.value})} /></div>
+          <div class="field"><label>Calibration date *</label><${DateField} value=${f.calibration_date} onChange=${e => setF({...f, calibration_date: e.target.value})} /></div>
           <div class="field"><label>Result *</label>
             <select value=${f.result} onChange=${e => setF({...f, result: e.target.value})}>
               <option value="pass">✅ Pass</option>
@@ -13253,7 +13276,7 @@ function TrainingRecordModal({ plant, me, users, skills, onClose, onSaved }) {
           </select>
         </div>
         <div class="field-row">
-          <div class="field"><label>Trained on *</label><input type="date" value=${f.trained_on} onChange=${e => setF({...f, trained_on: e.target.value})} /></div>
+          <div class="field"><label>Trained on *</label><${DateField} value=${f.trained_on} onChange=${e => setF({...f, trained_on: e.target.value})} /></div>
           <div class="field"><label>Method</label>
             <select value=${f.evaluation_method} onChange=${e => setF({...f, evaluation_method: e.target.value})}>
               <option>Practical demo</option>
@@ -13495,12 +13518,12 @@ function PpapEditModal({ plant, me, row, onClose, onSaved }) {
           </div>
         </div>
         <div class="field-row">
-          <div class="field"><label>Submitted on</label><input type="date" value=${f.submitted_on} onChange=${e => setF({...f, submitted_on: e.target.value})} /></div>
-          <div class="field"><label>Approved on</label><input type="date" value=${f.approved_on} onChange=${e => setF({...f, approved_on: e.target.value})} /></div>
+          <div class="field"><label>Submitted on</label><${DateField} value=${f.submitted_on} onChange=${e => setF({...f, submitted_on: e.target.value})} /></div>
+          <div class="field"><label>Approved on</label><${DateField} value=${f.approved_on} onChange=${e => setF({...f, approved_on: e.target.value})} /></div>
         </div>
         <div class="field-row">
-          <div class="field"><label>Interim until</label><input type="date" value=${f.interim_until} onChange=${e => setF({...f, interim_until: e.target.value})} /></div>
-          <div class="field"><label>Expires on</label><input type="date" value=${f.expires_on} onChange=${e => setF({...f, expires_on: e.target.value})} /></div>
+          <div class="field"><label>Interim until</label><${DateField} value=${f.interim_until} onChange=${e => setF({...f, interim_until: e.target.value})} /></div>
+          <div class="field"><label>Expires on</label><${DateField} value=${f.expires_on} onChange=${e => setF({...f, expires_on: e.target.value})} /></div>
         </div>
         <div class="field"><label>Approver name (customer side)</label><input value=${f.approver_name} onChange=${e => setF({...f, approver_name: e.target.value})} placeholder="QA Manager name at customer" /></div>
         <div class="field"><label>👤 Plant owner (auto-assigned tasks land here)</label>
@@ -15065,7 +15088,7 @@ function PfmeaHeaderEditModal({ plant, me, row, onClose, onSaved }) {
         <div class="field"><label>Part #</label><input value=${f.part_number} onChange=${e => setF({...f, part_number: e.target.value})} placeholder="ABS-12345 (optional)" /></div>
         <div class="field"><label>Team members</label><input value=${f.team_members} onChange=${e => setF({...f, team_members: e.target.value})} placeholder="QA, Production, Maintenance" /></div>
         <div class="field-row">
-          <div class="field"><label>FMEA date</label><input type="date" value=${f.fmea_date} onChange=${e => setF({...f, fmea_date: e.target.value})} /></div>
+          <div class="field"><label>FMEA date</label><${DateField} value=${f.fmea_date} onChange=${e => setF({...f, fmea_date: e.target.value})} /></div>
           <div class="field"><label>Status</label>
             <select value=${f.status} onChange=${e => setF({...f, status: e.target.value})}>
               <option value="draft">Draft</option>
@@ -15182,7 +15205,7 @@ function PfmeaItemEditModal({ plant, fmea, row, onClose, onSaved }) {
         <div class="field"><label>Recommended action</label><textarea rows="2" value=${f.recommended_action} onChange=${e => setF({...f, recommended_action: e.target.value})} placeholder="Poka-yoke gauge at OP-20 outfeed"></textarea></div>
         <div class="field-row">
           <div class="field"><label>Action owner (text)</label><input value=${f.action_owner} onChange=${e => setF({...f, action_owner: e.target.value})} placeholder="A. Kumar (QA)" /></div>
-          <div class="field"><label>Target date</label><input type="date" value=${f.target_date} onChange=${e => setF({...f, target_date: e.target.value})} /></div>
+          <div class="field"><label>Target date</label><${DateField} value=${f.target_date} onChange=${e => setF({...f, target_date: e.target.value})} /></div>
         </div>
         <div class="field"><label>👤 Action owner (auto-assigns Tasks when RPN ≥120)</label>
           <select value=${f.action_owner_user_id} onChange=${e => setF({...f, action_owner_user_id: e.target.value})}>
@@ -15348,7 +15371,7 @@ function LpaEditModal({ plant, me, row, onClose, onSaved }) {
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
         <div class="field-row">
-          <div class="field"><label>Date *</label><input type="date" value=${f.audit_date} onChange=${e => setF({...f, audit_date: e.target.value})} /></div>
+          <div class="field"><label>Date *</label><${DateField} value=${f.audit_date} onChange=${e => setF({...f, audit_date: e.target.value})} /></div>
           <div class="field"><label>Layer *</label>
             <select value=${f.layer} onChange=${e => setF({...f, layer: e.target.value})}>
               <option value="1">Layer 1 — Supervisor (daily)</option>
@@ -15573,7 +15596,7 @@ function MgmtReviewEditModal({ plant, me, row, onClose, onSaved }) {
         ${error && html`<div class="alert error">${error}</div>`}
         <div class="field-row">
           <div class="field"><label>Review #</label><input value=${f.review_no} onChange=${e => setF({...f, review_no: e.target.value})} placeholder="MR-2026-Q2" /></div>
-          <div class="field"><label>Date *</label><input type="date" value=${f.review_date} onChange=${e => setF({...f, review_date: e.target.value})} /></div>
+          <div class="field"><label>Date *</label><${DateField} value=${f.review_date} onChange=${e => setF({...f, review_date: e.target.value})} /></div>
         </div>
         <div class="field"><label>Chairperson</label><input value=${f.chairperson_name} onChange=${e => setF({...f, chairperson_name: e.target.value})} placeholder="Plant Head name" /></div>
         <div class="field"><label>Attendees</label><textarea rows="2" value=${f.attendees} onChange=${e => setF({...f, attendees: e.target.value})} placeholder="QA Manager, Production Head, Maintenance Head…"></textarea></div>
@@ -15599,7 +15622,7 @@ function MgmtReviewEditModal({ plant, me, row, onClose, onSaved }) {
               <option value="completed">Completed</option>
             </select>
           </div>
-          <div class="field"><label>Next review due</label><input type="date" value=${f.next_review_date} onChange=${e => setF({...f, next_review_date: e.target.value})} /></div>
+          <div class="field"><label>Next review due</label><${DateField} value=${f.next_review_date} onChange=${e => setF({...f, next_review_date: e.target.value})} /></div>
         </div>
         <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
         <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Create review' : 'Save')}</button>
@@ -15680,7 +15703,7 @@ function MgmtReviewActionsDrawer({ plant, me, review, onClose, onChanged }) {
             <div class="field"><label>Decision *</label><textarea rows="2" value=${nf.decision} onChange=${e => setNf({...nf, decision: e.target.value})} placeholder="Add 2nd shift on Line 3 for 30 days"></textarea></div>
             <div class="field-row">
               <div class="field"><label>Owner</label><input value=${nf.owner_name} onChange=${e => setNf({...nf, owner_name: e.target.value})} /></div>
-              <div class="field"><label>Target</label><input type="date" value=${nf.target_date} onChange=${e => setNf({...nf, target_date: e.target.value})} /></div>
+              <div class="field"><label>Target</label><${DateField} value=${nf.target_date} onChange=${e => setNf({...nf, target_date: e.target.value})} /></div>
             </div>
             <div style="display:flex;gap:8px">
               <button class="btn ghost small" onClick=${() => setAdding(false)}>Cancel</button>
@@ -15869,8 +15892,8 @@ function CsrEditModal({ plant, me, row, onClose, onSaved }) {
           <div class="field"><label>Evidence URL</label><input type="url" value=${f.evidence_url} onChange=${e => setF({...f, evidence_url: e.target.value})} /></div>
         </div>
         <div class="field-row">
-          <div class="field"><label>Effective from</label><input type="date" value=${f.effective_from} onChange=${e => setF({...f, effective_from: e.target.value})} /></div>
-          <div class="field"><label>Effective to</label><input type="date" value=${f.effective_to} onChange=${e => setF({...f, effective_to: e.target.value})} /></div>
+          <div class="field"><label>Effective from</label><${DateField} value=${f.effective_from} onChange=${e => setF({...f, effective_from: e.target.value})} /></div>
+          <div class="field"><label>Effective to</label><${DateField} value=${f.effective_to} onChange=${e => setF({...f, effective_to: e.target.value})} /></div>
         </div>
         <div class="field-row">
           <div class="field"><label>Compliance status *</label>
@@ -15890,8 +15913,8 @@ function CsrEditModal({ plant, me, row, onClose, onSaved }) {
           </select>
         </div>
         <div class="field-row">
-          <div class="field"><label>Last reviewed</label><input type="date" value=${f.last_reviewed_on} onChange=${e => setF({...f, last_reviewed_on: e.target.value})} /></div>
-          <div class="field"><label>Next review</label><input type="date" value=${f.next_review_on} onChange=${e => setF({...f, next_review_on: e.target.value})} /></div>
+          <div class="field"><label>Last reviewed</label><${DateField} value=${f.last_reviewed_on} onChange=${e => setF({...f, last_reviewed_on: e.target.value})} /></div>
+          <div class="field"><label>Next review</label><${DateField} value=${f.next_review_on} onChange=${e => setF({...f, next_review_on: e.target.value})} /></div>
         </div>
         <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
         <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Add CSR' : 'Save')}</button>
@@ -16280,7 +16303,7 @@ function IapEditModal({ plant, me, row, onClose, onSaved }) {
           <div class="field"><label>Clauses</label><input value=${f.clauses_covered} onChange=${e => setF({...f, clauses_covered: e.target.value})} placeholder="8.5.1, 8.5.1.3, 8.6" /></div>
         </div>
         <div class="field-row">
-          <div class="field"><label>Planned date *</label><input type="date" value=${f.planned_date} onChange=${e => setF({...f, planned_date: e.target.value})} /></div>
+          <div class="field"><label>Planned date *</label><${DateField} value=${f.planned_date} onChange=${e => setF({...f, planned_date: e.target.value})} /></div>
           <div class="field"><label>Duration (days)</label><input type="number" min="0.25" step="0.25" value=${f.planned_duration_days} onChange=${e => setF({...f, planned_duration_days: e.target.value})} /></div>
         </div>
         <div class="field-row">
@@ -16304,11 +16327,11 @@ function IapEditModal({ plant, me, row, onClose, onSaved }) {
               <option value="cancelled">Cancelled</option>
             </select>
           </div>
-          <div class="field"><label>Closure due</label><input type="date" value=${f.closure_due_date} onChange=${e => setF({...f, closure_due_date: e.target.value})} /></div>
+          <div class="field"><label>Closure due</label><${DateField} value=${f.closure_due_date} onChange=${e => setF({...f, closure_due_date: e.target.value})} /></div>
         </div>
         <div class="field-row">
-          <div class="field"><label>Actual start</label><input type="date" value=${f.actual_start_date} onChange=${e => setF({...f, actual_start_date: e.target.value})} /></div>
-          <div class="field"><label>Actual end</label><input type="date" value=${f.actual_end_date} onChange=${e => setF({...f, actual_end_date: e.target.value})} /></div>
+          <div class="field"><label>Actual start</label><${DateField} value=${f.actual_start_date} onChange=${e => setF({...f, actual_start_date: e.target.value})} /></div>
+          <div class="field"><label>Actual end</label><${DateField} value=${f.actual_end_date} onChange=${e => setF({...f, actual_end_date: e.target.value})} /></div>
         </div>
         <div class="field-row">
           <div class="field"><label>NCs raised</label><input type="number" min="0" value=${f.nc_count} onChange=${e => setF({...f, nc_count: e.target.value})} /></div>
@@ -17085,7 +17108,7 @@ function AttendanceModule({ plant, me, activeUnit }) {
       <div class="card" style="padding:10px 12px;margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end">
         <div class="field" style="margin:0;flex:1;min-width:140px">
           <label style="font-size:11px">Date</label>
-          <input type="date" value=${date} max=${new Date().toISOString().slice(0,10)} onChange=${e => setDate(e.target.value)} style="font-size:13px" />
+          <${DateField} value=${date} max=${new Date().toISOString().slice(0,10)} onChange=${e => setDate(e.target.value)} style="font-size:13px" />
         </div>
         <div class="field" style="margin:0;flex:2;min-width:160px">
           <label style="font-size:11px">Search employee</label>
@@ -17577,7 +17600,7 @@ function PayrollHolidays({ plant, holidays, onChange }) {
     <div class="card" style="margin-bottom:10px">
       <div class="card-title">📅 Govt holidays — working these = overtime</div>
       <div class="field-row" style="align-items:end">
-        <div class="field" style="flex:1"><label>Date</label><input type="date" value=${date} onChange=${e => setDate(e.target.value)} /></div>
+        <div class="field" style="flex:1"><label>Date</label><${DateField} value=${date} onChange=${e => setDate(e.target.value)} /></div>
         <div class="field" style="flex:1.4"><label>Name</label><input type="text" value=${name} onChange=${e => setName(e.target.value)} placeholder="e.g. Diwali" /></div>
         <button class="btn small" disabled=${busy||!date} onClick=${add}>＋ Add</button>
       </div>
@@ -17902,7 +17925,7 @@ function HrEmployeeModal({ plant, me, employee, onClose, onSaved, onEnroll }) {
         ${F('Phone (WhatsApp — payslip is sent here)', inp('phone', { placeholder: '10-digit mobile', inputmode: 'tel' }))}
         <div style="display:flex;gap:10px">
           <div style="flex:1">${F('Blood group', html`<select value=${f.blood_group} onChange=${e => set('blood_group', e.target.value)} style="width:100%;padding:9px 11px;border:1px solid var(--slate-300);border-radius:8px;font-size:14px"><option value="">—</option>${BLOOD_GROUPS.filter(Boolean).map(b => html`<option value=${b}>${b}</option>`)}</select>`)}</div>
-          <div style="flex:1">${F('Joining date', html`<input type="date" value=${f.date_of_joining} onInput=${e => set('date_of_joining', e.target.value)} style="width:100%;padding:9px 11px;border:1px solid var(--slate-300);border-radius:8px;font-size:14px" />`)}</div>
+          <div style="flex:1">${F('Joining date', html`<${DateField} value=${f.date_of_joining} onInput=${e => set('date_of_joining', e.target.value)} style="width:100%;padding:9px 11px;border:1px solid var(--slate-300);border-radius:8px;font-size:14px" />`)}</div>
         </div>
         ${F('Address', html`<textarea value=${f.address} onInput=${e => set('address', e.target.value)} rows="2" placeholder="optional" style="width:100%;padding:9px 11px;border:1px solid var(--slate-300);border-radius:8px;font-size:14px;resize:vertical"></textarea>`)}
         <div style="font-size:11px;color:var(--slate-500);margin:2px 0 8px">💡 Salary &amp; designation are set separately (and privately) in <b>Attendance → Payroll</b>.</div>
@@ -19938,7 +19961,7 @@ function RejectionEntryModal({ plant, me, activeUnit, parts, rtypes, users, edit
         <div class="modal-header"><div class="modal-title">${editTarget ? 'Edit' : '+ Log'} rejection</div><button class="close-btn" onClick=${onClose}>×</button></div>
         ${err && html`<div class="alert error">${err}</div>`}
         <div class="field-row">
-          <div class="field"><label>Date *</label><input type="date" value=${f.rej_date} onChange=${e => set('rej_date', e.target.value)} /></div>
+          <div class="field"><label>Date *</label><${DateField} value=${f.rej_date} onChange=${e => set('rej_date', e.target.value)} /></div>
           <div class="field"><label>Type</label><select value=${f.category} onChange=${e => set('category', e.target.value)}><option value="inhouse">Inhouse</option><option value="supplier">Supplier</option><option value="customer">Customer</option></select></div>
         </div>
         <div class="field"><label>Part *</label>
@@ -21796,10 +21819,10 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
           ${period === 'custom' && html`
             <div style="display:flex;gap:8px;margin-top:8px">
               <label style="flex:1"><div style="font-size:10px;color:var(--slate-500);margin-bottom:3px">From</div>
-                <input type="date" value=${customFrom} onChange=${e => setCustomFrom(e.target.value)} style="width:100%;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                <${DateField} value=${customFrom} onChange=${e => setCustomFrom(e.target.value)} style="width:100%;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
               </label>
               <label style="flex:1"><div style="font-size:10px;color:var(--slate-500);margin-bottom:3px">To</div>
-                <input type="date" value=${customTo} onChange=${e => setCustomTo(e.target.value)} style="width:100%;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                <${DateField} value=${customTo} onChange=${e => setCustomTo(e.target.value)} style="width:100%;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
               </label>
             </div>
           `}
@@ -21889,7 +21912,7 @@ function PettyCashBookModal({ plant, me, users, activeUnit, onClose, onSaved }) 
               <input type="number" step="any" min=${0} value=${form.opening_balance} onChange=${e => setForm({...form, opening_balance: e.target.value})} />
             </div>
             <div class="field"><label>As of date</label>
-              <input type="date" value=${form.opening_date} onChange=${e => setForm({...form, opening_date: e.target.value})} />
+              <${DateField} value=${form.opening_date} onChange=${e => setForm({...form, opening_date: e.target.value})} />
             </div>
           </div>
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
@@ -22011,7 +22034,7 @@ function PettyCashTxnModal({ plant, me, books, users, initial, advances, onClose
               </select>
             </div>
             <div class="field"><label>Date *</label>
-              <input type="date" required value=${form.txn_date} onChange=${e => setForm({...form, txn_date: e.target.value})} />
+              <${DateField} required value=${form.txn_date} onChange=${e => setForm({...form, txn_date: e.target.value})} />
             </div>
           </div>
           <div class="field"><label>Amount ₹ *</label>
@@ -22288,7 +22311,7 @@ function IdleLogModal({ plant, me, machine, shifts, onClose, onSaved }) {
         ${err && html`<div class="alert error">${err}</div>`}
         <form onSubmit=${submit}>
           <div class="field-row">
-            <div class="field"><label>Date *</label><input type="date" required value=${form.log_date} onChange=${e => setForm({...form, log_date: e.target.value})} /></div>
+            <div class="field"><label>Date *</label><${DateField} required value=${form.log_date} onChange=${e => setForm({...form, log_date: e.target.value})} /></div>
             <div class="field"><label>Shift</label>
               <select value=${form.shift_id} onChange=${e => setForm({...form, shift_id: e.target.value})}>
                 <option value="">— Full day —</option>
@@ -22518,8 +22541,8 @@ function ProjectModal({ plant, me, customers, users, editTarget, onClose, onSave
             <div class="field"><label>Actual weight (kg)</label><input type="number" step="any" value=${form.actual_weight_kg} onChange=${e=>setForm({...form,actual_weight_kg:e.target.value})} /></div>
           </div>
           <div class="field-row">
-            <div class="field"><label>Start date</label><input type="date" value=${form.start_date||''} onChange=${e=>setForm({...form,start_date:e.target.value})} /></div>
-            <div class="field"><label>Target date</label><input type="date" value=${form.target_date||''} onChange=${e=>setForm({...form,target_date:e.target.value})} /></div>
+            <div class="field"><label>Start date</label><${DateField} value=${form.start_date||''} onChange=${e=>setForm({...form,start_date:e.target.value})} /></div>
+            <div class="field"><label>Target date</label><${DateField} value=${form.target_date||''} onChange=${e=>setForm({...form,target_date:e.target.value})} /></div>
           </div>
           <div class="field"><label>Progress: ${form.progress_pct||0}%</label><input type="range" min=${0} max=${100} step=${5} value=${form.progress_pct||0} onChange=${e=>setForm({...form,progress_pct:e.target.value})} style="width:100%" /></div>
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes||''} onChange=${e=>setForm({...form,notes:e.target.value})}></textarea></div>
@@ -25511,7 +25534,7 @@ function ExpenseModal({ plant, me, vendors, projects, editTarget, onClose, onSav
         ${err && html`<div class="alert error">${err}</div>`}
         <form onSubmit=${submit}>
           <div class="field-row">
-            <div class="field"><label>Date *</label><input type="date" required value=${form.expense_date} onChange=${e=>setForm({...form,expense_date:e.target.value})} /></div>
+            <div class="field"><label>Date *</label><${DateField} required value=${form.expense_date} onChange=${e=>setForm({...form,expense_date:e.target.value})} /></div>
             <div class="field"><label>Amount ₹ *</label><input type="number" step="any" min=${0} required value=${form.amount} onChange=${e=>setForm({...form,amount:e.target.value})} autoFocus /></div>
           </div>
           <div class="field-row">
@@ -25926,7 +25949,7 @@ function PoPackingForm({ plant, me, kind, previewNumber, customers, vendors, onS
     ${err && html`<div class="alert error">${err}</div>`}
     <form onSubmit=${submit}>
       <div class="field-row">
-        <div class="field"><label>Date *</label><input type="date" required value=${form.doc_date} onChange=${e=>setForm({...form,doc_date:e.target.value})} /></div>
+        <div class="field"><label>Date *</label><${DateField} required value=${form.doc_date} onChange=${e=>setForm({...form,doc_date:e.target.value})} /></div>
         <div class="field"><label>${isPo ? 'Vendor *' : 'Customer *'}</label>
           <div style="display:flex;gap:6px;align-items:stretch">
             <select required value=${form.party_id} onChange=${e=>setForm({...form,party_id:e.target.value})} style="flex:1">
@@ -25939,7 +25962,7 @@ function PoPackingForm({ plant, me, kind, previewNumber, customers, vendors, onS
         </div>
       </div>
       <div class="field-row">
-        ${isPo ? html`<div class="field"><label>Expected delivery</label><input type="date" value=${form.delivery_date} onChange=${e=>setForm({...form,delivery_date:e.target.value})} /></div>` :
+        ${isPo ? html`<div class="field"><label>Expected delivery</label><${DateField} value=${form.delivery_date} onChange=${e=>setForm({...form,delivery_date:e.target.value})} /></div>` :
                  html`<div class="field"><label>Transport / vehicle</label><input type="text" value=${form.transport} onChange=${e=>setForm({...form,transport:e.target.value})} placeholder="TN-09-..." /></div>`}
         <div class="field"><label>${isPo ? 'Payment terms' : 'Reference'}</label><input type="text" value=${form.payment_terms} onChange=${e=>setForm({...form,payment_terms:e.target.value})} placeholder=${isPo?'30 days':'against DC#'} /></div>
       </div>
@@ -26187,7 +26210,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
         </div>
       `}
       <div class="field-row">
-        <div class="field"><label>Doc date *</label><input type="date" required value=${form.doc_date} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
+        <div class="field"><label>Doc date *</label><${DateField} required value=${form.doc_date} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
         <div class="field"><label>${partyType === 'vendor' ? 'Vendor *' : 'Customer *'}</label>
           <div style="display:flex;gap:6px;align-items:stretch">
             <select required value=${form.customer_id} onChange=${e => setForm({...form, customer_id: e.target.value})} style="flex:1">
@@ -27013,14 +27036,14 @@ function JobworkSendModal({ plant, me, vendors, onClose, onSaved }) {
           </div>
           <div class="field-row">
             <div class="field"><label>DC number</label><input type="text" value=${form.doc_number} onChange=${e => setForm({...form, doc_number: e.target.value})} placeholder="auto if blank" /></div>
-            <div class="field"><label>DC date *</label><input type="date" required value=${form.doc_date} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
+            <div class="field"><label>DC date *</label><${DateField} required value=${form.doc_date} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
           </div>
           <div class="field"><label>Process / operation</label>
             <input type="text" value=${form.process} onChange=${e => setForm({...form, process: e.target.value})} placeholder="Plating · Heat treatment · Grinding · Machining · Coating" />
           </div>
           <div class="field-row">
             <div class="field"><label>SLA days</label><input type="number" min=${1} value=${form.sla_days} onChange=${e => setForm({...form, sla_days: e.target.value})} /></div>
-            <div class="field"><label>Expected return</label><input type="date" value=${form.expected_return_date} onChange=${e => setForm({...form, expected_return_date: e.target.value})} /></div>
+            <div class="field"><label>Expected return</label><${DateField} value=${form.expected_return_date} onChange=${e => setForm({...form, expected_return_date: e.target.value})} /></div>
           </div>
 
           <div class="field"><label>Parts to send *</label>
@@ -27187,7 +27210,7 @@ function JobworkReceiveModal({ plant, me, line, onClose, onSaved }) {
         <form onSubmit=${submit}>
           <div class="field-row">
             <div class="field"><label>DC-in number</label><input type="text" value=${form.doc_number} onChange=${e => setForm({...form, doc_number: e.target.value})} placeholder="auto if blank" /></div>
-            <div class="field"><label>Received date *</label><input type="date" required value=${form.doc_date} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
+            <div class="field"><label>Received date *</label><${DateField} required value=${form.doc_date} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
           </div>
           <div class="field-row">
             <div class="field"><label>${isConv ? 'Yield received (' + (line.yield_uom || 'pcs') + ') *' : 'Qty received *'}</label>
@@ -27736,7 +27759,7 @@ function VoiceNotesModule({ plant, me }) {
         <div class="card" style="padding:14px;margin-bottom:12px">
           <div class="field-row" style="display:flex;gap:10px">
             <div class="field" style="flex:2"><label>Subject *</label><input type="text" required value=${subject} onInput=${e => setSubject(e.target.value)} /></div>
-            <div class="field" style="flex:1"><label>Date</label><input type="date" value=${meetingDate} onInput=${e => setMeetingDate(e.target.value)} /></div>
+            <div class="field" style="flex:1"><label>Date</label><${DateField} value=${meetingDate} onInput=${e => setMeetingDate(e.target.value)} /></div>
           </div>
           <div class="field-row" style="display:flex;gap:10px">
             <div class="field" style="flex:1">
@@ -27778,7 +27801,7 @@ function VoiceNotesModule({ plant, me }) {
                   <option value="">${it.owner_external_name ? '🙋 ' + it.owner_external_name + ' (external)' : '— Owner —'}</option>
                   ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
                 </select>
-                <input type="date" value=${it.due_date} onChange=${e => updateAi(idx, { due_date: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                <${DateField} value=${it.due_date} onChange=${e => updateAi(idx, { due_date: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
                 <select value=${it.priority} onChange=${e => updateAi(idx, { priority: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px">
                   <option value="high">🔴 High</option>
                   <option value="medium">🟡 Medium</option>
@@ -27977,7 +28000,7 @@ function MomCreateModal({ plant, me, users, onClose, onSaved }) {
           `}
           <div class="field"><label>Subject *</label><input type="text" required value=${form.subject} onChange=${e => setForm({...form, subject: e.target.value})} placeholder="Weekly quality review · 8D for porosity · Audit planning" /></div>
           <div class="field-row">
-            <div class="field"><label>Date *</label><input type="date" required value=${form.meeting_date} onChange=${e => setForm({...form, meeting_date: e.target.value})} /></div>
+            <div class="field"><label>Date *</label><${DateField} required value=${form.meeting_date} onChange=${e => setForm({...form, meeting_date: e.target.value})} /></div>
             <div class="field"><label>Time</label><input type="time" value=${form.meeting_time} onChange=${e => setForm({...form, meeting_time: e.target.value})} /></div>
             <div class="field"><label>Duration (min)</label><input type="number" min=${0} value=${form.duration_minutes} onChange=${e => setForm({...form, duration_minutes: e.target.value})} /></div>
           </div>
@@ -28010,7 +28033,7 @@ function MomCreateModal({ plant, me, users, onClose, onSaved }) {
                       <option value="">— Responsible person —</option>
                       ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}${u.role ? ' · ' + u.role : ''}</option>`)}
                     </select>
-                    <input type="date" value=${p.due_date} onChange=${e => setPoint(idx, { due_date: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                    <${DateField} value=${p.due_date} onChange=${e => setPoint(idx, { due_date: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
                   </div>
                 </div>
               `)}
@@ -28267,7 +28290,7 @@ function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
             ${users.map(u => html`<option key=${u.id} value=${u.id}>${u.full_name}</option>`)}
           </select>
         </div>
-        <div class="field"><label>Due date</label><input type="date" value=${newAction.due_date} onChange=${e => setNewAction({...newAction, due_date: e.target.value})} /></div>
+        <div class="field"><label>Due date</label><${DateField} value=${newAction.due_date} onChange=${e => setNewAction({...newAction, due_date: e.target.value})} /></div>
       </div>
       <button class="btn small" onClick=${addAction} disabled=${busy || !newAction.description.trim()}>+ Add</button>
       <p style="font-size:11px;color:var(--slate-500);margin:6px 0 0">Assigning an internal owner auto-creates a task in their Action Hub. When that task closes, this MOM action auto-closes too — and when every item is done, the MOM auto-closes.</p>
@@ -28424,7 +28447,7 @@ function ComplaintCreateModal({ plant, me, customers, users, onClose, onSaved })
           </div>
           <div class="field-row">
             <div class="field"><label>Qty affected</label><input type="number" min=${0} value=${form.qty_affected} onChange=${e => setForm({...form, qty_affected: e.target.value})} /></div>
-            <div class="field"><label>Complaint date *</label><input type="date" required value=${form.complaint_date} onChange=${e => setForm({...form, complaint_date: e.target.value})} /></div>
+            <div class="field"><label>Complaint date *</label><${DateField} required value=${form.complaint_date} onChange=${e => setForm({...form, complaint_date: e.target.value})} /></div>
             <div class="field"><label>Severity</label>
               <select value=${form.severity} onChange=${e => setForm({...form, severity: e.target.value})}>
                 <option value="minor">Minor</option><option value="major">Major</option><option value="critical">Critical</option>
@@ -30011,9 +30034,9 @@ function NpdCreateModal({ plant, me, customers, users, onClose, onSaved }) {
             </div>
           </div>
           <div class="field-row">
-            <div class="field"><label>RFQ received</label><input type="date" value=${form.rfq_received_date} onChange=${e => setForm({...form, rfq_received_date: e.target.value})} /></div>
-            <div class="field"><label>Quote target</label><input type="date" value=${form.quote_target_date} onChange=${e => setForm({...form, quote_target_date: e.target.value})} /></div>
-            <div class="field"><label>SOP target</label><input type="date" value=${form.sop_target_date} onChange=${e => setForm({...form, sop_target_date: e.target.value})} /></div>
+            <div class="field"><label>RFQ received</label><${DateField} value=${form.rfq_received_date} onChange=${e => setForm({...form, rfq_received_date: e.target.value})} /></div>
+            <div class="field"><label>Quote target</label><${DateField} value=${form.quote_target_date} onChange=${e => setForm({...form, quote_target_date: e.target.value})} /></div>
+            <div class="field"><label>SOP target</label><${DateField} value=${form.sop_target_date} onChange=${e => setForm({...form, sop_target_date: e.target.value})} /></div>
           </div>
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
           <button class="btn" disabled=${busy || !form.project_code || !form.part_name}>${busy ? 'Saving…' : 'Create project'}</button>
@@ -30144,13 +30167,13 @@ function NpdDetail({ project, plant, customers, users, me, onClose, onChanged })
               ${row.target && html`
                 <label style="flex:1;min-width:120px;font-size:11px;color:var(--slate-500)">
                   Target
-                  <input type="date" value=${p[row.target] || ''} onChange=${e => update({ [row.target]: e.target.value || null })} disabled=${busy} style="display:block;margin-top:2px;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px;width:100%" />
+                  <${DateField} value=${p[row.target] || ''} onChange=${e => update({ [row.target]: e.target.value || null })} disabled=${busy} style="display:block;margin-top:2px;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px;width:100%" />
                 </label>
               `}
               ${row.actual && html`
                 <label style="flex:1;min-width:120px;font-size:11px;color:var(--slate-500)">
                   Actual
-                  <input type="date" value=${p[row.actual] || ''} onChange=${e => update({ [row.actual]: e.target.value || null })} disabled=${busy} style="display:block;margin-top:2px;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px;width:100%" />
+                  <${DateField} value=${p[row.actual] || ''} onChange=${e => update({ [row.actual]: e.target.value || null })} disabled=${busy} style="display:block;margin-top:2px;padding:5px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:5px;width:100%" />
                 </label>
               `}
             </div>
@@ -30441,7 +30464,7 @@ function NpdFeasibility({ p, me, plant, busy, update, docs, onReload }) {
     <div class="card" style="margin-top:10px">
       <div class="card-title">🔍 Feasibility decision</div>
       <div class="field"><label>Target date</label>
-        <input type="date" value=${p.feasibility_target_date || ''} disabled=${busy}
+        <${DateField} value=${p.feasibility_target_date || ''} disabled=${busy}
           onChange=${e => update({ feasibility_target_date: e.target.value || null })} />
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin:8px 0">
@@ -30948,7 +30971,7 @@ function PmTaskEditModal({ plant, me, row, onClose, onSaved }) {
         </div>
         <div class="field-row">
           <div class="field"><label>Est. minutes</label><input type="number" min="1" value=${f.estimated_minutes} onChange=${e => setF({...f, estimated_minutes: e.target.value})} /></div>
-          <div class="field"><label>Next due</label><input type="date" value=${f.next_due_date} onChange=${e => setF({...f, next_due_date: e.target.value})} /></div>
+          <div class="field"><label>Next due</label><${DateField} value=${f.next_due_date} onChange=${e => setF({...f, next_due_date: e.target.value})} /></div>
         </div>
         <div class="field"><label>Required skills</label><input value=${f.required_skills} onChange=${e => setF({...f, required_skills: e.target.value})} placeholder="Cert mechanical fitter L2" /></div>
         <div class="field"><label>👤 Owner (auto-assigns Tasks if PM is skipped)</label>
@@ -31012,7 +31035,7 @@ function PmExecutionModal({ plant, me, task, onClose, onSaved }) {
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
         <div class="field-row">
-          <div class="field"><label>Scheduled date</label><input type="date" value=${f.scheduled_date} onChange=${e => setF({...f, scheduled_date: e.target.value})} /></div>
+          <div class="field"><label>Scheduled date</label><${DateField} value=${f.scheduled_date} onChange=${e => setF({...f, scheduled_date: e.target.value})} /></div>
           <div class="field"><label>Status</label>
             <select value=${f.status} onChange=${e => setF({...f, status: e.target.value})}>
               <option value="done">✓ Done</option>
@@ -31022,7 +31045,7 @@ function PmExecutionModal({ plant, me, task, onClose, onSaved }) {
         </div>
         ${f.status === 'done' && html`
           <div class="field-row">
-            <div class="field"><label>Performed date</label><input type="date" value=${f.performed_date} onChange=${e => setF({...f, performed_date: e.target.value})} /></div>
+            <div class="field"><label>Performed date</label><${DateField} value=${f.performed_date} onChange=${e => setF({...f, performed_date: e.target.value})} /></div>
             <div class="field"><label>Duration (min)</label><input type="number" min="1" value=${f.duration_minutes} onChange=${e => setF({...f, duration_minutes: e.target.value})} /></div>
           </div>
           <div class="field"><label>Performed by</label><input value=${f.performed_by_name} onChange=${e => setF({...f, performed_by_name: e.target.value})} /></div>
@@ -31257,9 +31280,9 @@ function QoEditModal({ plant, me, row, onClose, onSaved }) {
               <option value="quarterly">Quarterly</option>
             </select>
           </div>
-          <div class="field"><label>Next review</label><input type="date" value=${f.next_review_on} onChange=${e => setF({...f, next_review_on: e.target.value})} /></div>
+          <div class="field"><label>Next review</label><${DateField} value=${f.next_review_on} onChange=${e => setF({...f, next_review_on: e.target.value})} /></div>
         </div>
-        <div class="field"><label>Last reviewed</label><input type="date" value=${f.last_reviewed_on} onChange=${e => setF({...f, last_reviewed_on: e.target.value})} /></div>
+        <div class="field"><label>Last reviewed</label><${DateField} value=${f.last_reviewed_on} onChange=${e => setF({...f, last_reviewed_on: e.target.value})} /></div>
         <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
         <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Add objective' : 'Save')}</button>
       </div>
@@ -31462,7 +31485,7 @@ function RiskEditModal({ plant, me, row, onClose, onSaved }) {
               <option value="escalated">Escalated</option>
             </select>
           </div>
-          <div class="field"><label>Next review</label><input type="date" value=${f.next_review_date} onChange=${e => setF({...f, next_review_date: e.target.value})} /></div>
+          <div class="field"><label>Next review</label><${DateField} value=${f.next_review_date} onChange=${e => setF({...f, next_review_date: e.target.value})} /></div>
         </div>
         <div class="field"><label>Notes</label><textarea rows="2" value=${f.notes} onChange=${e => setF({...f, notes: e.target.value})}></textarea></div>
         <button class="btn" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : (isNew ? 'Add risk' : 'Save')}</button>
@@ -31641,8 +31664,8 @@ function ContingencyEditModal({ plant, me, row, onClose, onSaved }) {
           </select>
         </div>
         <div class="field-row">
-          <div class="field"><label>Last tested</label><input type="date" value=${f.last_tested_on} onChange=${e => setF({...f, last_tested_on: e.target.value})} /></div>
-          <div class="field"><label>Next test</label><input type="date" value=${f.next_test_date} onChange=${e => setF({...f, next_test_date: e.target.value})} /></div>
+          <div class="field"><label>Last tested</label><${DateField} value=${f.last_tested_on} onChange=${e => setF({...f, last_tested_on: e.target.value})} /></div>
+          <div class="field"><label>Next test</label><${DateField} value=${f.next_test_date} onChange=${e => setF({...f, next_test_date: e.target.value})} /></div>
         </div>
         <div class="field"><label>Last test result</label><input value=${f.last_test_result} onChange=${e => setF({...f, last_test_result: e.target.value})} placeholder="Drill conducted Apr 10 — DG started in 45 sec, OK" /></div>
         <div class="field-row">
@@ -32897,7 +32920,7 @@ function StageLogBatchVoiceModal({ plant, me, parts, machines, units, shifts, us
         ${error && html`<div class="alert error" style="font-size:12px">${error}</div>`}
 
         <div class="field-row">
-          <div class="field"><label>Date *</label><input type="date" required value=${logDate} onChange=${e => setLogDate(e.target.value)} disabled=${phase !== 'idle'} /></div>
+          <div class="field"><label>Date *</label><${DateField} required value=${logDate} onChange=${e => setLogDate(e.target.value)} disabled=${phase !== 'idle'} /></div>
           <div class="field"><label>Shift *</label>
             <select required value=${shiftId} onChange=${e => setShiftId(e.target.value)} disabled=${phase !== 'idle'}>
               ${shifts.map(s => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
@@ -34276,7 +34299,7 @@ function NewProjectModal({ plant, me, onClose, onCreated, cloneFrom }) {
             </div>
             <div class="field" style="flex:1.3">
               <label>Target completion</label>
-              <input type="date" value=${targetDate} onInput=${e => setTargetDate(e.target.value)} />
+              <${DateField} value=${targetDate} onInput=${e => setTargetDate(e.target.value)} />
             </div>
           </div>
           <div class="field-row" style="display:flex;gap:10px">
@@ -35932,8 +35955,8 @@ function Stocks({ plant, me, activeUnit }) {
                   <option value="adjustment_out">Adj− only</option>
                 </optgroup>
               </select>
-              <input type="date" value=${txnDateFrom} onChange=${e => setTxnDateFrom(e.target.value)} placeholder="From" style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px" />
-              <input type="date" value=${txnDateTo} onChange=${e => setTxnDateTo(e.target.value)} placeholder="To" style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px" />
+              <${DateField} value=${txnDateFrom} onChange=${e => setTxnDateFrom(e.target.value)} placeholder="From" style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px" />
+              <${DateField} value=${txnDateTo} onChange=${e => setTxnDateTo(e.target.value)} placeholder="To" style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px" />
               ${(txnSearch || txnTypeFilter !== 'all' || txnDateFrom || txnDateTo) && html`
                 <button class="btn small ghost" onClick=${() => { setTxnSearch(''); setTxnTypeFilter('all'); setTxnDateFrom(''); setTxnDateTo(''); }} style="padding:7px 12px;font-size:12px">Clear</button>
               `}
@@ -38471,7 +38494,7 @@ function PaymentModal({ plant, me, doc, balance, onClose, onSaved }) {
                 <option value="other">Other</option>
               </select>
             </div>
-            <div class="field"><label>Date *</label><input type="date" required value=${form.payment_date} onChange=${e => setForm({...form, payment_date: e.target.value})} /></div>
+            <div class="field"><label>Date *</label><${DateField} required value=${form.payment_date} onChange=${e => setForm({...form, payment_date: e.target.value})} /></div>
           </div>
           <div class="field"><label>Reference / Txn ID</label><input type="text" value=${form.reference} onChange=${e => setForm({...form, reference: e.target.value})} placeholder="UTR / Cheque# / UPI ref" /></div>
           ${['neft','rtgs','imps','cheque'].includes(form.payment_mode) && html`
@@ -38599,9 +38622,9 @@ function DocumentEditModal({ plant, me, doc, vendors, onClose, onSaved }) {
           <div class="field"><label>Vendor Name (free text)</label><input type="text" value=${form.vendor_name_raw || ''} onChange=${e => setForm({...form, vendor_name_raw: e.target.value})} /></div>
           <div class="field-row">
             <div class="field"><label>Doc Number</label><input type="text" value=${form.doc_number || ''} onChange=${e => setForm({...form, doc_number: e.target.value})} /></div>
-            <div class="field"><label>Doc Date</label><input type="date" value=${form.doc_date || ''} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
+            <div class="field"><label>Doc Date</label><${DateField} value=${form.doc_date || ''} onChange=${e => setForm({...form, doc_date: e.target.value})} /></div>
           </div>
-          <div class="field"><label>Due Date</label><input type="date" value=${form.due_date || ''} onChange=${e => setForm({...form, due_date: e.target.value})} /></div>
+          <div class="field"><label>Due Date</label><${DateField} value=${form.due_date || ''} onChange=${e => setForm({...form, due_date: e.target.value})} /></div>
           <div class="field-row">
             <div class="field"><label>Taxable</label><input type="number" step="0.01" value=${form.taxable_value || ''} onChange=${e => setForm({...form, taxable_value: e.target.value})} /></div>
             <div class="field"><label>Tax</label><input type="number" step="0.01" value=${form.tax_amount || ''} onChange=${e => setForm({...form, tax_amount: e.target.value})} /></div>
@@ -39422,7 +39445,7 @@ function StageLog({ plant, me, parts, machines, dies, units, shifts, users }) {
 
     <div class="card" style="margin-bottom:10px">
       <div class="field-row">
-        <div class="field"><label>Date</label><input type="date" value=${filterDate} onChange=${e => setFilterDate(e.target.value)} /></div>
+        <div class="field"><label>Date</label><${DateField} value=${filterDate} onChange=${e => setFilterDate(e.target.value)} /></div>
         <div class="field"><label>Part</label>
           <select value=${filterPart} onChange=${e => setFilterPart(e.target.value)}>
             <option value="all">All parts</option>
@@ -39751,7 +39774,7 @@ function BulkLogModal({ plant, me, parts, machines, units, shifts, users, defaul
         ${error && html`<div class="alert error">${error}</div>`}
         <form onSubmit=${submit}>
           <div class="field-row">
-            <div class="field"><label>Date *</label><input type="date" required value=${logDate} onChange=${e => setLogDate(e.target.value)} /></div>
+            <div class="field"><label>Date *</label><${DateField} required value=${logDate} onChange=${e => setLogDate(e.target.value)} /></div>
             <div class="field"><label>Shift *</label>
               <select required value=${shiftId} onChange=${e => setShiftId(e.target.value)}>
                 ${shifts.map(s => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
@@ -40347,7 +40370,7 @@ function StageLogModal({ plant, me, pendingEntry, parts, machines, dies, units, 
         ${error && html`<div class="alert error">${error}</div>`}
         <form onSubmit=${submit}>
           <div class="field-row">
-            <div class="field"><label>Date *</label><input type="date" required value=${form.log_date} disabled=${isReconcile} onChange=${e => setForm({...form, log_date: e.target.value})} /></div>
+            <div class="field"><label>Date *</label><${DateField} required value=${form.log_date} disabled=${isReconcile} onChange=${e => setForm({...form, log_date: e.target.value})} /></div>
             <div class="field"><label>Shift *</label>
               <select required value=${form.shift_id} disabled=${isReconcile} onChange=${e => setForm({...form, shift_id: e.target.value})}>
                 ${shifts.map(s => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
@@ -41579,7 +41602,7 @@ function TracePage({ plant, me, activeUnit }) {
 
         <div class="field-row" style="margin:0;align-items:flex-end">
           ${anchor === 'date' && html`
-            <div class="field" style="margin:0;flex:1"><label style="font-size:11px">Anchor date</label><input type="date" value=${date} onChange=${e => setDate(e.target.value)} style="font-size:13px;padding:6px 8px" /></div>
+            <div class="field" style="margin:0;flex:1"><label style="font-size:11px">Anchor date</label><${DateField} value=${date} onChange=${e => setDate(e.target.value)} style="font-size:13px;padding:6px 8px" /></div>
             <div class="field" style="margin:0;width:140px"><label style="font-size:11px">Window (± days)</label>
               <select value=${windowDays} onChange=${e => setWindowDays(parseInt(e.target.value))} style="font-size:13px;padding:6px 8px">
                 <option value=${0}>Same day only</option>
@@ -41597,7 +41620,7 @@ function TracePage({ plant, me, activeUnit }) {
                 ${parts.map(p => html`<option key=${p.id} value=${p.id}>${esc(p.part_number)}${p.name ? ' · ' + esc(p.name) : ''}</option>`)}
               </select>
             </div>
-            <div class="field" style="margin:0;width:140px"><label style="font-size:11px">Center on</label><input type="date" value=${date} onChange=${e => setDate(e.target.value)} style="font-size:13px;padding:6px 8px" /></div>
+            <div class="field" style="margin:0;width:140px"><label style="font-size:11px">Center on</label><${DateField} value=${date} onChange=${e => setDate(e.target.value)} style="font-size:13px;padding:6px 8px" /></div>
           `}
           ${anchor === 'machine' && html`
             <div class="field" style="margin:0;flex:1.5"><label style="font-size:11px">Machine</label>
@@ -41606,7 +41629,7 @@ function TracePage({ plant, me, activeUnit }) {
                 ${machines.map(m => html`<option key=${m.id} value=${m.id}>${esc(m.code)}${m.name ? ' · ' + esc(m.name) : ''}</option>`)}
               </select>
             </div>
-            <div class="field" style="margin:0;width:140px"><label style="font-size:11px">Center on</label><input type="date" value=${date} onChange=${e => setDate(e.target.value)} style="font-size:13px;padding:6px 8px" /></div>
+            <div class="field" style="margin:0;width:140px"><label style="font-size:11px">Center on</label><${DateField} value=${date} onChange=${e => setDate(e.target.value)} style="font-size:13px;padding:6px 8px" /></div>
             <div class="field" style="margin:0;width:140px"><label style="font-size:11px">Window (± days)</label>
               <select value=${windowDays} onChange=${e => setWindowDays(parseInt(e.target.value))} style="font-size:13px;padding:6px 8px">
                 <option value=${1}>± 1 day</option>
@@ -41774,8 +41797,8 @@ function MovementsView({ plant, me }) {
           <button class=${'btn small ' + (direction === 'inward' ? '' : 'ghost')} onClick=${() => setDirection('inward')}>📥 Inward ${direction !== 'outward' && inwardCount > 0 ? '· ' + inwardCount : ''}</button>
         </div>
         <div class="field-row" style="margin:0">
-          <div class="field" style="margin:0;flex:1"><label style="font-size:11px">From</label><input type="date" value=${dateFrom} onChange=${e => setDateFrom(e.target.value)} style="font-size:12px;padding:5px 8px" /></div>
-          <div class="field" style="margin:0;flex:1"><label style="font-size:11px">To</label><input type="date" value=${dateTo} onChange=${e => setDateTo(e.target.value)} style="font-size:12px;padding:5px 8px" /></div>
+          <div class="field" style="margin:0;flex:1"><label style="font-size:11px">From</label><${DateField} value=${dateFrom} onChange=${e => setDateFrom(e.target.value)} style="font-size:12px;padding:5px 8px" /></div>
+          <div class="field" style="margin:0;flex:1"><label style="font-size:11px">To</label><${DateField} value=${dateTo} onChange=${e => setDateTo(e.target.value)} style="font-size:12px;padding:5px 8px" /></div>
           <div class="field" style="margin:0;flex:1.5"><label style="font-size:11px">Customer / Vendor</label>
             <select value=${counterpartyFilter} onChange=${e => setCounterpartyFilter(e.target.value)} style="font-size:12px;padding:5px 8px">
               <option value="">All (${counterpartyOptions.length})</option>
@@ -43804,7 +43827,7 @@ function ScheduleAddModal({ plant, me, customers, parts, onClose, onSaved }) {
               </div>
               <div style="flex:1">
                 <div style="font-size:10px;color:var(--slate-500);margin-bottom:2px">Date *</div>
-                <input type="date" required value=${l.delivery_date || ''} onChange=${e => updateLine(idx, { delivery_date: e.target.value })} style="width:100%;padding:6px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:6px" />
+                <${DateField} required value=${l.delivery_date || ''} onChange=${e => updateLine(idx, { delivery_date: e.target.value })} style="width:100%;padding:6px 8px;font-size:12px;border:1px solid var(--slate-200);border-radius:6px" />
               </div>
               <div style="flex:0.8">
                 <div style="font-size:10px;color:var(--slate-500);margin-bottom:2px">Qty *</div>
@@ -44378,7 +44401,7 @@ function SupplyEntryModal({ plant, me, schedule, progress, prefillLine, onClose,
           `}
           <div class="field-row">
             <div class="field"><label>Supplied Qty *</label><input type="number" required step="0.001" min=${0.001} value=${form.supplied_qty} onChange=${e => setForm({...form, supplied_qty: e.target.value})} /></div>
-            <div class="field"><label>Dispatch Date *</label><input type="date" required value=${form.dispatch_date} onChange=${e => setForm({...form, dispatch_date: e.target.value})} /></div>
+            <div class="field"><label>Dispatch Date *</label><${DateField} required value=${form.dispatch_date} onChange=${e => setForm({...form, dispatch_date: e.target.value})} /></div>
           </div>
           <div class="field-row">
             <div class="field"><label>DC Number</label><input type="text" value=${form.dc_number} onChange=${e => setForm({...form, dc_number: e.target.value})} /></div>
@@ -45527,7 +45550,7 @@ function DocNumberEditModal({ plant, me, record, existing, onClose, onSaved }) {
 
         <div class="field">
           <label>Effective Date *</label>
-          <input type="date" value=${effectiveDate} onChange=${e => setEffectiveDate(e.target.value)} />
+          <${DateField} value=${effectiveDate} onChange=${e => setEffectiveDate(e.target.value)} />
         </div>
 
         <div class="field-row">
@@ -45934,7 +45957,7 @@ function IatfVersionModal({ plant, me, row, currentVersion, onClose, onSaved }) 
           </select>
         </div>
         <div class="field"><label>Effective from</label>
-          <input type="date" value=${effectiveFrom} onChange=${e => setEffectiveFrom(e.target.value)} />
+          <${DateField} value=${effectiveFrom} onChange=${e => setEffectiveFrom(e.target.value)} />
         </div>
         ${reviewDate && html`<div class="alert info" style="margin-bottom:14px">Next review auto-scheduled for <strong>${reviewDate}</strong> (cadence ${row.review_cadence_days}d)</div>`}
         <div class="field"><label>File URL (optional)</label>
@@ -46849,13 +46872,13 @@ function ReportConfig({ plant, me, report, onClose }) {
       <div class="card-title">CONFIGURE</div>
 
       ${needsSingleDate && html`
-        <div class="field"><label>Date *</label><input type="date" value=${singleDate} onChange=${e => setSingleDate(e.target.value)} /></div>
+        <div class="field"><label>Date *</label><${DateField} value=${singleDate} onChange=${e => setSingleDate(e.target.value)} /></div>
       `}
 
       ${needsDateRange && html`
         <div class="field-row">
-          <div class="field"><label>From *</label><input type="date" value=${dateFrom} onChange=${e => setDateFrom(e.target.value)} /></div>
-          <div class="field"><label>To *</label><input type="date" value=${dateTo} onChange=${e => setDateTo(e.target.value)} /></div>
+          <div class="field"><label>From *</label><${DateField} value=${dateFrom} onChange=${e => setDateFrom(e.target.value)} /></div>
+          <div class="field"><label>To *</label><${DateField} value=${dateTo} onChange=${e => setDateTo(e.target.value)} /></div>
         </div>
       `}
 
