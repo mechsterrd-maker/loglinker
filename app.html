@@ -2395,6 +2395,7 @@ const MORE_GROUPS = [
       { key:'ppc',           icon:'🗓', label:'Production Planning',   mfg:true, sub:'Plan work per stage per day · assign operators · track planned vs actual (PDC → CNC → dispatch)' },
       { key:'fettling',      icon:'🪓', label:'Fettling (contract)',  mfg:true, sub:'Daily plan & work done for the fettling contract workers · piece-rate payout' },
       { key:'rdc_returns',   icon:'🔁', label:'Returnable DC tracker', sub:'Items sent on returnable DC · days out · mark received & close' },
+      { key:'bom',           icon:'🧱', label:'Bill of Materials',     sub:'RM consumed per fabricated item / sub-job · drives stock issue & sub-contract' },
       { key:'tpm',           icon:'🛠', label:'TPM Daily Checks',     sub:'30-sec machine checks · oil, coolant, leaks, guards' },
       { key:'maintenance',   icon:'🔧', label:'Maintenance',          sub:'Breakdowns log, machine status' },
       { key:'cutting',       icon:'✂️', label:'Cutting Planner',      sub:'1D cutting optimisation for rods, tubes, bars · auto layout with kerf · waste %' },
@@ -3226,6 +3227,139 @@ const ppcMonday = (iso) => { const x = new Date(iso + 'T00:00:00'); const g = (x
 const ppcMonthStart = (iso) => iso.slice(0,7) + '-01';
 const ppcDayName = (iso) => new Date(iso+'T00:00:00').toLocaleDateString('en-IN',{weekday:'short'});
 const ppcDayShort = (iso) => new Date(iso+'T00:00:00').toLocaleDateString('en-IN',{day:'2-digit',month:'short'});
+
+// ============= BILL OF MATERIALS (BOM) =============
+// One BOM per output item (a sub-job / fabricated part). Lines are the RM stock
+// items it consumes, each with its own unit + scrap %. Drives BOM-based stock
+// issue and the sub-contract RM sizing / reconciliation (built on top of this).
+function BomModule({ plant, me, activeUnit }) {
+  const [boms, setBoms] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState(null);   // bom object, {} for new, or null
+  const [q, setQ] = useState('');
+  const u = activeUnit?.unit_id;
+  const scope = (query) => u ? query.or(`unit_id.eq.${u},unit_id.is.null`) : query;
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await scope(sb.from('mcp_bom')
+      .select('*, output:output_item_id(id,code,name,uom), lines:mcp_bom_lines(*, rm:rm_item_id(id,code,name,uom))')
+      .eq('plant_id', plant.id)).order('created_at', { ascending: false });
+    setBoms(data || []);
+    setLoading(false);
+  }, [plant.id, u]);
+  useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
+
+  const outName = (b) => b.output ? ((b.output.code ? b.output.code + ' · ' : '') + (b.output.name || '')) : '?';
+  const filtered = !q.trim() ? boms : boms.filter(b => (outName(b) + ' ' + (b.lines || []).map(l => l.rm?.name || '').join(' ')).toLowerCase().includes(q.toLowerCase()));
+
+  return html`
+    <div>
+      <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
+        <div><h1>🧱 Bill of Materials</h1><div class="sub">What raw material each fabricated item / sub-job consumes</div></div>
+        <button class="btn small" onClick=${() => setEditing({})}>+ New BOM</button>
+      </div>
+      <input type="search" value=${q} onInput=${e => setQ(e.target.value)} placeholder="Search output or material…" style="width:100%;border:1px solid var(--slate-200);border-radius:6px;padding:8px 10px;font-size:13px;margin-bottom:12px" />
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        filtered.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🧱</div><div style="font-size:13px">${boms.length === 0 ? 'No BOMs yet. Create one: pick the item you make, then list the raw materials it consumes (with each material’s unit and scrap %).' : 'No matches.'}</div><div style="margin-top:8px"><button class="btn small" onClick=${() => setEditing({})}>+ New BOM</button></div></div></div>` :
+        filtered.map(b => html`
+          <div class="card" key=${b.id} style="margin-bottom:8px;cursor:pointer" onClick=${() => setEditing(b)}>
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+              <div style="flex:1;min-width:0">
+                <div style="font-weight:700">${outName(b)}</div>
+                <div style="font-size:11px;color:var(--slate-500);margin-top:2px">makes ${fmtNum(b.output_qty)} ${b.output?.uom || ''} · ${(b.lines || []).length} material${(b.lines || []).length !== 1 ? 's' : ''}</div>
+                <div style="font-size:11px;color:var(--slate-600);margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">
+                  ${(b.lines || []).slice(0, 6).map(l => html`<span class="badge slate" style="font-size:10px">${l.rm?.name || l.rm?.code || '?'} ${fmtNum(l.qty_per)}${l.uom ? ' ' + l.uom : ''}${l.scrap_pct ? ` +${l.scrap_pct}%` : ''}</span>`)}
+                  ${(b.lines || []).length > 6 ? html`<span style="font-size:10px;color:var(--slate-400)">+${(b.lines || []).length - 6} more</span>` : ''}
+                </div>
+              </div>
+              <span style="color:var(--slate-300)">›</span>
+            </div>
+          </div>`)}
+      ${editing != null && html`<${BomEditorModal} plant=${plant} me=${me} editTarget=${editing.id ? editing : null} onClose=${() => setEditing(null)} onSaved=${() => { setEditing(null); refresh(); }} />`}
+    </div>`;
+}
+
+function BomEditorModal({ plant, me, editTarget, onClose, onSaved }) {
+  const [outputId, setOutputId] = useState(editTarget?.output_item_id || '');
+  const [outputQty, setOutputQty] = useState(editTarget?.output_qty ?? 1);
+  const [lines, setLines] = useState(editTarget
+    ? (editTarget.lines || []).slice().sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0)).map(l => ({ rm_item_id: l.rm_item_id, qty_per: l.qty_per, uom: l.uom || '', scrap_pct: l.scrap_pct || 0 }))
+    : [{ rm_item_id: '', qty_per: '', uom: '', scrap_pct: 0 }]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const setLine = (i, patch) => setLines(ls => ls.map((x, idx) => idx === i ? { ...x, ...patch } : x));
+  const addLine = () => setLines(ls => [...ls, { rm_item_id: '', qty_per: '', uom: '', scrap_pct: 0 }]);
+  const rmLine = (i) => setLines(ls => ls.length <= 1 ? ls : ls.filter((_, idx) => idx !== i));
+
+  const save = async () => {
+    setErr('');
+    if (!outputId) { setErr('Pick the output item this BOM makes.'); return; }
+    const valid = lines.filter(l => l.rm_item_id && parseFloat(l.qty_per) > 0);
+    if (valid.length === 0) { setErr('Add at least one material with a quantity.'); return; }
+    setBusy(true);
+    try {
+      let bomId = editTarget?.id;
+      const header = { plant_id: plant.id, output_item_id: outputId, output_qty: parseFloat(outputQty) || 1, updated_at: new Date().toISOString() };
+      if (bomId) {
+        const { error } = await sb.from('mcp_bom').update(header).eq('id', bomId); if (error) throw error;
+        await sb.from('mcp_bom_lines').delete().eq('bom_id', bomId);
+      } else {
+        const { data, error } = await sb.from('mcp_bom').insert({ ...header, created_by: me.id }).select('id').single();
+        if (error) throw error; bomId = data.id;
+      }
+      const rows = valid.map((l, idx) => ({ plant_id: plant.id, bom_id: bomId, rm_item_id: l.rm_item_id, qty_per: parseFloat(l.qty_per) || 0, uom: l.uom || null, scrap_pct: parseFloat(l.scrap_pct) || 0, sort_order: idx }));
+      const { error: lerr } = await sb.from('mcp_bom_lines').insert(rows); if (lerr) throw lerr;
+      showToast('BOM saved'); onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  const del = async () => {
+    if (!editTarget?.id) return;
+    if (!confirm('Delete this BOM?')) return;
+    await sb.from('mcp_bom').delete().eq('id', editTarget.id);
+    showToast('BOM deleted'); onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header"><div class="modal-title">${editTarget ? 'Edit' : 'New'} BOM</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field"><label>Output item (what you make / the sub-job)</label>
+          <${StockItemPicker} plant=${plant} value=${outputId} onChange=${(id) => setOutputId(id)} placeholder="— Pick output item —" />
+        </div>
+        <div class="field"><label>Base output quantity — the materials below make this many</label>
+          <input type="number" step="any" min=${0} value=${outputQty} onInput=${e => setOutputQty(e.target.value)} />
+        </div>
+        <div class="field"><label>Materials consumed</label>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            ${lines.map((l, idx) => html`
+              <div key=${idx} style="border:1px solid var(--slate-200);border-radius:6px;padding:8px;background:var(--slate-50)">
+                <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
+                  <span style="font-size:11px;font-weight:600;color:var(--teal-700);min-width:16px">${idx + 1}.</span>
+                  <div style="flex:1;min-width:140px"><${StockItemPicker} plant=${plant} value=${l.rm_item_id} onChange=${(id, p) => setLine(idx, { rm_item_id: id, uom: l.uom || p?.uom || '' })} placeholder="— Pick material —" /></div>
+                  ${lines.length > 1 && html`<button type="button" class="btn small danger" style="padding:2px 8px" onClick=${() => rmLine(idx)}>×</button>`}
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 0.8fr 0.8fr;gap:6px">
+                  <input type="number" step="any" min=${0} value=${l.qty_per} onInput=${e => setLine(idx, { qty_per: e.target.value })} placeholder="Qty per" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  <input type="text" value=${l.uom} onInput=${e => setLine(idx, { uom: e.target.value })} placeholder="unit" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  <input type="number" step="any" min=${0} value=${l.scrap_pct} onInput=${e => setLine(idx, { scrap_pct: e.target.value })} placeholder="scrap %" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                </div>
+              </div>`)}
+            <button type="button" class="btn small ghost" onClick=${addLine} style="align-self:flex-start">+ Add material</button>
+          </div>
+          <div style="font-size:10px;color:var(--slate-400);margin-top:4px">Qty per = material used to make the base output quantity above. Scrap % is added when RM is issued.</div>
+        </div>
+        <div style="display:flex;gap:6px;margin-top:8px">
+          ${editTarget?.id && html`<button class="btn ghost" style="color:var(--rose-600)" onClick=${del}>Delete</button>`}
+          <button class="btn" disabled=${busy} style="flex:1" onClick=${save}>${busy ? 'Saving…' : 'Save BOM'}</button>
+        </div>
+      </div>
+    </div>`;
+}
 
 // ============= RETURNABLE DC TRACKER =============
 // Items sent out on a returnable DC (dc_out_returnable) — machines, tools, dies —
@@ -4314,6 +4448,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'ppc'}><${PpcModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'fettling'}><${FettlingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'rdc_returns'}><${RdcReturns} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'bom'}><${BomModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
       <${Page} active=${denied}><${AccessDenied} moduleKey=${tab} /></${Page}>
 
@@ -10397,6 +10532,7 @@ const RBAC_MODULES = [
   { key:'ppc', label:'Production Planning (PPC)', group:'ops' },
   { key:'fettling', label:'Fettling (contract work)', group:'ops' },
   { key:'rdc_returns', label:'Returnable DC tracker', group:'ops' },
+  { key:'bom', label:'Bill of Materials', group:'ops' },
   { key:'quality', label:'Quality', group:'ops' },
   { key:'maintenance', label:'Maintenance', group:'ops' },
   { key:'stocks', label:'Stocks', group:'ops' },
