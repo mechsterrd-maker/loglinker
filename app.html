@@ -929,6 +929,9 @@ const installFallback = async () => {
 // ============= UTILITIES =============
 const escapeHtml = s => (s || '').toString();
 const fmtDate = d => new Date(d).toLocaleString('en-IN', { day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' });
+// Calendar date as dd/mm/yyyy everywhere. Date-only ISO strings (length 10) get a
+// midday-safe suffix so the day never shifts across a timezone. en-GB → 26/08/2026.
+const fmtDMY = d => { if (!d) return '—'; const s = '' + d; const x = new Date(s.length === 10 ? s + 'T00:00:00' : s); return isNaN(x.getTime()) ? '—' : x.toLocaleDateString('en-GB', { day:'2-digit', month:'2-digit', year:'numeric' }); };
 const fmtNum = n => Number(n || 0).toLocaleString('en-IN');
 
 // Map a route-step / stage value to the candidate machine.category values
@@ -20037,7 +20040,7 @@ function QuotationModule({ plant, me }) {
             </div>
             <div style="text-align:right">
               <div style="font-size:16px;font-weight:700;color:var(--teal-700)">${inr(q.grand_total)}</div>
-              <div style="font-size:10px;color:var(--slate-400)">${new Date(q.created_at).toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'2-digit'})}</div>
+              <div style="font-size:10px;color:var(--slate-400)">${fmtDMY(q.created_at)}</div>
             </div>
           </div>
         </div>
@@ -20927,7 +20930,7 @@ function PettyCashModule({ plant, me, activeUnit, navAction }) {
                 <div style="flex:1;min-width:0">
                   <div style="font-size:13px;font-weight:600">${emoji(t.txn_type)} ${t.description}</div>
                   <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
-                    ${t.txn_no} · ${t.txn_date} · ${txnLabel(t.txn_type)}
+                    ${t.txn_no} · ${fmtDMY(t.txn_date)} · ${txnLabel(t.txn_type)}
                     ${t.party?.full_name ? ' · ' + t.party.full_name : (t.party_name ? ' · ' + t.party_name : '')}
                     ${t.vendor_name ? ' · ' + t.vendor_name : ''}
                     ${t.category ? ' · ' + t.category : ''}
@@ -21021,7 +21024,7 @@ function PettyCashModule({ plant, me, activeUnit, navAction }) {
 function rtResolveValue(hint, ctx) {
   if (!hint) return '';
   if (hint === 'row_num') return ctx.row_num ?? '';
-  if (hint === 'today') return new Date().toLocaleDateString();
+  if (hint === 'today') return fmtDMY(new Date());
   if (hint === 'now') return new Date().toLocaleString();
   const idx = hint.indexOf('.');
   if (idx < 0) return '';
@@ -21760,7 +21763,7 @@ function PettyCashReportModal({ plant, me, books, balances, onClose }) {
           txnRows +
           '<tr class="net"><td colspan="7" style="text-align:right">Net (in − out)</td><td class="num" style="color:' + (net >= 0 ? '#047857' : '#b91c1c') + '">' + (net >= 0 ? '+' : '−') + '₹' + fmtNum(Math.abs(net).toFixed(0)) + '</td></tr>' +
           '</tbody></table>') +
-      '<div class="meta"><span>' + esc(plant.name) + ' · Petty Cash Report</span><span>Loglinkr · ' + esc(new Date().toLocaleDateString()) + '</span></div>' +
+      '<div class="meta"><span>' + esc(plant.name) + ' · Petty Cash Report</span><span>Loglinkr · ' + esc(fmtDMY(new Date())) + '</span></div>' +
       '</body></html>';
     const w = window.open('', '_blank');
     if (!w) { alert('Pop-up blocked — allow pop-ups for this site so the report can open.'); return; }
@@ -22349,7 +22352,7 @@ function ProjectTracker({ plant, me, myPerms, go }) {
   const refresh = useCallback(async () => {
     setLoading(true);
     const [p, c, u] = await Promise.all([
-      unitScope(sb.from('mcp_projects').select('*, customer:customer_id(name), owner:owner_user_id(full_name)').eq('plant_id', plant.id).order('created_at', { ascending:false })),
+      unitScope(sb.from('mcp_projects').select('*, customer:customer_id(name), owner:owner_user_id(full_name)').eq('plant_id', plant.id).order('code', { ascending: true, nullsFirst: false }).order('name')),
       sb.from('mcp_sched_customers').select('id, name').eq('plant_id', plant.id).order('name'),
       sb.from('users').select('id, full_name').eq('plant_id', plant.id).order('full_name'),
     ]);
@@ -22771,7 +22774,7 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
           <div key=${b.id} style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-top:1px solid var(--slate-100);font-size:12px">
             <div style="min-width:0;flex:1">
               <div style="font-weight:600">${b.doc_type||'doc'}${b.doc_number?' · '+b.doc_number:''}</div>
-              <div style="color:var(--slate-500);font-size:11px">${b.vendor_name_raw||'—'}${b.doc_date?' · '+b.doc_date:''}${stageName?' · '+stageName:''}</div>
+              <div style="color:var(--slate-500);font-size:11px">${b.vendor_name_raw||'—'}${b.doc_date?' · '+fmtDMY(b.doc_date):''}${stageName?' · '+stageName:''}</div>
             </div>
             ${b.total_value && html`<div style="font-weight:700">₹${fmtNum(b.total_value)}</div>`}
           </div>
@@ -23812,7 +23815,7 @@ function CuttingPlanner({ plant, me }) {
                   : html`<div><b>${((Number(p.totals.totalPiecesMm) || 0) / 1000).toFixed(1)}m</b> pieces</div>`}
               </div>
             ` : html`<div style="font-size:11px;color:var(--slate-400)">No layout computed yet</div>`}
-            <div style="font-size:10px;color:var(--slate-400);margin-top:6px">${p.created_at ? new Date(p.created_at).toLocaleDateString() : ''}</div>
+            <div style="font-size:10px;color:var(--slate-400);margin-top:6px">${p.created_at ? fmtDMY(p.created_at) : ''}</div>
           </div>
         `)}
       </div>
@@ -25670,7 +25673,7 @@ function SalesDocFilteredList({ recent, loading, META, onView }) {
             <div style="flex:1;min-width:0">
               <div style="font-size:13px;font-weight:600">${m.ico} ${d.doc_number}</div>
               <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
-                ${m.label} · ${d.doc_date}${d.vendor_name_raw ? ' · ' + d.vendor_name_raw : ''} · ${Array.isArray(d.items) ? d.items.length : 0} item${(d.items?.length||0)===1?'':'s'}
+                ${m.label} · ${fmtDMY(d.doc_date)}${d.vendor_name_raw ? ' · ' + d.vendor_name_raw : ''} · ${Array.isArray(d.items) ? d.items.length : 0} item${(d.items?.length||0)===1?'':'s'}
               </div>
             </div>
             <div style="text-align:right;flex-shrink:0">
@@ -26076,7 +26079,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
     if (!plant?.id) return;
     sb.from('mcp_projects').select('id, code, name, status')
       .eq('plant_id', plant.id).neq('status', 'completed').neq('status', 'cancelled')
-      .order('name').then(({ data }) => setProjects(data || []));
+      .order('code', { ascending: true, nullsFirst: false }).order('name').then(({ data }) => setProjects(data || []));
   }, [plant?.id]);
 
   const setItem = (i, patch) => setForm(f => ({ ...f, items: f.items.map((x, idx) => idx === i ? { ...x, ...patch } : x) }));
@@ -26534,7 +26537,7 @@ function DocFormatsModule({ plant, me }) {
                 ${t.config?.html && html`<span class="badge teal" style="font-size:9px;background:var(--slate-100);color:var(--slate-600)">HTML</span>`}
               </div>
               <div style="font-size:11px;color:var(--slate-500);margin-top:3px">
-                ${t.config?.title || '—'} · ${t.ai_model || 'AI'} · ${new Date(t.created_at).toLocaleDateString()}
+                ${t.config?.title || '—'} · ${t.ai_model || 'AI'} · ${fmtDMY(t.created_at)}
               </div>
             </div>
             <div style="display:flex;gap:6px;flex-wrap:wrap">
@@ -26584,7 +26587,7 @@ function PoPackingPreview({ doc, plant, me, customers, vendors, onClose }) {
         </div>
         <div style="text-align:right">
           <div><span style="color:#666">${isPo?'PO':'PL'} No: </span><strong style="font-family:monospace">${doc.doc_number}</strong></div>
-          <div style="margin-top:3px"><span style="color:#666">Date: </span><strong>${doc.doc_date}</strong></div>
+          <div style="margin-top:3px"><span style="color:#666">Date: </span><strong>${fmtDMY(doc.doc_date)}</strong></div>
           ${doc.raw_extraction?.delivery_date && html`<div style="margin-top:3px"><span style="color:#666">Delivery by: </span>${doc.raw_extraction.delivery_date}</div>`}
           ${doc.raw_extraction?.payment_terms && html`<div style="margin-top:3px"><span style="color:#666">${isPo?'Terms':'Ref'}: </span>${doc.raw_extraction.payment_terms}</div>`}
           ${doc.raw_extraction?.transport && html`<div style="margin-top:3px"><span style="color:#666">Transport: </span>${doc.raw_extraction.transport}</div>`}
@@ -26676,7 +26679,7 @@ function SalesDocPreview({ doc, plant, me, customers, vendors, onClose }) {
         </div>
         <div style="text-align:right">
           <div><span style="color:#666">${isInvoice?'Invoice':'DC'} No: </span><strong style="font-family:monospace">${doc.doc_number}</strong></div>
-          <div style="margin-top:3px"><span style="color:#666">Date: </span><strong>${doc.doc_date}</strong></div>
+          <div style="margin-top:3px"><span style="color:#666">Date: </span><strong>${fmtDMY(doc.doc_date)}</strong></div>
           ${doc.raw_extraction?.po_reference && html`<div style="margin-top:3px"><span style="color:#666">PO ref: </span>${doc.raw_extraction.po_reference}</div>`}
           ${doc.raw_extraction?.vehicle_no && html`<div style="margin-top:3px"><span style="color:#666">Vehicle: </span>${doc.raw_extraction.vehicle_no}</div>`}
           ${doc.raw_extraction?.eway_bill && html`<div style="margin-top:3px"><span style="color:#666">E-way: </span>${doc.raw_extraction.eway_bill}</div>`}
@@ -26885,7 +26888,7 @@ function SubContractingModule({ plant, me }) {
             <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
               <div style="flex:1">
                 <div style="font-size:13px;font-weight:500">${l.part?.part_number ? l.part.part_number + ' · ' : ''}${l.item_name}</div>
-                <div style="font-size:11px;color:var(--slate-500)">${l.vendor?.name || '?'} · ${l.process || ''} · closed ${l.closed_at ? new Date(l.closed_at).toLocaleDateString() : ''}</div>
+                <div style="font-size:11px;color:var(--slate-500)">${l.vendor?.name || '?'} · ${l.process || ''} · closed ${l.closed_at ? fmtDMY(l.closed_at) : ''}</div>
               </div>
               <div style="text-align:right">
                 <div style="font-size:12px;font-weight:600;color:var(--emerald-600)">✓ ${fmtNum(l.qty_received_back)} of ${fmtNum(l.qty_sent)}</div>
@@ -28245,7 +28248,7 @@ function MomDetail({ plant, me, meeting: initialMeeting, users, onClose }) {
                 ${a.owner ? '👤 ' + a.owner.full_name : (a.owner_external_name ? '👤 ' + a.owner_external_name : '— unassigned —')}
                 ${a.due_date ? ' · 📅 ' + a.due_date : ''}
                 ${a.action_id ? html` · <span class="badge teal" style="font-size:9px">📌 task</span>` : ''}
-                ${isDone && a.closed_at ? ' · ✓ ' + new Date(a.closed_at).toLocaleDateString() : ''}
+                ${isDone && a.closed_at ? ' · ✓ ' + fmtDMY(a.closed_at) : ''}
               </div>
             </div>
             ${!isDone && html`<button class="btn small danger" onClick=${() => removeAction(a.id)} style="padding:2px 8px;font-size:11px">×</button>`}
@@ -33098,7 +33101,7 @@ function TaskBatchVoiceModal({ plant, me, users, onClose, onSaved }) {
   const projectsByName = useMemo(() => Object.fromEntries(projects.map(p => [p.name?.toLowerCase(), p])), [projects]);
 
   useEffect(() => {
-    sb.from('mcp_projects').select('id, code, name').eq('plant_id', plant.id).neq('status', 'completed').neq('status', 'cancelled').order('name')
+    sb.from('mcp_projects').select('id, code, name').eq('plant_id', plant.id).neq('status', 'completed').neq('status', 'cancelled').order('code', { ascending: true, nullsFirst: false }).order('name')
       .then(({ data }) => setProjects(data || []));
   }, [plant.id]);
 
@@ -36468,7 +36471,7 @@ function TaskBatchImportModal({ plant, me, users, onClose, onSaved }) {
   const [notes, setNotes] = useState(null);
 
   useEffect(() => {
-    sb.from('mcp_projects').select('id, code, name').eq('plant_id', plant.id).neq('status','completed').neq('status','cancelled').order('name')
+    sb.from('mcp_projects').select('id, code, name').eq('plant_id', plant.id).neq('status','completed').neq('status','cancelled').order('code', { ascending: true, nullsFirst: false }).order('name')
       .then(({ data }) => setProjects(data || []));
   }, [plant.id]);
 
@@ -37066,7 +37069,7 @@ function ActionModal({ plant, me, users, departments, editTarget, onClose, onSav
       .select('id, code, name')
       .eq('plant_id', plant.id)
       .neq('status', 'completed').neq('status', 'cancelled')
-      .order('name')
+      .order('code', { ascending: true, nullsFirst: false }).order('name')
       .then(({ data }) => setProjects(data || []));
   }, [plant.id]);
 
@@ -37723,7 +37726,7 @@ function Documents({ plant, me, activeUnit }) {
                   <div class="list-item-sub">
                     <span class="badge teal">${docTypeLabels[d.doc_type] || d.doc_type}</span>
                     ${d.doc_number ? ' · ' + d.doc_number : ''}
-                    ${d.doc_date ? ' · ' + d.doc_date : ''}
+                    ${d.doc_date ? ' · ' + fmtDMY(d.doc_date) : ''}
                     ${d.due_date && ['pending','approved','partial'].includes(d.status) ? ' · ' + (overdue ? '⚠️ ' : '') + 'due ' + d.due_date : ''}
                   </div>
                 </div>
@@ -37865,7 +37868,7 @@ function Documents({ plant, me, activeUnit }) {
                   <div class="list-item-title">${r.item_name}${r.process ? ' · ' + r.process : ''}</div>
                   <div class="list-item-sub">
                     🏢 ${r.vendor_name || '(unknown vendor)'} · DC ${r.doc_number || '?'}
-                    ${r.sent_on ? ' · sent ' + r.sent_on : ''}
+                    ${r.sent_on ? ' · sent ' + fmtDMY(r.sent_on) : ''}
                   </div>
                   <div class="list-item-sub" style="margin-top:3px">
                     Sent ${fmtNum(r.qty_sent)} ${r.uom || ''} · Back ${fmtNum(r.qty_received_back)} · <strong>Pending ${fmtNum(r.qty_pending)} ${r.uom || ''}</strong>
@@ -37874,7 +37877,7 @@ function Documents({ plant, me, activeUnit }) {
                     <span class=${'badge ' + (r.status === 'partial' ? 'amber' : '')}>${r.status}</span>
                     ${r.source === 'returnable_dc' ? html`<span class="badge slate" style="font-size:10px">Returnable DC</span>` : ''}
                     <span class=${'badge ' + (r.sla_breached ? 'rose' : 'teal')} style="font-size:10px">${r.days_pending}d ${r.source === 'returnable_dc' ? 'out' : 'at vendor'}</span>
-                    ${r.source !== 'returnable_dc' && (r.sla_days ? html`<span class="badge" style="font-size:10px;background:var(--slate-200);color:var(--slate-700)">SLA ${r.sla_days}d → ${r.expected_return_date}</span>` : html`<span class="badge amber" style="font-size:10px">no SLA</span>`)}
+                    ${r.source !== 'returnable_dc' && (r.sla_days ? html`<span class="badge" style="font-size:10px;background:var(--slate-200);color:var(--slate-700)">SLA ${r.sla_days}d → ${fmtDMY(r.expected_return_date)}</span>` : html`<span class="badge amber" style="font-size:10px">no SLA</span>`)}
                     ${r.sla_breached && html`<span class="badge rose" style="font-size:10px">⚠️ ${r.days_overdue}d overdue</span>`}
                     ${r.source !== 'returnable_dc' && html`<button class="btn small ghost" style="padding:2px 8px;font-size:11px;margin-left:auto" onClick=${(e) => { e.stopPropagation(); setRetSlaModal(r); }}>${r.sla_days ? 'Edit SLA' : 'Set SLA'}</button>`}
                   </div>
@@ -37978,7 +37981,7 @@ function ReturnableSlaModal({ line, onClose, onSaved }) {
         <div class="card" style="background:var(--slate-50);margin-bottom:14px">
           <div class="card-row"><span class="label">Item</span><span class="value">${line.item_name}</span></div>
           <div class="card-row"><span class="label">Vendor</span><span class="value">${line.vendor_name || '?'}</span></div>
-          <div class="card-row"><span class="label">Sent</span><span class="value">${line.sent_on || fmtDate(line.sent_at)}</span></div>
+          <div class="card-row"><span class="label">Sent</span><span class="value">${line.sent_on ? fmtDMY(line.sent_on) : fmtDate(line.sent_at)}</span></div>
           <div class="card-row"><span class="label">Pending</span><span class="value">${fmtNum(line.qty_pending)} ${line.uom || ''}</span></div>
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
@@ -38013,7 +38016,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
   useEffect(() => {
     if (!plant?.id) return;
     sb.from('mcp_projects').select('id, code, name, status')
-      .eq('plant_id', plant.id).neq('status', 'cancelled').order('name')
+      .eq('plant_id', plant.id).neq('status', 'cancelled').order('code', { ascending: true, nullsFirst: false }).order('name')
       .then(({ data }) => setProjects(data || []));
   }, [plant?.id]);
 
@@ -38124,7 +38127,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       <div class="card-row"><span class="label">Vendor</span><span class="value">${doc.mcp_logistics_vendors?.name || doc.vendor_name_raw || '?'}</span></div>
       ${doc.vendor_gstin_raw && html`<div class="card-row"><span class="label">GSTIN</span><span class="value mono">${doc.vendor_gstin_raw}</span></div>`}
       <div class="card-row"><span class="label">Doc #</span><span class="value mono">${doc.doc_number || '—'}</span></div>
-      <div class="card-row"><span class="label">Date</span><span class="value">${doc.doc_date || '—'}</span></div>
+      <div class="card-row"><span class="label">Date</span><span class="value">${fmtDMY(doc.doc_date)}</span></div>
       ${doc.due_date && html`<div class="card-row"><span class="label">Due</span><span class="value" style=${overdue ? 'color:var(--rose-500)' : ''}>${overdue ? '⚠️ ' : ''}${doc.due_date}</span></div>`}
     </div>
 
@@ -38510,7 +38513,7 @@ function DocumentEditModal({ plant, me, doc, vendors, onClose, onSaved }) {
     sb.from('mcp_projects').select('id, code, name, status')
       .eq('plant_id', plant.id)
       .neq('status', 'completed').neq('status', 'cancelled')
-      .order('name')
+      .order('code', { ascending: true, nullsFirst: false }).order('name')
       .then(({ data }) => setProjects(data || []));
   }, [plant.id]);
 
@@ -38672,7 +38675,7 @@ function VendorDetail({ plant, me, vendor: initialVendor, jobworkStock: jobworkS
         sb.from('mcp_logistics_documents').select('*').eq('plant_id', plant.id).eq('vendor_id', vendor.id).order('doc_date', { ascending: false }).limit(500),
       jobworkStockProp ? Promise.resolve({ data: jobworkStockProp }) :
         sb.from('v_vendor_jobwork_stock').select('*').eq('plant_id', plant.id).eq('vendor_id', vendor.id),
-      sb.from('mcp_projects').select('id, code, name, status').eq('plant_id', plant.id),
+      sb.from('mcp_projects').select('id, code, name, status').eq('plant_id', plant.id).order('code', { ascending: true, nullsFirst: false }).order('name'),
       sb.from('mcp_logistics_grn_receptions').select('document_id, reception_date, status').eq('plant_id', plant.id).eq('vendor_id', vendor.id),
     ]).then(([d, jw, pr, grn]) => {
       setDocsLocal(d.data || []);
@@ -38946,7 +38949,7 @@ function VendorDetail({ plant, me, vendor: initialVendor, jobworkStock: jobworkS
             <div class="list-item-row">
               <div class="list-item-main">
                 <div class="list-item-title">${d.doc_number || '(no number)'} · ${docLabel(d.doc_type)}</div>
-                <div class="list-item-sub">${d.doc_date || '?'}${d.due_date ? ' · due ' + d.due_date : ''}${PAYABLE_TYPES.has(d.doc_type) ? ' · ₹' + fmtNum(d.total_value || 0) : ''}</div>
+                <div class="list-item-sub">${d.doc_date ? fmtDMY(d.doc_date) : '?'}${d.due_date ? ' · due ' + fmtDMY(d.due_date) : ''}${PAYABLE_TYPES.has(d.doc_type) ? ' · ₹' + fmtNum(d.total_value || 0) : ''}</div>
               </div>
               ${d.status && html`<span class=${'badge ' + statusBadge(d.status)}>${d.status}</span>`}
             </div>
@@ -40620,7 +40623,7 @@ function GrnReceptionModal({ plant, me, doc, onClose, onSaved }) {
         <div class="card" style="background:var(--slate-50);margin-bottom:14px">
           <div class="card-row"><span class="label">Vendor</span><span class="value">${doc.vendor_name_raw || '?'}</span></div>
           <div class="card-row"><span class="label">Invoice #</span><span class="value mono">${doc.doc_number || '—'}</span></div>
-          <div class="card-row"><span class="label">Date</span><span class="value">${doc.doc_date || '—'}</span></div>
+          <div class="card-row"><span class="label">Date</span><span class="value">${fmtDMY(doc.doc_date)}</span></div>
           <div class="card-row"><span class="label">Amount</span><span class="value">₹${fmtNum(doc.total_value || 0)}</span></div>
         </div>
 
@@ -41757,7 +41760,7 @@ function MovementsView({ plant, me }) {
               <div key=${g.id} style="background:white;border:1px solid var(--amber-200);border-radius:6px;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:12px">
                 <div style="flex:1;min-width:0">
                   <div style="font-size:13px;font-weight:600">${esc(g.vendor_name || 'Unknown vendor')} · ${esc(g.reference_no || '—')}</div>
-                  <div style="font-size:11px;color:var(--slate-600);margin-top:2px">${g.reception_date} · ${(g.mcp_logistics_grn_lines || []).length} line${(g.mcp_logistics_grn_lines || []).length === 1 ? '' : 's'}</div>
+                  <div style="font-size:11px;color:var(--slate-600);margin-top:2px">${fmtDMY(g.reception_date)} · ${(g.mcp_logistics_grn_lines || []).length} line${(g.mcp_logistics_grn_lines || []).length === 1 ? '' : 's'}</div>
                 </div>
                 <button class="btn small" onClick=${() => setVerifyTarget(g)}>Verify & receive</button>
               </div>
@@ -41950,7 +41953,7 @@ function GrnVerifyModal({ plant, me, grn, onClose, onSaved }) {
         <div class="modal-header">
           <div>
             <div class="modal-title">📥 Verify & Receive GRN</div>
-            <div style="font-size:12px;color:var(--slate-500);font-weight:400;margin-top:2px">${esc(grn.vendor_name || '—')} · ${esc(grn.reference_no || '—')} · ${grn.reception_date}</div>
+            <div style="font-size:12px;color:var(--slate-500);font-weight:400;margin-top:2px">${esc(grn.vendor_name || '—')} · ${esc(grn.reference_no || '—')} · ${fmtDMY(grn.reception_date)}</div>
           </div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
@@ -42862,7 +42865,7 @@ function ItemMapperView({ plant, me }) {
       return html`
         <div class="card" style="margin-bottom:8px" key=${r.key}>
           <div class="list-item-title">${r.item.name || 'Item'} · ${fmtNum(r.item.qty)} ${r.item.uom || ''}</div>
-          <div class="list-item-sub" style="margin-bottom:8px">${r.doc.doc_number ? '📄 ' + r.doc.doc_number + ' · ' : ''}${r.doc.doc_date || ''}${!r.cid ? ' · ⚠ customer not mapped' : ''}</div>
+          <div class="list-item-sub" style="margin-bottom:8px">${r.doc.doc_number ? '📄 ' + r.doc.doc_number + ' · ' : ''}${r.doc.doc_date ? fmtDMY(r.doc.doc_date) : ''}${!r.cid ? ' · ⚠ customer not mapped' : ''}</div>
           ${!r.cid ? html`<div class="alert info" style="font-size:12px">Map this bill's customer first in the <b>Bill Mapping</b> tab.</div>` :
             cands.length === 0 ? html`<div class="alert info" style="font-size:12px">No open schedule lines left for this customer.</div>` :
             html`<div style="display:flex;flex-direction:column;gap:8px">
@@ -45271,7 +45274,7 @@ function DocNumberManager({ plant, me }) {
                         <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
                           <span style="background:var(--emerald-50);color:var(--emerald-800);font-weight:700;font-size:12px;padding:3px 8px;border-radius:4px;font-family:monospace">${docInfo.doc_number}</span>
                           <span style="font-size:11px;color:var(--slate-700);font-weight:600">Rev ${docInfo.revision}</span>
-                          <span style="font-size:11px;color:var(--slate-500)">${docInfo.effective_date ? new Date(docInfo.effective_date).toLocaleDateString('en-IN', {day:'2-digit', month:'short', year:'2-digit'}) : '—'}</span>
+                          <span style="font-size:11px;color:var(--slate-500)">${fmtDMY(docInfo.effective_date)}</span>
                         </div>
                         ${docInfo.issued_by && html`<div style="font-size:11px;color:var(--slate-500);margin-top:3px">Issued by: ${docInfo.issued_by}</div>`}
                       ` : html`
@@ -45596,7 +45599,7 @@ function DocNumberHistoryModal({ plant, record, onClose }) {
                 <div style="font-size:11px;color:var(--slate-500)">
                   ${h.changed_by_name || 'Unknown'} · ${new Date(h.changed_at).toLocaleString('en-IN', {dateStyle:'medium', timeStyle:'short'})}
                 </div>
-                ${h.effective_date && html`<div style="font-size:11px;color:var(--slate-600);margin-top:2px">Effective: ${new Date(h.effective_date).toLocaleDateString('en-IN', {dateStyle:'medium'})}</div>`}
+                ${h.effective_date && html`<div style="font-size:11px;color:var(--slate-600);margin-top:2px">Effective: ${fmtDMY(h.effective_date)}</div>`}
                 ${h.issued_by && html`<div style="font-size:11px;color:var(--slate-600);margin-top:2px">Issued by: ${h.issued_by}${h.approved_by ? ' · Approved by: ' + h.approved_by : ''}</div>`}
                 ${h.change_reason && html`<div style="font-size:11px;color:var(--slate-700);margin-top:4px;background:var(--slate-50);padding:6px 8px;border-radius:4px">${h.change_reason}</div>`}
               </div>
@@ -45974,7 +45977,7 @@ function IatfNcrRegisterLive({ plant }) {
                 <span class=${'badge ' + (n.severity === 'critical' ? 'rose' : n.severity === 'major' ? 'amber' : '')} style="font-size:10px">${n.severity}</span>
               </div>
               <div style="font-size:12px;color:var(--slate-700);margin-top:2px">${n.title}</div>
-              <div style="font-size:10px;color:var(--slate-500);margin-top:3px">${n.source} · ${n.status} · ${n.created_at?.slice(0,10)}${n.closed_at ? ' · closed ' + n.closed_at.slice(0,10) : ''}</div>
+              <div style="font-size:10px;color:var(--slate-500);margin-top:3px">${n.source} · ${n.status} · ${fmtDMY(n.created_at)}${n.closed_at ? ' · closed ' + fmtDMY(n.closed_at) : ''}</div>
             </div>
           `)}
           ${ncrs.length > 50 && html`<div style="font-size:11px;color:var(--slate-500);text-align:center;padding:6px">…and ${ncrs.length - 50} more</div>`}
@@ -46008,7 +46011,7 @@ function IatfCustomerComplaintLive({ plant }) {
               <span class=${'badge ' + (n.severity === 'critical' ? 'rose' : n.severity === 'major' ? 'amber' : '')} style="font-size:10px">${n.severity}</span>
             </div>
             <div style="font-size:12px;color:var(--slate-700);margin-top:2px">${n.title}</div>
-            <div style="font-size:10px;color:var(--slate-500);margin-top:3px">${n.status} · ${n.created_at?.slice(0,10)}${n.closed_at ? ' · closed ' + n.closed_at.slice(0,10) : ''}</div>
+            <div style="font-size:10px;color:var(--slate-500);margin-top:3px">${n.status} · ${fmtDMY(n.created_at)}${n.closed_at ? ' · closed ' + fmtDMY(n.closed_at) : ''}</div>
           </div>
         `)
       }
@@ -46040,7 +46043,7 @@ function IatfAuditFindingsLive({ plant }) {
               <span class=${'badge ' + (a.status === 'completed' ? 'emerald' : a.status === 'in_progress' ? 'amber' : '')} style="font-size:10px">${a.status}</span>
             </div>
             ${a.source_label && html`<div style="font-size:10px;color:var(--slate-500);margin-top:2px">${a.source_label}</div>`}
-            <div style="font-size:10px;color:var(--slate-500);margin-top:3px">opened ${a.created_at?.slice(0,10)}${a.completed_at ? ' · closed ' + a.completed_at.slice(0,10) : ''}</div>
+            <div style="font-size:10px;color:var(--slate-500);margin-top:3px">opened ${fmtDMY(a.created_at)}${a.completed_at ? ' · closed ' + fmtDMY(a.completed_at) : ''}</div>
           </div>
         `)
       }
@@ -46338,7 +46341,7 @@ function PerfUserDrillModal({ plant, me, user, actions, users, onClose, onEditTa
                   <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
                     <div style="flex:1;min-width:0">
                       <div style="font-weight:600;font-size:13px">${a.title}</div>
-                      <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${a.department ? a.department + ' · ' : ''}${a.due_at ? 'Due ' + new Date(a.due_at).toLocaleDateString() : 'No due date'}${a.completed_at ? ' · closed ' + new Date(a.completed_at).toLocaleDateString() : ''}</div>
+                      <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${a.department ? a.department + ' · ' : ''}${a.due_at ? 'Due ' + fmtDMY(a.due_at) : 'No due date'}${a.completed_at ? ' · closed ' + fmtDMY(a.completed_at) : ''}</div>
                     </div>
                     <span class=${'badge ' + (a.status === 'completed' ? 'emerald' : (a.status === 'open' || a.status === 'in_progress') && a.due_at && new Date(a.due_at) < new Date() ? 'rose' : 'amber')} style="font-size:10px">${a.status.replace('_', ' ')}</span>
                   </div>
@@ -46366,8 +46369,8 @@ function PerfProjectDrillModal({ plant, me, project, stats, milestones, actions,
           <div><span style="color:var(--slate-500)">Quantity</span><br/><b>${project.qty ? fmtNum(project.qty) + ' ' + (project.uom || '') : '—'}</b></div>
           <div><span style="color:var(--slate-500)">PO No</span><br/><b>${project.po_number || '—'}</b></div>
           <div><span style="color:var(--slate-500)">Status</span><br/><b>${(project.status || 'planning').replace('_', ' ')}</b></div>
-          <div><span style="color:var(--slate-500)">Start</span><br/><b>${project.start_date || '—'}</b></div>
-          <div><span style="color:var(--slate-500)">Target</span><br/><b>${project.target_date || '—'}</b></div>
+          <div><span style="color:var(--slate-500)">Start</span><br/><b>${fmtDMY(project.start_date)}</b></div>
+          <div><span style="color:var(--slate-500)">Target</span><br/><b>${fmtDMY(project.target_date)}</b></div>
         </div>
 
         <div style="margin-bottom:14px">
@@ -46388,7 +46391,7 @@ function PerfProjectDrillModal({ plant, me, project, stats, milestones, actions,
               <span style="width:22px;height:22px;border-radius:50%;background:${m.status === 'done' ? 'var(--emerald-100)' : m.status === 'in_progress' ? 'var(--amber-100)' : 'var(--slate-100)'};color:${m.status === 'done' ? 'var(--emerald-700)' : m.status === 'in_progress' ? 'var(--amber-700)' : 'var(--slate-500)'};display:inline-flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0">${m.status === 'done' ? '✓' : m.seq}</span>
               <div style="flex:1;min-width:0">
                 <div style="font-weight:600">${m.name}</div>
-                <div style="font-size:11px;color:var(--slate-500)">${m.target_date ? 'Target ' + m.target_date : 'No target'}${m.done_date ? ' · done ' + m.done_date : ''}</div>
+                <div style="font-size:11px;color:var(--slate-500)">${m.target_date ? 'Target ' + fmtDMY(m.target_date) : 'No target'}${m.done_date ? ' · done ' + fmtDMY(m.done_date) : ''}</div>
               </div>
               <span class=${'badge ' + (m.status === 'done' ? 'emerald' : m.status === 'in_progress' ? 'amber' : '')} style="font-size:10px">${m.status}</span>
             </div>
@@ -46403,7 +46406,7 @@ function PerfProjectDrillModal({ plant, me, project, stats, milestones, actions,
                 <div style="display:flex;justify-content:space-between;gap:8px">
                   <div style="flex:1;min-width:0">
                     <div style="font-weight:600;font-size:13px">${a.title}</div>
-                    <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${u ? u.full_name : '— Unassigned —'}${a.due_at ? ' · due ' + new Date(a.due_at).toLocaleDateString() : ''}</div>
+                    <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${u ? u.full_name : '— Unassigned —'}${a.due_at ? ' · due ' + fmtDMY(a.due_at) : ''}</div>
                   </div>
                   <span class=${'badge ' + (a.status === 'completed' ? 'emerald' : (a.status === 'open' || a.status === 'in_progress') && a.due_at && new Date(a.due_at) < new Date() ? 'rose' : 'amber')} style="font-size:10px">${a.status.replace('_', ' ')}</span>
                 </div>
@@ -46989,8 +46992,8 @@ ${bodyHtml}
 
 const esc = (s) => s == null ? '' : String(s);
 const rpFmt = (n) => Number(n || 0).toLocaleString('en-IN');
-const rpFmtDateTime = (s) => s ? new Date(s).toLocaleString('en-IN', { dateStyle:'medium', timeStyle:'short' }) : '—';
-const rpFmtDate = (s) => s ? new Date(s).toLocaleDateString('en-IN', { dateStyle:'medium' }) : '—';
+const rpFmtDateTime = (s) => s ? new Date(s).toLocaleString('en-GB', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' }) : '—';
+const rpFmtDate = (s) => s ? new Date(s).toLocaleDateString('en-GB', { day:'2-digit', month:'2-digit', year:'numeric' }) : '—';
 
 // =================================================================
 // GENERIC IATF VIEW REPORT — backs every doc that has a v_iatf_* view
@@ -47127,10 +47130,10 @@ async function genIatfView(plant, viewName, title, clauses, dateFrom, dateTo) {
     if (typeof v === 'number') return '<span class="num">' + v.toLocaleString('en-IN') + '</span>';
     if (typeof v === 'object') return esc(JSON.stringify(v));
     if (typeof v === 'string' && v.match(/^\d{4}-\d{2}-\d{2}T/)) {
-      return new Date(v).toLocaleString('en-IN', { dateStyle:'medium', timeStyle:'short' });
+      return new Date(v).toLocaleString('en-GB', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
     }
     if (typeof v === 'string' && v.match(/^\d{4}-\d{2}-\d{2}$/)) {
-      return new Date(v).toLocaleDateString('en-IN', { dateStyle:'medium' });
+      return new Date(v).toLocaleDateString('en-GB', { day:'2-digit', month:'2-digit', year:'numeric' });
     }
     // Status / severity badge
     if (typeof v === 'string') {
@@ -48043,7 +48046,7 @@ async function genPartAttainmentRollup(plant, month) {
 async function genAiAuditHistory(plant, from, to) {
   const { data: runs } = await sb.from('ai_audit_runs').select('*').gte('created_at', from).lte('created_at', to + 'T23:59:59').order('created_at', { ascending: false });
   const rows = (runs || []).map(r => `<tr>
-    <td>${new Date(r.created_at).toLocaleString('en-IN')}</td>
+    <td>${rpFmtDateTime(r.created_at)}</td>
     <td><b>${esc(r.audit_type || '-')}</b></td>
     <td>${esc(r.scope || '-')}</td>
     <td>${r.findings_count || 0}</td>
@@ -48062,7 +48065,7 @@ async function genInterunitTransfers(plant, from, to) {
     <td>${esc(t.dc_number || '-')}</td>
     <td>${esc(t.from_unit?.name || '-')} → ${esc(t.to_unit?.name || '-')}</td>
     <td><span class="badge ${t.status === 'received' ? 'emerald' : t.status === 'in_transit' ? 'amber' : ''}">${esc(t.status || '-')}</span></td>
-    <td>${t.received_at ? new Date(t.received_at).toLocaleString('en-IN') : '—'}</td>
+    <td>${rpFmtDateTime(t.received_at)}</td>
     <td>${esc(t.notes || '-')}</td>
   </tr>`).join('');
   return reportShell(plant, 'Inter-Unit Material Transfers', `${from} to ${to}`,
@@ -48074,7 +48077,7 @@ async function genEntityActivityTimeline(plant, entityType, entityId) {
   if (!entityId) return reportShell(plant, 'Entity Activity Timeline', '—', '<div class="empty">Pick an entity first</div>');
   const { data: logs } = await sb.from('activity_log').select('*, users(full_name)').eq('entity_type', entityType).eq('entity_id', entityId).order('created_at', { ascending: true });
   const rows = (logs || []).map(l => `<tr>
-    <td>${new Date(l.created_at).toLocaleString('en-IN')}</td>
+    <td>${rpFmtDateTime(l.created_at)}</td>
     <td>${esc(l.users?.full_name || 'system')}</td>
     <td><b>${esc(l.action || '-')}</b></td>
     <td>${esc(l.summary || '')}</td>
