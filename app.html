@@ -2394,6 +2394,7 @@ const MORE_GROUPS = [
     items: [
       { key:'ppc',           icon:'🗓', label:'Production Planning',   mfg:true, sub:'Plan work per stage per day · assign operators · track planned vs actual (PDC → CNC → dispatch)' },
       { key:'fettling',      icon:'🪓', label:'Fettling (contract)',  mfg:true, sub:'Daily plan & work done for the fettling contract workers · piece-rate payout' },
+      { key:'rdc_returns',   icon:'🔁', label:'Returnable DC tracker', sub:'Items sent on returnable DC · days out · mark received & close' },
       { key:'tpm',           icon:'🛠', label:'TPM Daily Checks',     sub:'30-sec machine checks · oil, coolant, leaks, guards' },
       { key:'maintenance',   icon:'🔧', label:'Maintenance',          sub:'Breakdowns log, machine status' },
       { key:'cutting',       icon:'✂️', label:'Cutting Planner',      sub:'1D cutting optimisation for rods, tubes, bars · auto layout with kerf · waste %' },
@@ -3225,6 +3226,100 @@ const ppcMonday = (iso) => { const x = new Date(iso + 'T00:00:00'); const g = (x
 const ppcMonthStart = (iso) => iso.slice(0,7) + '-01';
 const ppcDayName = (iso) => new Date(iso+'T00:00:00').toLocaleDateString('en-IN',{weekday:'short'});
 const ppcDayShort = (iso) => new Date(iso+'T00:00:00').toLocaleDateString('en-IN',{day:'2-digit',month:'short'});
+
+// ============= RETURNABLE DC TRACKER =============
+// Items sent out on a returnable DC (dc_out_returnable) — machines, tools, dies —
+// tracked per line: days out, expected return, mark received (full/partial), close.
+// Backed by mcp_rdc_lines (synced from the returnable DC's items).
+function RdcReturns({ plant, me, activeUnit }) {
+  const [lines, setLines] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState('open');   // open | done | all
+  const [busy, setBusy] = useState({});
+  const [recv, setRecv] = useState({});     // line id -> qty string
+  const u = activeUnit?.unit_id;
+  const scope = (q) => u ? q.or(`unit_id.eq.${u},unit_id.is.null`) : q;
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await scope(sb.from('mcp_rdc_lines').select('*, doc:doc_id(doc_number)').eq('plant_id', plant.id)).order('created_at', { ascending: false });
+    setLines(data || []);
+    setLoading(false);
+  }, [plant.id, u]);
+  useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
+
+  const daysOut = (l) => l.sent_on ? Math.floor((Date.now() - new Date(l.sent_on + 'T00:00:00')) / 86400000) : null;
+  const overdueDays = (l) => { if (!l.expected_return_date) return null; const d = Math.floor((Date.now() - new Date(l.expected_return_date + 'T00:00:00')) / 86400000); return d > 0 ? d : null; };
+  const pending = (l) => Math.max(Number(l.qty_sent || 0) - Number(l.qty_received || 0), 0);
+  const isOpen = (l) => l.status === 'open' || l.status === 'partial';
+
+  const shown = lines.filter(l => tab === 'all' ? true : tab === 'open' ? isOpen(l) : !isOpen(l));
+  const openCount = lines.filter(isOpen).length;
+  const overdueCount = lines.filter(l => isOpen(l) && overdueDays(l)).length;
+
+  const call = async (id, fn) => {
+    setBusy(b => ({ ...b, [id]: true }));
+    const { data, error } = await fn();
+    setBusy(b => ({ ...b, [id]: false }));
+    if (error || data?.success === false) { showToast(error?.message || data?.error || 'Failed'); return false; }
+    await refresh(); return true;
+  };
+  const doReceive = async (l) => {
+    const q = Number(recv[l.id] ?? pending(l)) || 0;
+    if (q <= 0) { showToast('Enter a quantity'); return; }
+    const ok = await call(l.id, () => sb.rpc('receive_rdc_line', { p_line_id: l.id, p_qty: q }));
+    if (ok) { showToast('✓ Received'); setRecv(r => { const n = { ...r }; delete n[l.id]; return n; }); }
+  };
+  const doClose = async (l) => { if (await call(l.id, () => sb.rpc('close_rdc_line', { p_line_id: l.id, p_reopen: false }))) showToast('Closed'); };
+  const doReopen = async (l) => { if (await call(l.id, () => sb.rpc('close_rdc_line', { p_line_id: l.id, p_reopen: true }))) showToast('Reopened'); };
+  const setDue = (l, date) => call(l.id, () => sb.rpc('set_rdc_expected_return', { p_line_id: l.id, p_date: date || null }));
+
+  const STATUS = { open: { l: 'Open', c: 'amber' }, partial: { l: 'Partial', c: 'amber' }, received: { l: 'Received', c: 'emerald' }, closed: { l: 'Closed', c: 'slate' } };
+
+  return html`
+    <div>
+      <div class="page-header"><div><h1>🔁 Returnable DC tracker</h1><div class="sub">Machines / tools / dies sent on returnable basis · days out · mark received & close</div></div></div>
+      <div class="stat-grid" style="grid-template-columns:repeat(2,1fr)">
+        <div class="stat ${openCount ? 'amber' : 'teal'}"><div class="stat-num">${openCount}</div><div class="stat-label">Open</div></div>
+        <div class="stat ${overdueCount ? 'rose' : 'teal'}"><div class="stat-num">${overdueCount}</div><div class="stat-label">Overdue</div></div>
+      </div>
+      <div class="auth-tabs" style="margin-bottom:14px">
+        <button class=${'auth-tab' + (tab === 'open' ? ' active' : '')} onClick=${() => setTab('open')}>Open · ${openCount}</button>
+        <button class=${'auth-tab' + (tab === 'done' ? ' active' : '')} onClick=${() => setTab('done')}>Received / Closed</button>
+        <button class=${'auth-tab' + (tab === 'all' ? ' active' : '')} onClick=${() => setTab('all')}>All</button>
+      </div>
+      ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        shown.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🔁</div><div style="font-size:13px">No returnable-DC items ${tab === 'open' ? 'open' : 'here'}. Create a Returnable DC (RDC) in Make Documents and its items appear here for tracking.</div></div></div>` :
+        shown.map(l => { const st = STATUS[l.status] || { l: l.status, c: '' }; const od = overdueDays(l); return html`
+          <div class="card" key=${l.id} style="margin-bottom:8px">
+            <div class="list-item-main">
+              <div class="list-item-title">${l.item_name || 'Item'}</div>
+              <div class="list-item-sub">🏢 ${l.party_name || '—'} · DC ${l.doc?.doc_number || '?'}${l.sent_on ? ' · sent ' + l.sent_on : ''}</div>
+              <div class="list-item-sub" style="margin-top:3px">Sent ${fmtNum(l.qty_sent)} ${l.uom || ''} · Back ${fmtNum(l.qty_received)} · <strong>Pending ${fmtNum(pending(l))} ${l.uom || ''}</strong></div>
+              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                <span class=${'badge ' + st.c}>${st.l}</span>
+                ${daysOut(l) != null && html`<span class="badge teal" style="font-size:10px">${daysOut(l)}d out</span>`}
+                ${od && html`<span class="badge rose" style="font-size:10px">⚠️ ${od}d overdue</span>`}
+              </div>
+            </div>
+            ${isOpen(l) ? html`
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px;border-top:1px solid var(--slate-100);padding-top:10px">
+                <label style="font-size:11px;color:var(--slate-500)">Expected return<input type="date" value=${l.expected_return_date || ''} onChange=${e => setDue(l, e.target.value)} style="margin-left:6px;border:1px solid var(--slate-200);border-radius:5px;padding:4px 6px;font-size:12px" /></label>
+                <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
+                  <input type="number" step="any" min=${0} value=${recv[l.id] ?? ''} placeholder=${'qty ' + fmtNum(pending(l))} onInput=${e => setRecv(r => ({ ...r, [l.id]: e.target.value }))} style="width:88px;border:1px solid var(--slate-200);border-radius:5px;padding:5px 6px;font-size:12px;text-align:right" />
+                  <button class="btn small" disabled=${!!busy[l.id]} onClick=${() => doReceive(l)}>✓ Receive</button>
+                  <button class="btn small ghost" disabled=${!!busy[l.id]} onClick=${() => doClose(l)}>Close</button>
+                </div>
+              </div>` :
+              html`<div style="margin-top:8px;display:flex;gap:8px;align-items:center;border-top:1px solid var(--slate-100);padding-top:8px">
+                <span style="font-size:11px;color:var(--slate-500)">${l.status === 'received' ? '✓ Fully received' : 'Closed'}${l.received_at ? ' · ' + fmtDate(l.received_at) : ''}</span>
+                <button class="btn small ghost" style="margin-left:auto" disabled=${!!busy[l.id]} onClick=${() => doReopen(l)}>Reopen</button>
+              </div>`}
+          </div>`;
+        })}
+    </div>`;
+}
 
 // ============= FETTLING (CONTRACT WORK) — simple daily plan & done =============
 // A deliberately small module for the handful of contract workers who fettle
@@ -4218,6 +4313,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'petty_cash'}><${PettyCashModule} plant=${plant} me=${me} activeUnit=${activeUnit} navAction=${navAction} /></${Page}>
       <${Page} active=${pageTab === 'ppc'}><${PpcModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'fettling'}><${FettlingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'rdc_returns'}><${RdcReturns} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
       <${Page} active=${denied}><${AccessDenied} moduleKey=${tab} /></${Page}>
 
@@ -10300,6 +10396,7 @@ const RBAC_MODULES = [
   { key:'production', label:'Production', group:'ops' },
   { key:'ppc', label:'Production Planning (PPC)', group:'ops' },
   { key:'fettling', label:'Fettling (contract work)', group:'ops' },
+  { key:'rdc_returns', label:'Returnable DC tracker', group:'ops' },
   { key:'quality', label:'Quality', group:'ops' },
   { key:'maintenance', label:'Maintenance', group:'ops' },
   { key:'stocks', label:'Stocks', group:'ops' },
