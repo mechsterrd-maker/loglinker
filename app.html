@@ -36213,14 +36213,90 @@ function Stocks({ plant, me, activeUnit }) {
   `;
 }
 
+// ---- Raw-material master: densities + per-section weight formulas ----
+// Weight is kg per STOCK unit — per metre for length items, per piece for plate/
+// sheet. Anything with calc:null (channel/beam/fastener/consumable) takes a manual
+// weight. Density kg/m³.
+const RM_MATERIALS = [
+  { key:'MS',        label:'MS (mild steel)', short:'MS',  abbr:'MS',  rho:7850 },
+  { key:'SS',        label:'Stainless (SS)',  short:'SS',  abbr:'SS',  rho:8000 },
+  { key:'Aluminium', label:'Aluminium',       short:'Alu', abbr:'ALU', rho:2700 },
+  { key:'Cast Iron', label:'Cast Iron',       short:'CI',  abbr:'CI',  rho:7200 },
+  { key:'Brass',     label:'Brass',           short:'Brass', abbr:'BR', rho:8500 },
+  { key:'Copper',    label:'Copper',          short:'Cu',  abbr:'CU',  rho:8960 },
+  { key:'Other',     label:'Other',           short:'',    abbr:'MAT', rho:7850 },
+];
+const RM_SECTIONS = [
+  { key:'angle',      label:'Angle',            abbr:'ANG',  unit:'mtr', dims:['A (mm)','B (mm)','Thk (mm)'], calc:(d,r)=> ((d.a+d.b-d.c)*d.c)/1e6*r },
+  { key:'flat',       label:'Flat',             abbr:'FLT',  unit:'mtr', dims:['Width (mm)','Thk (mm)'],       calc:(d,r)=> (d.a*d.b)/1e6*r },
+  { key:'round_bar',  label:'Round bar',        abbr:'RND',  unit:'mtr', dims:['Dia (mm)'],                    calc:(d,r)=> (Math.PI/4*d.a*d.a)/1e6*r },
+  { key:'square_bar', label:'Square bar',       abbr:'SQR',  unit:'mtr', dims:['Side (mm)'],                   calc:(d,r)=> (d.a*d.a)/1e6*r },
+  { key:'block',      label:'Rect. block / bar',abbr:'BLK',  unit:'mtr', dims:['A (mm)','B (mm)'],             calc:(d,r)=> (d.a*d.b)/1e6*r },
+  { key:'rhs',        label:'RHS (rect tube)',  abbr:'RHS',  unit:'mtr', dims:['A (mm)','B (mm)','Thk (mm)'],  calc:(d,r)=> ((d.a*d.b)-Math.max(0,d.a-2*d.c)*Math.max(0,d.b-2*d.c))/1e6*r },
+  { key:'shs',        label:'SHS (square tube)',abbr:'SHS',  unit:'mtr', dims:['Side (mm)','Thk (mm)'],        calc:(d,r)=> ((d.a*d.a)-Math.max(0,d.a-2*d.b)*Math.max(0,d.a-2*d.b))/1e6*r },
+  { key:'pipe',       label:'Pipe (OD × ID)',   abbr:'PIPE', unit:'mtr', dims:['OD (mm)','ID (mm)'],           calc:(d,r)=> (Math.PI/4*(d.a*d.a-d.b*d.b))/1e6*r },
+  { key:'plate',      label:'Plate (per piece)',abbr:'PLT',  unit:'nos', dims:['Thk (mm)','Width (mm)','Length (mm)'], calc:(d,r)=> (d.a*(d.b||0)*(d.c||0))/1e9*r },
+  { key:'sheet',      label:'Sheet (per piece)',abbr:'SHT',  unit:'nos', dims:['Thk (mm)','Width (mm)','Length (mm)'], calc:(d,r)=> (d.a*(d.b||0)*(d.c||0))/1e9*r },
+  { key:'channel',    label:'Channel (ISMC)',   abbr:'CHN',  unit:'mtr', dims:[], spec:'Designation (e.g. ISMC 100)', calc:null },
+  { key:'beam',       label:'Beam (ISMB)',      abbr:'BEAM', unit:'mtr', dims:[], spec:'Designation (e.g. ISMB 150)', calc:null },
+  { key:'fastener',   label:'Fastener',         abbr:'FAS',  unit:'nos', dims:[], spec:'e.g. M10 × 40 HT Bolt',       calc:null },
+  { key:'consumable', label:'Consumable',       abbr:'CON',  unit:'nos', dims:[], spec:'e.g. 3.15mm Welding rod',     calc:null },
+  { key:'other',      label:'Other',            abbr:'OTH',  unit:'nos', dims:[], spec:'Describe the material',       calc:null },
+];
+// Build code / name / size / unit-weight / stock-unit from the RM selections.
+function rmBuild(materialKey, sectionKey, d1, d2, d3, spec) {
+  const M = RM_MATERIALS.find(m => m.key === materialKey) || RM_MATERIALS[RM_MATERIALS.length - 1];
+  const S = RM_SECTIONS.find(s => s.key === sectionKey) || RM_SECTIONS[RM_SECTIONS.length - 1];
+  const geo = S.dims.length > 0;
+  const a = parseFloat(d1) || 0, b = parseFloat(d2) || 0, c = parseFloat(d3) || 0;
+  let sizeSpec, weight = null, dimCode;
+  if (geo) {
+    const parts = [d1, d2, d3].slice(0, S.dims.length).filter(x => x !== '' && x != null).map(x => ('' + x).trim());
+    sizeSpec = parts.join('×');
+    dimCode = parts.join('X');
+    if (S.calc) { const w = S.calc({ a, b, c }, M.rho); weight = w > 0 ? Math.round(w * 1000) / 1000 : null; }
+  } else {
+    sizeSpec = (spec || '').trim();
+    dimCode = sizeSpec.toUpperCase().replace(/[^A-Z0-9]+/g, '');
+  }
+  const noTypeInName = ['fastener', 'consumable', 'other'].includes(S.key);
+  const name = (noTypeInName
+    ? ((M.short ? M.short + ' ' : '') + sizeSpec)
+    : ((M.short ? M.short + ' ' : '') + S.label.replace(/ \(.*\)$/, '') + ' ' + sizeSpec)).trim();
+  const code = [M.abbr, S.abbr, dimCode].filter(Boolean).join('-');
+  return { code, name, size_spec: sizeSpec, unit_weight: weight, uom: S.unit };
+}
+
 function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategory, onClose, onSaved }) {
   const isEdit = !!editTarget;
   // Existing sub-categories in the same category → offered as a datalist so
   // people reuse the same wording instead of inventing near-duplicates.
   const alreadyOpened = isEdit && !!editTarget.opening_recorded_at;
-  const [form, setForm] = useState(editTarget || { code:'', name:'', category: defaultCategory || 'general', subcategory:'', uom:'nos', reorder_level:'', unit_cost:'', opening_qty: 0 });
+  const [form, setForm] = useState(() => {
+    const base = editTarget || { code:'', name:'', category: defaultCategory || 'general', subcategory:'', uom:'nos', reorder_level:'', unit_cost:'', opening_qty: 0 };
+    const secDef = RM_SECTIONS.find(s => s.key === base.section_type);
+    const isSpecType = secDef && secDef.dims.length === 0;
+    return {
+      material:'MS', section_type:'', spec:'', size_spec:'',
+      ...base,
+      dim1: base.dim1 ?? '', dim2: base.dim2 ?? '', dim3: base.dim3 ?? '',
+      unit_weight: base.unit_weight ?? '', rate_per_kg: base.rate_per_kg ?? '',
+      spec: isSpecType ? (base.size_spec || '') : '',
+    };
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const isRaw = form.category === 'raw_material';
+  const rmSec = RM_SECTIONS.find(s => s.key === form.section_type) || null;
+
+  // RM: auto-build code / name / stock-unit / weight from the picked material +
+  // section + sizes. Runs only in RM mode and only when a section is chosen.
+  useEffect(() => {
+    if (form.category !== 'raw_material' || !form.section_type) return;
+    const b = rmBuild(form.material, form.section_type, form.dim1, form.dim2, form.dim3, form.spec);
+    setForm(f => ({ ...f, code: b.code, name: b.name, size_spec: b.size_spec, uom: b.uom,
+      unit_weight: b.unit_weight != null ? b.unit_weight : f.unit_weight }));
+  }, [form.category, form.material, form.section_type, form.dim1, form.dim2, form.dim3, form.spec]);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -36235,6 +36311,17 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
         reorder_level: form.reorder_level ? parseFloat(form.reorder_level) : null,
         unit_cost: form.unit_cost ? parseFloat(form.unit_cost) : null,
       };
+      if (form.category === 'raw_material') {
+        const num = (v) => (v !== '' && v != null ? parseFloat(v) : null);
+        payload.material = form.material || null;
+        payload.section_type = form.section_type || null;
+        payload.dim1 = num(form.dim1); payload.dim2 = num(form.dim2); payload.dim3 = num(form.dim3);
+        payload.size_spec = form.size_spec || null;
+        payload.unit_weight = num(form.unit_weight);
+        payload.rate_per_kg = num(form.rate_per_kg);
+        // Keep unit_cost (₹ per stock unit) consistent with ₹/kg × unit-weight.
+        if (payload.rate_per_kg != null && payload.unit_weight != null) payload.unit_cost = Math.round(payload.rate_per_kg * payload.unit_weight * 100) / 100;
+      }
       if (!isEdit && activeUnit?.unit_id) payload.unit_id = activeUnit.unit_id;
       if (isEdit) {
         const { error } = await sb.from('mcp_stocks_items').update(payload).eq('id', editTarget.id);
@@ -36269,35 +36356,82 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
         </div>
         ${error && html`<div class="alert error">${error}</div>`}
         <form onSubmit=${submit}>
-          <div class="field-row">
-            <div class="field"><label>Code *</label><input type="text" required value=${form.code} onChange=${e => setForm({...form, code: e.target.value})} placeholder="ALU-ADC12" /></div>
-            <div class="field"><label>UOM</label>
-              <select value=${form.uom} onChange=${e => setForm({...form, uom: e.target.value})}>
-                <option value="nos">Nos</option><option value="kg">Kg</option><option value="ltr">Ltr</option>
-                <option value="mtr">Mtr</option><option value="set">Set</option><option value="box">Box</option>
-              </select>
-            </div>
+          <div class="field"><label>Category</label>
+            <select value=${form.category} onChange=${e => setForm({...form, category: e.target.value})}>
+              <option value="raw_material">Raw Material</option>
+              <option value="die_spares">Die Spares</option>
+              <option value="consumables">Consumables</option>
+              <option value="tools">Tools</option>
+              <option value="packing">Packing</option>
+              <option value="bought_out">Bought-out</option>
+              <option value="general">General</option>
+            </select>
           </div>
-          <div class="field"><label>Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} placeholder="Aluminum ADC-12 ingots" /></div>
-          <div class="field-row">
-            <div class="field"><label>Category</label>
-              <select value=${form.category} onChange=${e => setForm({...form, category: e.target.value})}>
-                <option value="raw_material">Raw Material</option>
-                <option value="die_spares">Die Spares</option>
-                <option value="consumables">Consumables</option>
-                <option value="tools">Tools</option>
-                <option value="packing">Packing</option>
-                <option value="bought_out">Bought-out</option>
-                <option value="general">General</option>
-              </select>
+
+          ${isRaw ? html`
+            <div class="field-row">
+              <div class="field"><label>Material *</label>
+                <select value=${form.material} onChange=${e => setForm({...form, material: e.target.value})}>
+                  ${RM_MATERIALS.map(m => html`<option key=${m.key} value=${m.key}>${m.label}</option>`)}
+                </select>
+              </div>
+              <div class="field"><label>Section type *</label>
+                <select required value=${form.section_type} onChange=${e => setForm({...form, section_type: e.target.value, dim1:'', dim2:'', dim3:'', spec:''})}>
+                  <option value="">— Pick —</option>
+                  ${RM_SECTIONS.map(s => html`<option key=${s.key} value=${s.key}>${s.label}</option>`)}
+                </select>
+              </div>
             </div>
+            ${rmSec && rmSec.dims.length > 0 ? html`
+              <div class="field"><label>Size</label>
+                <div style="display:flex;gap:6px">
+                  ${rmSec.dims.map((lbl, di) => html`
+                    <input key=${di} type="number" step="any" min=${0} value=${form['dim' + (di + 1)]} onInput=${e => { const v = e.target.value; setForm(f => ({ ...f, ['dim' + (di + 1)]: v })); }} placeholder=${lbl} title=${lbl} style="flex:1;min-width:0;padding:8px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />
+                  `)}
+                </div>
+                <div style="font-size:10px;color:var(--slate-400);margin-top:3px">${rmSec.dims.join('  ·  ')}</div>
+              </div>
+            ` : rmSec ? html`
+              <div class="field"><label>Description *</label><input type="text" required value=${form.spec} onInput=${e => { const v = e.target.value; setForm(f => ({ ...f, spec: v })); }} placeholder=${rmSec.spec || ''} /></div>
+            ` : ''}
+            ${form.section_type && html`
+              <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);padding:10px 12px;margin-bottom:10px">
+                <div style="font-size:10px;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.5px">Auto code</div>
+                <div style="font-family:monospace;font-weight:700;font-size:14px;color:var(--teal-800)">${form.code || '—'}</div>
+                <div style="font-size:10px;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.5px;margin-top:6px">Name (editable)</div>
+                <input type="text" required value=${form.name} onChange=${e => setForm({ ...form, name: e.target.value })} style="width:100%;box-sizing:border-box;padding:7px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px;margin-top:2px" />
+              </div>
+              <div class="field-row">
+                <div class="field"><label>Stock in</label>
+                  <select value=${form.uom} onChange=${e => setForm({ ...form, uom: e.target.value })}>
+                    <option value="mtr">Metre</option><option value="nos">Nos</option><option value="kg">Kg</option>
+                    <option value="ft">Feet</option><option value="set">Set</option>
+                  </select>
+                </div>
+                <div class="field"><label>Weight (kg / ${form.uom || 'unit'})</label>
+                  <input type="number" step="any" min=${0} value=${form.unit_weight} onChange=${e => setForm({ ...form, unit_weight: e.target.value })} placeholder=${rmSec && rmSec.calc ? 'auto' : 'enter'} />
+                </div>
+              </div>
+              <div style="font-size:11px;color:var(--slate-500);margin:-4px 0 10px">${form.unit_weight ? '≈ ' + fmtNum(form.unit_weight) + ' kg per ' + (form.uom || 'unit') + (form.rate_per_kg ? '  ·  ₹' + fmtNum(Math.round(form.unit_weight * form.rate_per_kg)) + ' / ' + (form.uom || 'unit') : '') : (rmSec && rmSec.calc ? 'Enter the sizes above — weight auto-fills.' : 'Enter kg per ' + (form.uom || 'unit') + ' — used for stock value.')}</div>
+            `}
+          ` : html`
+            <div class="field-row">
+              <div class="field"><label>Code *</label><input type="text" required value=${form.code} onChange=${e => setForm({...form, code: e.target.value})} placeholder="ALU-ADC12" /></div>
+              <div class="field"><label>UOM</label>
+                <select value=${form.uom} onChange=${e => setForm({...form, uom: e.target.value})}>
+                  <option value="nos">Nos</option><option value="kg">Kg</option><option value="ltr">Ltr</option>
+                  <option value="mtr">Mtr</option><option value="set">Set</option><option value="box">Box</option>
+                </select>
+              </div>
+            </div>
+            <div class="field"><label>Name *</label><input type="text" required value=${form.name} onChange=${e => setForm({...form, name: e.target.value})} placeholder="Aluminum ADC-12 ingots" /></div>
             <div class="field"><label>Sub-category</label>
               <input type="text" list="subcat-options" value=${form.subcategory || ''} onChange=${e => setForm({...form, subcategory: e.target.value})} placeholder="e.g. Grinding Machines" />
               <datalist id="subcat-options">
                 ${[...new Set((allItems || []).filter(i => i.category === form.category && i.subcategory).map(i => i.subcategory))].sort().map(sc => html`<option value=${sc}></option>`)}
               </datalist>
             </div>
-          </div>
+          `}
           <div class="field-row">
             ${!isEdit ? html`
               <div class="field"><label>Opening qty * <span style="font-weight:400;color:var(--amber-700);font-size:11px">· one-time</span></label><input type="number" required min=${0} step="0.001" value=${form.opening_qty} onChange=${e => setForm({...form, opening_qty: e.target.value})} placeholder="0" /></div>
@@ -36306,7 +36440,9 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
             `}
             <div class="field"><label>Reorder level</label><input type="number" step="0.001" value=${form.reorder_level || ''} onChange=${e => setForm({...form, reorder_level: e.target.value})} /></div>
           </div>
-          <div class="field"><label>Unit cost (₹)</label><input type="number" step="0.01" value=${form.unit_cost || ''} onChange=${e => setForm({...form, unit_cost: e.target.value})} /></div>
+          ${isRaw
+            ? html`<div class="field"><label>Rate (₹ / kg)</label><input type="number" step="0.01" value=${form.rate_per_kg || ''} onChange=${e => setForm({...form, rate_per_kg: e.target.value})} placeholder="e.g. 62" /></div>`
+            : html`<div class="field"><label>Unit cost (₹)</label><input type="number" step="0.01" value=${form.unit_cost || ''} onChange=${e => setForm({...form, unit_cost: e.target.value})} /></div>`}
           ${!isEdit && html`
             <div class="card" style="background:var(--amber-50);border-color:var(--amber-200);padding:8px 10px;margin-bottom:10px">
               <div style="font-size:11px;color:var(--amber-800);line-height:1.5">
