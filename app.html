@@ -22819,12 +22819,16 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
   const [progressDraft, setProgressDraft] = useState(project.progress_pct||0);
   const [weightDraft, setWeightDraft] = useState(project.actual_weight_kg||'');
   const [askModal, setAskModal] = useState(null); // { kind:'approval'|'query', stage }
+  const [components, setComponents] = useState([]); // per-project WIP components (cut parts etc.)
+  const [receiveOpen, setReceiveOpen] = useState(false);
+  const [compAction, setCompAction] = useState(null); // { mode:'send'|'dispatch', comp }
   const restricted = isProjectRestricted(myPerms);
 
   const reload = useCallback(async () => {
-    const [m, d] = await Promise.all([
+    const [m, d, c] = await Promise.all([
       sb.from('mcp_project_milestones').select('*').eq('project_id', project.id).order('seq'),
       sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, total_value, stage_id, created_at').eq('project_id', project.id).eq('hide_from_project', false).order('created_at',{ascending:false}).limit(40),
+      sb.from('mcp_project_components').select('*').eq('project_id', project.id).order('created_at'),
     ]);
     const all = m.data || [];
     const tops = all.filter(x => !x.parent_id);
@@ -22835,6 +22839,7 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
     setStages(tops);
     setSubs(childMap);
     setBills(d.data || []);
+    setComponents(c.data || []);
   }, [project.id]);
   useEffect(()=>{ reload(); }, [reload]);
   useEffect(()=>{ setProgressDraft(project.progress_pct||0); setWeightDraft(project.actual_weight_kg||''); }, [project.id]);
@@ -22934,6 +22939,33 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
 
     <div class="card" style="padding:14px;margin-bottom:10px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div style="font-size:12px;font-weight:700;color:var(--slate-600)">🧩 Components (sub-work) · ${components.length}</div>
+        ${!restricted && html`<button class="btn small" onClick=${() => setReceiveOpen(true)} style="font-size:11px">+ Receive</button>`}
+      </div>
+      <div style="font-size:10px;color:var(--slate-400);margin-bottom:8px">Cut / processed parts for this job — counted, no stock master needed. Receive what comes back, send on for the next process, dispatch when done.</div>
+      ${components.length === 0 ? html`<div style="font-size:12px;color:var(--slate-400);padding:4px 0">Nothing yet. Tap "+ Receive" when cut components come back from laser / a vendor.</div>` :
+        components.map(c => {
+          const badge = c.status === 'at_vendor' ? { t: 'at ' + (c.location || 'vendor'), col: 'amber' } : c.status === 'dispatched' ? { t: 'dispatched', col: 'emerald' } : { t: (c.location || 'in-house'), col: 'teal' };
+          return html`
+            <div key=${c.id} style="border:1px solid var(--slate-100);border-radius:6px;padding:8px 10px;margin-bottom:6px;background:white">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:13px;font-weight:600">${c.name}</div>
+                  <div style="font-size:11px;color:var(--slate-500);margin-top:2px">on hand <b>${fmtNum(c.qty_on_hand)}</b> ${c.uom}${c.qty_at_vendor > 0 ? ' · at vendor ' + fmtNum(c.qty_at_vendor) : ''}${c.qty_dispatched_total > 0 ? ' · dispatched ' + fmtNum(c.qty_dispatched_total) : ''}${c.stage ? ' · ' + c.stage : ''}</div>
+                </div>
+                <span class=${'badge ' + badge.col} style="font-size:10px;white-space:nowrap">${badge.t}</span>
+              </div>
+              ${!restricted && html`<div style="display:flex;gap:6px;margin-top:8px">
+                <button class="btn small ghost" onClick=${() => setCompAction({ mode: 'send', comp: c })} disabled=${c.qty_on_hand <= 0} style="font-size:11px">🚚 Send</button>
+                <button class="btn small ghost" onClick=${() => setCompAction({ mode: 'dispatch', comp: c })} disabled=${c.qty_on_hand <= 0} style="font-size:11px">📦 Dispatch</button>
+              </div>`}
+            </div>
+          `;
+        })}
+    </div>
+
+    <div class="card" style="padding:14px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
         <div style="font-size:12px;font-weight:700;color:var(--slate-600)">Stages · ${stages.length}</div>
         <div style="font-size:10px;color:var(--slate-400)">tap status to advance · expand for actions</div>
       </div>
@@ -23025,6 +23057,119 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
     `}
 
     ${askModal && html`<${StageAskModal} plant=${plant} me=${me} project=${project} stage=${askModal.stage} kind=${askModal.kind} onClose=${()=>setAskModal(null)} onSent=${()=>setAskModal(null)} />`}
+    ${receiveOpen && html`<${ReceiveComponentsModal} plant=${plant} me=${me} project=${project} onClose=${() => setReceiveOpen(false)} onSaved=${() => { setReceiveOpen(false); reload(); }} />`}
+    ${compAction && html`<${ComponentMoveModal} plant=${plant} me=${me} action=${compAction} onClose=${() => setCompAction(null)} onSaved=${() => { setCompAction(null); reload(); }} />`}
+  `;
+}
+
+// Inward cut/processed components for a project — typed as they arrive, no stock
+// master. Each row upserts into mcp_project_components via pc_receive.
+function ReceiveComponentsModal({ plant, me, project, onClose, onSaved }) {
+  const [rows, setRows] = useState([{ name: '', qty: '', uom: 'nos' }]);
+  const [stage, setStage] = useState('');
+  const [from, setFrom] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const setRow = (i, patch) => setRows(rs => rs.map((r, idx) => idx === i ? { ...r, ...patch } : r));
+  const addRow = () => setRows(rs => [...rs, { name: '', qty: '', uom: 'nos' }]);
+  const removeRow = (i) => setRows(rs => rs.length <= 1 ? rs : rs.filter((_, idx) => idx !== i));
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      const valid = rows.filter(r => r.name.trim() && parseFloat(r.qty) > 0);
+      if (valid.length === 0) throw new Error('Add at least one component with a quantity');
+      for (const r of valid) {
+        const { data, error } = await sb.rpc('pc_receive', {
+          p_project_id: project.id, p_name: r.name.trim(), p_qty: parseFloat(r.qty),
+          p_uom: r.uom || 'nos', p_stage: stage.trim() || null, p_location: from.trim() || 'In-house',
+        });
+        if (error) throw error;
+        if (data && data.success === false) throw new Error(data.error || 'Save failed');
+      }
+      showToast('✓ ' + valid.length + ' component' + (valid.length === 1 ? '' : 's') + ' received');
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header"><div class="modal-title">Receive components · ${project.code ? project.code + ' · ' : ''}${project.name}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Stage / process</label><input type="text" value=${stage} onChange=${e => setStage(e.target.value)} placeholder="e.g. laser cut" /></div>
+            <div class="field"><label>From (vendor / in-house)</label><input type="text" value=${from} onChange=${e => setFrom(e.target.value)} placeholder="e.g. Sri Laser" /></div>
+          </div>
+          <div class="field"><label>Components received</label>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              ${rows.map((r, i) => html`
+                <div key=${i} style="display:flex;gap:6px;align-items:center">
+                  <input type="text" value=${r.name} onInput=${e => setRow(i, { name: e.target.value })} placeholder="Component name (e.g. Bracket-A)" style="flex:1;min-width:0;padding:7px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  <input type="number" step="any" min=${0} value=${r.qty} onInput=${e => setRow(i, { qty: e.target.value })} placeholder="Qty" style="width:64px;padding:7px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  <select value=${r.uom} onChange=${e => setRow(i, { uom: e.target.value })} style="width:64px;padding:7px 4px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white">
+                    ${['nos', 'set', 'kg', 'mtr'].map(u => html`<option key=${u} value=${u}>${u}</option>`)}
+                  </select>
+                  ${rows.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => removeRow(i)} style="padding:2px 8px;font-size:11px">×</button>`}
+                </div>
+              `)}
+            </div>
+            <button type="button" class="btn small ghost" onClick=${addRow} style="font-size:12px;margin-top:6px">+ Add component</button>
+          </div>
+          <button class="btn" disabled=${busy} style="width:100%">${busy ? 'Saving…' : '➕ Receive into project'}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// Send components on to the next process (at a vendor) or dispatch to the customer.
+function ComponentMoveModal({ plant, me, action, onClose, onSaved }) {
+  const { mode, comp } = action;
+  const isSend = mode === 'send';
+  const [qty, setQty] = useState(String(comp.qty_on_hand || ''));
+  const [location, setLocation] = useState('');
+  const [stage, setStage] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      const q = parseFloat(qty);
+      if (!(q > 0)) throw new Error('Enter a quantity');
+      if (q > parseFloat(comp.qty_on_hand)) throw new Error('Only ' + comp.qty_on_hand + ' on hand');
+      const rpc = isSend ? 'pc_send' : 'pc_dispatch';
+      const args = isSend
+        ? { p_component_id: comp.id, p_qty: q, p_location: location.trim() || 'vendor', p_stage: stage.trim() || null }
+        : { p_component_id: comp.id, p_qty: q };
+      const { data, error } = await sb.rpc(rpc, args);
+      if (error) throw error;
+      if (data && data.success === false) throw new Error(data.error || 'Failed');
+      showToast(isSend ? '🚚 Sent to ' + (location.trim() || 'vendor') : '📦 Dispatched');
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:420px">
+        <div class="modal-header"><div class="modal-title">${isSend ? '🚚 Send for next process' : '📦 Dispatch to customer'}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div style="font-size:13px;font-weight:600;margin-bottom:2px">${comp.name}</div>
+        <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">on hand ${fmtNum(comp.qty_on_hand)} ${comp.uom}</div>
+        <form onSubmit=${submit}>
+          <div class="field"><label>Quantity</label><input type="number" step="any" min=${0} max=${comp.qty_on_hand} required value=${qty} onChange=${e => setQty(e.target.value)} /></div>
+          ${isSend && html`
+            <div class="field"><label>To (vendor / process location)</label><input type="text" required value=${location} onChange=${e => setLocation(e.target.value)} placeholder="e.g. Powder Coat Co" /></div>
+            <div class="field"><label>Process / stage</label><input type="text" value=${stage} onChange=${e => setStage(e.target.value)} placeholder="e.g. powder coating" /></div>
+            <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">Make the physical Returnable DC in Make Documents; this just moves the count out to the vendor.</div>
+          `}
+          <button class="btn" disabled=${busy} style="width:100%">${busy ? 'Saving…' : (isSend ? 'Send out' : 'Dispatch')}</button>
+        </form>
+      </div>
+    </div>
   `;
 }
 
