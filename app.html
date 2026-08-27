@@ -26660,12 +26660,18 @@ function DocFormatBar({ plant, me, doc, party, isInvoice, onPrintDefault, defaul
 
   const refresh = useCallback(async () => {
     if (!source) return;
+    // A returnable DC is just a DC — if the plant has no dedicated returnable-DC
+    // format, reuse its Delivery Challan format so both print identically.
+    const sources = doc.doc_type === 'dc_out_returnable' ? ['dc_out_returnable', 'dc_out'] : [source];
     const { data } = await sb.from('mcp_record_templates')
-      .select('id, name, config, ai_confidence, is_default, created_at')
-      .eq('plant_id', plant.id).eq('source', source).eq('active', true)
+      .select('id, name, config, ai_confidence, is_default, created_at, source')
+      .eq('plant_id', plant.id).in('source', sources).eq('active', true)
       .order('created_at', { ascending: false });
-    setTemplates(data || []);
-  }, [plant.id, source]);
+    // Prefer a dedicated returnable-DC template over the borrowed DC one.
+    const rows = (data || []).slice().sort((a, b) =>
+      (a.source === 'dc_out_returnable' ? 0 : 1) - (b.source === 'dc_out_returnable' ? 0 : 1));
+    setTemplates(rows);
+  }, [plant.id, source, doc.doc_type]);
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
 
