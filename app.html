@@ -22455,9 +22455,16 @@ function ProjectTracker({ plant, me, myPerms, go }) {
 }
 
 function ProjectModal({ plant, me, customers, users, editTarget, onClose, onSaved }) {
-  const [form, setForm] = useState(editTarget || {
-    code:'', name:'', customer_id:'', site_location:'', status:'planning',
-    order_value:'', est_weight_kg:'', actual_weight_kg:'', start_date:'', target_date:'', progress_pct:0, owner_user_id:'', notes:'',
+  const [form, setForm] = useState(() => {
+    const base = editTarget || {
+      code:'', name:'', customer_id:'', site_location:'', status:'planning',
+      order_value:'', est_weight_kg:'', actual_weight_kg:'', start_date:'', target_date:'', progress_pct:0, owner_user_id:'', notes:'',
+    };
+    // Project code = a number + an optional letter suffix, e.g. 331A / 331B. Split
+    // an existing code back into its two boxes; a legacy non-numeric code falls
+    // into the number box unchanged so it stays editable.
+    const m = ('' + (base.code || '')).match(/^\s*(\d+)\s*([A-Za-z]*)\s*$/);
+    return { ...base, code_num: m ? m[1] : (base.code || ''), code_alpha: m ? (m[2] || '').toUpperCase() : '' };
   });
   const [milestones, setMilestones] = useState([]);
   const [newMs, setNewMs] = useState('');
@@ -22476,8 +22483,11 @@ function ProjectModal({ plant, me, customers, users, editTarget, onClose, onSave
     e.preventDefault(); setErr(''); setBusy(true);
     try {
       if (!form.name.trim()) throw new Error('Project name required');
+      const codeNum = ('' + (form.code_num || '')).trim();
+      const codeAlpha = ('' + (form.code_alpha || '')).trim().toUpperCase();
+      const builtCode = codeNum ? (codeNum + codeAlpha) : null;
       const payload = {
-        plant_id: plant.id, code: form.code||null, name: form.name.trim(),
+        plant_id: plant.id, code: builtCode, name: form.name.trim(),
         customer_id: form.customer_id||null, customer_name: customers.find(c=>c.id===form.customer_id)?.name || form.customer_name || null,
         site_location: form.site_location||null, status: form.status,
         order_value: form.order_value?parseFloat(form.order_value):null,
@@ -22522,7 +22532,13 @@ function ProjectModal({ plant, me, customers, users, editTarget, onClose, onSave
         ${err && html`<div class="alert error">${err}</div>`}
         <form onSubmit=${submit}>
           <div class="field-row">
-            <div class="field"><label>Project code</label><input type="text" value=${form.code} onChange=${e=>setForm({...form,code:e.target.value})} placeholder="PRJ-001" /></div>
+            <div class="field"><label>Project code</label>
+              <div style="display:flex;gap:6px;align-items:center">
+                <input type="text" inputmode="numeric" value=${form.code_num} onChange=${e=>setForm({...form,code_num:e.target.value.replace(/[^0-9]/g,'')})} placeholder="331" style="flex:1;min-width:0" />
+                <input type="text" maxlength="2" value=${form.code_alpha} onChange=${e=>setForm({...form,code_alpha:e.target.value.replace(/[^A-Za-z]/g,'').toUpperCase()})} placeholder="A" style="width:52px;text-align:center;text-transform:uppercase" />
+              </div>
+              ${(form.code_num||form.code_alpha) ? html`<div style="font-size:11px;color:var(--slate-500);margin-top:3px">Code: <b>${('' + (form.code_num||'')).trim() + ('' + (form.code_alpha||'')).trim().toUpperCase()}</b></div>` : ''}
+            </div>
             <div class="field"><label>Status</label><select value=${form.status} onChange=${e=>setForm({...form,status:e.target.value})}>
               <option value="planning">Planning</option><option value="in_progress">In progress</option><option value="on_hold">On hold</option><option value="completed">Completed</option><option value="cancelled">Cancelled</option>
             </select></div>
