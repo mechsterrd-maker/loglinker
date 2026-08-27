@@ -21461,10 +21461,27 @@ function rtBuildDocCtx({ doc, plant, party, isInvoice }) {
     docFields.ship_to_gstin    = raw.ship_to_gstin || party?.gstin || '';
   }
 
+  // Show the project inside each item's description (per-item, else the doc-level
+  // project), and make sure an approx weight is present (qty × unit weight) so a
+  // template's weight column fills even on older items.
+  const docProj = docFields.project_name;
+  const rows = items.map(it => {
+    const proj = it.project_name || docProj || '';
+    const gw = (it.gross_weight != null && it.gross_weight !== '')
+      ? it.gross_weight
+      : (it.unit_weight != null ? Math.round(parseFloat(it.unit_weight) * (parseFloat(it.qty) || 0) * 1000) / 1000 : it.gross_weight);
+    return {
+      ...it,
+      name: (it.name || '') + (proj ? '  ·  Project: ' + proj : ''),
+      gross_weight: gw,
+      weight: it.weight != null ? it.weight : gw,
+    };
+  });
+
   return {
     plant,
     doc: docFields,
-    rows: items,
+    rows,
   };
 }
 
@@ -21520,11 +21537,6 @@ function rtExpandHtmlTemplate(htmlIn, ctx) {
 //      kept for petty cash and any older templates already saved.
 function rtRenderDocument(template, ctx) {
   const docTitle = template.title || 'Report';
-  // Force-print the project reference even when a custom template has no field
-  // for it — otherwise a DC tagged to a job would print with no project on it.
-  const projBanner = (ctx.doc && ctx.doc.project_name)
-    ? '<div style="font-family:Arial,Helvetica,sans-serif;font-size:12px;font-weight:700;border:1px solid #000;padding:5px 9px;margin:0 0 8px;background:#f2f2f2">Project Ref: ' + rtEsc(ctx.doc.project_name) + '</div>'
-    : '';
   if (template.html && String(template.html).trim().length > 0) {
     const body = rtExpandHtmlTemplate(rtSanitizeHtml(template.html), ctx);
     const extraCss = template.css ? rtSanitizeHtml(template.css) : '';
@@ -21537,7 +21549,6 @@ function rtRenderDocument(template, ctx) {
       '@media print{.rt-btn{display:none}body{padding:0}}' +
       extraCss + '</style></head><body>' +
       '<button class="rt-btn" onclick="window.print()">🖨 Save as PDF / Print</button>' +
-      projBanner +
       body +
       '</body></html>';
   }
@@ -21546,7 +21557,6 @@ function rtRenderDocument(template, ctx) {
   const footers = (template.footer_blocks || []).map(b => rtRenderBlock(b, ctx)).join('');
   return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + rtEsc(docTitle) + '</title><style>' + RT_PRINT_CSS + '</style></head><body>' +
     '<button class="rt-btn" onclick="window.print()">🖨 Save as PDF / Print</button>' +
-    projBanner +
     headers + table + footers +
     '</body></html>';
 }
@@ -26361,9 +26371,20 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
       if (numErr) throw numErr;
 
       const projName = (pid) => { const p = projects.find(x => x.id === pid); return p ? ((p.code ? p.code + ' · ' : '') + (p.name || '')) : null; };
+      // Pull unit-weight + size for stock lines so we can stamp an approx weight
+      // (qty × kg/unit) and size onto each item — the challan print shows both.
+      const stkMeta = {};
+      const wStockIds = [...new Set(validItems.filter(it => it.kind === 'stock' && it.stock_item_id).map(it => it.stock_item_id))];
+      if (wStockIds.length) {
+        const { data: sm } = await sb.from('mcp_stocks_items').select('id, unit_weight, size_spec').in('id', wStockIds);
+        (sm || []).forEach(s => { stkMeta[s.id] = s; });
+      }
       const items = validItems.map(it => {
         // Each line falls back to the document-level project when it has none.
         const lineProj = it.project_id || form.project_id || null;
+        const meta = it.kind === 'stock' ? stkMeta[it.stock_item_id] : null;
+        const uw = meta && meta.unit_weight != null ? parseFloat(meta.unit_weight) : null;
+        const gw = uw != null ? Math.round(uw * (parseFloat(it.qty) || 0) * 1000) / 1000 : null;
         return {
           name: it.name.trim(),
           part_id: it.kind === 'part' ? (it.part_id || null) : null,
@@ -26371,9 +26392,13 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
           machine_id: it.kind === 'machine' ? (it.machine_id || null) : null,
           project_id: lineProj,
           project_name: projName(lineProj),
+          size: meta ? (meta.size_spec || null) : null,
           hsn: it.hsn || null,
           qty: parseFloat(it.qty),
           uom: it.uom || 'nos',
+          unit_weight: uw,
+          weight: gw,
+          gross_weight: gw,
           rate: isInvoice && it.rate ? parseFloat(it.rate) : null,
           amount: isInvoice && it.amount ? parseFloat(it.amount) : null,
         };
@@ -26504,7 +26529,9 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
               <div style=${'display:grid;grid-template-columns:'+(isInvoice?'0.7fr 0.6fr 0.5fr 0.8fr 0.8fr':'1fr 0.7fr 0.6fr')+';gap:6px'}>
                 <input type="text" value=${it.hsn} onChange=${e => setItem(idx, { hsn: e.target.value })} placeholder="HSN" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
                 <input type="number" step="any" min=${0} value=${it.qty} onChange=${e => { setItem(idx, { qty: e.target.value }); }} onBlur=${() => recalcAmount(idx)} placeholder="Qty *" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
-                <input type="text" value=${it.uom} onChange=${e => setItem(idx, { uom: e.target.value })} placeholder="UoM" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                <select value=${it.uom} onChange=${e => setItem(idx, { uom: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white" title="Unit">
+                  ${[...new Set([it.uom, 'nos','mtr','kg','ft','sqft','set','box','ltr','pair','roll'].filter(Boolean))].map(u => html`<option key=${u} value=${u}>${u}</option>`)}
+                </select>
                 ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.rate} onChange=${e => setItem(idx, { rate: e.target.value })} onBlur=${() => recalcAmount(idx)} placeholder="Rate ₹" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />`}
                 ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.amount} onChange=${e => setItem(idx, { amount: e.target.value })} placeholder="Amount ₹" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;font-weight:600" />`}
               </div>
