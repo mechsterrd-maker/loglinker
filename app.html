@@ -2422,6 +2422,7 @@ const MORE_GROUPS = [
       { key:'fettling',      icon:'🪓', label:'Fettling (contract)',  mfg:true, sub:'Daily plan & work done for the fettling contract workers · piece-rate payout' },
       { key:'rdc_returns',   icon:'🔁', label:'Returnable DC tracker', sub:'Items sent on returnable DC · days out · mark received & close' },
       { key:'bom',           icon:'🧱', label:'Bill of Materials',     sub:'RM consumed per fabricated item / sub-job · drives stock issue & sub-contract' },
+      { key:'project_history', icon:'🔎', label:'Project Material History', sub:'Search a project + date range · all material sent & received · net balance per item' },
       { key:'tpm',           icon:'🛠', label:'TPM Daily Checks',     sub:'30-sec machine checks · oil, coolant, leaks, guards' },
       { key:'maintenance',   icon:'🔧', label:'Maintenance',          sub:'Breakdowns log, machine status' },
       { key:'cutting',       icon:'✂️', label:'Cutting Planner',      sub:'1D cutting optimisation for rods, tubes, bars · auto layout with kerf · waste %' },
@@ -3385,6 +3386,174 @@ function BomEditorModal({ plant, me, editTarget, onClose, onSaved }) {
         </div>
       </div>
     </div>`;
+}
+
+// ============= PROJECT MATERIAL HISTORY =============
+// Search one project over a date range and see every bit of material SENT and
+// RECEIVED for it — from DCs, returnable DCs, bills, sub-job DCs, etc. — plus a
+// net "still out / net in" balance per item. Backed by project_material_history()
+// which unnests each document's items and matches per-item or doc-level project.
+const PMH_DOC_LABEL = {
+  dc_out:'DC out', dc_out_returnable:'Returnable DC', invoice_out:'Invoice out',
+  job_work_dc_out:'Job-work DC out', interunit_dc_out:'Inter-unit DC out', packing_list:'Packing list',
+  invoice_in:'Bill / Invoice in', job_work_dc_in:'Sub-job received', bill:'Bill', dc_in:'DC in',
+  interunit_dc_in:'Inter-unit in', po:'Purchase order',
+};
+function ProjectMaterialHistory({ plant, me, activeUnit }) {
+  const [projects, setProjects] = useState([]);
+  const [projectId, setProjectId] = useState('');
+  const isoAgo = (months) => { const d = new Date(); d.setMonth(d.getMonth() - months); return d.toISOString().slice(0, 10); };
+  const [from, setFrom] = useState(() => isoAgo(3));
+  const [to, setTo] = useState(() => new Date().toISOString().slice(0, 10));
+  const [rows, setRows] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    if (!plant?.id) return;
+    sb.from('mcp_projects').select('id, code, name')
+      .eq('plant_id', plant.id)
+      .order('code', { ascending: true, nullsFirst: false }).order('name')
+      .then(({ data }) => setProjects(data || []));
+  }, [plant?.id]);
+
+  const runSearch = async () => {
+    if (!projectId) { setErr('Pick a project first'); return; }
+    setErr(''); setLoading(true); setRows(null);
+    const { data, error } = await sb.rpc('project_material_history', { p_project_id: projectId, p_from: from, p_to: to });
+    if (error) setErr(error.message); else setRows(data || []);
+    setLoading(false);
+  };
+
+  const setRange = (months) => { setFrom(isoAgo(months)); setTo(new Date().toISOString().slice(0, 10)); };
+  const setYear = () => { setFrom(new Date(new Date().getFullYear(), 0, 1).toISOString().slice(0, 10)); setTo(new Date().toISOString().slice(0, 10)); };
+
+  const all = rows || [];
+  const sentLines = all.filter(r => r.direction === 'sent');
+  const recdLines = all.filter(r => r.direction === 'received');
+  const proj = projects.find(p => p.id === projectId);
+
+  // Net balance per item name. "Still out" = sent − received (material you sent
+  // out on returnable / job-work basis that hasn't come back).
+  const byItem = useMemo(() => {
+    const m = {};
+    for (const r of all) {
+      const key = (r.item_name || '—').trim() || '—';
+      const k = key.toLowerCase();
+      if (!m[k]) m[k] = { name: key, uom: r.uom || '', sent: 0, received: 0 };
+      if (r.direction === 'sent') m[k].sent += Number(r.qty) || 0;
+      else if (r.direction === 'received') m[k].received += Number(r.qty) || 0;
+      if (!m[k].uom && r.uom) m[k].uom = r.uom;
+    }
+    return Object.values(m).sort((a, b) => a.name.localeCompare(b.name));
+  }, [rows]);
+
+  // Documents in date order, each with its matching item lines.
+  const byDoc = useMemo(() => {
+    const m = {};
+    for (const r of all) {
+      if (!m[r.doc_id]) m[r.doc_id] = { doc_id: r.doc_id, doc_number: r.doc_number, doc_type: r.doc_type, doc_date: r.doc_date, direction: r.direction, party_name: r.party_name, items: [] };
+      m[r.doc_id].items.push(r);
+    }
+    return Object.values(m).sort((a, b) => (a.doc_date > b.doc_date ? -1 : a.doc_date < b.doc_date ? 1 : 0));
+  }, [rows]);
+
+  const docCount = byDoc.length;
+
+  return html`
+    <div class="page-header">
+      <h1>🔎 Project Material History</h1>
+      <div class="sub">Pick a project and a date range — see everything sent out and received in, with a net balance per item.</div>
+    </div>
+
+    <div class="card" style="padding:14px;margin-bottom:14px">
+      <div class="field"><label>Project</label>
+        <select value=${projectId} onChange=${e => setProjectId(e.target.value)}>
+          <option value="">— Pick a project —</option>
+          ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+        </select>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>From</label><${DateField} value=${from} onChange=${e => setFrom(e.target.value)} /></div>
+        <div class="field"><label>To</label><${DateField} value=${to} onChange=${e => setTo(e.target.value)} /></div>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+        <button type="button" class="btn small ghost" onClick=${() => setRange(1)} style="font-size:11px">Last month</button>
+        <button type="button" class="btn small ghost" onClick=${() => setRange(3)} style="font-size:11px">Last 3 months</button>
+        <button type="button" class="btn small ghost" onClick=${() => setRange(12)} style="font-size:11px">Last 12 months</button>
+        <button type="button" class="btn small ghost" onClick=${setYear} style="font-size:11px">This year</button>
+      </div>
+      ${err && html`<div class="alert error" style="margin-bottom:8px">${err}</div>`}
+      <button class="btn" onClick=${runSearch} disabled=${loading} style="width:100%">${loading ? 'Searching…' : '🔎 Search history'}</button>
+    </div>
+
+    ${rows != null && html`
+      ${all.length === 0 ? html`
+        <div class="card"><div class="empty"><div class="icon">📭</div><div style="font-size:13px">No material moved for <b>${proj ? ((proj.code ? proj.code + ' · ' : '') + proj.name) : 'this project'}</b> between ${fmtDMY(from)} and ${fmtDMY(to)}.</div><div style="font-size:11px;color:var(--slate-500);margin-top:6px">Tag DCs / bills to this project (on the document, or per item) and they'll show up here.</div></div></div>
+      ` : html`
+        <div class="card" style="padding:12px 14px;margin-bottom:12px;background:var(--teal-50);border-color:var(--teal-200)">
+          <div style="font-size:13px;font-weight:700;color:var(--slate-800)">${proj ? ((proj.code ? proj.code + ' · ' : '') + proj.name) : 'Project'}</div>
+          <div style="font-size:11px;color:var(--slate-600);margin-top:2px">${fmtDMY(from)} → ${fmtDMY(to)} · ${docCount} document${docCount === 1 ? '' : 's'}</div>
+          <div style="display:flex;gap:16px;margin-top:8px;font-size:12px">
+            <div><span style="color:var(--slate-500)">📤 Sent</span> <b>${sentLines.length}</b> line${sentLines.length === 1 ? '' : 's'}</div>
+            <div><span style="color:var(--slate-500)">📥 Received</span> <b>${recdLines.length}</b> line${recdLines.length === 1 ? '' : 's'}</div>
+          </div>
+        </div>
+
+        <div class="section-h">Net per item</div>
+        <div class="card" style="padding:0;margin-bottom:14px;overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;font-size:12px;min-width:420px">
+            <thead>
+              <tr style="background:var(--slate-100);text-align:left">
+                <th style="padding:8px 10px">Item</th>
+                <th style="padding:8px 10px;text-align:right">📤 Sent</th>
+                <th style="padding:8px 10px;text-align:right">📥 Received</th>
+                <th style="padding:8px 10px;text-align:right">Balance</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${byItem.map((r, i) => { const bal = r.sent - r.received; return html`
+                <tr key=${i} style="border-top:1px solid var(--slate-100)">
+                  <td style="padding:8px 10px">${r.name}${r.uom ? html`<span style="color:var(--slate-400);font-size:11px"> · ${r.uom}</span>` : ''}</td>
+                  <td style="padding:8px 10px;text-align:right;font-family:monospace">${r.sent ? fmtNum(r.sent) : '—'}</td>
+                  <td style="padding:8px 10px;text-align:right;font-family:monospace">${r.received ? fmtNum(r.received) : '—'}</td>
+                  <td style=${'padding:8px 10px;text-align:right;font-family:monospace;font-weight:700;color:'+(bal > 0 ? 'var(--amber-700)' : bal < 0 ? 'var(--teal-700)' : 'var(--slate-400)')}>
+                    ${bal === 0 ? '0' : (bal > 0 ? fmtNum(bal) + ' out' : fmtNum(-bal) + ' in')}
+                  </td>
+                </tr>
+              `; })}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-h">Timeline · newest first</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          ${byDoc.map(d => { const sent = d.direction === 'sent'; return html`
+            <div class="card" key=${d.doc_id} style="padding:10px 12px">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:13px;font-weight:600">
+                    <span style=${'display:inline-block;font-size:10px;font-weight:700;padding:1px 7px;border-radius:10px;margin-right:6px;color:white;background:'+(sent ? 'var(--rose-500)' : d.direction === 'received' ? 'var(--emerald-600)' : 'var(--slate-400)')}>${sent ? '📤 SENT' : d.direction === 'received' ? '📥 RECEIVED' : 'DOC'}</span>
+                    ${d.doc_number || '—'}
+                  </div>
+                  <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${PMH_DOC_LABEL[d.doc_type] || d.doc_type}${d.party_name ? ' · ' + d.party_name : ''}</div>
+                </div>
+                <div style="font-size:11px;color:var(--slate-500);white-space:nowrap">${fmtDMY(d.doc_date)}</div>
+              </div>
+              <div style="margin-top:8px;border-top:1px solid var(--slate-100);padding-top:6px;display:flex;flex-direction:column;gap:3px">
+                ${d.items.map((it, j) => html`
+                  <div key=${j} style="display:flex;justify-content:space-between;gap:8px;font-size:12px">
+                    <span style="color:var(--slate-700);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${it.item_name || '—'}</span>
+                    <span style="font-family:monospace;color:var(--slate-600);white-space:nowrap">${fmtNum(it.qty)}${it.uom ? ' ' + it.uom : ''}</span>
+                  </div>
+                `)}
+              </div>
+            </div>
+          `; })}
+        </div>
+      `}
+    `}
+  `;
 }
 
 // ============= RETURNABLE DC TRACKER =============
@@ -4474,6 +4643,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'ppc'}><${PpcModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'fettling'}><${FettlingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'rdc_returns'}><${RdcReturns} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'project_history'}><${ProjectMaterialHistory} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'bom'}><${BomModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
       <${Page} active=${denied}><${AccessDenied} moduleKey=${tab} /></${Page}>
@@ -10558,6 +10728,7 @@ const RBAC_MODULES = [
   { key:'ppc', label:'Production Planning (PPC)', group:'ops' },
   { key:'fettling', label:'Fettling (contract work)', group:'ops' },
   { key:'rdc_returns', label:'Returnable DC tracker', group:'ops' },
+  { key:'project_history', label:'Project Material History', group:'ops' },
   { key:'bom', label:'Bill of Materials', group:'ops' },
   { key:'quality', label:'Quality', group:'ops' },
   { key:'maintenance', label:'Maintenance', group:'ops' },
@@ -26105,7 +26276,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
     // 'stock' line (StockItemPicker from mcp_stocks_items). DC-out rows
     // tagged 'stock' carry a stock_item_id that the cascade trigger uses
     // to deduct stock without name guessing.
-    items: [{ kind: 'part', part_id: '', stock_item_id: '', machine_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }],
+    items: [{ kind: 'part', part_id: '', stock_item_id: '', machine_id: '', project_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }],
     cgst_pct: 9,
     sgst_pct: 9,
     igst_pct: 18,
@@ -26122,7 +26293,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   }, [plant?.id]);
 
   const setItem = (i, patch) => setForm(f => ({ ...f, items: f.items.map((x, idx) => idx === i ? { ...x, ...patch } : x) }));
-  const addItem = () => setForm(f => ({ ...f, items: [...f.items, { kind: 'part', part_id: '', stock_item_id: '', machine_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }] }));
+  const addItem = () => setForm(f => ({ ...f, items: [...f.items, { kind: 'part', part_id: '', stock_item_id: '', machine_id: '', project_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }] }));
   const removeItem = (i) => setForm(f => ({ ...f, items: f.items.length <= 1 ? f.items : f.items.filter((_, idx) => idx !== i) }));
   const recalcAmount = (i) => {
     const it = form.items[i];
@@ -26153,17 +26324,24 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
       });
       if (numErr) throw numErr;
 
-      const items = validItems.map(it => ({
-        name: it.name.trim(),
-        part_id: it.kind === 'part' ? (it.part_id || null) : null,
-        stock_item_id: it.kind === 'stock' ? (it.stock_item_id || null) : null,
-        machine_id: it.kind === 'machine' ? (it.machine_id || null) : null,
-        hsn: it.hsn || null,
-        qty: parseFloat(it.qty),
-        uom: it.uom || 'nos',
-        rate: isInvoice && it.rate ? parseFloat(it.rate) : null,
-        amount: isInvoice && it.amount ? parseFloat(it.amount) : null,
-      }));
+      const projName = (pid) => { const p = projects.find(x => x.id === pid); return p ? ((p.code ? p.code + ' · ' : '') + (p.name || '')) : null; };
+      const items = validItems.map(it => {
+        // Each line falls back to the document-level project when it has none.
+        const lineProj = it.project_id || form.project_id || null;
+        return {
+          name: it.name.trim(),
+          part_id: it.kind === 'part' ? (it.part_id || null) : null,
+          stock_item_id: it.kind === 'stock' ? (it.stock_item_id || null) : null,
+          machine_id: it.kind === 'machine' ? (it.machine_id || null) : null,
+          project_id: lineProj,
+          project_name: projName(lineProj),
+          hsn: it.hsn || null,
+          qty: parseFloat(it.qty),
+          uom: it.uom || 'nos',
+          rate: isInvoice && it.rate ? parseFloat(it.rate) : null,
+          amount: isInvoice && it.amount ? parseFloat(it.amount) : null,
+        };
+      });
 
       const { data: doc, error } = await sb.from('mcp_logistics_documents').insert({
         plant_id: plant.id,
@@ -26192,6 +26370,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
           cgst_pct: form.cgst_pct, sgst_pct: form.sgst_pct, igst_pct: form.igst_pct,
           customer: party ? { name: party.name, gstin: party.gstin, address: party.address, city: party.city } : null,
           project_id: form.project_id || null,
+          project_name: projName(form.project_id),
         },
         status: 'approved',
         notes: form.notes || null,
@@ -26292,6 +26471,15 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
                 ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.rate} onChange=${e => setItem(idx, { rate: e.target.value })} onBlur=${() => recalcAmount(idx)} placeholder="Rate ₹" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />`}
                 ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.amount} onChange=${e => setItem(idx, { amount: e.target.value })} placeholder="Amount ₹" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;font-weight:600" />`}
               </div>
+              ${projects.length > 0 && html`
+                <div style="display:flex;align-items:center;gap:6px;margin-top:6px">
+                  <span style="font-size:11px;color:var(--slate-500);white-space:nowrap">📐 Project</span>
+                  <select value=${it.project_id || ''} onChange=${e => setItem(idx, { project_id: e.target.value })} style=${'flex:1;padding:6px 8px;border:1px solid '+(it.project_id ? 'var(--teal-300)' : 'var(--slate-200)')+';border-radius:5px;font-size:12px;background:white'}>
+                    <option value="">— ${form.project_id ? 'same as document (' + ((projects.find(p => p.id === form.project_id)||{}).code || (projects.find(p => p.id === form.project_id)||{}).name || '') + ')' : 'none'} —</option>
+                    ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+                  </select>
+                </div>
+              `}
             </div>
           `)}
           <button type="button" class="btn small ghost" onClick=${addItem} style="font-size:12px;align-self:flex-start">+ Add another item</button>
@@ -26719,6 +26907,7 @@ function SalesDocPreview({ doc, plant, me, customers, vendors, onClose }) {
         <div style="text-align:right">
           <div><span style="color:#666">${isInvoice?'Invoice':'DC'} No: </span><strong style="font-family:monospace">${doc.doc_number}</strong></div>
           <div style="margin-top:3px"><span style="color:#666">Date: </span><strong>${fmtDMY(doc.doc_date)}</strong></div>
+          ${doc.raw_extraction?.project_name && html`<div style="margin-top:3px"><span style="color:#666">Project: </span><strong>${doc.raw_extraction.project_name}</strong></div>`}
           ${doc.raw_extraction?.po_reference && html`<div style="margin-top:3px"><span style="color:#666">PO ref: </span>${doc.raw_extraction.po_reference}</div>`}
           ${doc.raw_extraction?.vehicle_no && html`<div style="margin-top:3px"><span style="color:#666">Vehicle: </span>${doc.raw_extraction.vehicle_no}</div>`}
           ${doc.raw_extraction?.eway_bill && html`<div style="margin-top:3px"><span style="color:#666">E-way: </span>${doc.raw_extraction.eway_bill}</div>`}
@@ -26742,7 +26931,7 @@ function SalesDocPreview({ doc, plant, me, customers, vendors, onClose }) {
           ${items.map((it, i) => html`
             <tr key=${i} style="border:1px solid #000">
               <td style="padding:6px;border:1px solid #000;text-align:center">${i+1}</td>
-              <td style="padding:6px;border:1px solid #000">${it.name}</td>
+              <td style="padding:6px;border:1px solid #000">${it.name}${it.project_name ? html`<div style="font-size:10px;color:#555;margin-top:2px">📐 ${it.project_name}</div>` : ''}</td>
               <td style="padding:6px;border:1px solid #000;text-align:center">${it.hsn||''}</td>
               <td style="padding:6px;border:1px solid #000;text-align:right">${it.qty}</td>
               <td style="padding:6px;border:1px solid #000;text-align:center">${it.uom||''}</td>
