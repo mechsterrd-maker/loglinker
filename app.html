@@ -21432,6 +21432,11 @@ function rtBuildDocCtx({ doc, plant, party, isInvoice }) {
     discount_amount:   raw.discount_amount || 0,
     round_off:         raw.round_off || 0,
     amount_in_words:   raw.amount_in_words || '',
+    // Project reference: the document-level tag, else the distinct per-item
+    // projects. Available to templates as {{doc.project_name}} / {{doc.project_ref}}
+    // and force-printed as a banner by rtRenderDocument even if the template omits it.
+    project_name:      (raw.project_name || [...new Set(items.map(it => it.project_name).filter(Boolean))].join(', ')) || '',
+    project_ref:       (raw.project_name || [...new Set(items.map(it => it.project_name).filter(Boolean))].join(', ')) || '',
     total_qty:         items.reduce((s, it) => s + (parseFloat(it.qty) || 0), 0),
     total_packages:    pt.packages || items.reduce((s, it) => s + (parseInt(it.packages) || 0), 0),
     total_gross_weight: pt.gross_wt || items.reduce((s, it) => s + (parseFloat(it.gross_wt) || 0), 0),
@@ -21515,6 +21520,11 @@ function rtExpandHtmlTemplate(htmlIn, ctx) {
 //      kept for petty cash and any older templates already saved.
 function rtRenderDocument(template, ctx) {
   const docTitle = template.title || 'Report';
+  // Force-print the project reference even when a custom template has no field
+  // for it — otherwise a DC tagged to a job would print with no project on it.
+  const projBanner = (ctx.doc && ctx.doc.project_name)
+    ? '<div style="font-family:Arial,Helvetica,sans-serif;font-size:12px;font-weight:700;border:1px solid #000;padding:5px 9px;margin:0 0 8px;background:#f2f2f2">Project Ref: ' + rtEsc(ctx.doc.project_name) + '</div>'
+    : '';
   if (template.html && String(template.html).trim().length > 0) {
     const body = rtExpandHtmlTemplate(rtSanitizeHtml(template.html), ctx);
     const extraCss = template.css ? rtSanitizeHtml(template.css) : '';
@@ -21527,6 +21537,7 @@ function rtRenderDocument(template, ctx) {
       '@media print{.rt-btn{display:none}body{padding:0}}' +
       extraCss + '</style></head><body>' +
       '<button class="rt-btn" onclick="window.print()">🖨 Save as PDF / Print</button>' +
+      projBanner +
       body +
       '</body></html>';
   }
@@ -21535,6 +21546,7 @@ function rtRenderDocument(template, ctx) {
   const footers = (template.footer_blocks || []).map(b => rtRenderBlock(b, ctx)).join('');
   return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + rtEsc(docTitle) + '</title><style>' + RT_PRINT_CSS + '</style></head><body>' +
     '<button class="rt-btn" onclick="window.print()">🖨 Save as PDF / Print</button>' +
+    projBanner +
     headers + table + footers +
     '</body></html>';
 }
@@ -26283,6 +26295,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  const [showOverride, setShowOverride] = useState(false); // shown after a stock shortfall
   const [projects, setProjects] = useState([]);
   // Load active projects so a DC can be issued against one (fabrication jobs).
   useEffect(() => {
@@ -26292,7 +26305,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
       .order('code', { ascending: true, nullsFirst: false }).order('name').then(({ data }) => setProjects(data || []));
   }, [plant?.id]);
 
-  const setItem = (i, patch) => setForm(f => ({ ...f, items: f.items.map((x, idx) => idx === i ? { ...x, ...patch } : x) }));
+  const setItem = (i, patch) => { if (showOverride) { setShowOverride(false); setErr(''); } setForm(f => ({ ...f, items: f.items.map((x, idx) => idx === i ? { ...x, ...patch } : x) })); };
   const addItem = () => setForm(f => ({ ...f, items: [...f.items, { kind: 'part', part_id: '', stock_item_id: '', machine_id: '', project_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }] }));
   const removeItem = (i) => setForm(f => ({ ...f, items: f.items.length <= 1 ? f.items : f.items.filter((_, idx) => idx !== i) }));
   const recalcAmount = (i) => {
@@ -26311,12 +26324,35 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   const taxAmount = cgst + sgst + igst;
   const total = taxableValue + taxAmount;
 
-  const submit = async (e) => {
+  const submit = async (e, override = false) => {
     e.preventDefault(); setErr(''); setBusy(true);
     try {
       const useVendor = !isInvoice && partyType === 'vendor';
       if (!form.customer_id) throw new Error(useVendor ? 'Pick a vendor' : 'Pick a customer');
       if (validItems.length === 0) throw new Error('Add at least one item with qty');
+
+      // Stock guard: a DC that issues more than is in stock would drive the item
+      // negative. Check before consuming a doc number; let the user override.
+      if (!isInvoice && !override) {
+        const stockLines = validItems.filter(it => it.kind === 'stock' && it.stock_item_id);
+        if (stockLines.length) {
+          const ids = [...new Set(stockLines.map(it => it.stock_item_id))];
+          const req = {};
+          stockLines.forEach(it => { req[it.stock_item_id] = (req[it.stock_item_id] || 0) + (parseFloat(it.qty) || 0); });
+          const { data: stk } = await sb.from('mcp_stocks_items').select('id, name, uom, current_qty').in('id', ids);
+          const short = [];
+          (stk || []).forEach(s => {
+            const avail = parseFloat(s.current_qty || 0);
+            if (req[s.id] > avail) short.push(s.name + ' — need ' + fmtNum(req[s.id]) + ' ' + (s.uom || '') + ', only ' + fmtNum(avail) + ' ' + (s.uom || '') + ' in stock');
+          });
+          if (short.length) {
+            setShowOverride(true); setBusy(false);
+            setErr('⚠ Not enough stock:\n• ' + short.join('\n• ') + '\n\nReduce the qty or add stock first. To send it anyway (stock will go negative), tap "Issue anyway" below.');
+            return;
+          }
+        }
+      }
+
       const party = partyList.find(c => c.id === form.customer_id);
       // Allocate the next number atomically (this commits it — even if save fails, the number is consumed)
       const { data: docNo, error: numErr } = await sb.rpc('get_next_logistics_doc_number', {
@@ -26392,7 +26428,8 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
       ${(me?.role === 'plant_head' || me?.role === 'admin') && html`<${SetStartingNumberPanel} plant=${plant} kind=${kind} onChanged=${onCounterChanged} />`}
     </div>
 
-    ${err && html`<div class="alert error">${err}</div>`}
+    ${err && html`<div class="alert error" style="white-space:pre-line">${err}</div>`}
+    ${showOverride && html`<button type="button" class="btn" onClick=${(e) => submit(e, true)} disabled=${busy} style="background:var(--amber-600);margin-bottom:10px">⚠ Issue anyway — allow negative stock</button>`}
 
     <form onSubmit=${submit}>
       ${!isInvoice && html`
@@ -26870,6 +26907,7 @@ function SalesDocPreview({ doc, plant, me, customers, vendors, onClose }) {
   const cust = customers.find(c => c.id === custId) || (doc.raw_extraction?.customer || null);
   const items = Array.isArray(doc.items) ? doc.items : [];
   const igst = !!doc.raw_extraction?.igst;
+  const docProject = doc.raw_extraction?.project_name || [...new Set(items.map(it => it.project_name).filter(Boolean))].join(', ');
   const printIt = () => window.print();
 
   return html`
@@ -26907,7 +26945,7 @@ function SalesDocPreview({ doc, plant, me, customers, vendors, onClose }) {
         <div style="text-align:right">
           <div><span style="color:#666">${isInvoice?'Invoice':'DC'} No: </span><strong style="font-family:monospace">${doc.doc_number}</strong></div>
           <div style="margin-top:3px"><span style="color:#666">Date: </span><strong>${fmtDMY(doc.doc_date)}</strong></div>
-          ${doc.raw_extraction?.project_name && html`<div style="margin-top:3px"><span style="color:#666">Project: </span><strong>${doc.raw_extraction.project_name}</strong></div>`}
+          ${docProject && html`<div style="margin-top:3px"><span style="color:#666">Project: </span><strong>${docProject}</strong></div>`}
           ${doc.raw_extraction?.po_reference && html`<div style="margin-top:3px"><span style="color:#666">PO ref: </span>${doc.raw_extraction.po_reference}</div>`}
           ${doc.raw_extraction?.vehicle_no && html`<div style="margin-top:3px"><span style="color:#666">Vehicle: </span>${doc.raw_extraction.vehicle_no}</div>`}
           ${doc.raw_extraction?.eway_bill && html`<div style="margin-top:3px"><span style="color:#666">E-way: </span>${doc.raw_extraction.eway_bill}</div>`}
