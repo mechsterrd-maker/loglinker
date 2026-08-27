@@ -26276,6 +26276,18 @@ function SetStartingNumberPanel({ plant, kind, onChanged }) {
     </div>`;
 }
 
+// A DC line points at one of these. The dropdown shows the stock CATEGORY
+// (raw material, spares, tools, consumables) or the machines/parts masters; the
+// picker below is then scoped to that category and searchable.
+const DC_PICK_CATS = [
+  { key: 'raw_material', label: '📦 Raw Material', kind: 'stock',   cat: 'raw_material' },
+  { key: 'die_spares',   label: '🔩 Spares',       kind: 'stock',   cat: 'die_spares' },
+  { key: 'tools',        label: '🛠 Tools',        kind: 'stock',   cat: 'tools' },
+  { key: 'consumables',  label: '🧴 Consumables',  kind: 'stock',   cat: 'consumables' },
+  { key: 'all',          label: '📦 Any stock item', kind: 'stock', cat: null },
+  { key: 'machines',     label: '🏭 Machines',     kind: 'machine', cat: null },
+  { key: 'part',         label: '🔧 Part',         kind: 'part',    cat: null },
+];
 function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors = [], onCounterChanged, onSaved, onCancel }) {
   const isInvoice = kind === 'invoice';
   const isReturnable = kind === 'rdc';
@@ -26301,7 +26313,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
     // 'stock' line (StockItemPicker from mcp_stocks_items). DC-out rows
     // tagged 'stock' carry a stock_item_id that the cascade trigger uses
     // to deduct stock without name guessing.
-    items: [{ kind: 'stock', part_id: '', stock_item_id: '', machine_id: '', project_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }],
+    items: [{ kind: 'stock', pickcat: 'raw_material', part_id: '', stock_item_id: '', machine_id: '', project_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }],
     cgst_pct: 9,
     sgst_pct: 9,
     igst_pct: 18,
@@ -26319,7 +26331,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   }, [plant?.id]);
 
   const setItem = (i, patch) => { if (showOverride) { setShowOverride(false); setErr(''); } setForm(f => ({ ...f, items: f.items.map((x, idx) => idx === i ? { ...x, ...patch } : x) })); };
-  const addItem = () => setForm(f => ({ ...f, items: [...f.items, { kind: 'stock', part_id: '', stock_item_id: '', machine_id: '', project_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }] }));
+  const addItem = () => setForm(f => ({ ...f, items: [...f.items, { kind: 'stock', pickcat: 'raw_material', part_id: '', stock_item_id: '', machine_id: '', project_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '' }] }));
   const removeItem = (i) => setForm(f => ({ ...f, items: f.items.length <= 1 ? f.items : f.items.filter((_, idx) => idx !== i) }));
   const recalcAmount = (i) => {
     const it = form.items[i];
@@ -26514,17 +26526,15 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
             <div key=${idx} style="border:1px solid var(--slate-200);border-radius:6px;padding:8px;background:var(--slate-50)">
               <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
                 <span style="font-size:11px;font-weight:600;color:var(--teal-700);min-width:18px">${idx+1}.</span>
-                <select value=${it.kind || 'stock'} onChange=${e => { const k = e.target.value; setItem(idx, { kind: k, part_id: '', stock_item_id: '', machine_id: '' }); }} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;font-weight:600;background:white" title="What kind of line is this?">
-                  <option value="stock">📦 Stock item</option>
-                  <option value="part">🔧 Part</option>
-                  <option value="machine">🛠 Machine</option>
+                <select value=${it.pickcat || 'raw_material'} onChange=${e => { const c = DC_PICK_CATS.find(x => x.key === e.target.value) || DC_PICK_CATS[0]; setItem(idx, { pickcat: c.key, kind: c.kind, part_id: '', stock_item_id: '', machine_id: '' }); }} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;font-weight:600;background:white" title="Category to pick from">
+                  ${DC_PICK_CATS.map(c => html`<option key=${c.key} value=${c.key}>${c.label}</option>`)}
                 </select>
                 <div style="flex:1;min-width:160px">
                   ${it.kind === 'part'
                     ? html`<${PartPicker} plant=${plant} value=${it.part_id} onChange=${(id, p) => setItem(idx, { part_id: id, name: p ? (p.part_number + ' · ' + (p.name || '')) : it.name })} placeholder="🔍 Search & pick part…" />`
-                    : (it.kind || 'stock') === 'stock'
-                    ? html`<${StockItemPicker} plant=${plant} value=${it.stock_item_id} onChange=${(id, p) => setItem(idx, { stock_item_id: id, name: p ? ((p.code ? p.code + ' · ' : '') + (p.name || '')) : it.name, uom: p?.uom || it.uom })} placeholder="🔍 Search & pick stock item…" />`
-                    : html`<${MachinePicker} plant=${plant} value=${it.machine_id} onChange=${(id, p) => setItem(idx, { machine_id: id, name: p ? ((p.code ? p.code + ' · ' : '') + (p.display_name || [p.make, p.model].filter(Boolean).join(' ') || p.code || '')) : it.name })} placeholder="🔍 Search & pick machine…" />`}
+                    : it.kind === 'machine'
+                    ? html`<${MachinePicker} plant=${plant} value=${it.machine_id} onChange=${(id, p) => setItem(idx, { machine_id: id, name: p ? ((p.code ? p.code + ' · ' : '') + (p.display_name || [p.make, p.model].filter(Boolean).join(' ') || p.code || '')) : it.name })} placeholder="🔍 Search & pick machine…" />`
+                    : html`<${StockItemPicker} plant=${plant} value=${it.stock_item_id} category=${(DC_PICK_CATS.find(x => x.key === it.pickcat) || {}).cat || null} onChange=${(id, p) => setItem(idx, { stock_item_id: id, name: p ? ((p.code ? p.code + ' · ' : '') + (p.name || '')) : it.name, uom: p?.uom || it.uom })} placeholder="🔍 Search & pick item…" />`}
                 </div>
                 ${form.items.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => removeItem(idx)} style="padding:2px 8px;font-size:11px">×</button>`}
               </div>
@@ -29153,7 +29163,7 @@ function IatfDocsLibrary() {
 // Stock item dropdown -- parallel to PartPicker but pulls from
 // mcp_stocks_items so the user can dispatch raw / sub-assembly inventory.
 // The DC create form switches between this and PartPicker per-row.
-function StockItemPicker({ plant, value, onChange, placeholder, allowClear = true }) {
+function StockItemPicker({ plant, value, onChange, placeholder, allowClear = true, category = null }) {
   const [items, setItems] = useState([]);
   const [search, setSearch] = useState('');
   const [open, setOpen] = useState(false);
@@ -29161,10 +29171,12 @@ function StockItemPicker({ plant, value, onChange, placeholder, allowClear = tru
   const wrapRef = useRef(null);
 
   useEffect(() => {
-    sb.from('mcp_stocks_items').select('id, code, name, uom, current_qty')
-      .eq('plant_id', plant.id).order('code')
-      .then(({ data }) => { setItems(data || []); setLoading(false); });
-  }, [plant.id]);
+    setLoading(true);
+    let q = sb.from('mcp_stocks_items').select('id, code, name, uom, current_qty')
+      .eq('plant_id', plant.id);
+    if (category) q = q.eq('category', category);
+    q.order('code').then(({ data }) => { setItems(data || []); setLoading(false); });
+  }, [plant.id, category]);
 
   useEffect(() => {
     if (!open) return;
