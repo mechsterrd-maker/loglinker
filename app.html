@@ -38604,6 +38604,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
   const [editing, setEditing] = useState(isNew);
   const [projects, setProjects] = useState([]);
   const [savingItem, setSavingItem] = useState(null);
+  const [inwarding, setInwarding] = useState(false);
   // Active/known projects, so each received material line can be assigned to a job.
   useEffect(() => {
     if (!plant?.id) return;
@@ -38642,6 +38643,30 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     if (error) { showToast(error.message); return; }
     setDoc(d => ({ ...d, items: next }));
     showToast(projectId ? '🏗 Assigned to project' : 'Project cleared');
+  };
+
+  // Push each line that has a project onto that project's Components list (WIP),
+  // via pc_receive. Marks the line so it can't be inwarded twice.
+  const inwardToComponents = async () => {
+    const cur = Array.isArray(doc.items) ? doc.items : [];
+    const todo = cur.filter(x => x.project_id && !x.inwarded_component && parseFloat(x.qty) > 0);
+    if (todo.length === 0) { showToast('Assign a project to the parts first (dropdown on each line)'); return; }
+    setInwarding(true);
+    const vendor = doc.mcp_logistics_vendors?.name || doc.vendor_name_raw || 'In-house';
+    try {
+      for (const x of todo) {
+        const { data, error } = await sb.rpc('pc_receive', {
+          p_project_id: x.project_id, p_name: (x.name || x.item_name || 'part'), p_qty: parseFloat(x.qty),
+          p_uom: x.uom || 'nos', p_stage: x.process || 'received', p_location: 'In-house',
+        });
+        if (error) throw error;
+        if (data && data.success === false) throw new Error(data.error);
+      }
+      const next = cur.map(x => (x.project_id && !x.inwarded_component && parseFloat(x.qty) > 0) ? { ...x, inwarded_component: true } : x);
+      await sb.from('mcp_logistics_documents').update({ items: next }).eq('id', doc.id);
+      setDoc(d => ({ ...d, items: next }));
+      showToast('✓ ' + todo.length + ' part' + (todo.length === 1 ? '' : 's') + ' inwarded to their projects');
+    } catch (e) { showToast('Failed: ' + e.message); } finally { setInwarding(false); }
   };
 
   if (isNew && editing) {
@@ -38762,6 +38787,18 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       `}
     `}
 
+    ${items.length > 0 && ['job_work_dc_in','dc_in','bill','invoice_in','interunit_dc_in'].includes(doc.doc_type) && html`
+      ${(() => {
+        const ready = items.filter(x => x.project_id && !x.inwarded_component && parseFloat(x.qty) > 0).length;
+        const done = items.filter(x => x.inwarded_component).length;
+        return html`<div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:6px">
+          <div style="font-weight:700;color:var(--teal-700);margin-bottom:4px">🧩 Inward parts to project components</div>
+          <div style="font-size:12px;color:var(--slate-700);margin-bottom:8px">Assign each line to its project (dropdowns below), then add them to those projects' Components lists — counted, no stock master.${done > 0 ? ' Already inwarded: ' + done + '.' : ''}</div>
+          <button class="btn" onClick=${inwardToComponents} disabled=${inwarding || ready === 0}>${inwarding ? 'Adding…' : (ready > 0 ? '📥 Inward ' + ready + ' part' + (ready === 1 ? '' : 's') + ' to projects' : 'Assign projects first')}</button>
+        </div>`;
+      })()}
+    `}
+
     ${items.length > 0 && html`
       <div class="section-h">Items · ${items.length}</div>
       ${items.map((it, i) => html`
@@ -38777,6 +38814,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
                   ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
                 </select>
                 ${savingItem === i && html`<span style="font-size:10px;color:var(--slate-400)">saving…</span>`}
+                ${it.inwarded_component && html`<span class="badge emerald" style="font-size:10px">✓ in project</span>`}
               </div>
             </div>
             ${it.amount && html`<span style="font-size:13px;font-weight:600">₹${fmtNum(it.amount)}</span>`}
