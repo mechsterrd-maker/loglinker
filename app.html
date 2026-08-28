@@ -38605,6 +38605,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
   const [projects, setProjects] = useState([]);
   const [savingItem, setSavingItem] = useState(null);
   const [inwarding, setInwarding] = useState(false);
+  const [openRdcs, setOpenRdcs] = useState([]); // returnable DCs still open for this doc's vendor
   // Active/known projects, so each received material line can be assigned to a job.
   useEffect(() => {
     if (!plant?.id) return;
@@ -38667,6 +38668,29 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       setDoc(d => ({ ...d, items: next }));
       showToast('✓ ' + todo.length + ' part' + (todo.length === 1 ? '' : 's') + ' inwarded to their projects');
     } catch (e) { showToast('Failed: ' + e.message); } finally { setInwarding(false); }
+  };
+
+  // Returnable DCs still open — matched to this document's vendor when possible, so
+  // you can close the sheet's RDC right after inwarding the parts it became.
+  useEffect(() => {
+    if (!doc?.id) return;
+    const vname = (doc.mcp_logistics_vendors?.name || doc.vendor_name_raw || '').toLowerCase().trim();
+    sb.from('mcp_rdc_lines').select('*').eq('plant_id', plant.id).in('status', ['open', 'partial']).order('sent_on')
+      .then(({ data }) => {
+        let rows = data || [];
+        if (vname) {
+          const m = rows.filter(r => { const pn = (r.party_name || '').toLowerCase().trim(); return pn && (pn.includes(vname) || vname.includes(pn)); });
+          rows = m.length ? m : rows; // no vendor match → show all so it can still be closed
+        }
+        setOpenRdcs(rows);
+      });
+  }, [doc?.id]);
+
+  const closeRdc = async (line) => {
+    const { data, error } = await sb.rpc('close_rdc_line', { p_line_id: line.id, p_reopen: false });
+    if (error || (data && data.success === false)) { showToast('Could not close: ' + (error?.message || data?.error || '')); return; }
+    showToast('🔁 Returnable DC closed');
+    setOpenRdcs(rs => rs.filter(r => r.id !== line.id));
   };
 
   if (isNew && editing) {
@@ -38797,6 +38821,22 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
           <button class="btn" onClick=${inwardToComponents} disabled=${inwarding || ready === 0}>${inwarding ? 'Adding…' : (ready > 0 ? '📥 Inward ' + ready + ' part' + (ready === 1 ? '' : 's') + ' to projects' : 'Assign projects first')}</button>
         </div>`;
       })()}
+    `}
+
+    ${openRdcs.length > 0 && ['job_work_dc_in','dc_in','bill','invoice_in','interunit_dc_in'].includes(doc.doc_type) && html`
+      <div class="card" style="background:#fff7ed;border-color:#fed7aa;margin-bottom:6px">
+        <div style="font-weight:700;color:var(--amber-800);margin-bottom:4px">🔁 Returnable DCs still open</div>
+        <div style="font-size:12px;color:var(--slate-700);margin-bottom:8px">The sheet/material you sent out has come back as these parts, so it won't "return" as itself — close its returnable DC here once you've received it.</div>
+        ${openRdcs.map(r => html`
+          <div key=${r.id} style="display:flex;justify-content:space-between;align-items:center;gap:8px;border-top:1px solid #fde68a;padding:6px 0">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.item_name || 'item'}</div>
+              <div style="font-size:11px;color:var(--slate-500)">${r.party_name || ''} · ${r.doc_id ? 'sent ' + fmtDMY(r.sent_on) : ''} · ${fmtNum(r.qty_sent)} ${r.uom || ''} out</div>
+            </div>
+            <button class="btn small" onClick=${() => closeRdc(r)} style="font-size:11px;white-space:nowrap">✓ Received &amp; close</button>
+          </div>
+        `)}
+      </div>
     `}
 
     ${items.length > 0 && html`
