@@ -3444,8 +3444,7 @@ function PlanDetail({ plant, me, planId, onBack }) {
   const [products, setProducts] = useState([]);
   const [materials, setMaterials] = useState([]);
   const [rq, setRq] = useState({});
-  const [mq, setMq] = useState({});
-  const [mu, setMu] = useState({}); // per-material return unit: 'nos' | 'kg'
+  const [retMat, setRetMat] = useState(null); // material being returned (offcut dialog)
   const [busy, setBusy] = useState(false);
 
   const reload = useCallback(async () => {
@@ -3474,14 +3473,6 @@ function PlanDetail({ plant, me, planId, onBack }) {
     const { data, error } = await sb.rpc('sc_plan_receive', { p_product_id: prod.id, p_qty: q });
     if (error || data?.success === false) { showToast('Failed'); return; }
     showToast(data.completed ? '✅ Plan complete · Returnable DC closed' : 'Received'); setRq(m => { const n = { ...m }; delete n[prod.id]; return n; }); reload();
-  };
-  const returnMat = async (mat, scrap) => {
-    const q = parseFloat(mq[mat.id] ?? 0);
-    if (!(q > 0)) { showToast('Enter the returned amount'); return; }
-    const unit = mu[mat.id] || 'nos';
-    const { data, error } = await sb.rpc('sc_material_return', { p_material_id: mat.id, p_qty: q, p_scrap: !!scrap, p_unit: unit });
-    if (error || data?.success === false) { showToast(error?.message || data?.error || 'Failed'); return; }
-    showToast(scrap ? 'Marked scrap' : ('↩ Offcut returned' + (unit === 'kg' ? ' · ' + fmtNum(data?.returned_nos) + ' sheet-eq' : ''))); setMq(m => { const n = { ...m }; delete n[mat.id]; return n; }); reload();
   };
 
   return html`
@@ -3518,16 +3509,91 @@ function PlanDetail({ plant, me, planId, onBack }) {
       <div class="card" key=${m.id} style="padding:10px 12px;margin-bottom:6px">
         <div style="font-size:13px;font-weight:600">${m.name || 'Material'}</div>
         <div style="font-size:11px;color:var(--slate-500);margin-bottom:6px">sent ${fmtNum(m.qty_sent)} ${m.uom}${m.qty_returned > 0 ? ' · returned ' + fmtNum(m.qty_returned) : ''}</div>
-        ${plan.status !== 'draft' && html`<div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
-          <input type="number" step="any" min=${0} placeholder="offcut" value=${mq[m.id] || ''} onInput=${e => setMq(x => ({ ...x, [m.id]: e.target.value }))} style="width:70px;padding:5px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
-          <select value=${mu[m.id] || 'nos'} onChange=${e => setMu(x => ({ ...x, [m.id]: e.target.value }))} style="padding:5px 4px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white" title="Enter the offcut as sheets or by weight">
-            <option value="nos">sheets</option>
-            <option value="kg">kg</option>
-          </select>
-          <button class="btn small ghost" onClick=${() => returnMat(m, false)} style="font-size:11px">↩ Return to stock</button>
-          <button class="btn small ghost" onClick=${() => returnMat(m, true)} style="font-size:11px">Scrap</button>
-        </div>`}
+        ${plan.status !== 'draft' && html`<button class="btn small ghost" onClick=${() => setRetMat(m)} style="font-size:11px">↩ Return offcut / scrap</button>`}
       </div>`)}
+
+    ${retMat && html`<${ReturnOffcutModal} plant=${plant} material=${retMat} onClose=${() => setRetMat(null)} onSaved=${() => { setRetMat(null); reload(); }} />`}
+  `;
+}
+
+// Return leftover raw material from a subcontract plan. A laser offcut is a smaller
+// rectangular SHEET (same material/thickness) — record its custom W×L and it goes to
+// stock as that size (weight auto-scaled by area). Also supports weight-only and scrap.
+function ReturnOffcutModal({ plant, material, onClose, onSaved }) {
+  const [mode, setMode] = useState('offcut'); // offcut | weight | scrap
+  const [orig, setOrig] = useState(null);
+  const [width, setWidth] = useState('');
+  const [length, setLength] = useState('');
+  const [qty, setQty] = useState('1');
+  const [kg, setKg] = useState('');
+  const [scrapQty, setScrapQty] = useState('');
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+
+  useEffect(() => {
+    if (!material.stock_item_id) return;
+    sb.from('mcp_stocks_items').select('*').eq('id', material.stock_item_id).maybeSingle().then(({ data }) => setOrig(data));
+  }, [material.stock_item_id]);
+
+  // Preview offcut weight, scaled from the parent sheet by area.
+  const preview = (() => {
+    if (!orig || !orig.unit_weight || !orig.dim2 || !orig.dim3) return null;
+    const w = parseFloat(width), l = parseFloat(length);
+    if (!(w > 0 && l > 0)) return null;
+    return Math.round(orig.unit_weight * (w * l) / (orig.dim2 * orig.dim3) * 1000) / 1000;
+  })();
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      let data, error;
+      if (mode === 'offcut') {
+        ({ data, error } = await sb.rpc('sc_material_return_offcut', { p_material_id: material.id, p_qty: parseFloat(qty) || 0, p_width: parseFloat(width) || 0, p_length: parseFloat(length) || 0 }));
+      } else if (mode === 'weight') {
+        ({ data, error } = await sb.rpc('sc_material_return', { p_material_id: material.id, p_qty: parseFloat(kg) || 0, p_scrap: false, p_unit: 'kg' }));
+      } else {
+        ({ data, error } = await sb.rpc('sc_material_return', { p_material_id: material.id, p_qty: parseFloat(scrapQty) || 0, p_scrap: true, p_unit: 'nos' }));
+      }
+      if (error) throw error;
+      if (data && data.success === false) throw new Error(data.error || 'Failed');
+      showToast(mode === 'scrap' ? 'Marked scrap' : ('↩ Returned to stock' + (mode === 'offcut' && data?.code ? ' · ' + data.code : '')));
+      onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  const thk = orig?.dim1;
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:440px">
+        <div class="modal-header"><div class="modal-title">Return leftover material</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        <div style="font-size:13px;font-weight:600;margin-bottom:2px">${material.name || 'Material'}</div>
+        <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">sent ${fmtNum(material.qty_sent)} ${material.uom}${thk ? ' · thickness ' + thk + ' mm' : ''}</div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div style="display:inline-flex;border:1px solid var(--slate-200);border-radius:6px;overflow:hidden;background:white;font-size:12px;font-weight:600;margin-bottom:12px">
+          ${[['offcut', '📐 Offcut sheet'], ['weight', '⚖ By weight'], ['scrap', '🗑 Scrap']].map(([k, lbl]) => html`
+            <button type="button" onClick=${() => setMode(k)} style=${'padding:7px 12px;border:none;cursor:pointer;background:' + (mode === k ? 'var(--teal-600)' : 'white') + ';color:' + (mode === k ? 'white' : 'var(--slate-600)')}>${lbl}</button>`)}
+        </div>
+        <form onSubmit=${submit}>
+          ${mode === 'offcut' && html`
+            <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">The leftover sheet's size (same material & thickness). It goes to stock as this size.</div>
+            <div class="field-row">
+              <div class="field"><label>Width (mm)</label><input type="number" step="any" min=${0} required value=${width} onInput=${e => setWidth(e.target.value)} placeholder="e.g. 600" /></div>
+              <div class="field"><label>Length (mm)</label><input type="number" step="any" min=${0} required value=${length} onInput=${e => setLength(e.target.value)} placeholder="e.g. 1200" /></div>
+            </div>
+            <div class="field"><label>How many such offcut sheets</label><input type="number" step="any" min=${0} required value=${qty} onChange=${e => setQty(e.target.value)} /></div>
+            ${preview != null && html`<div style="font-size:11px;color:var(--teal-700);margin:-4px 0 10px">≈ ${fmtNum(preview)} kg each · goes to stock as ${orig?.material || ''} Sheet ${thk ? thk + '×' : ''}${width || '?'}×${length || '?'}</div>`}
+          `}
+          ${mode === 'weight' && html`
+            <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">Just weigh the leftover — it's added back as sheet-equivalent using the parent sheet's weight.</div>
+            <div class="field"><label>Weight returned (kg)</label><input type="number" step="any" min=${0} required value=${kg} onChange=${e => setKg(e.target.value)} /></div>
+          `}
+          ${mode === 'scrap' && html`
+            <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">Not usable — just record it as scrap (no stock added).</div>
+            <div class="field"><label>Scrap qty (sheets)</label><input type="number" step="any" min=${0} required value=${scrapQty} onChange=${e => setScrapQty(e.target.value)} /></div>
+          `}
+          <button class="btn" disabled=${busy} style="width:100%">${busy ? 'Saving…' : (mode === 'scrap' ? 'Record scrap' : '↩ Return to stock')}</button>
+        </form>
+      </div>
+    </div>
   `;
 }
 
