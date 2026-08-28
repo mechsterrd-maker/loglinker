@@ -2423,6 +2423,7 @@ const MORE_GROUPS = [
       { key:'rdc_returns',   icon:'🔁', label:'Returnable DC tracker', sub:'Items sent on returnable DC · days out · mark received & close' },
       { key:'bom',           icon:'🧱', label:'Bill of Materials',     sub:'RM consumed per fabricated item / sub-job · drives stock issue & sub-contract' },
       { key:'project_history', icon:'🔎', label:'Project Material History', sub:'Search a project + date range · all material sent & received · net balance per item' },
+      { key:'subcontract_plans', icon:'🧾', label:'Subcontract Plans', sub:'Plan RM + products for a vendor · import to returnable DC · receive against plan · auto-close' },
       { key:'tpm',           icon:'🛠', label:'TPM Daily Checks',     sub:'30-sec machine checks · oil, coolant, leaks, guards' },
       { key:'maintenance',   icon:'🔧', label:'Maintenance',          sub:'Breakdowns log, machine status' },
       { key:'cutting',       icon:'✂️', label:'Cutting Planner',      sub:'1D cutting optimisation for rods, tubes, bars · auto layout with kerf · waste %' },
@@ -3386,6 +3387,232 @@ function BomEditorModal({ plant, me, editTarget, onClose, onSaved }) {
         </div>
       </div>
     </div>`;
+}
+
+// ============= SUBCONTRACT JOB PLANS =============
+// Planner sets vendor + products (planned qty per project) + raw materials to send.
+// Admin issues it as a Returnable DC, receives bills against the planned products;
+// the RDC closes when the plan is fulfilled. Leftover sheet recorded on return.
+const SC_STATUS = { draft:{c:'',l:'Draft'}, issued:{c:'amber',l:'Issued'}, receiving:{c:'amber',l:'Receiving'}, completed:{c:'emerald',l:'Completed'}, cancelled:{c:'',l:'Cancelled'} };
+function SubcontractPlans({ plant, me, activeUnit }) {
+  const [plans, setPlans] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState('open');
+  const [activeId, setActiveId] = useState(null);
+  const [newOpen, setNewOpen] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('mcp_subcontract_plans').select('*').eq('plant_id', plant.id).order('created_at', { ascending: false }).limit(200);
+    setPlans(data || []); setLoading(false);
+  }, [plant.id]);
+  useEffect(() => { refresh(); }, [refresh]);
+  useAutoRefresh(refresh);
+
+  if (activeId) return html`<${PlanDetail} plant=${plant} me=${me} planId=${activeId} onBack=${() => { setActiveId(null); refresh(); }} />`;
+
+  const shown = plans.filter(p => filter === 'all' ? true : filter === 'done' ? p.status === 'completed' : (p.status !== 'completed' && p.status !== 'cancelled'));
+
+  return html`
+    <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
+      <div><h1>🧾 Subcontract Plans</h1><div class="sub">Plan → Returnable DC → receive against plan → auto-close</div></div>
+      <button class="btn small" onClick=${() => setNewOpen(true)}>+ New plan</button>
+    </div>
+    <div class="auth-tabs" style="margin-bottom:12px">
+      <button class=${'auth-tab' + (filter === 'open' ? ' active' : '')} onClick=${() => setFilter('open')}>Open</button>
+      <button class=${'auth-tab' + (filter === 'done' ? ' active' : '')} onClick=${() => setFilter('done')}>Completed</button>
+      <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
+    </div>
+    ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+      shown.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🧾</div><div style="font-size:13px">No plans yet. Tap + New plan.</div></div></div>` :
+      shown.map(p => { const b = SC_STATUS[p.status] || { c: '', l: p.status }; return html`
+        <div class="card" key=${p.id} onClick=${() => setActiveId(p.id)} style="margin-bottom:6px;padding:12px 14px;cursor:pointer">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:13px;font-weight:600">${p.title || 'Plan'} · ${p.vendor_name || '—'}</div>
+              <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${fmtDMY(p.created_at)}${p.dc_doc_id ? ' · DC issued' : ''}</div>
+            </div>
+            <span class=${'badge ' + b.c}>${b.l}</span>
+          </div>
+        </div>`; })}
+    ${newOpen && html`<${NewPlanModal} plant=${plant} me=${me} onClose=${() => setNewOpen(false)} onSaved=${(id) => { setNewOpen(false); refresh(); if (id) setActiveId(id); }} />`}
+  `;
+}
+
+function PlanDetail({ plant, me, planId, onBack }) {
+  const [plan, setPlan] = useState(null);
+  const [products, setProducts] = useState([]);
+  const [materials, setMaterials] = useState([]);
+  const [rq, setRq] = useState({});
+  const [mq, setMq] = useState({});
+  const [busy, setBusy] = useState(false);
+
+  const reload = useCallback(async () => {
+    const [pl, pr, ma] = await Promise.all([
+      sb.from('mcp_subcontract_plans').select('*').eq('id', planId).maybeSingle(),
+      sb.from('mcp_subcontract_plan_products').select('*').eq('plan_id', planId).order('created_at'),
+      sb.from('mcp_subcontract_plan_materials').select('*').eq('plan_id', planId).order('created_at'),
+    ]);
+    setPlan(pl.data); setProducts(pr.data || []); setMaterials(ma.data || []);
+  }, [planId]);
+  useEffect(() => { reload(); }, [reload]);
+
+  if (!plan) return html`<div class="loader"><div class="spinner"></div></div>`;
+  const b = SC_STATUS[plan.status] || { c: '', l: plan.status };
+
+  const issue = async () => {
+    setBusy(true);
+    const { data, error } = await sb.rpc('sc_plan_issue_dc', { p_plan_id: planId, p_date: new Date().toISOString().slice(0, 10) });
+    setBusy(false);
+    if (error || data?.success === false) { showToast('Failed: ' + (error?.message || data?.error || '')); return; }
+    showToast('📦 Returnable DC ' + (data.doc_number || '') + ' created · stock deducted'); reload();
+  };
+  const receive = async (prod) => {
+    const q = parseFloat(rq[prod.id] ?? (prod.qty_planned - prod.qty_received));
+    if (!(q > 0)) { showToast('Enter a qty'); return; }
+    const { data, error } = await sb.rpc('sc_plan_receive', { p_product_id: prod.id, p_qty: q });
+    if (error || data?.success === false) { showToast('Failed'); return; }
+    showToast(data.completed ? '✅ Plan complete · Returnable DC closed' : 'Received'); setRq(m => { const n = { ...m }; delete n[prod.id]; return n; }); reload();
+  };
+  const returnMat = async (mat, scrap) => {
+    const q = parseFloat(mq[mat.id] ?? 0);
+    if (!(q > 0)) { showToast('Enter the returned qty'); return; }
+    const { data, error } = await sb.rpc('sc_material_return', { p_material_id: mat.id, p_qty: q, p_scrap: !!scrap });
+    if (error || data?.success === false) { showToast('Failed'); return; }
+    showToast(scrap ? 'Marked scrap' : '↩ Offcut returned to stock'); setMq(m => { const n = { ...m }; delete n[mat.id]; return n; }); reload();
+  };
+
+  return html`
+    <div class="page-header" style="display:flex;align-items:center;gap:10px">
+      <button class="btn ghost small" onClick=${onBack} style="padding:6px 10px">← Back</button>
+      <div style="flex:1;min-width:0"><h1 style="font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${plan.title || 'Plan'}</h1><div class="sub">${plan.vendor_name || '—'} · <span class=${'badge ' + b.c}>${b.l}</span></div></div>
+    </div>
+
+    ${plan.status === 'draft' && html`<div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:10px">
+      <div style="font-size:12px;color:var(--slate-700);margin-bottom:8px">Send the raw material to the vendor as a Returnable DC. Stock is deducted and the RDC starts tracking.</div>
+      <button class="btn" onClick=${issue} disabled=${busy || materials.length === 0}>${busy ? '…' : '📦 Import plan → Returnable DC'}</button>
+    </div>`}
+    ${plan.dc_doc_id && html`<div class="card" style="margin-bottom:10px;font-size:12px;color:var(--slate-600)">✅ Returnable DC issued. Receive bills against the products below — the RDC closes automatically when every product is fully received.</div>`}
+
+    <div class="section-h">Products · planned vs received</div>
+    ${products.length === 0 ? html`<div class="empty"><div style="font-size:13px">No products in this plan</div></div>` :
+      products.map(pr => { const pending = parseFloat(pr.qty_planned) - parseFloat(pr.qty_received); const done = pending <= 0; return html`
+      <div class="card" key=${pr.id} style="padding:10px 12px;margin-bottom:6px">
+        <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13px;font-weight:600">${pr.name}</div>
+            <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${pr.project_name ? pr.project_name + ' · ' : ''}<b>${fmtNum(pr.qty_received)}</b> / ${fmtNum(pr.qty_planned)} ${pr.uom}${done ? ' · ✅ done' : ' · pending ' + fmtNum(pending)}</div>
+          </div>
+          ${!done && plan.status !== 'draft' && html`<div style="display:flex;gap:4px;align-items:center">
+            <input type="number" step="any" min=${0} value=${rq[pr.id] ?? pending} onInput=${e => setRq(m => ({ ...m, [pr.id]: e.target.value }))} style="width:56px;padding:5px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+            <button class="btn small" onClick=${() => receive(pr)} style="font-size:11px">Receive</button>
+          </div>`}
+        </div>
+      </div>`; })}
+
+    <div class="section-h">Raw material sent · returnable</div>
+    ${materials.length === 0 ? html`<div class="empty"><div style="font-size:13px">No raw material recorded</div></div>` :
+      materials.map(m => html`
+      <div class="card" key=${m.id} style="padding:10px 12px;margin-bottom:6px">
+        <div style="font-size:13px;font-weight:600">${m.name || 'Material'}</div>
+        <div style="font-size:11px;color:var(--slate-500);margin-bottom:6px">sent ${fmtNum(m.qty_sent)} ${m.uom}${m.qty_returned > 0 ? ' · returned ' + fmtNum(m.qty_returned) : ''}</div>
+        ${plan.status !== 'draft' && html`<div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
+          <input type="number" step="any" min=${0} placeholder="offcut qty" value=${mq[m.id] || ''} onInput=${e => setMq(x => ({ ...x, [m.id]: e.target.value }))} style="width:80px;padding:5px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+          <button class="btn small ghost" onClick=${() => returnMat(m, false)} style="font-size:11px">↩ Return to stock</button>
+          <button class="btn small ghost" onClick=${() => returnMat(m, true)} style="font-size:11px">Scrap</button>
+        </div>`}
+      </div>`)}
+  `;
+}
+
+function NewPlanModal({ plant, me, onClose, onSaved }) {
+  const [vendors, setVendors] = useState([]);
+  const [projects, setProjects] = useState([]);
+  const [vendorId, setVendorId] = useState('');
+  const [title, setTitle] = useState('');
+  const [products, setProducts] = useState([{ name: '', project_id: '', qty: '', uom: 'nos' }]);
+  const [materials, setMaterials] = useState([{ stock_item_id: '', name: '', qty: '', uom: 'nos' }]);
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+
+  useEffect(() => {
+    sb.from('mcp_logistics_vendors').select('id, name').eq('plant_id', plant.id).order('name').then(({ data }) => setVendors(data || []));
+    sb.from('mcp_projects').select('id, code, name').eq('plant_id', plant.id).neq('status', 'completed').neq('status', 'cancelled').order('code', { ascending: true, nullsFirst: false }).order('name').then(({ data }) => setProjects(data || []));
+  }, [plant.id]);
+
+  const setProd = (i, patch) => setProducts(ps => ps.map((p, idx) => idx === i ? { ...p, ...patch } : p));
+  const setMat = (i, patch) => setMaterials(ms => ms.map((m, idx) => idx === i ? { ...m, ...patch } : m));
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      if (!vendorId) throw new Error('Pick a vendor');
+      const vp = products.filter(p => p.name.trim() && parseFloat(p.qty) > 0);
+      if (vp.length === 0) throw new Error('Add at least one product with a quantity');
+      const vm = materials.filter(m => (m.stock_item_id || m.name.trim()) && parseFloat(m.qty) > 0);
+      const vendor = vendors.find(v => v.id === vendorId);
+      const { data: plan, error } = await sb.from('mcp_subcontract_plans').insert({ plant_id: plant.id, vendor_id: vendorId, vendor_name: vendor?.name || null, title: title.trim() || null, status: 'draft', created_by: me.id }).select('id').single();
+      if (error) throw error;
+      const prodRows = vp.map(p => { const proj = projects.find(x => x.id === p.project_id); return { plan_id: plan.id, plant_id: plant.id, project_id: p.project_id || null, project_name: proj ? ((proj.code ? proj.code + ' · ' : '') + proj.name) : null, name: p.name.trim(), uom: p.uom || 'nos', qty_planned: parseFloat(p.qty) }; });
+      const { error: pe } = await sb.from('mcp_subcontract_plan_products').insert(prodRows);
+      if (pe) throw pe;
+      if (vm.length) {
+        const matRows = vm.map(m => ({ plan_id: plan.id, plant_id: plant.id, stock_item_id: m.stock_item_id || null, name: (m.name || '').trim() || null, uom: m.uom || 'nos', qty_sent: parseFloat(m.qty) }));
+        const { error: me2 } = await sb.from('mcp_subcontract_plan_materials').insert(matRows);
+        if (me2) throw me2;
+      }
+      showToast('🧾 Plan created'); onSaved(plan.id);
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:600px">
+        <div class="modal-header"><div class="modal-title">New subcontract plan</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Vendor *</label>
+              <select required value=${vendorId} onChange=${e => setVendorId(e.target.value)}><option value="">— Pick vendor —</option>${vendors.map(v => html`<option key=${v.id} value=${v.id}>${v.name}</option>`)}</select>
+            </div>
+            <div class="field"><label>Title</label><input type="text" value=${title} onChange=${e => setTitle(e.target.value)} placeholder="e.g. Laser cut - week 34" /></div>
+          </div>
+
+          <div class="field"><label>Products to be made *</label>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              ${products.map((p, i) => html`
+                <div key=${i} style="border:1px solid var(--slate-200);border-radius:6px;padding:8px;background:var(--slate-50)">
+                  <div style="display:flex;gap:6px;margin-bottom:4px">
+                    <input type="text" value=${p.name} onInput=${e => setProd(i, { name: e.target.value })} placeholder="Product / part name" style="flex:1;min-width:0;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                    <input type="number" step="any" min=${0} value=${p.qty} onInput=${e => setProd(i, { qty: e.target.value })} placeholder="Qty" style="width:60px;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                    ${products.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => setProducts(ps => ps.filter((_, idx) => idx !== i))} style="padding:2px 8px;font-size:11px">×</button>`}
+                  </div>
+                  <select value=${p.project_id} onChange=${e => setProd(i, { project_id: e.target.value })} style="width:100%;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white">
+                    <option value="">— project (optional) —</option>${projects.map(pr => html`<option key=${pr.id} value=${pr.id}>${pr.code ? pr.code + ' · ' : ''}${pr.name}</option>`)}
+                  </select>
+                </div>
+              `)}
+            </div>
+            <button type="button" class="btn small ghost" onClick=${() => setProducts(ps => [...ps, { name: '', project_id: '', qty: '', uom: 'nos' }])} style="font-size:12px;margin-top:6px">+ Add product</button>
+          </div>
+
+          <div class="field"><label>Raw material to send (returnable)</label>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              ${materials.map((m, i) => html`
+                <div key=${i} style="display:flex;gap:6px;align-items:center">
+                  <div style="flex:1;min-width:0"><${StockItemPicker} plant=${plant} value=${m.stock_item_id} category="raw_material" onChange=${(id, it) => setMat(i, { stock_item_id: id, name: it ? ((it.code ? it.code + ' · ' : '') + (it.name || '')) : m.name, uom: it?.uom || m.uom })} placeholder="🔍 Pick sheet / plate…" /></div>
+                  <input type="number" step="any" min=${0} value=${m.qty} onInput=${e => setMat(i, { qty: e.target.value })} placeholder="Qty" style="width:60px;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  ${materials.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => setMaterials(ms => ms.filter((_, idx) => idx !== i))} style="padding:2px 8px;font-size:11px">×</button>`}
+                </div>
+              `)}
+            </div>
+            <button type="button" class="btn small ghost" onClick=${() => setMaterials(ms => [...ms, { stock_item_id: '', name: '', qty: '', uom: 'nos' }])} style="font-size:12px;margin-top:6px">+ Add material</button>
+          </div>
+
+          <button class="btn" disabled=${busy} style="width:100%">${busy ? 'Saving…' : '🧾 Create plan (draft)'}</button>
+        </form>
+      </div>
+    </div>
+  `;
 }
 
 // ============= PROJECT MATERIAL HISTORY =============
@@ -4644,6 +4871,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'fettling'}><${FettlingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'rdc_returns'}><${RdcReturns} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'project_history'}><${ProjectMaterialHistory} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'subcontract_plans'}><${SubcontractPlans} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'bom'}><${BomModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
       <${Page} active=${denied}><${AccessDenied} moduleKey=${tab} /></${Page}>
@@ -10729,6 +10957,7 @@ const RBAC_MODULES = [
   { key:'fettling', label:'Fettling (contract work)', group:'ops' },
   { key:'rdc_returns', label:'Returnable DC tracker', group:'ops' },
   { key:'project_history', label:'Project Material History', group:'ops' },
+  { key:'subcontract_plans', label:'Subcontract Plans', group:'ops' },
   { key:'bom', label:'Bill of Materials', group:'ops' },
   { key:'quality', label:'Quality', group:'ops' },
   { key:'maintenance', label:'Maintenance', group:'ops' },
