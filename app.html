@@ -3445,6 +3445,7 @@ function PlanDetail({ plant, me, planId, onBack }) {
   const [materials, setMaterials] = useState([]);
   const [rq, setRq] = useState({});
   const [mq, setMq] = useState({});
+  const [mu, setMu] = useState({}); // per-material return unit: 'nos' | 'kg'
   const [busy, setBusy] = useState(false);
 
   const reload = useCallback(async () => {
@@ -3476,10 +3477,11 @@ function PlanDetail({ plant, me, planId, onBack }) {
   };
   const returnMat = async (mat, scrap) => {
     const q = parseFloat(mq[mat.id] ?? 0);
-    if (!(q > 0)) { showToast('Enter the returned qty'); return; }
-    const { data, error } = await sb.rpc('sc_material_return', { p_material_id: mat.id, p_qty: q, p_scrap: !!scrap });
-    if (error || data?.success === false) { showToast('Failed'); return; }
-    showToast(scrap ? 'Marked scrap' : '↩ Offcut returned to stock'); setMq(m => { const n = { ...m }; delete n[mat.id]; return n; }); reload();
+    if (!(q > 0)) { showToast('Enter the returned amount'); return; }
+    const unit = mu[mat.id] || 'nos';
+    const { data, error } = await sb.rpc('sc_material_return', { p_material_id: mat.id, p_qty: q, p_scrap: !!scrap, p_unit: unit });
+    if (error || data?.success === false) { showToast(error?.message || data?.error || 'Failed'); return; }
+    showToast(scrap ? 'Marked scrap' : ('↩ Offcut returned' + (unit === 'kg' ? ' · ' + fmtNum(data?.returned_nos) + ' sheet-eq' : ''))); setMq(m => { const n = { ...m }; delete n[mat.id]; return n; }); reload();
   };
 
   return html`
@@ -3517,7 +3519,11 @@ function PlanDetail({ plant, me, planId, onBack }) {
         <div style="font-size:13px;font-weight:600">${m.name || 'Material'}</div>
         <div style="font-size:11px;color:var(--slate-500);margin-bottom:6px">sent ${fmtNum(m.qty_sent)} ${m.uom}${m.qty_returned > 0 ? ' · returned ' + fmtNum(m.qty_returned) : ''}</div>
         ${plan.status !== 'draft' && html`<div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
-          <input type="number" step="any" min=${0} placeholder="offcut qty" value=${mq[m.id] || ''} onInput=${e => setMq(x => ({ ...x, [m.id]: e.target.value }))} style="width:80px;padding:5px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+          <input type="number" step="any" min=${0} placeholder="offcut" value=${mq[m.id] || ''} onInput=${e => setMq(x => ({ ...x, [m.id]: e.target.value }))} style="width:70px;padding:5px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+          <select value=${mu[m.id] || 'nos'} onChange=${e => setMu(x => ({ ...x, [m.id]: e.target.value }))} style="padding:5px 4px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white" title="Enter the offcut as sheets or by weight">
+            <option value="nos">sheets</option>
+            <option value="kg">kg</option>
+          </select>
           <button class="btn small ghost" onClick=${() => returnMat(m, false)} style="font-size:11px">↩ Return to stock</button>
           <button class="btn small ghost" onClick=${() => returnMat(m, true)} style="font-size:11px">Scrap</button>
         </div>`}
