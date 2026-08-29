@@ -21884,14 +21884,30 @@ function rtRenderDocument(template, ctx) {
     const extraCss = template.css ? rtSanitizeHtml(template.css) : '';
     const orient = (template.orientation === 'landscape') ? 'landscape' : 'portrait';
     const pageSize = template.page_size || 'A4';
+    // Print two acknowledgement copies — Original and Duplicate — each on its
+    // own A4 page so one can be signed and returned. A forced page break after
+    // the first copy means the duplicate always starts fresh, whether the doc
+    // fills half a page or overflows a whole one. The letterhead's existing
+    // "Original / Duplicate / Triplicate / …" line is swapped for this copy's
+    // own label; if the template has no such line we add a small marker.
+    const copyLineRe = /Original\s*\/\s*Duplicate(?:\s*\/\s*Triplicate)?(?:\s*\/\s*(?:File|Office|Extra)\s*Copy)?/i;
+    const copies = (ctx.doc && ctx.doc.__copies) || ['Original Copy', 'Duplicate Copy'];
+    const bodies = copies.map((label, i) => {
+      let c = body;
+      if (copyLineRe.test(c)) c = c.replace(copyLineRe, '(' + rtEsc(label) + ')');
+      else c = '<div style="text-align:right;font-size:11px;font-weight:bold;margin-bottom:6px">(' + rtEsc(label) + ')</div>' + c;
+      const last = i === copies.length - 1;
+      return '<div class="doc-copy"' + (last ? ' style="page-break-after:auto;break-after:auto"' : '') + '>' + c + '</div>';
+    }).join('');
     return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + rtEsc(docTitle) + '</title>' +
       '<style>@page{size:' + pageSize + ' ' + orient + ';margin:8mm}' +
       'body{font-family:"Times New Roman",Times,serif;color:#000;margin:0;padding:10mm}' +
       '.rt-btn{position:fixed;top:12px;right:12px;padding:9px 16px;background:#0d9488;color:white;border:none;border-radius:6px;font-weight:700;cursor:pointer;font-size:13px;box-shadow:0 2px 6px rgba(0,0,0,0.15);z-index:9999;font-family:system-ui}' +
+      '.doc-copy{page-break-after:always;break-after:page}.doc-copy:last-child{page-break-after:auto;break-after:auto}' +
       '@media print{.rt-btn{display:none}body{padding:0}}' +
       extraCss + '</style></head><body>' +
       '<button class="rt-btn" onclick="window.print()">🖨 Save as PDF / Print</button>' +
-      body +
+      bodies +
       '</body></html>';
   }
   const headers = rtInjectLogo((template.header_blocks || []).map(b => rtRenderBlock(b, ctx)).join(''), ctx.plant);
