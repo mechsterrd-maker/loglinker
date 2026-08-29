@@ -4844,7 +4844,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <div class="topbar">
         <div class="topbar-left">
           ${plant.logo_url
-            ? html`<img class="topbar-logo" src=${plant.logo_url} style="object-fit:cover;background:#fff" alt="${plant.name}" />`
+            ? html`<img class="topbar-logo" src=${plant.logo_url} style="width:auto;height:30px;max-width:132px;object-fit:contain;background:#fff;border-radius:6px;padding:2px" alt="${plant.name}" />`
             : html`<div class="topbar-logo">${(plant.name || 'L').trim().charAt(0).toUpperCase()}</div>`}
           <div>
             <div class="topbar-title">${plant.name || 'Loglinkr'}</div>
@@ -5092,7 +5092,7 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, logout, onPr
     <div class="topnav-desktop">
       <div class="brand" onClick=${() => setTab('home')} title=${plant.name}>
         ${plant.logo_url
-          ? html`<img class="brand-mark" src=${plant.logo_url} style="object-fit:cover;background:#fff" alt="${plant.name}" />`
+          ? html`<img class="brand-mark" src=${plant.logo_url} style="width:auto;height:30px;max-width:150px;object-fit:contain;background:#fff;border-radius:6px;padding:2px" alt="${plant.name}" />`
           : html`<div class="brand-mark">${(plant.name || 'L').trim().charAt(0).toUpperCase()}</div>`}
         <div class="brand-text">
           <div class="brand-name">${plant.name || 'Loglinkr'}</div>
@@ -21839,10 +21839,34 @@ function rtExpandHtmlTemplate(htmlIn, ctx) {
 //      layout with two-column headers, multi-cell footers etc.
 //   2. { header_blocks, table, footer_blocks } — original block schema,
 //      kept for petty cash and any older templates already saved.
+// Put the plant's real logo into a rendered document. Handles two cases with
+// no per-template editing: an explicit {{plant.logo}} token, and the literal
+// "LOGO" dashed-box placeholder the AI drops in when it rebuilds a letterhead
+// from a scan. Runs on the raw template HTML BEFORE token expansion so the
+// {{plant.logo}} token isn't first resolved to a bare (escaped) URL string.
+function rtInjectLogo(htmlStr, plant) {
+  let out = String(htmlStr || '');
+  const logo = plant && plant.logo_url;
+  const img = logo
+    ? '<img src="' + rtEsc(logo) + '" alt="" style="max-height:74px;max-width:240px;width:auto;height:auto;object-fit:contain;vertical-align:middle" />'
+    : '';
+  // Explicit token — supported even before the logo exists (expands to nothing).
+  out = out.replace(/\{\{\s*plant\.logo(?:_url)?\s*\}\}/gi, () => img);
+  if (!logo) return out;
+  // Inline placeholder box (div/span/p) whose ONLY content is the logo word →
+  // swap the WHOLE box so the wide logo isn't clipped to a small square. The
+  // inner pattern forbids '<', so a wrapping <div>…<div>LOGO</div>…</div> never
+  // matches the outer div and swallows the real placeholder — only the leaf hits.
+  out = out.replace(/<(div|span|p)\b[^>]*>\s*\[?\s*(?:company\s+|business\s+|your\s+)?logo\s*\]?\s*<\/\1>/gi, () => img);
+  // Placeholder that is a whole table cell → keep the cell, replace its text.
+  out = out.replace(/(<(?:td|th)\b[^>]*>)\s*\[?\s*(?:company\s+|business\s+|your\s+)?logo\s*\]?\s*(<\/(?:td|th)>)/gi, (m, open, close) => open + img + close);
+  return out;
+}
+
 function rtRenderDocument(template, ctx) {
   const docTitle = template.title || 'Report';
   if (template.html && String(template.html).trim().length > 0) {
-    const body = rtExpandHtmlTemplate(rtSanitizeHtml(template.html), ctx);
+    const body = rtExpandHtmlTemplate(rtInjectLogo(rtSanitizeHtml(template.html), ctx.plant), ctx);
     const extraCss = template.css ? rtSanitizeHtml(template.css) : '';
     const orient = (template.orientation === 'landscape') ? 'landscape' : 'portrait';
     const pageSize = template.page_size || 'A4';
@@ -21856,7 +21880,7 @@ function rtRenderDocument(template, ctx) {
       body +
       '</body></html>';
   }
-  const headers = (template.header_blocks || []).map(b => rtRenderBlock(b, ctx)).join('');
+  const headers = rtInjectLogo((template.header_blocks || []).map(b => rtRenderBlock(b, ctx)).join(''), ctx.plant);
   const table   = rtRenderTable(template.table, ctx);
   const footers = (template.footer_blocks || []).map(b => rtRenderBlock(b, ctx)).join('');
   return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + rtEsc(docTitle) + '</title><style>' + RT_PRINT_CSS + '</style></head><body>' +
