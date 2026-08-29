@@ -27449,12 +27449,18 @@ function PoPackingPreview({ doc, plant, me, customers, vendors, onClose }) {
   `;
 }
 
-function SalesDocPreview({ doc, plant, me, customers, vendors, onClose }) {
+function SalesDocPreview({ doc: docProp, plant, me, customers, vendors, onClose }) {
+  const [doc, setDoc] = useState(docProp);
+  const [editing, setEditing] = useState(false);
   // PO and Packing List get their own print layout; DC/Invoice path below is unchanged.
   if (doc.doc_type === 'po' || doc.doc_type === 'packing_list') {
     return html`<${PoPackingPreview} doc=${doc} plant=${plant} me=${me} customers=${customers} vendors=${vendors} onClose=${onClose} />`;
   }
   const isInvoice = doc.doc_type === 'invoice_out';
+  // Correction window: the person who made the DC can edit it for 24h after creation.
+  const createdMs = doc.created_at ? new Date(doc.created_at).getTime() : 0;
+  const within24h = createdMs && (Date.now() - createdMs) < 24 * 3600 * 1000;
+  const canEdit = within24h && doc.created_by === me.id;
   const custId = doc.raw_extraction?.customer_id || doc.vendor_id;
   const cust = customers.find(c => c.id === custId) || (doc.raw_extraction?.customer || null);
   const items = Array.isArray(doc.items) ? doc.items : [];
@@ -27466,7 +27472,9 @@ function SalesDocPreview({ doc, plant, me, customers, vendors, onClose }) {
     <div class="page-header" style="display:flex;align-items:center;gap:10px">
       <button class="btn ghost small" onClick=${onClose} style="padding:6px 10px">← Back</button>
       <div style="flex:1"><h1 style="font-size:18px">${isInvoice ? '🧾 Tax Invoice' : '📦 Delivery Challan'} · ${doc.doc_number}</h1></div>
+      ${canEdit && html`<button class="btn ghost small" onClick=${() => setEditing(true)} style="padding:6px 10px" title="You can edit this for 24 hours after creating it">✏️ Edit</button>`}
     </div>
+    ${editing && html`<${DcEditModal} plant=${plant} me=${me} doc=${doc} onClose=${() => setEditing(false)} onSaved=${(updated) => { setDoc(updated); setEditing(false); }} />`}
     <${DocFormatBar} plant=${plant} me=${me} doc=${doc} party=${cust} isInvoice=${isInvoice} onPrintDefault=${printIt} defaultView=${html`
     <style>
       @media print {
@@ -27555,6 +27563,123 @@ function SalesDocPreview({ doc, plant, me, customers, vendors, onClose }) {
       </div>
     </div>
     `} />
+  `;
+}
+
+// 24-hour correction window for a DC / Invoice / RDC. Edits the header fields and the
+// existing item lines (not the stock item a line points to). For a plain DC (dc_out)
+// any quantity change is reconciled to stock as a delta, since stock was deducted once
+// at creation and the trigger doesn't re-fire on update.
+function DcEditModal({ plant, me, doc, onClose, onSaved }) {
+  const isInvoice = doc.doc_type === 'invoice_out';
+  const raw = doc.raw_extraction || {};
+  const [form, setForm] = useState({
+    doc_date: doc.doc_date || '',
+    vehicle_no: raw.vehicle_no || '',
+    eway_bill: raw.eway_bill || '',
+    po_reference: raw.po_reference || '',
+    notes: doc.notes || '',
+  });
+  const [items, setItems] = useState((Array.isArray(doc.items) ? doc.items : []).map(it => ({ ...it })));
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const setItem = (i, patch) => setItems(arr => arr.map((x, idx) => idx === i ? { ...x, ...patch } : x));
+  const removeItem = (i) => setItems(arr => arr.filter((_, idx) => idx !== i));
+
+  const taxable = items.reduce((s, it) => s + (parseFloat(it.amount) || 0), 0);
+  const igst = !!raw.igst;
+  const taxPct = igst ? (parseFloat(raw.igst_pct) || 18) : ((parseFloat(raw.cgst_pct) || 9) + (parseFloat(raw.sgst_pct) || 9));
+  const taxAmt = isInvoice ? taxable * taxPct / 100 : 0;
+
+  const submit = async (e) => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try {
+      const clean = items.filter(it => (it.name || '').trim() && parseFloat(it.qty) > 0).map(it => ({
+        ...it,
+        name: (it.name || '').trim(),
+        qty: parseFloat(it.qty),
+        uom: it.uom || 'nos',
+        hsn: it.hsn || null,
+        rate: isInvoice && it.rate ? parseFloat(it.rate) : (it.rate ?? null),
+        amount: isInvoice && it.amount ? parseFloat(it.amount) : (it.amount ?? null),
+      }));
+      if (clean.length === 0) throw new Error('Keep at least one item with a quantity');
+
+      const newRaw = { ...raw, vehicle_no: form.vehicle_no || null, eway_bill: form.eway_bill || null, po_reference: form.po_reference || null };
+      const payload = {
+        doc_date: form.doc_date || null,
+        items: clean,
+        raw_extraction: newRaw,
+        notes: form.notes || null,
+      };
+      if (isInvoice) { payload.taxable_value = taxable; payload.tax_amount = taxAmt; payload.total_value = taxable + taxAmt; }
+
+      // Stock delta for a plain DC (dc_out): compare old vs new qty per stock item.
+      if (doc.doc_type === 'dc_out') {
+        const sum = (arr) => { const m = {}; (arr || []).forEach(it => { if (it.stock_item_id) m[it.stock_item_id] = (m[it.stock_item_id] || 0) + (parseFloat(it.qty) || 0); }); return m; };
+        const before = sum(doc.items), after = sum(clean);
+        const ids = [...new Set([...Object.keys(before), ...Object.keys(after)])];
+        const txns = [];
+        for (const id of ids) {
+          const d = (after[id] || 0) - (before[id] || 0);
+          if (Math.abs(d) < 1e-9) continue;
+          txns.push({ plant_id: plant.id, item_id: id, txn_type: d > 0 ? 'issue' : 'adjustment_in', qty: Math.abs(d),
+            reference: 'DC edit: ' + (doc.doc_number || ''), notes: d > 0 ? 'Extra issued on DC edit' : 'Returned to stock on DC edit', performed_by: me.id, document_id: doc.id });
+        }
+        if (txns.length) { const { error: te } = await sb.from('mcp_stocks_transactions').insert(txns); if (te) throw te; }
+      }
+
+      const { data, error } = await sb.from('mcp_logistics_documents').update(payload).eq('id', doc.id).select('*').single();
+      if (error) throw error;
+      showToast('✓ ' + (doc.doc_number || 'Document') + ' updated');
+      onSaved(data);
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:600px">
+        <div class="modal-header"><div class="modal-title">Edit ${doc.doc_number || 'document'}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">Correction window — you can edit this for 24 hours after creating it. The document number stays the same.</div>
+        ${err && html`<div class="alert error" style="white-space:pre-line">${err}</div>`}
+        <form onSubmit=${submit}>
+          <div class="field-row">
+            <div class="field"><label>Doc date</label><${DateField} value=${form.doc_date} onChange=${e => setForm({ ...form, doc_date: e.target.value })} /></div>
+            <div class="field"><label>Vehicle no</label><input type="text" value=${form.vehicle_no} onChange=${e => setForm({ ...form, vehicle_no: e.target.value })} /></div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>E-way bill</label><input type="text" value=${form.eway_bill} onChange=${e => setForm({ ...form, eway_bill: e.target.value })} /></div>
+            <div class="field"><label>Reference / PO</label><input type="text" value=${form.po_reference} onChange=${e => setForm({ ...form, po_reference: e.target.value })} /></div>
+          </div>
+
+          <div class="field"><label>Items</label>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              ${items.map((it, i) => html`
+                <div key=${i} style="border:1px solid var(--slate-200);border-radius:6px;padding:8px;background:var(--slate-50)">
+                  <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
+                    <span style="font-size:11px;color:var(--teal-700);font-weight:600;min-width:16px">${i + 1}.</span>
+                    <input type="text" value=${it.name || ''} onInput=${e => setItem(i, { name: e.target.value })} placeholder="Item" style="flex:1;min-width:0;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                    ${it.stock_item_id && html`<span class="badge slate" style="font-size:9px" title="Stock line — qty change adjusts stock">📦</span>`}
+                    ${items.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => removeItem(i)} style="padding:2px 8px;font-size:11px">×</button>`}
+                  </div>
+                  <div style=${'display:grid;grid-template-columns:' + (isInvoice ? '0.7fr 0.6fr 0.5fr 0.8fr 0.8fr' : '1fr 0.7fr 0.6fr') + ';gap:6px'}>
+                    <input type="text" value=${it.hsn || ''} onInput=${e => setItem(i, { hsn: e.target.value })} placeholder="HSN" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                    <input type="number" step="any" min=${0} value=${it.qty} onInput=${e => setItem(i, { qty: e.target.value })} placeholder="Qty" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                    <input type="text" value=${it.uom || 'nos'} onInput=${e => setItem(i, { uom: e.target.value })} placeholder="UoM" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                    ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.rate || ''} onInput=${e => setItem(i, { rate: e.target.value, amount: ((parseFloat(e.target.value) || 0) * (parseFloat(it.qty) || 0)).toFixed(2) })} placeholder="Rate" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />`}
+                    ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.amount || ''} onInput=${e => setItem(i, { amount: e.target.value })} placeholder="Amount" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;font-weight:600" />`}
+                  </div>
+                </div>
+              `)}
+            </div>
+          </div>
+
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({ ...form, notes: e.target.value })}></textarea></div>
+          <button class="btn" disabled=${busy} style="width:100%">${busy ? 'Saving…' : '💾 Save changes'}</button>
+        </form>
+      </div>
+    </div>
   `;
 }
 
