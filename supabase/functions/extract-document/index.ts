@@ -1,4 +1,4 @@
-// extract-document/index.ts — v28 (capture customer_part_number per line item)
+// extract-document/index.ts — v29 (extract PDF bills via document block, not image)
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { Image } from "https://deno.land/x/imagescript@1.2.17/mod.ts";
@@ -8,7 +8,7 @@ const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-sonnet-4-6";
-const WORKER_VERSION = "v28";
+const WORKER_VERSION = "v29";
 // Claude Sonnet 4.6 pricing (USD per token). Update here if the model/pricing changes.
 const PRICE_IN_PER_TOK  = 3 / 1_000_000;
 const PRICE_OUT_PER_TOK = 15 / 1_000_000;
@@ -191,26 +191,34 @@ async function attemptExtraction(url: string, contextText: string): Promise<Atte
   let imgB64 = bytesToBase64(bytes);
   let mediaType = imgRes.headers.get("content-type") || "image/jpeg";
   if (mediaType.includes(";")) mediaType = mediaType.split(";")[0].trim();
-  if (!["image/jpeg","image/png","image/webp","image/gif"].includes(mediaType)) mediaType = "image/jpeg";
+  // A PDF bill must go to Claude as a document block, NOT an image — mislabeling
+  // PDF bytes as image/jpeg (the old behaviour) made every PDF extraction fail.
+  const isPdf = mediaType === "application/pdf" || /\.pdf(\?|$)/i.test(url);
   const rotationLog: number[] = [];
   let rotIn = 0, rotOut = 0;
-  {
+  let contentBlock: unknown;
+  if (isPdf) {
+    // Rotation detection/correction is image-only; PDFs carry their own page orientation.
+    contentBlock = { type: "document", source: { type: "base64", media_type: "application/pdf", data: imgB64 } };
+  } else {
+    if (!["image/jpeg","image/png","image/webp","image/gif"].includes(mediaType)) mediaType = "image/jpeg";
     const rot = await detectRotationDeg(imgB64, mediaType);
     rotIn = rot.inTok; rotOut = rot.outTok;
     if (rot.deg !== 0) {
       const rotated = await rotateImageBytes(bytes, rot.deg);
       if (rotated) { bytes = rotated.bytes; mediaType = rotated.mediaType; imgB64 = bytesToBase64(bytes); rotationLog.push(rot.deg); }
     }
+    contentBlock = { type: "image", source: { type: "base64", media_type: mediaType, data: imgB64 } };
   }
   const totalRotationDeg = rotationLog.reduce((s, d) => s + d, 0) % 360;
-  // Static rules ride in the cacheable system prompt; only the image + per-plant context vary.
+  // Static rules ride in the cacheable system prompt; only the image/PDF + per-plant context vary.
   const visionRes = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
     body: JSON.stringify({ model: MODEL, max_tokens: 3072,
       system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
       messages: [{ role: "user", content: [
-        { type: "image", source: { type: "base64", media_type: mediaType, data: imgB64 } },
+        contentBlock,
         { type: "text", text: contextText },
       ] }] }),
   });
