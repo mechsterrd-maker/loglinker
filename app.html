@@ -8995,36 +8995,43 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
     const { data: groupsData } = await unitGroupScope(sb.from('chat_groups').select('*').contains('members', [user.id]));
     const groupsList = groupsData || [];
 
-    // Get unread count + last message preview for each group
-    const enriched = await Promise.all(groupsList.map(async (g) => {
-      const lastRead = getLastRead(g.id);
-      const lastReadIso = new Date(lastRead || 0).toISOString();
-
-      // Count unread (messages newer than lastRead, not from self)
-      const { count } = await sb.from('chat_messages')
-        .select('id', { count: 'exact', head: true })
-        .eq('group_id', g.id)
-        .gt('created_at', lastReadIso)
-        .neq('sender_id', user.id);
-
-      // Last message — without users join to avoid RLS issues
-      const { data: lastMsgRaw } = await sb.from('chat_messages')
-        .select('body, attachments, created_at, sender_id')
-        .eq('group_id', g.id)
+    // Unread + last-message preview for every group. This used to fire ~3
+    // requests PER group (unread count, last message, sender name); once the
+    // plant has many channels (system lanes + a channel per project) that
+    // N+1 fan-out saturated the browser connection pool and the chat stuck on
+    // its spinner. Collapse it to a few BULK queries instead.
+    const groupIds = groupsList.map(g => g.id);
+    let enriched = groupsList.map(g => ({ ...g, unread: 0, lastMsg: null }));
+    if (groupIds.length) {
+      // One query: recent messages across all my groups (newest first).
+      const { data: recentRaw } = await sb.from('chat_messages')
+        .select('group_id, body, attachments, created_at, sender_id')
+        .in('group_id', groupIds)
         .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      let lastMsg = null;
-      if (lastMsgRaw) {
-        lastMsg = { ...lastMsgRaw, users: null };
-        if (lastMsgRaw.sender_id) {
-          const { data: sender } = await sb.from('users').select('full_name').eq('id', lastMsgRaw.sender_id).maybeSingle();
-          lastMsg.users = sender;
+        .limit(2000);
+      const recent = recentRaw || [];
+      const lastByGroup = {};
+      const unreadByGroup = {};
+      for (const m of recent) {
+        if (!lastByGroup[m.group_id]) lastByGroup[m.group_id] = m;
+        const lr = getLastRead(m.group_id) || 0;
+        if (m.sender_id !== user.id && new Date(m.created_at).getTime() > lr) {
+          unreadByGroup[m.group_id] = (unreadByGroup[m.group_id] || 0) + 1;
         }
       }
-
-      return { ...g, unread: count || 0, lastMsg };
-    }));
+      // One query: sender names for the last-message previews.
+      const senderIds = [...new Set(Object.values(lastByGroup).map(m => m.sender_id).filter(Boolean))];
+      const nameById = {};
+      if (senderIds.length) {
+        const { data: senders } = await sb.from('users').select('id, full_name').in('id', senderIds);
+        (senders || []).forEach(s => { nameById[s.id] = s.full_name; });
+      }
+      enriched = groupsList.map(g => {
+        const lm = lastByGroup[g.id];
+        const lastMsg = lm ? { ...lm, users: lm.sender_id ? { full_name: nameById[lm.sender_id] || null } : null } : null;
+        return { ...g, unread: unreadByGroup[g.id] || 0, lastMsg };
+      });
+    }
 
     // Sort: groups with unread first, then by last message time
     enriched.sort((a, b) => {
