@@ -21568,7 +21568,7 @@ function rtResolveValue(hint, ctx) {
 function rtFormatValue(val, format) {
   if (val == null || val === '') return '';
   if (format === 'currency') return '₹' + fmtNum(Number(val).toFixed(0));
-  if (format === 'date') return String(val);
+  if (format === 'date') return /^\d{4}-\d{2}-\d{2}/.test(String(val)) ? fmtDMY(String(val)) : String(val);
   if (format === 'number') return fmtNum(val);
   return String(val);
 }
@@ -21705,22 +21705,25 @@ function rtBuildDocCtx({ doc, plant, party, isInvoice }) {
   const isPacking = doc.doc_type === 'packing_list';
   const pt = raw.packing_totals || {};
 
+  // Print dates in Indian DD/MM/YYYY. Idempotent: only reformats an ISO
+  // (YYYY-MM-DD) value, so an already-formatted or {{…|date}} value passes through.
+  const fmtRtDate = v => { const s = String(v || ''); return /^\d{4}-\d{2}-\d{2}/.test(s) ? fmtDMY(s) : s; };
   const docFields = {
     doc_number:        doc.doc_number,
-    doc_date:          doc.doc_date,
-    due_date:          raw.delivery_date || raw.expected_return_date || '',
+    doc_date:          fmtRtDate(doc.doc_date),
+    due_date:          fmtRtDate(raw.delivery_date || raw.expected_return_date || ''),
     po_number:         raw.po_reference || '',
-    po_date:           raw.po_date || '',
+    po_date:           fmtRtDate(raw.po_date || ''),
     ref_number:        raw.ref_number || '',
     notes:             doc.notes || '',
     payment_terms:     raw.payment_terms || '',
     delivery_terms:    raw.delivery_terms || raw.transport || '',
-    return_by_date:    raw.expected_return_date || '',
+    return_by_date:    fmtRtDate(raw.expected_return_date || ''),
     purpose:           raw.purpose || '',
     transport_mode:    raw.transport || '',
     vehicle_no:        raw.vehicle_no || '',
     lr_number:         raw.lr_number || '',
-    lr_date:           raw.lr_date || '',
+    lr_date:           fmtRtDate(raw.lr_date || ''),
     transporter_name:  raw.transporter_name || '',
     eway_bill_no:      raw.eway_bill || raw.eway_bill_no || '',
     place_of_supply:   raw.place_of_supply || '',
