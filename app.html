@@ -21769,6 +21769,16 @@ function rtBuildDocCtx({ doc, plant, party, isInvoice }) {
   // project), and make sure an approx weight is present (qty × unit weight) so a
   // template's weight column fills even on older items.
   const docProj = docFields.project_name;
+  // Older docs stored the item name as "AUTO-CODE · Editable Name" (the picker
+  // used to bake the stock/part code in). Print only the editable name. Strip a
+  // leading segment only when it's a single code-like token (no spaces), so a
+  // hand-typed name that happens to contain " · " between words is left intact.
+  const stripItemCode = n => {
+    const s = String(n || '');
+    const i = s.indexOf(' · ');
+    if (i < 0) return s;
+    return /\s/.test(s.slice(0, i).trim()) ? s : s.slice(i + 3);
+  };
   const rows = items.map(it => {
     const proj = it.project_name || docProj || '';
     const gw = (it.gross_weight != null && it.gross_weight !== '')
@@ -21779,6 +21789,7 @@ function rtBuildDocCtx({ doc, plant, party, isInvoice }) {
     // already contains the size, so this replaces the redundant dimension.
     return {
       ...it,
+      name: stripItemCode(it.name),
       size: proj ? ('Project: ' + proj) : (it.size || null),
       gross_weight: gw,
       weight: it.weight != null ? it.weight : gw,
@@ -27007,10 +27018,10 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
                 </select>
                 <div style="flex:1;min-width:160px">
                   ${it.kind === 'part'
-                    ? html`<${PartPicker} plant=${plant} value=${it.part_id} onChange=${(id, p) => setItem(idx, { part_id: id, name: p ? (p.part_number + ' · ' + (p.name || '')) : it.name })} placeholder="🔍 Search & pick part…" />`
+                    ? html`<${PartPicker} plant=${plant} value=${it.part_id} onChange=${(id, p) => setItem(idx, { part_id: id, name: p ? (p.name || p.part_number || '') : it.name })} placeholder="🔍 Search & pick part…" />`
                     : it.kind === 'machine'
-                    ? html`<${MachinePicker} plant=${plant} value=${it.machine_id} onChange=${(id, p) => setItem(idx, { machine_id: id, name: p ? ((p.code ? p.code + ' · ' : '') + (p.display_name || [p.make, p.model].filter(Boolean).join(' ') || p.code || '')) : it.name })} placeholder="🔍 Search & pick machine…" />`
-                    : html`<${StockItemPicker} plant=${plant} value=${it.stock_item_id} category=${(DC_PICK_CATS.find(x => x.key === it.pickcat) || {}).cat || null} onChange=${(id, p) => setItem(idx, { stock_item_id: id, name: p ? ((p.code ? p.code + ' · ' : '') + (p.name || '')) : it.name, uom: p?.uom || it.uom })} placeholder="🔍 Search & pick item…" />`}
+                    ? html`<${MachinePicker} plant=${plant} value=${it.machine_id} onChange=${(id, p) => setItem(idx, { machine_id: id, name: p ? (p.display_name || [p.make, p.model].filter(Boolean).join(' ') || p.code || '') : it.name })} placeholder="🔍 Search & pick machine…" />`
+                    : html`<${StockItemPicker} plant=${plant} value=${it.stock_item_id} category=${(DC_PICK_CATS.find(x => x.key === it.pickcat) || {}).cat || null} onChange=${(id, p) => setItem(idx, { stock_item_id: id, name: p ? (p.name || p.code || '') : it.name, uom: p?.uom || it.uom })} placeholder="🔍 Search & pick item…" />`}
                 </div>
                 ${form.items.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => removeItem(idx)} style="padding:2px 8px;font-size:11px">×</button>`}
               </div>
