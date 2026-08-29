@@ -27457,10 +27457,11 @@ function SalesDocPreview({ doc: docProp, plant, me, customers, vendors, onClose 
     return html`<${PoPackingPreview} doc=${doc} plant=${plant} me=${me} customers=${customers} vendors=${vendors} onClose=${onClose} />`;
   }
   const isInvoice = doc.doc_type === 'invoice_out';
-  // Correction window: the person who made the DC can edit it for 24h after creation.
+  // Correction window: the person who made the DC (or a manager) can edit it for
+  // 24h after creation.
   const createdMs = doc.created_at ? new Date(doc.created_at).getTime() : 0;
   const within24h = createdMs && (Date.now() - createdMs) < 24 * 3600 * 1000;
-  const canEdit = within24h && doc.created_by === me.id;
+  const canEdit = within24h && (doc.created_by === me.id || ['plant_head', 'admin'].includes(me.role));
   const custId = doc.raw_extraction?.customer_id || doc.vendor_id;
   const cust = customers.find(c => c.id === custId) || (doc.raw_extraction?.customer || null);
   const items = Array.isArray(doc.items) ? doc.items : [];
@@ -27469,10 +27470,10 @@ function SalesDocPreview({ doc: docProp, plant, me, customers, vendors, onClose 
   const printIt = () => window.print();
 
   return html`
-    <div class="page-header" style="display:flex;align-items:center;gap:10px">
-      <button class="btn ghost small" onClick=${onClose} style="padding:6px 10px">← Back</button>
-      <div style="flex:1"><h1 style="font-size:18px">${isInvoice ? '🧾 Tax Invoice' : '📦 Delivery Challan'} · ${doc.doc_number}</h1></div>
-      ${canEdit && html`<button class="btn ghost small" onClick=${() => setEditing(true)} style="padding:6px 10px" title="You can edit this for 24 hours after creating it">✏️ Edit</button>`}
+    <div class="page-header" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <button class="btn ghost small" onClick=${onClose} style="padding:6px 10px;flex-shrink:0">← Back</button>
+      <div style="flex:1;min-width:0"><h1 style="font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${isInvoice ? '🧾 Tax Invoice' : '📦 Delivery Challan'} · ${doc.doc_number}</h1></div>
+      ${canEdit && html`<button class="btn small" onClick=${() => setEditing(true)} style="padding:6px 12px;flex-shrink:0;background:var(--teal-600);color:white" title="You can edit this for 24 hours after creating it">✏️ Edit</button>`}
     </div>
     ${editing && html`<${DcEditModal} plant=${plant} me=${me} doc=${doc} onClose=${() => setEditing(false)} onSaved=${(updated) => { setDoc(updated); setEditing(false); }} />`}
     <${DocFormatBar} plant=${plant} me=${me} doc=${doc} party=${cust} isInvoice=${isInvoice} onPrintDefault=${printIt} defaultView=${html`
