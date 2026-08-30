@@ -1,0 +1,5 @@
+-- Plan-issued returnable DC: carry each material's weight (unit + gross=unit×qty)
+-- from the RM master so the DC Approx Weight auto-fills, and list the plan's
+-- expected products in the DC notes. Applied via MCP; tracked mirror.
+-- (Full function body — see sc_plan_issue_dc.)
+-- See migration chat: adds unit_weight/gross_weight/weight to v_items and builds v_notes from mcp_subcontract_plan_products.

@@ -1,0 +1,4 @@
+-- Retroactively add weight + plan-product notes to already-issued plan returnable
+-- DCs (idempotent: weight only when missing; notes only if not already appended).
+-- Matches each DC line to its RM stock item by the code before ' · ' in the name.
+-- Applied via MCP; tracked mirror. Marvel plant.
