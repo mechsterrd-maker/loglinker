@@ -9665,7 +9665,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
                         </div>
                       `;
                     }
-                    return html`<div>${renderBody(m.body)}</div>`;
+                    return html`<div style="white-space:pre-wrap">${renderBody(m.body)}</div>`;
                   })()}
                   ${atts.map((a, i) => a.isVoice
                     ? html`<${VoiceNoteAtt} key=${i} url=${a.url} type=${a.type} duration=${a.duration} />`
@@ -23317,13 +23317,19 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
   const [components, setComponents] = useState([]); // per-project WIP components (cut parts etc.)
   const [receiveOpen, setReceiveOpen] = useState(false);
   const [compAction, setCompAction] = useState(null); // { mode:'send'|'dispatch', comp }
+  const [expenses, setExpenses] = useState({ total: 0, docs: [] }); // accurate per-item expenses for THIS project
+  const [expensesOpen, setExpensesOpen] = useState(false);
   const restricted = isProjectRestricted(myPerms);
 
   const reload = useCallback(async () => {
-    const [m, d, c] = await Promise.all([
+    const [m, d, c, e1, e2] = await Promise.all([
       sb.from('mcp_project_milestones').select('*').eq('project_id', project.id).order('seq'),
       sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, total_value, stage_id, created_at').eq('project_id', project.id).eq('hide_from_project', false).order('created_at',{ascending:false}).limit(40),
       sb.from('mcp_project_components').select('*').eq('project_id', project.id).order('created_at'),
+      // Accurate expenses: any bill with a line item assigned to this project…
+      sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, items, project_id').eq('plant_id', plant.id).contains('items', [{ project_id: project.id }]).limit(300),
+      // …plus bills tagged to this project at the document level.
+      sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, items, project_id').eq('project_id', project.id).limit(300),
     ]);
     const all = m.data || [];
     const tops = all.filter(x => !x.parent_id);
@@ -23335,7 +23341,22 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
     setSubs(childMap);
     setBills(d.data || []);
     setComponents(c.data || []);
-  }, [project.id]);
+    // Compute this project's expenses from per-item amounts (item's own project,
+    // falling back to the document's project) — the same rule as the chat slices.
+    const byId = {};
+    [...(e1.data || []), ...(e2.data || [])].forEach(dd => { byId[dd.id] = dd; });
+    let exTotal = 0; const exDocs = [];
+    Object.values(byId).forEach(dd => {
+      const its = Array.isArray(dd.items) ? dd.items : [];
+      const rel = its.filter(it => (it.project_id || dd.project_id || null) === project.id);
+      if (!rel.length) return;
+      const sub = rel.reduce((s, it) => s + (parseFloat(it.amount) || 0), 0);
+      exTotal += sub;
+      exDocs.push({ id: dd.id, doc_type: dd.doc_type, doc_number: dd.doc_number, doc_date: dd.doc_date, vendor: dd.vendor_name_raw, items: rel, subtotal: sub });
+    });
+    exDocs.sort((a, b) => new Date(b.doc_date || 0) - new Date(a.doc_date || 0));
+    setExpenses({ total: exTotal, docs: exDocs });
+  }, [project.id, plant.id]);
   useEffect(()=>{ reload(); }, [reload]);
   useEffect(()=>{ setProgressDraft(project.progress_pct||0); setWeightDraft(project.actual_weight_kg||''); }, [project.id]);
 
@@ -23457,6 +23478,38 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
             </div>
           `;
         })}
+    </div>
+
+    <div class="card" style="padding:0;margin-bottom:10px;overflow:hidden">
+      <div onClick=${() => setExpensesOpen(o => !o)} style="display:flex;align-items:center;gap:12px;padding:14px;cursor:pointer">
+        <div style="font-size:22px">💰</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;font-weight:700;color:var(--slate-600)">Project expenses</div>
+          <div style="font-family:'Bricolage Grotesque',sans-serif;font-size:20px;font-weight:700;color:var(--slate-900);line-height:1.1;margin-top:2px">₹${fmtNum(expenses.total)}</div>
+          <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${expenses.docs.length} bill${expenses.docs.length === 1 ? '' : 's'} · only this project's items counted</div>
+        </div>
+        <div style="font-size:16px;color:var(--slate-400);transform:${expensesOpen ? 'rotate(90deg)' : 'none'};transition:transform .12s">▸</div>
+      </div>
+      ${expensesOpen && html`
+        <div style="border-top:1px solid var(--slate-100)">
+          ${expenses.docs.length === 0 ? html`<div style="padding:14px;font-size:12px;color:var(--slate-400)">No bills assigned to this project yet. Assign bill items to this project in the bill processor.</div>` :
+            expenses.docs.map(dd => html`
+              <div key=${dd.id} style="padding:12px 14px;border-top:1px solid var(--slate-100)">
+                <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+                  <div style="font-size:12px;font-weight:700;color:var(--slate-800)">🧾 ${(dd.doc_type || 'document').replace(/_/g, ' ')} · ${dd.vendor || '—'}</div>
+                  <div style="font-size:13px;font-weight:700;color:var(--teal-700);white-space:nowrap">₹${fmtNum(dd.subtotal)}</div>
+                </div>
+                <div style="font-size:10px;color:var(--slate-400);margin-bottom:6px">${dd.doc_number || 'no number'}${dd.doc_date ? ' · ' + fmtDMY(dd.doc_date) : ''}</div>
+                ${dd.items.map((it, k) => html`
+                  <div key=${k} style="display:flex;justify-content:space-between;gap:10px;font-size:12px;color:var(--slate-600);padding:2px 0">
+                    <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">• ${it.name || 'item'}${it.qty ? ' × ' + fmtNum(it.qty) + ' ' + (it.uom || 'nos') : ''}</span>
+                    <span style="white-space:nowrap;color:var(--slate-500)">${it.amount ? '₹' + fmtNum(it.amount) : '—'}</span>
+                  </div>
+                `)}
+              </div>
+            `)}
+        </div>
+      `}
     </div>
 
     <div class="card" style="padding:14px;margin-bottom:10px">
