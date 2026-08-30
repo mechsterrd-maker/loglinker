@@ -3461,7 +3461,7 @@ function BomEditorModal({ plant, me, editTarget, onClose, onSaved }) {
 // Admin issues it as a Returnable DC, receives bills against the planned products;
 // the RDC closes when the plan is fulfilled. Leftover sheet recorded on return.
 const SC_STATUS = { draft:{c:'',l:'Draft'}, issued:{c:'amber',l:'Issued'}, receiving:{c:'amber',l:'Receiving'}, completed:{c:'emerald',l:'Completed'}, cancelled:{c:'',l:'Cancelled'} };
-function SubcontractPlans({ plant, me, activeUnit }) {
+function SubcontractPlans({ plant, me, activeUnit, go }) {
   const [plans, setPlans] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('open');
@@ -3476,7 +3476,7 @@ function SubcontractPlans({ plant, me, activeUnit }) {
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
 
-  if (activeId) return html`<${PlanDetail} plant=${plant} me=${me} planId=${activeId} onBack=${() => { setActiveId(null); refresh(); }} />`;
+  if (activeId) return html`<${PlanDetail} plant=${plant} me=${me} planId=${activeId} go=${go} onBack=${() => { setActiveId(null); refresh(); }} />`;
 
   const shown = plans.filter(p => filter === 'all' ? true : filter === 'done' ? p.status === 'completed' : (p.status !== 'completed' && p.status !== 'cancelled'));
 
@@ -3506,7 +3506,7 @@ function SubcontractPlans({ plant, me, activeUnit }) {
   `;
 }
 
-function PlanDetail({ plant, me, planId, onBack }) {
+function PlanDetail({ plant, me, planId, onBack, go }) {
   const [plan, setPlan] = useState(null);
   const [products, setProducts] = useState([]);
   const [materials, setMaterials] = useState([]);
@@ -3527,12 +3527,21 @@ function PlanDetail({ plant, me, planId, onBack }) {
   if (!plan) return html`<div class="loader"><div class="spinner"></div></div>`;
   const b = SC_STATUS[plan.status] || { c: '', l: plan.status };
 
-  const issue = async () => {
-    setBusy(true);
-    const { data, error } = await sb.rpc('sc_plan_issue_dc', { p_plan_id: planId, p_date: new Date().toISOString().slice(0, 10) });
-    setBusy(false);
-    if (error || data?.success === false) { showToast('Failed: ' + (error?.message || data?.error || '')); return; }
-    showToast('📦 Returnable DC ' + (data.doc_number || '') + ' created · stock deducted'); reload();
+  // Open the DC create form pre-filled from this plan (materials + plan-item notes)
+  // instead of auto-creating — the user reviews, adds approx value / transport, and
+  // Save creates the returnable DC (via sc_plan_issue_dc with the edited data).
+  const issue = () => {
+    const items = (materials || []).filter(m => parseFloat(m.qty_sent || 0) > 0).map(m => ({
+      kind: 'stock', pickcat: 'raw_material', part_id: '', stock_item_id: m.stock_item_id || '',
+      machine_id: '', project_id: '', name: m.name || '', hsn: '',
+      qty: String(m.qty_sent ?? ''), uom: m.uom || 'nos', rate: '', amount: '', approx_value: '',
+    }));
+    if (!items.length) { showToast('Add raw material to send first'); return; }
+    const prodNotes = (products || []).map(p => '• ' + (p.name || 'part') + ' — ' + (p.qty_planned ?? '') + ' ' + (p.uom || 'nos') + (p.project_name ? ' [' + p.project_name + ']' : '')).join('\n');
+    const notes = (plan.notes ? plan.notes + '\n\n' : '') + (prodNotes ? 'Plan items (to make & return):\n' + prodNotes : '');
+    const prefill = { plan_id: planId, plan_title: plan.title || '', party_type: 'vendor', vendor_id: plan.vendor_id || '', vendor_name: plan.vendor_name || '', notes, items };
+    try { sessionStorage.setItem('loglinkr_plan_dc_prefill', JSON.stringify(prefill)); } catch (_) {}
+    if (go) go('sales_docs', 'new_rdc'); else showToast('Open Documents → + RDC to create the DC');
   };
   const receive = async (prod) => {
     const q = parseFloat(rq[prod.id] ?? (prod.qty_planned - prod.qty_received));
@@ -3550,7 +3559,7 @@ function PlanDetail({ plant, me, planId, onBack }) {
 
     ${plan.status === 'draft' && html`<div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:10px">
       <div style="font-size:12px;color:var(--slate-700);margin-bottom:8px">Send the raw material to the vendor as a Returnable DC. Stock is deducted and the RDC starts tracking.</div>
-      <button class="btn" onClick=${issue} disabled=${busy || materials.length === 0}>${busy ? '…' : '📦 Import plan → Returnable DC'}</button>
+      <button class="btn" onClick=${issue} disabled=${materials.length === 0}>📦 Import to DC form (review &amp; issue)</button>
     </div>`}
     ${plan.dc_doc_id && html`<div class="card" style="margin-bottom:10px;font-size:12px;color:var(--slate-600)">✅ Returnable DC issued. Receive bills against the products below — the RDC closes automatically when every product is fully received.</div>`}
 
@@ -5044,7 +5053,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'fettling'}><${FettlingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'rdc_returns'}><${RdcReturns} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'project_history'}><${ProjectMaterialHistory} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${pageTab === 'subcontract_plans'}><${SubcontractPlans} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'subcontract_plans'}><${SubcontractPlans} plant=${plant} me=${me} activeUnit=${activeUnit} go=${go} /></${Page}>
       <${Page} active=${pageTab === 'bom'}><${BomModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
       <${Page} active=${denied}><${AccessDenied} moduleKey=${tab} /></${Page}>
@@ -27015,6 +27024,8 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   const [err, setErr] = useState('');
   const [showOverride, setShowOverride] = useState(false); // shown after a stock shortfall
   const [projects, setProjects] = useState([]);
+  const [planId, setPlanId] = useState('');       // set when this RDC came from a subcontract plan
+  const [planTitle, setPlanTitle] = useState('');
   // Load active projects so a DC can be issued against one (fabrication jobs).
   useEffect(() => {
     if (!plant?.id) return;
@@ -27022,6 +27033,17 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
       .eq('plant_id', plant.id).neq('status', 'completed').neq('status', 'cancelled')
       .order('code', { ascending: true, nullsFirst: false }).order('name').then(({ data }) => setProjects(data || []));
   }, [plant?.id]);
+  // Pre-fill from a subcontract plan ("Issue DC" opens this form instead of auto-creating).
+  useEffect(() => {
+    if (!isReturnable) return;
+    let pf = null;
+    try { const raw = sessionStorage.getItem('loglinkr_plan_dc_prefill'); if (raw) { pf = JSON.parse(raw); sessionStorage.removeItem('loglinkr_plan_dc_prefill'); } } catch (_) {}
+    if (!pf) return;
+    setPlanId(pf.plan_id || ''); setPlanTitle(pf.plan_title || '');
+    if (pf.party_type === 'vendor') setPartyType('vendor');
+    if (pf.vendor_id && pf.vendor_name) setAddedParties(prev => prev.some(x => x.id === pf.vendor_id) ? prev : [{ id: pf.vendor_id, name: pf.vendor_name, _kind: 'vendor' }, ...prev]);
+    setForm(f => ({ ...f, customer_id: pf.vendor_id || f.customer_id, notes: pf.notes || f.notes, items: (Array.isArray(pf.items) && pf.items.length) ? pf.items : f.items }));
+  }, []);
 
   const setItem = (i, patch) => { if (showOverride) { setShowOverride(false); setErr(''); } setForm(f => ({ ...f, items: f.items.map((x, idx) => idx === i ? { ...x, ...patch } : x) })); };
   const addItem = () => setForm(f => ({ ...f, items: [...f.items, { kind: 'stock', pickcat: 'raw_material', part_id: '', stock_item_id: '', machine_id: '', project_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '', approx_value: '' }] }));
@@ -27069,6 +27091,26 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
             return;
           }
         }
+      }
+
+      // Plan-issued RDC: create via the plan routine (it owns the returnable DC,
+      // stock deduction and plan status) with the edited items + notes.
+      if (planId) {
+        const planItems = validItems.map(it => ({
+          name: it.name.trim(),
+          stock_item_id: it.kind === 'stock' ? (it.stock_item_id || null) : null,
+          project_id: it.project_id || null,
+          hsn: it.hsn || null,
+          qty: parseFloat(it.qty),
+          uom: it.uom || 'nos',
+          approx_value: (it.approx_value !== '' && it.approx_value != null) ? parseFloat(it.approx_value) : null,
+        }));
+        const { data: pd, error: pErr } = await sb.rpc('sc_plan_issue_dc', { p_plan_id: planId, p_date: form.doc_date, p_items: planItems, p_notes: form.notes || null });
+        setBusy(false);
+        if (pErr || pd?.success === false) { setErr('Failed: ' + (pErr?.message || pd?.error || '')); return; }
+        showToast('📦 Returnable DC ' + (pd.doc_number || '') + ' created · stock deducted');
+        onSaved && onSaved();
+        return;
       }
 
       const party = partyList.find(c => c.id === form.customer_id);
@@ -27163,6 +27205,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
       <div style="font-size:11px;color:var(--slate-500);margin-top:2px">Next number — assigned atomically when you save. Continuous per plant per financial year.</div>
       ${(me?.role === 'plant_head' || me?.role === 'admin') && html`<${SetStartingNumberPanel} plant=${plant} kind=${kind} onChanged=${onCounterChanged} />`}
     </div>
+    ${planId && html`<div class="card" style="margin-bottom:12px;padding:10px 12px;background:#eef6ff;border-color:#bfdbfe;font-size:12px;color:var(--slate-700)">🧵 From subcontract plan${planTitle ? ' · ' + planTitle : ''} — materials, vendor and plan items are pre-filled. Add approx value / transport, then Save to issue the returnable DC.</div>`}
 
     ${err && html`<div class="alert error" style="white-space:pre-line">${err}</div>`}
     ${showOverride && html`<button type="button" class="btn" onClick=${(e) => submit(e, true)} disabled=${busy} style="background:var(--amber-600);margin-bottom:10px">⚠ Issue anyway — allow negative stock</button>`}

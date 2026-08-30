@@ -1,0 +1,4 @@
+-- Plan-issued DC now creatable from the (pre-filled, edited) DC form: sc_plan_issue_dc
+-- accepts optional p_items (with approx_value etc.) and p_notes; falls back to
+-- building from the plan when absent. Stock deduction + status stay plan-driven.
+-- (Full body applied via MCP — see chat.) Drops the old 2-arg signature.
