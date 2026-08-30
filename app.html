@@ -9556,8 +9556,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
     ? groupMembers.filter(mem => (mem.full_name || '').toLowerCase().includes(mentionQuery)).slice(0, 6)
     : [];
 
-  if (activeGroup) {
-    return html`
+  const threadPane = activeGroup ? html`
       <div class="chat-thread">
         <div class="thread-header">
           <button class="thread-back" onClick=${() => setActiveGroup(null)}>←</button>
@@ -9780,10 +9779,40 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
         ${editMsgTarget && html`<${MessageEditModal} message=${editMsgTarget} onClose=${() => setEditMsgTarget(null)} onSaved=${() => { setEditMsgTarget(null); loadMessages(activeGroup.id); }} />`}
         ${forwardMsgTarget && html`<${MessageForwardModal} plant=${plant} me=${me} message=${forwardMsgTarget} currentGroupId=${activeGroup.id} onClose=${() => setForwardMsgTarget(null)} onSaved=${() => { setForwardMsgTarget(null); }} />`}
       </div>
-    `;
-  }
+    ` : html`<div class="chat-empty-pane"><div style="font-size:34px">💬</div><div style="margin-top:8px;font-size:14px">Select a chat to start messaging</div></div>`;
+
+  // Categorise groups into a WhatsApp-style sectioned list: system/company
+  // channels, a Projects folder (with bill counts), and people/DMs.
+  const isProjGrp = g => !!(g.metadata && g.metadata.project_id);
+  const isDMGrp = g => g.type === 'dm' || (g.name || '').startsWith('DM:');
+  const companyGroups = groups.filter(g => !isProjGrp(g) && !isDMGrp(g));
+  const projectGroups = groups.filter(isProjGrp).sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), undefined, { numeric: true }));
+  const dmGroups = groups.filter(g => isDMGrp(g) && !isProjGrp(g));
+  const groupRow = (g) => {
+    const last = g.lastMsg;
+    const lastWho = last?.users?.full_name?.split(' ')[0];
+    const lastBody = last?.body || (Array.isArray(last?.attachments) && last.attachments.length ? '📎 ' + (last.attachments[0].name || 'attachment') : '');
+    const preview = last ? (lastWho ? lastWho + ': ' + lastBody : lastBody) : g.members.length + ' member' + (g.members.length > 1 ? 's' : '');
+    const active = activeGroup && activeGroup.id === g.id;
+    return html`
+      <div class=${'chat-item' + (active ? ' active' : '')} key=${g.id} onClick=${() => setActiveGroup(g)} style=${active ? 'border-color:var(--teal-400);background:var(--teal-50)' : ''}>
+        <div class="chat-avatar" style="overflow:hidden">${g.icon_url ? html`<img src=${g.icon_url} style="width:100%;height:100%;object-fit:cover" />` : (g.name[0] === '#' ? '#' : g.name[0])}</div>
+        <div class="chat-info" style="flex:1;min-width:0">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+            <div class="chat-name" style=${g.unread > 0 ? 'font-weight:700' : ''}>${g.name}${g.ai_logistics_enabled ? html` <span style="font-size:10px;background:var(--teal-100);color:var(--teal-700);padding:1px 6px;border-radius:999px;font-weight:600;vertical-align:middle">🤖 AI</span>` : ''}</div>
+            ${isProjGrp(g) && g.billCount > 0 ? html`<span class="bill-badge">🧾 ${g.billCount}</span>` : (last && html`<div style="font-size:11px;color:var(--slate-400);flex-shrink:0">${fmtDate(last.created_at)}</div>`)}
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:2px">
+            <div class="chat-preview" style=${g.unread > 0 ? 'color:var(--slate-700);font-weight:500' : ''}>${preview}</div>
+            ${g.unread > 0 && html`<span style="background:var(--teal-600);color:white;font-size:11px;font-weight:700;padding:2px 7px;border-radius:999px;min-width:20px;text-align:center;flex-shrink:0">${g.unread}</span>`}
+          </div>
+        </div>
+      </div>`;
+  };
 
   return html`
+    <div class=${'chat-shell' + (activeGroup ? ' has-active' : '')}>
+      <div class="chat-nav">
     <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start"><div><h1>Chat</h1><div class="sub">Plant communication</div></div><div style="display:flex;gap:8px;margin-top:6px">${canBroadcast && html`<button class="btn small" onClick=${() => setBroadcastOpen(true)} style="background:var(--teal-600);color:white" title="Send one message to every unit group">📢 Broadcast</button>`}<button class="btn small" onClick=${() => setGroupModal(true)}>+ New Group</button></div></div>
     <${PendingTasksPanel} plant=${plant} me=${me} setTab=${setTab} />
     ${notifPerm === 'default' && html`
@@ -9804,32 +9833,23 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
     `}
     ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
       groups.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">💬</div>No chat groups yet</div></div>` :
-      html`<div class="chat-list">
-        ${groups.map(g => {
-          const last = g.lastMsg;
-          const lastWho = last?.users?.full_name?.split(' ')[0];
-          const lastBody = last?.body || (Array.isArray(last?.attachments) && last.attachments.length ? '📎 ' + (last.attachments[0].name || 'attachment') : '');
-          const preview = last ? (lastWho ? lastWho + ': ' + lastBody : lastBody) : g.members.length + ' member' + (g.members.length > 1 ? 's' : '');
-          return html`
-            <div class="chat-item" key=${g.id} onClick=${() => setActiveGroup(g)}>
-              <div class="chat-avatar" style="overflow:hidden">${g.icon_url ? html`<img src=${g.icon_url} style="width:100%;height:100%;object-fit:cover" />` : (g.name[0] === '#' ? '#' : g.name[0])}</div>
-              <div class="chat-info">
-                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-                  <div class="chat-name" style=${g.unread > 0 ? 'font-weight:700' : ''}>${g.name}${g.ai_logistics_enabled ? html` <span style="font-size:10px;background:var(--teal-100);color:var(--teal-700);padding:1px 6px;border-radius:999px;font-weight:600;vertical-align:middle">🤖 AI</span>` : ''}</div>
-                  ${last && html`<div style="font-size:11px;color:var(--slate-400);flex-shrink:0">${fmtDate(last.created_at)}</div>`}
-                </div>
-                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:2px">
-                  <div class="chat-preview" style=${g.unread > 0 ? 'color:var(--slate-700);font-weight:500' : ''}>${preview}</div>
-                  ${g.unread > 0 && html`<span style="background:var(--teal-600);color:white;font-size:11px;font-weight:700;padding:2px 7px;border-radius:999px;min-width:20px;text-align:center;flex-shrink:0">${g.unread}</span>`}
-                </div>
-              </div>
-            </div>
-          `;
-        })}
-      </div>`
+      html`
+        ${companyGroups.length > 0 && html`
+          <div class="chat-sec">Channels <span class="cnt">${companyGroups.length}</span></div>
+          <div class="chat-list">${companyGroups.map(groupRow)}</div>`}
+        ${projectGroups.length > 0 && html`
+          <div class=${'chat-sec fold' + (projectsOpen ? ' open' : '')} onClick=${() => setProjectsOpen(o => !o)}>
+            📁 Projects <span class="cnt">${projectGroups.length}</span><span class="fold-caret">▸</span>
+          </div>
+          ${projectsOpen && html`<div class="chat-list">${projectGroups.map(groupRow)}</div>`}`}
+        ${dmGroups.length > 0 && html`
+          <div class="chat-sec">People <span class="cnt">${dmGroups.length}</span></div>
+          <div class="chat-list">${dmGroups.map(groupRow)}</div>`}
+      `
     }
+      </div>
+      <div class="chat-main">${threadPane}</div>
 
-    ${taskFromMsg && html`<${AssignTaskFromMsgModal} plant=${plant} me=${me} message=${taskFromMsg} group=${activeGroup} onClose=${() => setTaskFromMsg(null)} onSaved=${() => setTaskFromMsg(null)} />`}
     ${groupModal && html`<${GroupCreateModal} plant=${plant} me=${me} user=${user} onClose=${() => setGroupModal(false)} onSaved=${() => { setGroupModal(false); loadGroups(); }} />`}
     ${broadcastOpen && html`
       <div class="modal-backdrop active" onClick=${() => setBroadcastOpen(false)}>
@@ -9840,6 +9860,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
           <button class="btn" style="width:100%;margin-top:12px;background:var(--teal-600)" disabled=${bcBusy || !bcText.trim()} onClick=${sendBroadcast}>${bcBusy ? 'Sending…' : '📢 Send to all units'}</button>
         </div>
       </div>`}
+    </div>
   `;
 }
 
