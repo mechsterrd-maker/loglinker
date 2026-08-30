@@ -39427,6 +39427,17 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
   const [openRdcs, setOpenRdcs] = useState([]); // returnable DCs still open for this doc's vendor
   const [rdcQty, setRdcQty] = useState({});     // per-line qty typed for a partial receive
   const [isPlanner, setIsPlanner] = useState(false); // has this user authored a subcontract plan
+  const [stockItems, setStockItems] = useState([]);  // existing stock items, to match received lines
+  const [itemDest, setItemDest] = useState({});      // per-line: { dest, project_id, project_later, qty }
+  const [processing, setProcessing] = useState(false);
+  // Per-line stock destinations for the compulsory "receive → stock + project" flow.
+  const STOCK_DESTS = [
+    { v: 'raw_material', label: '🪨 Raw material' },
+    { v: 'tools',        label: '🔧 Tools' },
+    { v: 'general',      label: '🧩 Parts / General' },
+    { v: 'consumable',   label: '🧴 Consumables' },
+    { v: 'not_accountable', label: '🚫 Not accountable' },
+  ];
   // Active/known projects, so each received material line can be assigned to a job.
   useEffect(() => {
     if (!plant?.id) return;
@@ -39436,12 +39447,26 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     // "Planner" = anyone who has created a subcontract plan (there is no planner role).
     sb.from('mcp_subcontract_plans').select('id').eq('plant_id', plant.id).eq('created_by', me?.id).limit(1)
       .then(({ data }) => setIsPlanner(!!(data && data.length)));
+    // Existing stock items, so a received line can be matched instead of duplicated.
+    sb.from('mcp_stocks_items').select('id, code, name, uom, category').eq('plant_id', plant.id)
+      .then(({ data }) => setStockItems(data || []));
   }, [plant?.id, me?.id]);
+  // Seed per-line destinations from any project already assigned to the items.
+  useEffect(() => {
+    const its = Array.isArray(doc?.items) ? doc.items : [];
+    setItemDest(prev => {
+      const next = { ...prev };
+      its.forEach((it, i) => { if (next[i] === undefined) next[i] = { dest: '', project_id: it.project_id || '', project_later: false }; });
+      return next;
+    });
+  }, [doc?.id, Array.isArray(doc?.items) ? doc.items.length : 0]);
   // Only the planner, the person who posted the bill, and plant admin/head may
   // process it (assign items to projects, receive/close returnable DCs).
   const isPoster = !!doc?.created_by && doc.created_by === me?.id;
   const isAuthority = me?.role === 'admin' || me?.role === 'plant_head';
   const canProcess = isAuthority || isPoster || isPlanner;
+  // The receive → stock + project flow only applies to INWARD documents.
+  const isInward = ['job_work_dc_in', 'dc_in', 'bill', 'invoice_in', 'interunit_dc_in'].includes(doc?.doc_type);
 
   const refresh = useCallback(async () => {
     if (isNew || !doc?.id) return;
@@ -39473,6 +39498,68 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     if (error) { showToast(error.message); return; }
     setDoc(d => ({ ...d, items: next }));
     showToast(projectId ? '🏗 Assigned to project' : 'Project cleared');
+  };
+
+  const setDest = (i, patch) => setItemDest(prev => ({ ...prev, [i]: { ...(prev[i] || {}), ...patch } }));
+  const normName = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+  // Compulsory unified flow: every line must get a stock destination (or "not
+  // accountable") and a project (or "assign later"). One save adds the stock
+  // lines into their segment (matching or creating the stock item), records the
+  // GRN, and writes each item's project assignment.
+  const processAndSave = async () => {
+    const its = Array.isArray(doc?.items) ? doc.items : [];
+    if (!its.length) { showToast('No items to process'); return; }
+    for (let i = 0; i < its.length; i++) {
+      const d = itemDest[i] || {};
+      if (!d.dest) { showToast('Line ' + (i + 1) + ': pick a stock destination'); return; }
+      if (!d.project_later && !d.project_id) { showToast('Line ' + (i + 1) + ': pick a project or “assign later”'); return; }
+    }
+    setProcessing(true);
+    try {
+      const local = [...stockItems];
+      const grnLines = [];
+      for (let i = 0; i < its.length; i++) {
+        const d = itemDest[i];
+        if (d.dest === 'not_accountable') continue;
+        const cat = d.dest;
+        const nm = (its[i].name || its[i].item_name || 'item').trim();
+        let si = local.find(s => (s.category || '') === cat && normName(s.name) === normName(nm));
+        if (!si) {
+          const ins = { plant_id: plant.id, name: nm, category: cat, uom: its[i].uom || 'nos', current_qty: 0, opening_qty: 0 };
+          if (getActiveUnitId()) ins.unit_id = getActiveUnitId();
+          const { data: created, error } = await sb.from('mcp_stocks_items').insert(ins).select('id, code, name, uom, category').single();
+          if (error) throw error;
+          si = created; local.push(created);
+        }
+        grnLines.push({
+          stock_item_id: si.id, vendor_item_name: nm,
+          invoice_qty: parseFloat(its[i].qty || 0), received_qty: parseFloat(d.qty != null && d.qty !== '' ? d.qty : (its[i].qty || 0)),
+          rejected_qty: 0, rate: parseFloat(its[i].rate || 0), uom: its[i].uom || si.uom || 'nos', reject_reason: null, notes: null,
+        });
+      }
+      if (grnLines.length && !grnReception) {
+        const { data, error } = await sb.rpc('accept_grn_reception', { p_doc_id: doc.id, p_lines: grnLines, p_notes: 'Received via bill processor' });
+        if (error) throw error;
+        if (!data?.success) throw new Error(data?.error || 'Add-to-stock failed');
+      }
+      // Project assignment onto the doc items.
+      const nextItems = its.map((it, i) => {
+        const d = itemDest[i] || {};
+        if (d.project_id && !d.project_later) {
+          const proj = projects.find(p => p.id === d.project_id);
+          return { ...it, project_id: d.project_id, project_name: proj ? ((proj.code ? proj.code + ' · ' : '') + proj.name) : it.project_name };
+        }
+        return it;
+      });
+      const { error: uErr } = await sb.from('mcp_logistics_documents').update({ items: nextItems }).eq('id', doc.id);
+      if (uErr) throw uErr;
+      setDoc(dd => ({ ...dd, items: nextItems }));
+      setStockItems(local);
+      const naCount = its.filter((_, i) => itemDest[i]?.dest === 'not_accountable').length;
+      showToast('✅ Saved · ' + grnLines.length + ' to stock' + (naCount ? ' · ' + naCount + ' not accountable' : ''));
+      refresh();
+    } catch (e) { showToast('Failed: ' + (e.message || e)); } finally { setProcessing(false); }
   };
 
   // Push each line that has a project onto that project's Components list (WIP),
@@ -39647,13 +39734,18 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
             ${grnReception.actions && html`<div class="card-row" style="border:none;padding:4px 0"><span class="label">Follow-up</span><span class="value">${grnReception.actions.status} · ${grnReception.actions.title}</span></div>`}
           `}
         </div>
-      ` : items.length > 0 ? html`
+      ` : items.length > 0 ? (canProcess ? html`
+        <div class="card" style="background:var(--teal-50);border-color:var(--teal-200)">
+          <div style="font-weight:700;color:var(--teal-700);margin-bottom:4px">📦 Receive & file this bill</div>
+          <div style="font-size:12px;color:var(--slate-700)">Set each line's <b>project</b> (or “assign later”) and <b>stock destination</b> (or “not accountable”) below, then hit <b>Save</b> — it adds them to stock and to their projects in one go.</div>
+        </div>
+      ` : html`
         <div class="card" style="background:var(--teal-50);border-color:var(--teal-200)">
           <div style="font-weight:700;color:var(--teal-700);margin-bottom:6px">📦 Ready to receive into stock</div>
           <div style="font-size:13px;color:var(--slate-700);margin-bottom:10px">${items.length} item line${items.length > 1 ? 's' : ''} extracted. Confirm physical receipt and add to stock.</div>
           <button class="btn" onClick=${() => setGrnModal(true)}>📥 Receive into stock</button>
         </div>
-      ` : html`
+      `) : html`
         <div class="empty"><div style="font-size:13px">No items extracted from invoice yet. Edit document to add items manually before receiving.</div></div>
       `}
     `}
@@ -39712,22 +39804,48 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
             <div class="list-item-main">
               <div class="list-item-title">${it.name || it.item_name || '?'} ${(it.customer_part_number || it.part_no) && html`<span class="badge slate" style="margin-left:6px;font-family:monospace;font-size:10px">#${it.customer_part_number || it.part_no}</span>`}</div>
               <div class="list-item-sub">${it.qty || 0} ${it.uom || 'nos'} × ₹${fmtNum(it.rate || 0)} ${it.hsn ? '· HSN ' + it.hsn : ''} ${it.process ? '· ' + it.process : ''}</div>
-              <div style="display:flex;align-items:center;gap:6px;margin-top:6px;flex-wrap:wrap">
-                <span style="font-size:11px;color:${it.project_id ? 'var(--teal-700)' : 'var(--slate-400)'}">🏗 ${it.project_id ? 'Project' : 'Assign project'}</span>
-                ${canProcess ? html`
+              ${canProcess && isInward ? html`
+                <div style="display:flex;align-items:center;gap:6px;margin-top:6px;flex-wrap:wrap">
+                  <select value=${itemDest[i]?.project_later ? '__later__' : (itemDest[i]?.project_id || '')}
+                    onChange=${e => { const v = e.target.value; if (v === '__later__') setDest(i, { project_later: true, project_id: '' }); else setDest(i, { project_later: false, project_id: v }); }}
+                    style=${'flex:1;min-width:140px;max-width:230px;font-size:12px;padding:5px 6px;border:1px solid ' + ((itemDest[i]?.project_id || itemDest[i]?.project_later) ? 'var(--teal-300)' : 'var(--amber-300)') + ';border-radius:5px;background:white'}>
+                    <option value="">🏗 — project —</option>
+                    <option value="__later__">⏳ Assign later</option>
+                    ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+                  </select>
+                  <select value=${itemDest[i]?.dest || ''} onChange=${e => setDest(i, { dest: e.target.value })}
+                    style=${'flex:1;min-width:130px;max-width:200px;font-size:12px;padding:5px 6px;border:1px solid ' + (itemDest[i]?.dest ? 'var(--teal-300)' : 'var(--amber-300)') + ';border-radius:5px;background:white'}>
+                    <option value="">📦 — stock? —</option>
+                    ${STOCK_DESTS.map(d => html`<option key=${d.v} value=${d.v}>${d.label}</option>`)}
+                  </select>
+                  ${itemDest[i]?.dest && itemDest[i].dest !== 'not_accountable' && html`<input type="number" step="any" min="0" value=${itemDest[i]?.qty != null ? itemDest[i].qty : (it.qty || '')} onInput=${e => setDest(i, { qty: e.target.value })} title="Received qty" style="width:62px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px" />`}
+                  ${it.inwarded_component && html`<span class="badge emerald" style="font-size:10px">✓ in project</span>`}
+                </div>
+              ` : canProcess ? html`
+                <div style="display:flex;align-items:center;gap:6px;margin-top:6px;flex-wrap:wrap">
+                  <span style="font-size:11px;color:${it.project_id ? 'var(--teal-700)' : 'var(--slate-400)'}">🏗 ${it.project_id ? 'Project' : 'Assign project'}</span>
                   <select value=${it.project_id || ''} disabled=${savingItem === i} onChange=${e => assignItemProject(i, e.target.value)} style="flex:1;min-width:150px;max-width:280px;font-size:12px;padding:5px 6px;border:1px solid ${it.project_id ? 'var(--teal-300)' : 'var(--slate-200)'};border-radius:5px;background:white">
                     <option value="">— none —</option>
                     ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
                   </select>
-                ` : html`<span style="font-size:12px;color:var(--slate-600)">${it.project_id ? (it.project_name || (projects.find(p => p.id === it.project_id) || {}).name || 'assigned') : '— not assigned —'}</span>`}
-                ${savingItem === i && html`<span style="font-size:10px;color:var(--slate-400)">saving…</span>`}
-                ${it.inwarded_component && html`<span class="badge emerald" style="font-size:10px">✓ in project</span>`}
-              </div>
+                  ${savingItem === i && html`<span style="font-size:10px;color:var(--slate-400)">saving…</span>`}
+                </div>
+              ` : html`
+                <div style="display:flex;align-items:center;gap:6px;margin-top:6px">
+                  <span style="font-size:11px;color:${it.project_id ? 'var(--teal-700)' : 'var(--slate-400)'}">🏗 ${it.project_id ? (it.project_name || (projects.find(p => p.id === it.project_id) || {}).name || 'assigned') : '— not assigned —'}</span>
+                </div>
+              `}
             </div>
             ${it.amount && html`<span style="font-size:13px;font-weight:600">₹${fmtNum(it.amount)}</span>`}
           </div>
         </div>
       `)}
+      ${canProcess && isInward && items.length > 0 && html`
+        <button class="btn" style="width:100%;margin-top:10px" disabled=${processing} onClick=${processAndSave}>
+          ${processing ? 'Saving…' : '✅ Save — add to stock & assign projects'}
+        </button>
+        <div style="font-size:11px;color:var(--slate-500);margin-top:5px;text-align:center">Every line needs a project (or “assign later”) and a stock destination (or “not accountable”).</div>
+      `}
     `}
 
     ${['invoice_in','bill','invoice_out'].includes(doc.doc_type) && html`
