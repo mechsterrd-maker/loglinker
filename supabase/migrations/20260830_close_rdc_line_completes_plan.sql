@@ -1,0 +1,3 @@
+-- Receiving/closing returnable DCs now lives ONLY in the Returnable DC tracker.
+-- close_rdc_line: when all of a plan-issued DC's returnable lines are closed, mark
+-- that subcontract plan complete (and reopening a line reopens the plan). Mirror.
