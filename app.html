@@ -3966,6 +3966,7 @@ function RdcReturns({ plant, me, activeUnit }) {
   const [tab, setTab] = useState('open');   // open | done | all
   const [busy, setBusy] = useState({});
   const [recv, setRecv] = useState({});     // line id -> qty string
+  const [rcvModal, setRcvModal] = useState(null); // line being received in the full dialog
   const u = activeUnit?.unit_id;
   const scope = (q) => u ? q.or(`unit_id.eq.${u},unit_id.is.null`) : q;
 
@@ -4037,7 +4038,8 @@ function RdcReturns({ plant, me, activeUnit }) {
                 <label style="font-size:11px;color:var(--slate-500)">Expected return<${DateField} value=${l.expected_return_date || ''} onChange=${e => setDue(l, e.target.value)} style="margin-left:6px;border:1px solid var(--slate-200);border-radius:5px;padding:4px 6px;font-size:12px" /></label>
                 <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
                   <input type="number" step="any" min=${0} value=${recv[l.id] ?? ''} placeholder=${'qty ' + fmtNum(pending(l))} onInput=${e => setRecv(r => ({ ...r, [l.id]: e.target.value }))} style="width:88px;border:1px solid var(--slate-200);border-radius:5px;padding:5px 6px;font-size:12px;text-align:right" />
-                  <button class="btn small" disabled=${!!busy[l.id]} onClick=${() => doReceive(l)}>✓ Receive</button>
+                  <button class="btn small" disabled=${!!busy[l.id]} onClick=${() => doReceive(l)} title="Received the same material back">✓ Same back</button>
+                  <button class="btn small" style="background:var(--teal-600);color:#fff" onClick=${() => setRcvModal(l)} title="Receive as parts / balance to stock / scrap">📥 Receive…</button>
                   <button class="btn small ghost" disabled=${!!busy[l.id]} onClick=${() => doClose(l)}>Close</button>
                 </div>
               </div>` :
@@ -4047,7 +4049,105 @@ function RdcReturns({ plant, me, activeUnit }) {
               </div>`}
           </div>`;
         })}
+      ${rcvModal && html`<${ReceiveReturnModal} plant=${plant} me=${me} line=${rcvModal} onClose=${() => setRcvModal(null)} onSaved=${() => { setRcvModal(null); refresh(); }} />`}
     </div>`;
+}
+
+// Full receive dialog for a returnable line: receive finished PARTS (per the
+// subcontract plan), return BALANCE material to stock or mark SCRAP (with weight),
+// or record the SAME material back — all in one place. Reuses the tested RPCs
+// sc_plan_receive / sc_material_return / receive_rdc_line.
+function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
+  const [plan, setPlan] = useState(null);
+  const [products, setProducts] = useState([]);
+  const [materials, setMaterials] = useState([]);
+  const [pq, setPq] = useState({});      // product id -> qty
+  const [sameQty, setSameQty] = useState('');
+  const [retMat, setRetMat] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const pendingLine = Math.max(Number(line.qty_sent || 0) - Number(line.qty_received || 0), 0);
+
+  const reload = useCallback(async () => {
+    if (!line.doc_id) { setPlan(null); return; }
+    const { data: pl } = await sb.from('mcp_subcontract_plans').select('*').eq('plant_id', plant.id).eq('dc_doc_id', line.doc_id).maybeSingle();
+    setPlan(pl || null);
+    if (pl) {
+      const [pr, ma] = await Promise.all([
+        sb.from('mcp_subcontract_plan_products').select('*').eq('plan_id', pl.id).order('created_at'),
+        sb.from('mcp_subcontract_plan_materials').select('*').eq('plan_id', pl.id).order('created_at'),
+      ]);
+      setProducts(pr.data || []); setMaterials(ma.data || []);
+    }
+  }, [line.doc_id, plant.id]);
+  useEffect(() => { reload(); }, [reload]);
+
+  const receiveProduct = async (pr) => {
+    const pend = Number(pr.qty_planned || 0) - Number(pr.qty_received || 0);
+    const q = Number(pq[pr.id] != null && pq[pr.id] !== '' ? pq[pr.id] : pend) || 0;
+    if (q <= 0) { showToast('Enter a qty'); return; }
+    setBusy(true);
+    const { data, error } = await sb.rpc('sc_plan_receive', { p_product_id: pr.id, p_qty: q });
+    setBusy(false);
+    if (error || data?.success === false) { showToast('Failed: ' + (error?.message || data?.error || '')); return; }
+    showToast(data?.completed ? '✅ Plan complete · RDC closed' : '✓ Parts received to stock');
+    setPq(m => { const n = { ...m }; delete n[pr.id]; return n; });
+    reload(); onSaved && onSaved();
+  };
+  const receiveSame = async () => {
+    const q = Number(sameQty || pendingLine) || 0;
+    if (q <= 0) { showToast('Enter a qty'); return; }
+    setBusy(true);
+    const { data, error } = await sb.rpc('receive_rdc_line', { p_line_id: line.id, p_qty: q });
+    setBusy(false);
+    if (error || data?.success === false) { showToast('Failed'); return; }
+    showToast('✓ Same material received back'); onSaved && onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px;max-height:92vh;overflow-y:auto">
+        <div class="modal-header">
+          <div class="modal-title">📥 Receive · ${line.item_name || 'returnable'}</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div style="font-size:12px;color:var(--slate-600);margin-bottom:12px">${line.party_name || ''} · sent ${fmtNum(line.qty_sent)} ${line.uom || ''} · pending ${fmtNum(pendingLine)}</div>
+
+        ${plan ? html`
+          <div class="section-h">Finished parts back (per plan)</div>
+          ${products.length === 0 ? html`<div style="font-size:12px;color:var(--slate-400);padding:4px 0">No products in the plan.</div>` :
+            products.map(pr => { const pend = Number(pr.qty_planned || 0) - Number(pr.qty_received || 0); const done = pend <= 0; return html`
+              <div key=${pr.id} class="card" style="padding:8px 10px;margin-bottom:6px">
+                <div style="font-size:12px;font-weight:600">${pr.name}</div>
+                <div style="font-size:11px;color:var(--slate-500);margin-bottom:6px">${pr.project_name ? pr.project_name + ' · ' : ''}${fmtNum(pr.qty_received)} / ${fmtNum(pr.qty_planned)} ${pr.uom || ''}${done ? ' · ✅ done' : ' · pending ' + fmtNum(pend)}</div>
+                ${!done && html`<div style="display:flex;gap:6px;align-items:center">
+                  <input type="number" step="any" min=${0} value=${pq[pr.id] ?? pend} onInput=${e => setPq(m => ({ ...m, [pr.id]: e.target.value }))} style="width:80px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  <button class="btn small" disabled=${busy} onClick=${() => receiveProduct(pr)}>✓ Receive parts</button>
+                </div>`}
+              </div>`; })}
+
+          <div class="section-h" style="margin-top:14px">Balance material · return to stock / scrap</div>
+          ${materials.length === 0 ? html`<div style="font-size:12px;color:var(--slate-400);padding:4px 0">No material lines.</div>` :
+            materials.map(m => html`
+              <div key=${m.id} class="card" style="padding:8px 10px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;gap:8px">
+                <div style="min-width:0"><div style="font-size:12px;font-weight:600">${m.name || 'Material'}</div>
+                  <div style="font-size:11px;color:var(--slate-500)">sent ${fmtNum(m.qty_sent)} ${m.uom || ''}${m.qty_returned > 0 ? ' · returned ' + fmtNum(m.qty_returned) : ''}</div></div>
+                <button class="btn small ghost" style="white-space:nowrap" onClick=${() => setRetMat(m)}>↩ Return / scrap</button>
+              </div>`)}
+        ` : html`
+          <div style="font-size:12px;color:var(--slate-500);background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:10px;margin-bottom:12px">This returnable wasn't made from a subcontract plan, so there are no planned parts to receive. Record the same material back below. To receive it as <b>new parts</b> or return a <b>balance to stock/scrap</b>, create a Subcontract Plan for it.</div>
+        `}
+
+        <div class="section-h" style="margin-top:14px">Same material back</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input type="number" step="any" min=${0} value=${sameQty} placeholder=${'qty ' + fmtNum(pendingLine)} onInput=${e => setSameQty(e.target.value)} style="width:110px;padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />
+          <button class="btn small" disabled=${busy} onClick=${receiveSame}>✓ Received same material</button>
+        </div>
+
+        <button class="btn ghost" style="width:100%;margin-top:16px" onClick=${onClose}>Done</button>
+      </div>
+      ${retMat && html`<${ReturnOffcutModal} plant=${plant} material=${retMat} onClose=${() => setRetMat(null)} onSaved=${() => { setRetMat(null); reload(); onSaved && onSaved(); }} />`}
+    </div>
+  `;
 }
 
 // ============= FETTLING (CONTRACT WORK) — simple daily plan & done =============
