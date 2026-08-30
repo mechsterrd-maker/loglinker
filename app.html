@@ -39590,21 +39590,40 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     } catch (e) { showToast('Failed: ' + e.message); } finally { setInwarding(false); }
   };
 
-  // Returnable DCs still open — matched to this document's vendor when possible, so
-  // you can close the sheet's RDC right after inwarding the parts it became.
+  // Returnable DCs still open — narrowed to what's relevant so the whole list
+  // doesn't show. First by this document's vendor, then (key fix) by the PROJECTS
+  // on this bill: an RDC's project is derived from the outgoing DC it was sent on,
+  // so a returned part only lines up against the RM that was sent for the SAME
+  // project. Falls back to the wider list if nothing matches (never hides all).
   useEffect(() => {
     if (!doc?.id) return;
     const vname = (doc.mcp_logistics_vendors?.name || doc.vendor_name_raw || '').toLowerCase().trim();
-    sb.from('mcp_rdc_lines').select('*').eq('plant_id', plant.id).in('status', ['open', 'partial']).order('sent_on')
-      .then(({ data }) => {
-        let rows = data || [];
-        if (vname) {
-          const m = rows.filter(r => { const pn = (r.party_name || '').toLowerCase().trim(); return pn && (pn.includes(vname) || vname.includes(pn)); });
-          rows = m.length ? m : rows; // no vendor match → show all so it can still be closed
+    const billProjects = new Set((Array.isArray(doc.items) ? doc.items : []).map(it => it.project_id).filter(Boolean));
+    (async () => {
+      const { data } = await sb.from('mcp_rdc_lines').select('*').eq('plant_id', plant.id).in('status', ['open', 'partial']).order('sent_on');
+      let rows = data || [];
+      if (vname) {
+        const m = rows.filter(r => { const pn = (r.party_name || '').toLowerCase().trim(); return pn && (pn.includes(vname) || vname.includes(pn)); });
+        rows = m.length ? m : rows;
+      }
+      if (billProjects.size && rows.length) {
+        const docIds = [...new Set(rows.map(r => r.doc_id).filter(Boolean))];
+        if (docIds.length) {
+          const { data: srcDocs } = await sb.from('mcp_logistics_documents').select('id, project_id, items').in('id', docIds);
+          const docProj = {};
+          (srcDocs || []).forEach(sd => {
+            const ps = new Set();
+            if (sd.project_id) ps.add(sd.project_id);
+            (Array.isArray(sd.items) ? sd.items : []).forEach(it => { if (it.project_id) ps.add(it.project_id); });
+            docProj[sd.id] = ps;
+          });
+          const scoped = rows.filter(r => { const ps = docProj[r.doc_id]; return ps && [...ps].some(p => billProjects.has(p)); });
+          rows = scoped.length ? scoped : rows;
         }
-        setOpenRdcs(rows);
-      });
-  }, [doc?.id]);
+      }
+      setOpenRdcs(rows);
+    })();
+  }, [doc?.id, Array.isArray(doc?.items) ? doc.items.map(it => it.project_id || '').join(',') : '']);
 
   const closeRdc = async (line) => {
     const { data, error } = await sb.rpc('close_rdc_line', { p_line_id: line.id, p_reopen: false });
