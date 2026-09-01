@@ -45931,6 +45931,7 @@ function ScheduleDetail({ plant, me, schedule, onClose }) {
   const [supplies, setSupplies] = useState([]);
   const [loading, setLoading] = useState(true);
   const [supplyModal, setSupplyModal] = useState(null);  // null | line_object
+  const [editSupply, setEditSupply] = useState(null);  // null | supply_row (edit/delete a logged supply)
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showPlanner, setShowPlanner] = useState(false);
 
@@ -46162,18 +46163,20 @@ function ScheduleDetail({ plant, me, schedule, onClose }) {
     <div class="section-h">Supplies · ${supplies.length}</div>
     ${supplies.length === 0 ? html`<div class="empty"><div style="font-size:13px">No supplies yet.</div></div>` :
       supplies.slice(0, 20).map(s => html`
-        <div class="list-item" key=${s.id}>
+        <div class="list-item" key=${s.id} style="cursor:pointer" onClick=${() => setEditSupply(s)}>
           <div class="list-item-row">
             <div class="list-item-main">
               <div class="list-item-title">${fmtNum(s.supplied_qty)} ${s.dc_number ? '· DC ' + s.dc_number : ''}</div>
               <div class="list-item-sub">${fmtDMY(s.dispatch_date)} · ${s.recorded_user?.full_name || '?'}${s.vehicle_number ? ' · ' + s.vehicle_number : ''}</div>
             </div>
+            <span style="font-size:12px;color:var(--slate-400)">✏️ Edit</span>
           </div>
         </div>
       `)
     }
 
     ${supplyModal && html`<${SupplyEntryModal} plant=${plant} me=${me} schedule=${schedule} progress=${progress} prefillLine=${supplyModal} onClose=${() => setSupplyModal(null)} onSaved=${() => { setSupplyModal(null); refresh(); }} />`}
+    ${editSupply && html`<${EditSupplyModal} me=${me} supply=${editSupply} onClose=${() => setEditSupply(null)} onSaved=${() => { setEditSupply(null); refresh(); }} />`}
     ${confirmDelete && html`
       <div class="modal-backdrop active">
         <div class="modal" style="max-width:380px">
@@ -46265,6 +46268,98 @@ function SupplyEntryModal({ plant, me, schedule, progress, prefillLine, onClose,
           <div class="field"><label>Notes</label><textarea rows=${1} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
           <button class="btn" disabled=${loading}>${loading ? 'Logging…' : 'Log supply'}</button>
         </form>
+      </div>
+    </div>
+  `;
+}
+
+// Edit or delete an already-logged supply (fix a wrong entry). Updates the row
+// directly; the line-progress view re-sums automatically. Delete is gated by the
+// same rule as the DB (can_delete): admin/plant_head anytime, or the recorder
+// within 24h of logging.
+function EditSupplyModal({ me, supply, onClose, onSaved }) {
+  const [form, setForm] = useState({
+    supplied_qty: supply.supplied_qty ?? '',
+    dispatch_date: supply.dispatch_date || new Date().toISOString().slice(0, 10),
+    dc_number: supply.dc_number || '',
+    invoice_number: supply.invoice_number || '',
+    vehicle_number: supply.vehicle_number || '',
+    notes: supply.notes || '',
+  });
+  const [loading, setLoading] = useState(false);
+  const [confirmDel, setConfirmDel] = useState(false);
+  const [error, setError] = useState('');
+
+  const isAuthority = me.role === 'plant_head' || me.role === 'admin';
+  const isRecorderFresh = supply.recorded_by === me.id
+    && supply.created_at && (Date.now() - new Date(supply.created_at).getTime()) < 24 * 3600 * 1000;
+  const canDelete = isAuthority || isRecorderFresh;
+
+  const save = async (e) => {
+    e.preventDefault();
+    const qty = parseFloat(form.supplied_qty);
+    if (!(qty > 0)) { setError('Enter a valid supplied qty'); return; }
+    setError(''); setLoading(true);
+    try {
+      const { error } = await sb.from('mcp_sched_supplies').update({
+        supplied_qty: qty,
+        dispatch_date: form.dispatch_date,
+        dc_number: form.dc_number.trim() || null,
+        invoice_number: form.invoice_number.trim() || null,
+        vehicle_number: form.vehicle_number.trim() || null,
+        notes: form.notes.trim() || null,
+      }).eq('id', supply.id);
+      if (error) throw error;
+      showToast('Supply updated');
+      onSaved();
+    } catch (err) { setError(err.message); } finally { setLoading(false); }
+  };
+
+  const doDelete = async () => {
+    setError(''); setLoading(true);
+    try {
+      const { error, count } = await sb.from('mcp_sched_supplies').delete({ count: 'exact' }).eq('id', supply.id);
+      if (error) throw error;
+      if (!count) throw new Error('Not allowed to delete this entry');
+      showToast('Supply deleted');
+      onSaved();
+    } catch (err) { setError(err.message); setConfirmDel(false); } finally { setLoading(false); }
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">✏️ Edit Supply</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${error && html`<div class="alert error">${error}</div>`}
+        <form onSubmit=${save}>
+          <div class="field-row">
+            <div class="field"><label>Supplied Qty *</label><input type="number" required step="0.001" min=${0.001} value=${form.supplied_qty} onChange=${e => setForm({...form, supplied_qty: e.target.value})} /></div>
+            <div class="field"><label>Dispatch Date *</label><${DateField} required value=${form.dispatch_date} onChange=${e => setForm({...form, dispatch_date: e.target.value})} /></div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>DC Number</label><input type="text" value=${form.dc_number} onChange=${e => setForm({...form, dc_number: e.target.value})} /></div>
+            <div class="field"><label>Invoice #</label><input type="text" value=${form.invoice_number} onChange=${e => setForm({...form, invoice_number: e.target.value})} /></div>
+          </div>
+          <div class="field"><label>Vehicle Number</label><input type="text" value=${form.vehicle_number} onChange=${e => setForm({...form, vehicle_number: e.target.value})} /></div>
+          <div class="field"><label>Notes</label><textarea rows=${1} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
+          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : 'Save changes'}</button>
+        </form>
+        ${canDelete ? html`
+          ${!confirmDel ? html`
+            <button class="btn ghost small" style="color:var(--rose-600);margin-top:10px;width:100%" onClick=${() => setConfirmDel(true)}>🗑️ Delete this supply</button>
+          ` : html`
+            <div class="card" style="background:var(--rose-50);border-color:var(--rose-200);margin-top:10px">
+              <div style="font-size:13px;margin-bottom:8px">Delete this ${fmtNum(supply.supplied_qty)} supply? This removes it from the totals.</div>
+              <div style="display:flex;gap:8px">
+                <button class="btn small ghost" style="flex:1" onClick=${() => setConfirmDel(false)} disabled=${loading}>Cancel</button>
+                <button class="btn small" style="flex:1;background:var(--rose-600)" onClick=${doDelete} disabled=${loading}>${loading ? '…' : 'Delete'}</button>
+              </div>
+            </div>
+          `}
+        ` : html`<div style="font-size:11px;color:var(--slate-500);margin-top:10px;text-align:center">Only an admin / plant head can delete this entry.</div>`}
       </div>
     </div>
   `;
