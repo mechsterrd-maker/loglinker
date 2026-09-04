@@ -37074,7 +37074,7 @@ function Stocks({ plant, me, activeUnit }) {
   };
 
   if (activeItem) {
-    return html`<${ItemDetail} plant=${plant} me=${me} item=${activeItem} onClose=${() => { setActiveItem(null); refresh(); }} onEdit=${() => { setEditTarget(activeItem); setModal('item'); }} />`;
+    return html`<${ItemDetail} plant=${plant} me=${me} item=${activeItem} onClose=${() => { setActiveItem(null); refresh(); }} onEdit=${() => { setEditTarget(activeItem); setActiveItem(null); setModal('item'); }} onDeleted=${() => { setActiveItem(null); refresh(); }} />`;
   }
 
   return html`
@@ -37632,7 +37632,17 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
               ✓ Opening recorded ${fmtDate(editTarget.opening_recorded_at)}. To change qty, use receive-from-doc or an admin adjustment.
             </div>
           `}
-          <button class="btn" disabled=${loading}>${loading ? 'Saving…' : (isEdit ? 'Update' : '➕ Create item + opening')}</button>
+          <div style="display:flex;gap:8px">
+            ${isEdit && html`<button type="button" class="btn danger" disabled=${loading} onClick=${async () => {
+              if (!confirm('Delete "' + (form.code || form.name) + '"? This removes the item and its stock history. This cannot be undone.')) return;
+              setLoading(true);
+              const { data, error } = await sb.rpc('delete_stock_item', { p_item_id: editTarget.id });
+              setLoading(false);
+              if (error || data?.success === false) { setError(error?.message || data?.error || 'Could not delete'); return; }
+              showToast('🗑 Item deleted'); onSaved();
+            }} style="flex-shrink:0">🗑 Delete</button>`}
+            <button class="btn" disabled=${loading} style="flex:1">${loading ? 'Saving…' : (isEdit ? 'Update' : '➕ Create item + opening')}</button>
+          </div>
         </form>
       </div>
     </div>
@@ -37862,11 +37872,22 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
 }
 
 // ============= ITEM DETAIL — full ledger per item =============
-function ItemDetail({ plant, me, item: initialItem, onClose, onEdit }) {
+function ItemDetail({ plant, me, item: initialItem, onClose, onEdit, onDeleted }) {
   const [item, setItem] = useState(initialItem);
   const [txns, setTxns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [txnModal, setTxnModal] = useState(null); // null | 'in' | 'out'
+  const [deleting, setDeleting] = useState(false);
+
+  const doDelete = async () => {
+    if (!confirm('Delete "' + (item.code || item.name) + '"? This removes the item and its stock history. This cannot be undone.')) return;
+    setDeleting(true);
+    const { data, error } = await sb.rpc('delete_stock_item', { p_item_id: item.id });
+    setDeleting(false);
+    if (error || data?.success === false) { alert('Could not delete: ' + (error?.message || data?.error || '')); return; }
+    showToast('🗑 Item deleted');
+    (onDeleted || onClose)();
+  };
 
   const refresh = async () => {
     setLoading(true);
@@ -37920,7 +37941,8 @@ function ItemDetail({ plant, me, item: initialItem, onClose, onEdit }) {
         <h1 style="font-size:18px">${item.code}</h1>
         <div class="sub">${item.name}</div>
       </div>
-      <button class="btn small ghost" onClick=${onEdit}>Edit</button>
+      <button class="btn small ghost" onClick=${onEdit} style="flex-shrink:0">✏️ Edit</button>
+      <button class="btn small danger" onClick=${doDelete} disabled=${deleting} style="flex-shrink:0">${deleting ? '…' : '🗑'}</button>
     </div>
 
     <div class="card" style=${'background:' + (isLow ? 'var(--rose-50)' : 'var(--emerald-50)') + ';border-color:' + (isLow ? 'var(--rose-200)' : 'var(--emerald-200)')}>
