@@ -27124,9 +27124,11 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   const partyList = (partyType === 'vendor'
     ? [...addedParties.filter(p => p._kind === 'vendor'), ...vendors]
     : [...addedParties.filter(p => p._kind === 'customer'), ...customers]);
+  const manualNum = !!plant?.manual_doc_numbering;   // Marvel etc. type the number by hand
   const [form, setForm] = useState({
     doc_date: new Date().toISOString().slice(0,10),
     customer_id: '',
+    doc_number: '',
     place_of_supply: '',
     vehicle_no: '',
     eway_bill: '',
@@ -27237,11 +27239,19 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
       }
 
       const party = partyList.find(c => c.id === form.customer_id);
-      // Allocate the next number atomically (this commits it — even if save fails, the number is consumed)
-      const { data: docNo, error: numErr } = await sb.rpc('get_next_logistics_doc_number', {
-        p_plant_id: plant.id, p_doc_kind: kind, p_date: form.doc_date,
-      });
-      if (numErr) throw numErr;
+      let docNo;
+      if (manualNum) {
+        // This plant types its own number — don't touch the auto counter.
+        docNo = (form.doc_number || '').trim();
+        if (!docNo) throw new Error('Enter the document number');
+      } else {
+        // Allocate the next number atomically (this commits it — even if save fails, the number is consumed)
+        const { data: allocated, error: numErr } = await sb.rpc('get_next_logistics_doc_number', {
+          p_plant_id: plant.id, p_doc_kind: kind, p_date: form.doc_date,
+        });
+        if (numErr) throw numErr;
+        docNo = allocated;
+      }
 
       const projName = (pid) => { const p = projects.find(x => x.id === pid); return p ? ((p.code ? p.code + ' · ' : '') + (p.name || '')) : null; };
       // Pull unit-weight + size for stock lines so we can stamp an approx weight
@@ -27324,9 +27334,15 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   return html`
     <div class="card" style="margin-bottom:14px;padding:14px;background:var(--teal-50);border-color:var(--teal-200)">
       <div style="font-size:11px;font-weight:700;color:var(--teal-700);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">${isInvoice ? '🧾 New tax invoice' : (isReturnable ? '🔁 New returnable DC' : '📦 New delivery challan')}</div>
-      <div style="font-size:18px;font-weight:700;color:var(--slate-900);font-family:monospace">${previewNumber}</div>
-      <div style="font-size:11px;color:var(--slate-500);margin-top:2px">Next number — assigned atomically when you save. Continuous per plant per financial year.</div>
-      ${(me?.role === 'plant_head' || me?.role === 'admin') && html`<${SetStartingNumberPanel} plant=${plant} kind=${kind} onChanged=${onCounterChanged} />`}
+      ${manualNum ? html`
+        <label style="font-size:11px;font-weight:600;color:var(--slate-600)">${isInvoice ? 'Invoice' : (isReturnable ? 'RDC' : 'DC')} number *</label>
+        <input type="text" required value=${form.doc_number} onInput=${e => setForm({ ...form, doc_number: e.target.value })} placeholder="Type the number" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--slate-300);border-radius:6px;font-size:15px;font-weight:700;font-family:monospace;background:white;margin-top:3px" />
+        <div style="font-size:11px;color:var(--slate-500);margin-top:3px">Manual numbering — you type it. The auto series is paused for this plant.</div>
+      ` : html`
+        <div style="font-size:18px;font-weight:700;color:var(--slate-900);font-family:monospace">${previewNumber}</div>
+        <div style="font-size:11px;color:var(--slate-500);margin-top:2px">Next number — assigned atomically when you save. Continuous per plant per financial year.</div>
+        ${(me?.role === 'plant_head' || me?.role === 'admin') && html`<${SetStartingNumberPanel} plant=${plant} kind=${kind} onChanged=${onCounterChanged} />`}
+      `}
     </div>
     ${planId && html`<div class="card" style="margin-bottom:12px;padding:10px 12px;background:#eef6ff;border-color:#bfdbfe;font-size:12px;color:var(--slate-700)">🧵 From subcontract plan${planTitle ? ' · ' + planTitle : ''} — materials, vendor and plan items are pre-filled. Add approx value / transport, then Save to issue the returnable DC.</div>`}
 
