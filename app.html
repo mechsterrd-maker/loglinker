@@ -37824,6 +37824,14 @@ function ReceiveFromDocPicker({ plant, me, pendingReceptions, onClose, onSaved }
       }));
       const { error } = await sb.from('mcp_stocks_transactions').insert(rows);
       if (error) throw error;
+      // Carry the bill's price onto each received item so stock value fills in
+      // from the bill (latest-cost basis) instead of being asked for manually.
+      const priceUpdates = toPost
+        .map(l => ({ id: l._stock_item_id, price: parseFloat(l.unit_price != null && l.unit_price !== '' ? l.unit_price : (l.rate || 0)) }))
+        .filter(u => u.price > 0);
+      if (priceUpdates.length) {
+        await Promise.all(priceUpdates.map(u => sb.from('mcp_stocks_items').update({ unit_cost: u.price }).eq('id', u.id)));
+      }
       await sb.from('mcp_logistics_grn_receptions').update({ status: 'completed', verified_at: new Date().toISOString(), verified_by: me.id }).eq('id', activeRec.id);
       showToast('📥 ' + rows.length + ' line' + (rows.length===1?'':'s') + ' received');
       onSaved();
