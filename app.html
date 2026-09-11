@@ -36981,6 +36981,8 @@ function Stocks({ plant, me, activeUnit }) {
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [activeItem, setActiveItem] = useState(null);
+  const [priceTarget, setPriceTarget] = useState(null); // item whose price is being entered
+  const [needsPriceOnly, setNeedsPriceOnly] = useState(false); // filter: in-stock items with no price
   const [loading, setLoading] = useState(true);
   const [voiceOpen, setVoiceOpen] = useState(false);
   const isAdmin = me?.role === 'admin' || me?.role === 'plant_head';
@@ -37029,6 +37031,8 @@ function Stocks({ plant, me, activeUnit }) {
     const q = search.toLowerCase();
     filteredItems = filteredItems.filter(i => (i.code + ' ' + i.name + ' ' + (i.subcategory || '')).toLowerCase().includes(q));
   }
+  if (needsPriceOnly) filteredItems = filteredItems.filter(i => parseFloat(i.current_qty || 0) > 0 && !i.unit_cost);
+  const needPriceCount = items.filter(i => parseFloat(i.current_qty || 0) > 0 && !i.unit_cost).length;
 
   // Sub-categories available within the currently selected category (with counts)
   const subcatCounts = {};
@@ -37124,6 +37128,23 @@ function Stocks({ plant, me, activeUnit }) {
             </div>
           </div>
 
+          ${(() => {
+            const needPrice = items.filter(i => parseFloat(i.current_qty || 0) > 0 && !i.unit_cost).length;
+            const pricedWithStock = items.filter(i => parseFloat(i.current_qty || 0) > 0 && i.unit_cost).length;
+            return html`
+              <div class="card" onClick=${() => { setView('items'); setLayout('table'); }} style="cursor:pointer;background:linear-gradient(135deg,var(--teal-700),var(--teal-500));color:white;padding:14px 16px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;border:none">
+                <div style="min-width:0">
+                  <div style="font-size:11px;opacity:0.85;text-transform:uppercase;letter-spacing:0.5px">Stock value on hand</div>
+                  <div style="font-size:26px;font-weight:800;margin-top:2px">₹${fmtNum(Math.round(totalValue))}</div>
+                  <div style="font-size:11px;opacity:0.9;margin-top:2px">
+                    ${pricedWithStock} priced${needPrice > 0 ? html` · <strong>${needPrice} need a price</strong>` : ' · all items priced'}
+                  </div>
+                </div>
+                <div style="font-size:26px;flex-shrink:0">💰</div>
+              </div>
+            `;
+          })()}
+
           <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:14px">
             <button class="card" style="text-align:left;padding:14px;cursor:pointer;background:var(--teal-50);border-color:var(--teal-300);position:relative" onClick=${() => setModal('receive_picker')}>
               <div style="font-size:24px">📥</div>
@@ -37207,6 +37228,12 @@ function Stocks({ plant, me, activeUnit }) {
         <button class="btn small ${layout === 'list' ? '' : 'ghost'}" onClick=${() => setLayout('list')}>List</button>
         <button class="btn small ${layout === 'by_category' ? '' : 'ghost'}" onClick=${() => setLayout('by_category')}>By Category</button>
       </div>
+      ${needPriceCount > 0 && html`
+        <div style="margin-bottom:10px">
+          <button class="btn small ${needsPriceOnly ? '' : 'ghost'}" style="font-size:11px;${needsPriceOnly ? 'background:var(--amber-600);color:white' : 'color:var(--amber-700)'}" onClick=${() => { setNeedsPriceOnly(v => !v); if (!needsPriceOnly) setLayout('table'); }}>
+            ${needsPriceOnly ? '✓ ' : ''}💰 Needs price · ${needPriceCount}
+          </button>
+        </div>`}
 
       ${(layout === 'list' || layout === 'table') && html`
         <div class="auth-tabs" style="margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
@@ -37255,7 +37282,11 @@ function Stocks({ plant, me, activeUnit }) {
                     </td>
                     <td style="padding:7px 10px;color:var(--slate-500);white-space:nowrap">${lbl(i.category || 'general')}${i.subcategory ? html`<div style="font-size:10px;color:var(--slate-400)">${i.subcategory}</div>` : ''}</td>
                     <td style="padding:7px 10px;text-align:right;white-space:nowrap"><span style=${'font-weight:700;color:' + (isLow ? 'var(--rose-600)' : 'var(--slate-800)')}>${fmtNum(i.current_qty)}</span> <span style="color:var(--slate-400);font-size:11px">${i.uom}</span>${isLow ? html`<div style="font-size:9px;color:var(--rose-600);font-weight:600">LOW</div>` : (!i.opening_recorded_at ? html`<div style="font-size:9px;color:var(--amber-700);font-weight:600">NO OPENING</div>` : '')}</td>
-                    <td style="padding:7px 10px;text-align:right;color:var(--slate-500);white-space:nowrap">${i.unit_cost ? '₹' + fmtNum(i.unit_cost) : '—'}</td>
+                    <td style="padding:7px 10px;text-align:right;color:var(--slate-500);white-space:nowrap">${i.unit_cost
+                      ? '₹' + fmtNum(i.unit_cost)
+                      : (isAdmin
+                          ? html`<button class="btn small ghost" style="font-size:10px;padding:2px 8px;color:var(--teal-700)" onClick=${(e) => { e.stopPropagation(); setPriceTarget(i); }}>+ price</button>`
+                          : '—')}</td>
                     <td style="padding:7px 10px;text-align:right;white-space:nowrap;font-weight:600">${val ? '₹' + fmtNum(val) : '—'}</td>
                   </tr>`;
                 })}
@@ -37402,6 +37433,60 @@ function Stocks({ plant, me, activeUnit }) {
     ${modal === 'pick_part_for_stock' && html`<${PickPartForStockModal} plant=${plant} stockItems=${items} onPick=${(p) => { setEditTarget(p); setModal('track_stock'); }} onClose=${() => setModal(null)} />`}
     ${modal === 'track_stock' && editTarget && html`<${TrackStockForPartModal} plant=${plant} me=${me} part=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="stock_issue" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
+    ${priceTarget && html`<${QuickPriceModal} item=${priceTarget} onClose=${() => setPriceTarget(null)} onSaved=${() => { setPriceTarget(null); refresh(); }} />`}
+  `;
+}
+
+// Quick price entry — set a rate on an item (esp. old stock that came in before
+// bills carried prices) so its stock value (qty × rate) can be computed.
+function QuickPriceModal({ item, onClose, onSaved }) {
+  const isRaw = item.category === 'raw_material';
+  const uom = item.uom || 'nos';
+  const [val, setVal] = useState(item.unit_cost != null && item.unit_cost !== '' ? '' + item.unit_cost : '');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState('');
+  const qty = parseFloat(item.current_qty || 0);
+  const preview = (parseFloat(val) || 0) * qty;
+
+  const save = async () => {
+    const c = parseFloat(val);
+    if (!(c >= 0)) { setErr('Enter a valid price'); return; }
+    setSaving(true); setErr('');
+    const patch = { unit_cost: c };
+    // Raw material stocked in kg: the rate IS ₹/kg, keep both in sync.
+    if (isRaw && ['kg', 'kgs'].includes(uom.toLowerCase())) patch.rate_per_kg = c;
+    const { error } = await sb.from('mcp_stocks_items').update(patch).eq('id', item.id);
+    setSaving(false);
+    if (error) { setErr(error.message); return; }
+    showToast('💰 Price saved'); onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:380px">
+        <div class="modal-header">
+          <div class="modal-title">💰 Set price</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card" style="background:var(--slate-50);margin-bottom:12px">
+          <div class="card-row"><span class="label">Item</span><span class="value">${item.name || item.code}</span></div>
+          <div class="card-row"><span class="label">In stock</span><span class="value mono">${fmtNum(qty)} ${uom}</span></div>
+        </div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field">
+          <label>Price ₹ per ${uom}${isRaw && ['kg','kgs'].includes(uom.toLowerCase()) ? ' (₹/kg)' : ''}</label>
+          <input type="number" step="0.01" min=${0} value=${val} autoFocus
+            onInput=${e => setVal(e.target.value)}
+            onKeyDown=${e => { if (e.key === 'Enter') save(); }}
+            placeholder="e.g. 62" />
+        </div>
+        <div style="font-size:13px;color:var(--slate-600);margin:-2px 0 12px">
+          Stock value ≈ <strong style="color:var(--teal-700)">₹${fmtNum(Math.round(preview))}</strong>
+          <span style="color:var(--slate-400)">(${fmtNum(qty)} × ₹${fmtNum(parseFloat(val) || 0)})</span>
+        </div>
+        <button class="btn" disabled=${saving} style="width:100%" onClick=${save}>${saving ? 'Saving…' : 'Save price'}</button>
+      </div>
+    </div>
   `;
 }
 
