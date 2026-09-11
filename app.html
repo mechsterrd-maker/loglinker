@@ -5125,7 +5125,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'attendance_setup'}><${AttendanceSetupPage} plant=${plant} me=${me} reload=${reload} /></${Page}>
       <${Page} active=${pageTab === 'quality'}><${Quality} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'maintenance'}><${Maintenance} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${pageTab === 'stocks'}><${Stocks} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'stocks'}><${Stocks} plant=${plant} me=${me} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
       <${Page} active=${pageTab === 'actions'}><${ActionHub} plant=${plant} me=${me} activeUnit=${activeUnit} navAction=${navAction} /></${Page}>
       <${Page} active=${pageTab === 'documents'}><${Documents} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'schedules'}><${Schedules} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -36965,7 +36965,10 @@ function StockImportModal({ plant, me, activeUnit, existingItems, onClose, onSav
   `;
 }
 
-function Stocks({ plant, me, activeUnit }) {
+function Stocks({ plant, me, activeUnit, accessibleUnits }) {
+  const units = (accessibleUnits || []).filter(u => u.unit_id); // real units (not the "all" pseudo)
+  const multiUnit = units.length > 1;
+  const unitNameOf = (uid) => (units.find(u => u.unit_id === uid)?.unit_name) || (uid ? 'Other unit' : 'Shared');
   const [items, setItems] = useState([]);
   const [transactions, setTransactions] = useState([]);
   const [pendingReceptions, setPendingReceptions] = useState([]); // doc-backed GRNs awaiting verification
@@ -36983,6 +36986,10 @@ function Stocks({ plant, me, activeUnit }) {
   const [activeItem, setActiveItem] = useState(null);
   const [priceTarget, setPriceTarget] = useState(null); // item whose price is being entered
   const [needsPriceOnly, setNeedsPriceOnly] = useState(false); // filter: in-stock items with no price
+  const [unitFilter, setUnitFilter] = useState(activeUnit?.unit_id || 'all'); // 'all' | unit_id — which unit's stock to show
+  const [selectedIds, setSelectedIds] = useState(() => new Set()); // multi-select for bulk move-to-unit
+  const [splitTarget, setSplitTarget] = useState(null); // item being split across units
+  const [movingUnit, setMovingUnit] = useState(false);
   const [loading, setLoading] = useState(true);
   const [voiceOpen, setVoiceOpen] = useState(false);
   const isAdmin = me?.role === 'admin' || me?.role === 'plant_head';
@@ -36991,9 +36998,10 @@ function Stocks({ plant, me, activeUnit }) {
     setLoading(true);
     // Unit scope: hide other units' items when an activeUnit is set. NULL =
     // shared (visible everywhere).
-    const u = activeUnit?.unit_id;
+    // Fetch every item the user can see (RLS already scopes to this plant + the
+    // units they have access to). Unit filtering is done client-side so admins
+    // can view/manage all units together and reassign items between them.
     let itemsQ = sb.from('mcp_stocks_items').select('*').order('name');
-    if (u) itemsQ = itemsQ.or(`unit_id.eq.${u},unit_id.is.null`);
     const [i, t, recs] = await Promise.all([
       itemsQ,
       sb.from('mcp_stocks_transactions').select('*, mcp_stocks_items(code,name,uom,category), users:performed_by(full_name)').order('created_at', { ascending:false }).limit(500),
@@ -37007,6 +37015,9 @@ function Stocks({ plant, me, activeUnit }) {
 
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
+  // Follow the global unit switcher: when the active unit changes, show that
+  // unit's stock by default (the in-Stocks chips can still override to "All").
+  useEffect(() => { setUnitFilter(activeUnit?.unit_id || 'all'); }, [activeUnit?.unit_id]);
 
   // Live updates on stock changes
   useEffect(() => {
@@ -37033,6 +37044,8 @@ function Stocks({ plant, me, activeUnit }) {
   }
   if (needsPriceOnly) filteredItems = filteredItems.filter(i => parseFloat(i.current_qty || 0) > 0 && !i.unit_cost);
   const needPriceCount = items.filter(i => parseFloat(i.current_qty || 0) > 0 && !i.unit_cost).length;
+  // Unit filter (client-side): a specific unit also shows shared (null-unit) items.
+  if (multiUnit && unitFilter !== 'all') filteredItems = filteredItems.filter(i => i.unit_id === unitFilter || !i.unit_id);
 
   // Sub-categories available within the currently selected category (with counts)
   const subcatCounts = {};
@@ -37093,6 +37106,21 @@ function Stocks({ plant, me, activeUnit }) {
     `;
   };
 
+  const toggleSelect = (id) => setSelectedIds(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const clearSelect = () => setSelectedIds(new Set());
+  // Bulk-assign the selected items to a unit (RLS lets admins who hold both units do this).
+  const moveSelectedToUnit = async (targetUnitId) => {
+    const ids = [...selectedIds];
+    if (!ids.length) return;
+    if (!confirm('Move ' + ids.length + ' item' + (ids.length === 1 ? '' : 's') + ' to ' + unitNameOf(targetUnitId) + '?\n\nThis reassigns the whole item (and its stock) to that unit.')) return;
+    setMovingUnit(true);
+    const { error } = await sb.from('mcp_stocks_items').update({ unit_id: targetUnitId }).in('id', ids);
+    setMovingUnit(false);
+    if (error) { alert('Could not move: ' + error.message + '\n\n(You need access to both units to move items between them.)'); return; }
+    showToast('📦 ' + ids.length + ' moved to ' + unitNameOf(targetUnitId));
+    clearSelect(); refresh();
+  };
+
   if (activeItem) {
     return html`<${ItemDetail} plant=${plant} me=${me} item=${activeItem} onClose=${() => { setActiveItem(null); refresh(); }} onEdit=${() => { setEditTarget(activeItem); setActiveItem(null); setModal('item'); }} onDeleted=${() => { setActiveItem(null); refresh(); }} />`;
   }
@@ -37131,16 +37159,27 @@ function Stocks({ plant, me, activeUnit }) {
           ${(() => {
             const needPrice = items.filter(i => parseFloat(i.current_qty || 0) > 0 && !i.unit_cost).length;
             const pricedWithStock = items.filter(i => parseFloat(i.current_qty || 0) > 0 && i.unit_cost).length;
+            const valOf = (uid) => items.filter(i => i.unit_id === uid).reduce((s, i) => s + parseFloat(i.current_qty || 0) * parseFloat(i.unit_cost || 0), 0);
             return html`
-              <div class="card" onClick=${() => { setView('items'); setLayout('table'); }} style="cursor:pointer;background:linear-gradient(135deg,var(--teal-700),var(--teal-500));color:white;padding:14px 16px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;border:none">
-                <div style="min-width:0">
-                  <div style="font-size:11px;opacity:0.85;text-transform:uppercase;letter-spacing:0.5px">Stock value on hand</div>
-                  <div style="font-size:26px;font-weight:800;margin-top:2px">₹${fmtNum(Math.round(totalValue))}</div>
-                  <div style="font-size:11px;opacity:0.9;margin-top:2px">
-                    ${pricedWithStock} priced${needPrice > 0 ? html` · <strong>${needPrice} need a price</strong>` : ' · all items priced'}
+              <div class="card" onClick=${() => { setView('items'); setLayout('table'); }} style="cursor:pointer;background:linear-gradient(135deg,var(--teal-700),var(--teal-500));color:white;padding:14px 16px;margin-bottom:12px;border:none">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                  <div style="min-width:0">
+                    <div style="font-size:11px;opacity:0.85;text-transform:uppercase;letter-spacing:0.5px">Stock value on hand${multiUnit ? ' · all units' : ''}</div>
+                    <div style="font-size:26px;font-weight:800;margin-top:2px">₹${fmtNum(Math.round(totalValue))}</div>
+                    <div style="font-size:11px;opacity:0.9;margin-top:2px">
+                      ${pricedWithStock} priced${needPrice > 0 ? html` · <strong>${needPrice} need a price</strong>` : ' · all items priced'}
+                    </div>
                   </div>
+                  <div style="font-size:26px;flex-shrink:0">💰</div>
                 </div>
-                <div style="font-size:26px;flex-shrink:0">💰</div>
+                ${multiUnit && html`
+                  <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+                    ${units.map(u => html`
+                      <div key=${u.unit_id} style="background:rgba(255,255,255,0.15);border-radius:7px;padding:5px 10px;font-size:11px">
+                        <span style="opacity:0.85">${u.unit_name}</span> · <strong>₹${fmtNum(Math.round(valOf(u.unit_id)))}</strong>
+                      </div>
+                    `)}
+                  </div>`}
               </div>
             `;
           })()}
@@ -37235,6 +37274,27 @@ function Stocks({ plant, me, activeUnit }) {
           </button>
         </div>`}
 
+      ${multiUnit && html`
+        <div class="auth-tabs" style="margin-bottom:10px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;gap:6px">
+          <button class=${'auth-tab small' + (unitFilter === 'all' ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => setUnitFilter('all')}>All units · ${items.length}</button>
+          ${units.map(u => html`
+            <button key=${u.unit_id} class=${'auth-tab small' + (unitFilter === u.unit_id ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => setUnitFilter(u.unit_id)}>
+              ${u.unit_name} · ${items.filter(i => i.unit_id === u.unit_id).length}
+            </button>
+          `)}
+        </div>`}
+
+      ${multiUnit && selectedIds.size > 0 && html`
+        <div class="card" style="position:sticky;top:6px;z-index:5;background:var(--slate-800);color:white;padding:10px 12px;margin-bottom:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;border:none">
+          <span style="font-weight:700;font-size:13px">${selectedIds.size} selected</span>
+          <span style="font-size:12px;opacity:0.8">Move to:</span>
+          ${units.map(u => html`
+            <button key=${u.unit_id} class="btn small" disabled=${movingUnit} style="font-size:12px;background:white;color:var(--slate-800)" onClick=${() => moveSelectedToUnit(u.unit_id)}>${u.unit_name}</button>
+          `)}
+          ${selectedIds.size === 1 && html`<button class="btn small ghost" style="font-size:12px;color:white;border-color:rgba(255,255,255,0.4)" onClick=${() => { const it = items.find(i => selectedIds.has(i.id)); if (it) setSplitTarget(it); }}>✂ Split across units</button>`}
+          <button class="btn small ghost" style="font-size:12px;color:white;border-color:rgba(255,255,255,0.4);margin-left:auto" onClick=${clearSelect}>Clear</button>
+        </div>`}
+
       ${(layout === 'list' || layout === 'table') && html`
         <div class="auth-tabs" style="margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
           <button class=${'auth-tab' + (categoryFilter === 'all' ? ' active' : '')} onClick=${() => { setCategoryFilter('all'); setSubcategoryFilter('all'); }}>All · ${items.length}</button>
@@ -37262,11 +37322,15 @@ function Stocks({ plant, me, activeUnit }) {
         layout === 'table' ? (() => {
           const totVal = filteredItems.reduce((s, i) => s + (parseFloat(i.current_qty || 0) * parseFloat(i.unit_cost || 0)), 0);
           const anyVal = filteredItems.some(i => i.unit_cost);
+          const canSep = multiUnit && isAdmin; // show select-checkboxes for unit reassignment
+          const labelColspan = 4 + (canSep ? 1 : 0) + (multiUnit ? 1 : 0);
           return html`<div style="overflow-x:auto;border:1px solid var(--slate-200);border-radius:10px;-webkit-overflow-scrolling:touch">
             <table style="width:100%;border-collapse:collapse;font-size:12.5px">
               <thead><tr style="background:var(--slate-50);position:sticky;top:0">
+                ${canSep ? html`<th style="padding:8px 6px;width:28px"></th>` : ''}
                 <th style="text-align:left;padding:8px 10px;font-weight:700;color:var(--slate-600)">Item</th>
                 <th style="text-align:left;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Category</th>
+                ${multiUnit ? html`<th style="text-align:left;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Unit</th>` : ''}
                 <th style="text-align:right;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">In stock</th>
                 <th style="text-align:right;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Rate</th>
                 <th style="text-align:right;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Value</th>
@@ -37275,12 +37339,15 @@ function Stocks({ plant, me, activeUnit }) {
                 ${filteredItems.map(i => {
                   const isLow = i.reorder_level && i.current_qty <= i.reorder_level;
                   const val = (parseFloat(i.current_qty || 0) * parseFloat(i.unit_cost || 0));
-                  return html`<tr key=${i.id} onClick=${() => setActiveItem(i)} style="border-top:1px solid var(--slate-100);cursor:pointer">
+                  const sel = selectedIds.has(i.id);
+                  return html`<tr key=${i.id} onClick=${() => setActiveItem(i)} style=${'border-top:1px solid var(--slate-100);cursor:pointer' + (sel ? ';background:var(--teal-50)' : '')}>
+                    ${canSep ? html`<td style="padding:7px 6px;text-align:center" onClick=${(e) => { e.stopPropagation(); toggleSelect(i.id); }}><input type="checkbox" checked=${sel} onClick=${(e) => e.stopPropagation()} onChange=${() => toggleSelect(i.id)} /></td>` : ''}
                     <td style="padding:7px 10px">
                       <div style="font-weight:600">${i.name || i.code}</div>
                       ${i.code ? html`<div style="font-size:10px;color:var(--slate-400);font-family:'Geist Mono',monospace">${i.code}</div>` : ''}
                     </td>
                     <td style="padding:7px 10px;color:var(--slate-500);white-space:nowrap">${lbl(i.category || 'general')}${i.subcategory ? html`<div style="font-size:10px;color:var(--slate-400)">${i.subcategory}</div>` : ''}</td>
+                    ${multiUnit ? html`<td style="padding:7px 10px;white-space:nowrap"><span class="badge" style="font-size:10px;background:var(--slate-100);color:var(--slate-600)">${unitNameOf(i.unit_id)}</span></td>` : ''}
                     <td style="padding:7px 10px;text-align:right;white-space:nowrap"><span style=${'font-weight:700;color:' + (isLow ? 'var(--rose-600)' : 'var(--slate-800)')}>${fmtNum(i.current_qty)}</span> <span style="color:var(--slate-400);font-size:11px">${i.uom}</span>${isLow ? html`<div style="font-size:9px;color:var(--rose-600);font-weight:600">LOW</div>` : (!i.opening_recorded_at ? html`<div style="font-size:9px;color:var(--amber-700);font-weight:600">NO OPENING</div>` : '')}</td>
                     <td style="padding:7px 10px;text-align:right;color:var(--slate-500);white-space:nowrap">${i.unit_cost
                       ? '₹' + fmtNum(i.unit_cost)
@@ -37292,7 +37359,7 @@ function Stocks({ plant, me, activeUnit }) {
                 })}
               </tbody>
               ${anyVal ? html`<tfoot><tr style="border-top:2px solid var(--slate-200);background:var(--slate-50)">
-                <td style="padding:8px 10px;font-weight:700" colspan="4">Total stock value · ${filteredItems.length} item${filteredItems.length === 1 ? '' : 's'}</td>
+                <td style="padding:8px 10px;font-weight:700" colspan=${labelColspan}>Total stock value · ${filteredItems.length} item${filteredItems.length === 1 ? '' : 's'}</td>
                 <td style="padding:8px 10px;text-align:right;font-weight:800;color:var(--teal-700);white-space:nowrap">₹${fmtNum(totVal)}</td>
               </tr></tfoot>` : ''}
             </table>
@@ -37434,6 +37501,60 @@ function Stocks({ plant, me, activeUnit }) {
     ${modal === 'track_stock' && editTarget && html`<${TrackStockForPartModal} plant=${plant} me=${me} part=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="stock_issue" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
     ${priceTarget && html`<${QuickPriceModal} item=${priceTarget} onClose=${() => setPriceTarget(null)} onSaved=${() => { setPriceTarget(null); refresh(); }} />`}
+    ${splitTarget && html`<${SplitUnitModal} item=${splitTarget} units=${units} unitNameOf=${unitNameOf} onClose=${() => setSplitTarget(null)} onSaved=${() => { setSplitTarget(null); clearSelect(); refresh(); }} />`}
+  `;
+}
+
+// Split part of an item's stock into another unit (same sheet size stocked in
+// both units). Keeps some here, moves the rest to the chosen unit — the sibling
+// row in that unit is created/topped-up via the split_stock_item_to_unit RPC.
+function SplitUnitModal({ item, units, unitNameOf, onClose, onSaved }) {
+  const others = (units || []).filter(u => u.unit_id !== item.unit_id);
+  const [target, setTarget] = useState(others[0]?.unit_id || '');
+  const [qty, setQty] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState('');
+  const here = parseFloat(item.current_qty || 0);
+  const moveQty = parseFloat(qty) || 0;
+
+  const save = async () => {
+    if (!target) { setErr('Pick the other unit'); return; }
+    if (!(moveQty > 0)) { setErr('Enter a quantity greater than 0'); return; }
+    if (moveQty > here) { setErr('Only ' + fmtNum(here) + ' ' + item.uom + ' here — cannot move ' + fmtNum(moveQty)); return; }
+    setSaving(true); setErr('');
+    const { data, error } = await sb.rpc('split_stock_item_to_unit', { p_item_id: item.id, p_target_unit_id: target, p_qty: moveQty });
+    setSaving(false);
+    if (error || data?.success === false) { setErr(error?.message || data?.error || 'Could not split'); return; }
+    showToast('✂ ' + fmtNum(moveQty) + ' ' + item.uom + ' moved to ' + unitNameOf(target));
+    onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:400px">
+        <div class="modal-header">
+          <div class="modal-title">✂ Split across units</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        <div class="card" style="background:var(--slate-50);margin-bottom:12px">
+          <div class="card-row"><span class="label">Item</span><span class="value">${item.name || item.code}</span></div>
+          <div class="card-row"><span class="label">In ${unitNameOf(item.unit_id)}</span><span class="value mono">${fmtNum(here)} ${item.uom}</span></div>
+        </div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field"><label>Move to unit</label>
+          <select value=${target} onChange=${e => setTarget(e.target.value)}>
+            ${others.map(u => html`<option key=${u.unit_id} value=${u.unit_id}>${u.unit_name}</option>`)}
+          </select>
+        </div>
+        <div class="field"><label>Quantity to move (${item.uom})</label>
+          <input type="number" step="any" min=${0} max=${here} value=${qty} autoFocus onInput=${e => setQty(e.target.value)} placeholder=${'up to ' + fmtNum(here)} />
+        </div>
+        <div style="font-size:12px;color:var(--slate-600);margin:-2px 0 12px">
+          After: <strong>${fmtNum(Math.max(0, here - moveQty))} ${item.uom}</strong> in ${unitNameOf(item.unit_id)} · <strong>${fmtNum(moveQty)} ${item.uom}</strong> in ${target ? unitNameOf(target) : 'other unit'}
+        </div>
+        <button class="btn" disabled=${saving} style="width:100%" onClick=${save}>${saving ? 'Moving…' : '✂ Split stock'}</button>
+      </div>
+    </div>
   `;
 }
 
