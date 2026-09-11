@@ -37536,7 +37536,23 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
         showToast('📦 Item added · opening ' + fmtNum(opening) + ' ' + form.uom);
       }
       onSaved();
-    } catch (err) { setError(err.message); } finally { setLoading(false); }
+    } catch (err) {
+      // A colliding item code is the most common failure (two items resolving
+      // to the same auto-code, e.g. same material+size). Postgres returns a raw
+      // "duplicate key value violates unique constraint idx_stocks_items_code"
+      // which means nothing to the user — translate it into a clear next step.
+      const raw = err?.message || String(err);
+      if (err?.code === '23505' || /idx_stocks_items_code|duplicate key/i.test(raw)) {
+        const dup = (allItems || []).find(i => i.code === form.code && i.id !== editTarget?.id);
+        setError('An item with code "' + form.code + '" already exists'
+          + (dup ? ' (' + (dup.name || dup.code) + ')' : '') + '. '
+          + (isEdit
+              ? 'This edit would make it a duplicate. Either change the size/material so the code differs, or delete this item (🗑 below) and use the existing one instead.'
+              : 'Change the size/material so the code differs, or open the existing item to add stock to it.'));
+      } else {
+        setError(raw);
+      }
+    } finally { setLoading(false); }
   };
 
   return html`
@@ -39741,7 +39757,9 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
           const pfx = { raw_material: 'RM', tools: 'TL', general: 'GN', consumable: 'CN' }[cat] || 'IT';
           const base = nm.toUpperCase().replace(/[^A-Z0-9]+/g, '').slice(0, 10) || 'ITEM';
           const code = pfx + '-' + base + '-' + (Date.now().toString(36) + Math.floor(Math.random() * 1296).toString(36)).slice(-5).toUpperCase();
-          const ins = { plant_id: plant.id, code, name: nm, category: cat, uom: its[i].uom || 'nos', current_qty: 0, opening_qty: 0 };
+          // Mark it as opened now — the bill/GRN is its opening event, so it doesn't
+          // get stuck showing "NO OPENING" forever.
+          const ins = { plant_id: plant.id, code, name: nm, category: cat, uom: its[i].uom || 'nos', current_qty: 0, opening_qty: 0, opening_recorded_at: new Date().toISOString() };
           if (getActiveUnitId()) ins.unit_id = getActiveUnitId();
           const { data: created, error } = await sb.from('mcp_stocks_items').insert(ins).select('id, code, name, uom, category').single();
           if (error) throw error;
