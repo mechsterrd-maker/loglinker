@@ -4098,7 +4098,9 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
   const [parts, setParts] = useState([{ name: '', qty: '', uom: line.uom === 'nos' ? 'nos' : 'nos', project_id: '' }]);
   const guessMat = (nm) => { const s = (nm || '').toUpperCase(); if (/STAINLESS|\bSS\b/.test(s)) return 'SS'; if (/ALUM|\bAL\b/.test(s)) return 'Aluminium'; if (/BRASS/.test(s)) return 'Brass'; if (/COPPER|\bCU\b/.test(s)) return 'Copper'; if (/CAST\s*IRON|\bCI\b/.test(s)) return 'Cast Iron'; return 'MS'; };
   const guessSection = (nm) => { const s = (nm || '').toLowerCase(); if (/\brhs\b|rect.*tube/.test(s)) return 'rhs'; if (/\bshs\b|square.*tube/.test(s)) return 'shs'; if (/pipe|\bod\b/.test(s)) return 'pipe'; if (/angle/.test(s)) return 'angle'; if (/flat/.test(s)) return 'flat'; if (/round|\bdia\b/.test(s)) return 'round_bar'; if (/square\s*bar|\bsqr\b/.test(s)) return 'square_bar'; if (/rec\.?\s*bar|rect|block|\bbar\b/.test(s)) return 'block'; if (/sheet|coil/.test(s)) return 'sheet'; if (/plate/.test(s)) return 'plate'; return 'plate'; };
-  const [wMode, setWMode] = useState('none');         // none | offcut | weight | scrap
+  const [wOffOn, setWOffOn] = useState(false);        // reusable sized offcut → stock
+  const [wWtOn, setWWtOn] = useState(false);          // reusable by weight → stock
+  const [wScrapOn, setWScrapOn] = useState(false);    // scrap by weight → scrap bucket
   const [wMat, setWMat] = useState(() => guessMat(line.item_name));
   const [wSection, setWSection] = useState(() => guessSection(line.item_name));
   const [wd1, setWd1] = useState('');
@@ -4154,8 +4156,10 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
         }
       }
       // 2. Wastage / leftover → stock (offcut sheet or by weight); scrap adds nothing.
-      if (wMode === 'offcut' && parseFloat(wQty) > 0) {
-        if (!wBuilt.code) throw new Error('Enter the leftover size');
+      const mat = RM_MATERIALS.find(m => m.key === wMat);
+      // Reusable sized offcut → stock (any/all of these can be recorded together).
+      if (wOffOn && parseFloat(wQty) > 0) {
+        if (!wBuilt.code) throw new Error('Enter the offcut size');
         const { data, error } = await sb.rpc('rdc_receive_offcut', {
           p_line_id: line.id, p_code: wBuilt.code, p_name: wBuilt.name, p_material: wMat, p_section_type: wSection,
           p_d1: parseFloat(wd1) || null, p_d2: parseFloat(wd2) || null, p_d3: parseFloat(wd3) || null,
@@ -4164,16 +4168,18 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
           p_category: 'raw_material', p_ref_note: parseFloat(wOffKg) > 0 ? 'weighed ' + fmtNum(parseFloat(wOffKg)) + ' kg' : null,
         });
         if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Offcut save failed');
-      } else if (wMode === 'weight' && parseFloat(wKg) > 0) {
-        const mat = RM_MATERIALS.find(m => m.key === wMat);
+      }
+      // Reusable material by weight → stock.
+      if (wWtOn && parseFloat(wKg) > 0) {
         const { data, error } = await sb.rpc('rdc_receive_offcut', {
           p_line_id: line.id, p_code: (mat?.abbr || 'MAT') + '-OFC-KG', p_name: (mat?.short || wMat) + ' Offcut (kg)',
           p_material: wMat, p_section_type: 'other', p_d1: null, p_d2: null, p_d3: null, p_size_spec: 'kg',
           p_uom: 'kg', p_unit_weight: 1, p_rate_per_kg: null, p_qty: parseFloat(wKg), p_category: 'raw_material', p_ref_note: null,
         });
-        if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Offcut save failed');
-      } else if (wMode === 'scrap' && parseFloat(wScrapKg) > 0) {
-        const mat = RM_MATERIALS.find(m => m.key === wMat);
+        if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Weight save failed');
+      }
+      // Scrap by weight → scrap bucket (kept out of usable stock).
+      if (wScrapOn && parseFloat(wScrapKg) > 0) {
         const { data, error } = await sb.rpc('rdc_receive_offcut', {
           p_line_id: line.id, p_code: (mat?.abbr || 'MAT') + '-SCRAP-KG', p_name: (mat?.short || wMat) + ' Scrap (kg)',
           p_material: wMat, p_section_type: 'other', p_d1: null, p_d2: null, p_d3: null, p_size_spec: 'scrap',
@@ -4296,14 +4302,14 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
               </div>`)}
             <button type="button" class="btn small ghost" onClick=${addPart} style="border-style:dashed;color:var(--teal-700);width:100%;margin-bottom:12px">+ Add part</button>
 
-            <div class="section-h">Leftover / wastage</div>
-            <div style="display:inline-flex;border:1px solid var(--slate-200);border-radius:6px;overflow:hidden;background:white;font-size:11px;font-weight:600;margin-bottom:10px">
-              ${[['none', 'None'], ['offcut', '📐 Offcut piece'], ['weight', '⚖ Weight'], ['scrap', '🗑 Scrap']].map(([k, lbl]) => html`
-                <button type="button" onClick=${() => setWMode(k)} style=${'padding:6px 10px;border:none;cursor:pointer;background:' + (wMode === k ? 'var(--teal-600)' : 'white') + ';color:' + (wMode === k ? 'white' : 'var(--slate-600)')}>${lbl}</button>`)}
+            <div class="section-h">Leftover / wastage <span style="font-weight:400;color:var(--slate-400);font-size:11px">· tick any that apply</span></div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+              ${[['off', wOffOn, setWOffOn, '📐 Offcut piece'], ['wt', wWtOn, setWWtOn, '⚖ By weight'], ['scrap', wScrapOn, setWScrapOn, '🗑 Scrap']].map(([k, on, set, lbl]) => html`
+                <button key=${k} type="button" onClick=${() => set(v => !v)} style=${'padding:6px 12px;border:1px solid ' + (on ? 'var(--teal-600)' : 'var(--slate-200)') + ';border-radius:20px;cursor:pointer;font-size:12px;font-weight:600;background:' + (on ? 'var(--teal-600)' : 'white') + ';color:' + (on ? 'white' : 'var(--slate-600)')}>${on ? '✓ ' : ''}${lbl}</button>`)}
             </div>
-            ${(wMode === 'offcut' || wMode === 'weight') && html`
+            ${(wOffOn || wWtOn || wScrapOn) && html`
               <div class="field"><label>Material</label><select value=${wMat} onChange=${e => setWMat(e.target.value)}>${RM_MATERIALS.map(m => html`<option key=${m.key} value=${m.key}>${m.label}</option>`)}</select></div>`}
-            ${wMode === 'offcut' && html`
+            ${wOffOn && html`
               <div class="field"><label>Shape / section</label>
                 <select value=${wSection} onChange=${e => { setWSection(e.target.value); setWd1(''); setWd2(''); setWd3(''); setWSpec(''); }}>
                   ${RM_SECTIONS.map(s => html`<option key=${s.key} value=${s.key}>${s.label}</option>`)}
@@ -4324,8 +4330,8 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
               </div>
               ${wUnitWeight != null && html`<div style="font-size:11px;color:var(--teal-700);margin:-4px 0 8px">${wBuilt.name} · ≈ ${fmtNum(wUnitWeight)} kg/${wBuilt.uom} → added to stock${parseFloat(wOffKg) > 0 ? ' · weighed ' + fmtNum(parseFloat(wOffKg)) + ' kg noted' : ''}</div>`}
             `}
-            ${wMode === 'weight' && html`<div class="field"><label>Weight to stock (kg)</label><input type="number" step="any" min=${0} value=${wKg} onInput=${e => setWKg(e.target.value)} /></div>`}
-            ${wMode === 'scrap' && html`
+            ${wWtOn && html`<div class="field"><label>Reusable weight to stock (kg)</label><input type="number" step="any" min=${0} value=${wKg} onInput=${e => setWKg(e.target.value)} /></div>`}
+            ${wScrapOn && html`
               <div class="field"><label>Scrap weight (kg)</label><input type="number" step="any" min=${0} value=${wScrapKg} onInput=${e => setWScrapKg(e.target.value)} placeholder="e.g. 12" /></div>
               <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Recorded in a scrap bucket (for reference / scrap sale) — not usable stock.</div>`}
 
