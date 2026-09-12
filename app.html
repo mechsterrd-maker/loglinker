@@ -18813,6 +18813,7 @@ function HrEmployees({ plant, me }) {
   const [search, setSearch] = useState('');
   const [edit, setEdit] = useState(null);       // employee row | { _new:true }
   const [enrollFor, setEnrollFor] = useState(null);
+  const [photoFor, setPhotoFor] = useState(null); // enrolled worker to quick-capture a photo for
   const [photoView, setPhotoView] = useState(null); // { url, name } — enrolled face shown larger
 
   const refresh = useCallback(async () => {
@@ -18852,11 +18853,13 @@ function HrEmployees({ plant, me }) {
               <div style="font-size:11.5px;color:var(--slate-500)">${e.phone || 'no phone'}${e.date_of_joining ? ' · joined ' + e.date_of_joining : ''}</div>
             </div>
             ${enrolled(e.id) ? html`<span class="badge emerald">✓ face</span>` : html`<span class="badge slate">no face</span>`}
+            ${enrolled(e.id) && !(en && en.photo_url) ? html`<button class="btn small" style="background:var(--teal-50);color:var(--teal-700);border:1px solid var(--teal-200)" onClick=${() => setPhotoFor(e)}>📷 Photo</button>` : ''}
             <button class="btn small ${enrolled(e.id) ? 'ghost' : ''}" onClick=${() => setEnrollFor(e)}>${enrolled(e.id) ? 'Re-enroll' : 'Enroll'}</button>
           </div>`; })}
         </div>`}
       ${edit && html`<${HrEmployeeModal} plant=${plant} me=${me} employee=${edit._new ? null : edit} onClose=${() => setEdit(null)} onSaved=${() => { setEdit(null); refresh(); }} onEnroll=${(row) => { setEdit(null); setEnrollFor(row); }} />`}
       ${enrollFor && html`<${FaceEnrollModal} plant=${plant} me=${me} user=${enrollFor} existing=${enroll[enrollFor.id]} onClose=${() => setEnrollFor(null)} onSaved=${() => { setEnrollFor(null); refresh(); }} />`}
+      ${photoFor && html`<${FacePhotoModal} plant=${plant} user=${photoFor} existing=${enroll[photoFor.id]} onClose=${() => setPhotoFor(null)} onSaved=${() => { setPhotoFor(null); refresh(); }} />`}
       ${photoView && html`<div class="modal-backdrop active" onClick=${ev => { if (ev.target === ev.currentTarget) setPhotoView(null); }}>
         <div class="modal" style="max-width:320px;text-align:center">
           <div class="modal-header"><div class="modal-title">${photoView.name}</div><button class="close-btn" onClick=${() => setPhotoView(null)}>×</button></div>
@@ -19589,6 +19592,7 @@ function FaceAttendanceModule({ plant, me, locked }) {
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [enrollFor, setEnrollFor] = useState(null); // user being enrolled
+  const [photoFor, setPhotoFor] = useState(null);   // enrolled worker to quick-capture a photo for
   const [photoView, setPhotoView] = useState(null); // { url, name } — enrolled face shown larger
   // kiosk state
   const [engine, setEngine] = useState('idle');     // idle | loading | running
@@ -19982,6 +19986,7 @@ function FaceAttendanceModule({ plant, me, locked }) {
               <div style="font-size:11px;color:var(--slate-500)">${roleLabel ? roleLabel(u.role) : u.role}${done ? ' · ' + (e.descriptors.length) + ' sample' + (e.descriptors.length===1?'':'s') + (e.pin?' · PIN set':'') + (e.photo_url?'':' · no photo') : e && !e.consent ? ' · consent pending' : ''}</div>
             </div>
             ${done ? html`<span class="badge emerald">✓ face</span>` : html`<span class="badge slate">not enrolled</span>`}
+            ${done && !e.photo_url ? html`<button class="btn small" style="background:var(--teal-50);color:var(--teal-700);border:1px solid var(--teal-200)" onClick=${() => setPhotoFor(u)}>📷 Photo</button>` : ''}
             <button class="btn small" onClick=${() => setEnrollFor(u)}>${done ? 'Re-enroll' : 'Enroll'}</button>
             ${e ? html`<button class="btn small ghost" style="color:var(--rose-600)" onClick=${() => delEnroll(u.id)}>✕</button>` : ''}
           </div>`; })}
@@ -19989,6 +19994,8 @@ function FaceAttendanceModule({ plant, me, locked }) {
     `}
 
     ${enrollFor && html`<${FaceEnrollModal} plant=${plant} me=${me} user=${enrollFor} existing=${enroll[enrollFor.id]} onClose=${() => setEnrollFor(null)} onSaved=${() => { setEnrollFor(null); refresh(); }} />`}
+
+    ${photoFor && html`<${FacePhotoModal} plant=${plant} user=${photoFor} existing=${enroll[photoFor.id]} onClose=${() => setPhotoFor(null)} onSaved=${() => { setPhotoFor(null); refresh(); }} />`}
 
     ${photoView && html`<div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) setPhotoView(null); }}>
       <div class="modal" style="max-width:320px;text-align:center">
@@ -20128,6 +20135,74 @@ function FaceEnrollModal({ plant, me, user, existing, onClose, onSaved }) {
           <div style="display:flex;gap:8px">
             <button class="btn ghost" style="flex:1" onClick=${openCam}>↺ Retake face</button>
             <button class="btn" style="flex:2" disabled=${busy || (!consent && !hadFace)} onClick=${save}>${busy ? 'Saving…' : 'Save enrollment'}</button>
+          </div>
+        `}
+      </div>
+    </div>
+  `;
+}
+
+// Lightweight one-tap photo capture for a worker who is ALREADY face-enrolled
+// but has no reference photo yet — just snaps a picture and saves it to
+// photo_url, without redoing the 3-sample face enrollment.
+function FacePhotoModal({ plant, user, existing, onClose, onSaved }) {
+  const [phase, setPhase] = useState('camera');   // camera | preview
+  const [photo, setPhoto] = useState(existing?.photo_url || null);
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  const videoRef = useRef(null); const streamRef = useRef(null);
+
+  const stop = () => { try { streamRef.current?.getTracks().forEach(t => t.stop()); } catch (_) {} streamRef.current = null; };
+  const openCam = async () => {
+    setErr(''); setPhase('camera');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+      streamRef.current = stream;
+      setTimeout(() => { const v = videoRef.current; if (v) { v.srcObject = stream; v.play().catch(() => {}); } }, 120);
+    } catch (e) { setErr('Camera permission denied.'); }
+  };
+  useEffect(() => { openCam(); return () => stop(); }, []);
+
+  const take = () => {
+    const v = videoRef.current;
+    if (!v || !v.videoWidth) { setErr('Camera not ready — hold on a second and try again.'); return; }
+    try {
+      const pw = 200, ph = Math.round(200 * (v.videoHeight / v.videoWidth)) || 250;
+      const c = document.createElement('canvas'); c.width = pw; c.height = ph;
+      c.getContext('2d').drawImage(v, 0, 0, pw, ph);
+      setPhoto(c.toDataURL('image/jpeg', 0.72)); stop(); setPhase('preview');
+    } catch (e) { setErr('Capture failed'); }
+  };
+
+  const save = async () => {
+    if (!photo) { setErr('Take a photo first'); return; }
+    setBusy(true); setErr('');
+    const { error } = await sb.from('attendance_face_enrollments')
+      .update({ photo_url: photo, updated_at: new Date().toISOString() })
+      .eq('plant_id', plant.id).eq('user_id', user.id);
+    setBusy(false);
+    if (error) { setErr(error.message); return; }
+    showToast('✓ Photo saved for ' + user.full_name); onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) { stop(); onClose(); } }}>
+      <div class="modal" style="max-width:420px">
+        <div class="modal-header"><div class="modal-title">📷 Photo · ${user.full_name}</div><button class="close-btn" onClick=${() => { stop(); onClose(); }}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        ${phase === 'camera' ? html`
+          <div style="font-size:12px;color:var(--slate-600);margin-bottom:8px;text-align:center">Face the camera, then tap to take one photo. This is just a picture so you can recognise ${user.full_name.split(' ')[0]} in the list — the face punch is unchanged.</div>
+          <div style="position:relative">
+            <video ref=${videoRef} playsinline muted style="width:100%;border-radius:10px;background:#000;transform:scaleX(-1)"></video>
+            <div style="position:absolute;left:50%;top:48%;transform:translate(-50%,-50%);width:150px;height:190px;border:2px dashed rgba(255,255,255,.85);border-radius:50%;pointer-events:none"></div>
+          </div>
+          <button class="btn" style="width:100%;margin-top:10px" onClick=${take}>📸 Take photo</button>
+        ` : html`
+          <div style="text-align:center;padding:6px">
+            ${photo && html`<img src=${photo} alt=${user.full_name} style="width:150px;height:186px;object-fit:cover;border-radius:12px;border:2px solid var(--emerald-300);margin:0 auto 10px;display:block" />`}
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="btn ghost" style="flex:1" onClick=${openCam}>↺ Retake</button>
+            <button class="btn" style="flex:2" disabled=${busy} onClick=${save}>${busy ? 'Saving…' : 'Save photo'}</button>
           </div>
         `}
       </div>
