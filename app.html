@@ -22006,6 +22006,7 @@ function rtBuildDocCtx({ doc, plant, party, isInvoice }) {
     project_name:      (raw.project_name || [...new Set(items.map(it => it.project_name).filter(Boolean))].join(', ')) || '',
     project_ref:       (raw.project_name || [...new Set(items.map(it => it.project_name).filter(Boolean))].join(', ')) || '',
     total_qty:         items.reduce((s, it) => s + (parseFloat(it.qty) || 0), 0),
+    total_approx_value: items.reduce((s, it) => s + (parseFloat(it.approx_value) || 0), 0),
     total_packages:    pt.packages || items.reduce((s, it) => s + (parseInt(it.packages) || 0), 0),
     total_gross_weight: pt.gross_wt || items.reduce((s, it) => s + (parseFloat(it.gross_wt) || 0), 0),
     total_net_weight:   pt.net_wt   || items.reduce((s, it) => s + (parseFloat(it.net_wt) || 0), 0),
@@ -27848,7 +27849,7 @@ function SalesDocPreview({ doc: docProp, plant, me, customers, vendors, onClose 
       <div style="flex:1;min-width:0"><h1 style="font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${isInvoice ? '🧾 Tax Invoice' : '📦 Delivery Challan'} · ${doc.doc_number}</h1></div>
       ${canEdit && html`<button class="btn small" onClick=${() => setEditing(true)} style="padding:6px 12px;flex-shrink:0;background:var(--teal-600);color:white" title="You can edit this for 24 hours after creating it">✏️ Edit</button>`}
     </div>
-    ${editing && html`<${DcEditModal} plant=${plant} me=${me} doc=${doc} onClose=${() => setEditing(false)} onSaved=${(updated) => { setDoc(updated); setEditing(false); }} />`}
+    ${editing && html`<${DcEditModal} plant=${plant} me=${me} doc=${doc} onClose=${() => setEditing(false)} onSaved=${(updated) => { if (updated?._deleted) { setEditing(false); onClose(); } else { setDoc(updated); setEditing(false); } }} />`}
     <${DocFormatBar} plant=${plant} me=${me} doc=${doc} party=${cust} isInvoice=${isInvoice} onPrintDefault=${printIt} defaultView=${html`
     <style>
       @media print {
@@ -27947,13 +27948,16 @@ function SalesDocPreview({ doc: docProp, plant, me, customers, vendors, onClose 
 function DcEditModal({ plant, me, doc, onClose, onSaved }) {
   const isInvoice = doc.doc_type === 'invoice_out';
   const raw = doc.raw_extraction || {};
+  const isAdmin = ['admin', 'plant_head'].includes(me?.role);
   const [form, setForm] = useState({
+    doc_number: doc.doc_number || '',
     doc_date: doc.doc_date || '',
     vehicle_no: raw.vehicle_no || '',
     eway_bill: raw.eway_bill || '',
     po_reference: raw.po_reference || '',
     notes: doc.notes || '',
   });
+  const [deleting, setDeleting] = useState(false);
   const [items, setItems] = useState((Array.isArray(doc.items) ? doc.items : []).map(it => ({ ...it })));
   const [projects, setProjects] = useState([]);
   const [busy, setBusy] = useState(false);
@@ -27997,6 +28001,7 @@ function DcEditModal({ plant, me, doc, onClose, onSaved }) {
 
       const newRaw = { ...raw, vehicle_no: form.vehicle_no || null, eway_bill: form.eway_bill || null, po_reference: form.po_reference || null };
       const payload = {
+        doc_number: (form.doc_number || '').trim() || doc.doc_number,
         doc_date: form.doc_date || null,
         items: clean,
         raw_extraction: newRaw,
@@ -28021,18 +28026,34 @@ function DcEditModal({ plant, me, doc, onClose, onSaved }) {
 
       const { data, error } = await sb.from('mcp_logistics_documents').update(payload).eq('id', doc.id).select('*').single();
       if (error) throw error;
-      showToast('✓ ' + (doc.doc_number || 'Document') + ' updated');
+      showToast('✓ ' + (data.doc_number || 'Document') + ' updated');
       onSaved(data);
-    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e) {
+      const raw2 = e?.message || String(e);
+      if (e?.code === '23505' || /idx_docs_unique|duplicate key/i.test(raw2)) {
+        setErr('That document number is already used by another document (same date & party). Pick a different number.');
+      } else { setErr(raw2); }
+    } finally { setBusy(false); }
+  };
+
+  const doDelete = async () => {
+    if (!confirm('Delete ' + (doc.doc_number || 'this document') + '?\n\nThis permanently removes the challan and returns any issued stock. This cannot be undone.')) return;
+    setErr(''); setDeleting(true);
+    const { data, error } = await sb.rpc('delete_logistics_document', { p_doc_id: doc.id });
+    setDeleting(false);
+    if (error || data?.success === false) { setErr(error?.message || data?.error || 'Could not delete'); return; }
+    showToast('🗑 ' + (doc.doc_number || 'Document') + ' deleted');
+    onSaved({ ...doc, _deleted: true });
   };
 
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal" style="max-width:600px">
         <div class="modal-header"><div class="modal-title">Edit ${doc.doc_number || 'document'}</div><button class="close-btn" onClick=${onClose}>×</button></div>
-        <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">Correction window — you can edit this for 24 hours after creating it. The document number stays the same.</div>
+        <div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">Correction window — you can edit this for 24 hours after creating it. You can also change the document number or delete it.</div>
         ${err && html`<div class="alert error" style="white-space:pre-line">${err}</div>`}
         <form onSubmit=${submit}>
+          <div class="field"><label>Document number</label><input type="text" value=${form.doc_number} onChange=${e => setForm({ ...form, doc_number: e.target.value })} placeholder="e.g. MMPL/25-26/RDC:544" /></div>
           <div class="field-row">
             <div class="field"><label>Doc date</label><${DateField} value=${form.doc_date} onChange=${e => setForm({ ...form, doc_date: e.target.value })} /></div>
             <div class="field"><label>Vehicle no</label><input type="text" value=${form.vehicle_no} onChange=${e => setForm({ ...form, vehicle_no: e.target.value })} /></div>
@@ -28076,7 +28097,10 @@ function DcEditModal({ plant, me, doc, onClose, onSaved }) {
           </div>
 
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({ ...form, notes: e.target.value })}></textarea></div>
-          <button class="btn" disabled=${busy} style="width:100%">${busy ? 'Saving…' : '💾 Save changes'}</button>
+          <div style="display:flex;gap:8px">
+            <button type="button" class="btn danger" disabled=${busy || deleting} onClick=${doDelete} style="flex-shrink:0">${deleting ? 'Deleting…' : '🗑 Delete'}</button>
+            <button class="btn" disabled=${busy || deleting} style="flex:1">${busy ? 'Saving…' : '💾 Save changes'}</button>
+          </div>
         </form>
       </div>
     </div>
