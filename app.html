@@ -3991,7 +3991,9 @@ function RdcReturns({ plant, me, activeUnit }) {
   const [tab, setTab] = useState('open');   // open | done | all
   const [busy, setBusy] = useState({});
   const [recv, setRecv] = useState({});     // line id -> qty string
-  const [rcvModal, setRcvModal] = useState(null); // line being received in the full dialog
+  const [rcvModal, setRcvModal] = useState(null); // DC group being received in the full dialog
+  const [expanded, setExpanded] = useState(() => new Set()); // expanded DC groups
+  const toggleExp = (k) => setExpanded(prev => { const n = new Set(prev); n.has(k) ? n.delete(k) : n.add(k); return n; });
   const u = activeUnit?.unit_id;
   const scope = (q) => u ? q.or(`unit_id.eq.${u},unit_id.is.null`) : q;
 
@@ -4010,6 +4012,17 @@ function RdcReturns({ plant, me, activeUnit }) {
   const isOpen = (l) => l.status === 'open' || l.status === 'partial';
 
   const shown = lines.filter(l => tab === 'all' ? true : tab === 'open' ? isOpen(l) : !isOpen(l));
+  // Group the visible lines by their DC so one returnable DC = one card (its
+  // items expand underneath), instead of a separate card per item.
+  const groups = (() => {
+    const m = new Map();
+    for (const l of shown) {
+      const key = l.doc_id || l.id;
+      if (!m.has(key)) m.set(key, { key, doc_id: l.doc_id, doc_number: l.doc?.doc_number, party_name: l.party_name, sent_on: l.sent_on, lines: [] });
+      m.get(key).lines.push(l);
+    }
+    return [...m.values()];
+  })();
   const openCount = lines.filter(isOpen).length;
   const overdueCount = lines.filter(l => isOpen(l) && overdueDays(l)).length;
 
@@ -4045,34 +4058,51 @@ function RdcReturns({ plant, me, activeUnit }) {
         <button class=${'auth-tab' + (tab === 'all' ? ' active' : '')} onClick=${() => setTab('all')}>All</button>
       </div>
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
-        shown.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🔁</div><div style="font-size:13px">No returnable-DC items ${tab === 'open' ? 'open' : 'here'}. Create a Returnable DC (RDC) in Make Documents and its items appear here for tracking.</div></div></div>` :
-        shown.map(l => { const st = STATUS[l.status] || { l: l.status, c: '' }; const od = overdueDays(l); return html`
-          <div class="card" key=${l.id} style="margin-bottom:8px">
+        groups.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🔁</div><div style="font-size:13px">No returnable-DC items ${tab === 'open' ? 'open' : 'here'}. Create a Returnable DC (RDC) in Make Documents and its items appear here for tracking.</div></div></div>` :
+        groups.map(g => {
+          const openLines = g.lines.filter(isOpen);
+          const anyOpen = openLines.length > 0;
+          const totalPending = g.lines.reduce((s, l) => s + pending(l), 0);
+          const ods = g.lines.map(overdueDays).filter(Boolean);
+          const maxOverdue = ods.length ? Math.max(...ods) : null;
+          const douts = g.lines.map(daysOut).filter(x => x != null);
+          const maxDaysOut = douts.length ? Math.max(...douts) : null;
+          const isExp = expanded.has(g.key);
+          return html`
+          <div class="card" key=${g.key} style="margin-bottom:8px">
             <div class="list-item-main">
-              <div class="list-item-title">${l.item_name || 'Item'}</div>
-              <div class="list-item-sub">🏢 ${l.party_name || '—'} · DC ${l.doc?.doc_number || '?'}${l.sent_on ? ' · sent ' + l.sent_on : ''}</div>
-              <div class="list-item-sub" style="margin-top:3px">Sent ${fmtNum(l.qty_sent)} ${l.uom || ''} · Back ${fmtNum(l.qty_received)} · <strong>Pending ${fmtNum(pending(l))} ${l.uom || ''}</strong></div>
+              <div class="list-item-title">DC ${g.doc_number || '?'}</div>
+              <div class="list-item-sub">🏢 ${g.party_name || '—'}${g.sent_on ? ' · sent ' + g.sent_on : ''} · ${g.lines.length} item${g.lines.length === 1 ? '' : 's'}</div>
+              <div class="list-item-sub" style="margin-top:3px"><strong>Pending ${fmtNum(totalPending)}</strong> · ${openLines.length} open item${openLines.length === 1 ? '' : 's'}</div>
               <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
-                <span class=${'badge ' + st.c}>${st.l}</span>
-                ${daysOut(l) != null && html`<span class="badge teal" style="font-size:10px">${daysOut(l)}d out</span>`}
-                ${od && html`<span class="badge rose" style="font-size:10px">⚠️ ${od}d overdue</span>`}
+                <span class=${'badge ' + (anyOpen ? 'amber' : 'emerald')}>${anyOpen ? 'Open' : 'Done'}</span>
+                ${maxDaysOut != null && html`<span class="badge teal" style="font-size:10px">${maxDaysOut}d out</span>`}
+                ${maxOverdue && html`<span class="badge rose" style="font-size:10px">⚠️ ${maxOverdue}d overdue</span>`}
               </div>
             </div>
-            ${isOpen(l) ? html`
-              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px;border-top:1px solid var(--slate-100);padding-top:10px">
-                <label style="font-size:11px;color:var(--slate-500)">Expected return<${DateField} value=${l.expected_return_date || ''} onChange=${e => setDue(l, e.target.value)} style="margin-left:6px;border:1px solid var(--slate-200);border-radius:5px;padding:4px 6px;font-size:12px" /></label>
-                <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
-                  <button class="btn small" style="background:var(--teal-600);color:#fff" onClick=${() => setRcvModal(l)} title="Receive with details — same back, or as parts + wastage">📥 Receive…</button>
-                  <button class="btn small ghost" disabled=${!!busy[l.id]} onClick=${() => doClose(l)}>Close</button>
-                </div>
-              </div>` :
-              html`<div style="margin-top:8px;display:flex;gap:8px;align-items:center;border-top:1px solid var(--slate-100);padding-top:8px">
-                <span style="font-size:11px;color:var(--slate-500)">${l.status === 'received' ? '✓ Fully received' : 'Closed'}${l.received_at ? ' · ' + fmtDate(l.received_at) : ''}</span>
-                <button class="btn small ghost" style="margin-left:auto" disabled=${!!busy[l.id]} onClick=${() => doReopen(l)}>Reopen</button>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:10px;border-top:1px solid var(--slate-100);padding-top:10px">
+              <button class="btn small ghost" onClick=${() => toggleExp(g.key)}>${isExp ? '▲ Hide items' : '▾ View items (' + g.lines.length + ')'}</button>
+              ${anyOpen && html`<button class="btn small" style="margin-left:auto;background:var(--teal-600);color:#fff" onClick=${() => setRcvModal(g)} title="Receive — pick the input material, record the parts made + leftover">📥 Receive…</button>`}
+            </div>
+            ${isExp && html`
+              <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+                ${g.lines.map(l => { const st = STATUS[l.status] || { l: l.status, c: '' }; const lod = overdueDays(l); return html`
+                  <div key=${l.id} class="card" style="padding:8px 10px;margin:0;background:var(--slate-50)">
+                    <div style="font-size:12px;font-weight:600">${l.item_name || 'Item'}</div>
+                    <div style="font-size:11px;color:var(--slate-500)">Sent ${fmtNum(l.qty_sent)} ${l.uom || ''} · Back ${fmtNum(l.qty_received)} · Pending ${fmtNum(pending(l))}</div>
+                    <div style="margin-top:5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                      <span class=${'badge ' + st.c} style="font-size:10px">${st.l}</span>
+                      ${lod ? html`<span class="badge rose" style="font-size:9px">${lod}d overdue</span>` : ''}
+                      ${isOpen(l) ? html`
+                        <label style="font-size:10px;color:var(--slate-500);margin-left:auto">Exp<${DateField} value=${l.expected_return_date || ''} onChange=${e => setDue(l, e.target.value)} style="margin-left:4px;border:1px solid var(--slate-200);border-radius:4px;padding:3px 5px;font-size:11px" /></label>
+                        <button class="btn small ghost" disabled=${!!busy[l.id]} onClick=${() => doClose(l)} style="font-size:11px;padding:2px 8px">Close</button>
+                      ` : html`<button class="btn small ghost" style="margin-left:auto;font-size:11px;padding:2px 8px" disabled=${!!busy[l.id]} onClick=${() => doReopen(l)}>Reopen</button>`}
+                    </div>
+                  </div>`; })}
               </div>`}
           </div>`;
         })}
-      ${rcvModal && html`<${ReceiveReturnModal} plant=${plant} me=${me} line=${rcvModal} onClose=${() => setRcvModal(null)} onSaved=${() => { setRcvModal(null); refresh(); }} />`}
+      ${rcvModal && html`<${ReceiveReturnModal} plant=${plant} me=${me} lines=${rcvModal.lines} onClose=${() => setRcvModal(null)} onSaved=${() => { setRcvModal(null); refresh(); }} />`}
     </div>`;
 }
 
@@ -4080,7 +4110,12 @@ function RdcReturns({ plant, me, activeUnit }) {
 // subcontract plan), return BALANCE material to stock or mark SCRAP (with weight),
 // or record the SAME material back — all in one place. Reuses the tested RPCs
 // sc_plan_receive / sc_material_return / receive_rdc_line.
-function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
+function ReceiveReturnModal({ plant, me, lines, onClose, onSaved }) {
+  const allLines = Array.isArray(lines) ? lines : (lines ? [lines] : []);
+  const linePending = (l) => Math.max(Number(l.qty_sent || 0) - Number(l.qty_received || 0), 0);
+  // Which sent item (input material) is being received now.
+  const [selLineId, setSelLineId] = useState(() => (allLines.find(l => l.status === 'open' || l.status === 'partial') || allLines[0] || {}).id);
+  const line = allLines.find(l => l.id === selLineId) || allLines[0] || {};
   const [plan, setPlan] = useState(null);
   const [products, setProducts] = useState([]);
   const [materials, setMaterials] = useState([]);
@@ -4088,7 +4123,7 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
   const [sameQty, setSameQty] = useState('');
   const [retMat, setRetMat] = useState(null);
   const [busy, setBusy] = useState(false);
-  const pendingLine = Math.max(Number(line.qty_sent || 0) - Number(line.qty_received || 0), 0);
+  const pendingLine = linePending(line);
 
   // Ad-hoc receive (no formal plan) — the common laser-cut case.
   const [mode, setMode] = useState('same');           // same | parts
@@ -4128,8 +4163,8 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
   const wUnitWeight = wBuilt.unit_weight;
 
   const askCompleteAndClose = async () => {
-    if (confirm('Saved.\n\nIs this returnable DC now fully COMPLETED?\n\nOK = close it (done)\nCancel = keep it open (still pending)')) {
-      await sb.rpc('close_rdc_line', { p_line_id: line.id, p_reopen: false });
+    if (confirm('Saved.\n\nIs this whole returnable DC now COMPLETED (all items back)?\n\nOK = close the DC\nCancel = keep it open (still receiving)')) {
+      for (const l of allLines) { await sb.rpc('close_rdc_line', { p_line_id: l.id, p_reopen: false }); }
     }
   };
 
@@ -4239,10 +4274,16 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal" style="max-width:560px;max-height:92vh;overflow-y:auto">
         <div class="modal-header">
-          <div class="modal-title">📥 Receive · ${line.item_name || 'returnable'}</div>
+          <div class="modal-title">📥 Receive · DC ${line.doc?.doc_number || ''}</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
-        <div style="font-size:12px;color:var(--slate-600);margin-bottom:12px">${line.party_name || ''} · sent ${fmtNum(line.qty_sent)} ${line.uom || ''} · pending ${fmtNum(pendingLine)}</div>
+        ${allLines.length > 1 && html`
+          <div class="field"><label>Input material (which sent item came back)</label>
+            <select value=${selLineId} onChange=${e => setSelLineId(e.target.value)}>
+              ${allLines.map(l => html`<option key=${l.id} value=${l.id}>${l.item_name || 'Item'} · pending ${fmtNum(linePending(l))} ${l.uom || ''}${linePending(l) <= 0 ? ' ✓' : ''}</option>`)}
+            </select>
+          </div>`}
+        <div style="font-size:12px;color:var(--slate-600);margin-bottom:12px">${line.party_name || ''} · <strong>${line.item_name || ''}</strong> · sent ${fmtNum(line.qty_sent)} ${line.uom || ''} · pending ${fmtNum(pendingLine)}</div>
 
         ${plan ? html`
           <div class="section-h">Finished parts back (per plan)</div>
