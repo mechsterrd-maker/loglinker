@@ -4113,9 +4113,10 @@ function RdcReturns({ plant, me, activeUnit }) {
 function ReceiveReturnModal({ plant, me, lines, onClose, onSaved }) {
   const allLines = Array.isArray(lines) ? lines : (lines ? [lines] : []);
   const linePending = (l) => Math.max(Number(l.qty_sent || 0) - Number(l.qty_received || 0), 0);
-  // Which sent item (input material) is being received now.
-  const [selLineId, setSelLineId] = useState(() => (allLines.find(l => l.status === 'open' || l.status === 'partial') || allLines[0] || {}).id);
-  const line = allLines.find(l => l.id === selLineId) || allLines[0] || {};
+  const line = allLines.find(l => l.status === 'open' || l.status === 'partial') || allLines[0] || {}; // reference line (doc/unit)
+  // Per-input "received same material back" — mark which sent items came back and how much.
+  const [recvSel, setRecvSel] = useState(() => { const o = {}; allLines.forEach(l => { o[l.id] = { on: false, qty: '' + linePending(l) }; }); return o; });
+  const setRecv1 = (id, patch) => setRecvSel(s => ({ ...s, [id]: { ...s[id], ...patch } }));
   const [plan, setPlan] = useState(null);
   const [products, setProducts] = useState([]);
   const [materials, setMaterials] = useState([]);
@@ -4126,7 +4127,6 @@ function ReceiveReturnModal({ plant, me, lines, onClose, onSaved }) {
   const pendingLine = linePending(line);
 
   // Ad-hoc receive (no formal plan) — the common laser-cut case.
-  const [mode, setMode] = useState('same');           // same | parts
   const [rcvDate, setRcvDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [refNo, setRefNo] = useState('');
   const [projects, setProjects] = useState([]);
@@ -4171,7 +4171,14 @@ function ReceiveReturnModal({ plant, me, lines, onClose, onSaved }) {
   const saveAdhoc = async () => {
     setBusy(true);
     try {
-      const note = (refNo ? 'Ref ' + refNo + ' · ' : '') + 'recd ' + rcvDate;
+      // 0. Inputs that came back as-is → mark each ticked input received.
+      for (const l of allLines) {
+        const r = recvSel[l.id];
+        if (r && r.on && parseFloat(r.qty) > 0) {
+          const { data, error } = await sb.rpc('receive_rdc_line', { p_line_id: l.id, p_qty: parseFloat(r.qty) });
+          if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Receive failed');
+        }
+      }
       // 1. Parts → project components (each assigned to a project)
       const validParts = parts.filter(p => (p.name || '').trim() && parseFloat(p.qty) > 0);
       for (const p of validParts) {
@@ -4221,11 +4228,6 @@ function ReceiveReturnModal({ plant, me, lines, onClose, onSaved }) {
           p_uom: 'kg', p_unit_weight: 1, p_rate_per_kg: null, p_qty: parseFloat(wScrapKg), p_category: 'general', p_ref_note: 'scrap',
         });
         if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Scrap save failed');
-      }
-      // 3. The sent sheet has been consumed into parts — mark it received.
-      if (pendingLine > 0) {
-        const { error } = await sb.rpc('receive_rdc_line', { p_line_id: line.id, p_qty: pendingLine });
-        if (error) throw error;
       }
       await askCompleteAndClose();
       showToast('✓ Received' + (validParts.length ? ' · ' + validParts.length + ' part' + (validParts.length === 1 ? '' : 's') : ''));
@@ -4277,13 +4279,7 @@ function ReceiveReturnModal({ plant, me, lines, onClose, onSaved }) {
           <div class="modal-title">📥 Receive · DC ${line.doc?.doc_number || ''}</div>
           <button class="close-btn" onClick=${onClose}>×</button>
         </div>
-        ${allLines.length > 1 && html`
-          <div class="field"><label>Input material (which sent item came back)</label>
-            <select value=${selLineId} onChange=${e => setSelLineId(e.target.value)}>
-              ${allLines.map(l => html`<option key=${l.id} value=${l.id}>${l.item_name || 'Item'} · pending ${fmtNum(linePending(l))} ${l.uom || ''}${linePending(l) <= 0 ? ' ✓' : ''}</option>`)}
-            </select>
-          </div>`}
-        <div style="font-size:12px;color:var(--slate-600);margin-bottom:12px">${line.party_name || ''} · <strong>${line.item_name || ''}</strong> · sent ${fmtNum(line.qty_sent)} ${line.uom || ''} · pending ${fmtNum(pendingLine)}</div>
+        <div style="font-size:12px;color:var(--slate-600);margin-bottom:12px">${line.party_name || ''} · ${allLines.length} item${allLines.length === 1 ? '' : 's'} sent</div>
 
         ${plan ? html`
           <div class="section-h">Finished parts back (per plan)</div>
@@ -4316,19 +4312,19 @@ function ReceiveReturnModal({ plant, me, lines, onClose, onSaved }) {
             <div class="field"><label>Received on</label><${DateField} value=${rcvDate} onChange=${e => setRcvDate(e.target.value)} /></div>
             <div class="field"><label>Their DC / invoice no</label><input type="text" value=${refNo} onInput=${e => setRefNo(e.target.value)} placeholder="for reference" /></div>
           </div>
-          <div style="display:inline-flex;border:1px solid var(--slate-200);border-radius:6px;overflow:hidden;background:white;font-size:12px;font-weight:600;margin-bottom:12px">
-            ${[['same', '↔ Same back'], ['parts', '🧩 As parts + wastage']].map(([k, lbl]) => html`
-              <button type="button" onClick=${() => setMode(k)} style=${'padding:7px 12px;border:none;cursor:pointer;background:' + (mode === k ? 'var(--teal-600)' : 'white') + ';color:' + (mode === k ? 'white' : 'var(--slate-600)')}>${lbl}</button>`)}
-          </div>
+          <div class="section-h">Inputs back as material <span style="font-weight:400;color:var(--slate-400);font-size:11px">· tick what returned uncut</span></div>
+          ${allLines.map(l => { const p = linePending(l); const r = recvSel[l.id] || { on: false, qty: '' }; return html`
+            <div key=${l.id} style="display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--slate-100)">
+              <input type="checkbox" checked=${r.on} onChange=${e => setRecv1(l.id, { on: e.target.checked })} />
+              <div style="flex:1;min-width:0">
+                <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${l.item_name || 'Item'}</div>
+                <div style="font-size:10px;color:var(--slate-400)">pending ${fmtNum(p)} ${l.uom || ''}</div>
+              </div>
+              <input type="number" step="any" min=${0} value=${r.qty} onInput=${e => setRecv1(l.id, { qty: e.target.value, on: true })} style="width:72px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;text-align:right" />
+              <span style="font-size:10px;color:var(--slate-400)">${l.uom || ''}</span>
+            </div>`; })}
 
-          ${mode === 'same' ? html`
-            <div style="font-size:11px;color:var(--slate-500);margin-bottom:6px">The same material came back as-is (uncut). Records it received.</div>
-            <div style="display:flex;gap:6px;align-items:center">
-              <input type="number" step="any" min=${0} value=${sameQty} placeholder=${'qty ' + fmtNum(pendingLine)} onInput=${e => setSameQty(e.target.value)} style="width:110px;padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />
-              <button class="btn small" disabled=${busy} onClick=${receiveSame}>✓ Received same</button>
-            </div>
-          ` : html`
-            <div class="section-h">Parts received — pick a project, or leave blank for stock</div>
+          <div class="section-h" style="margin-top:14px">Parts made — pick a project, or leave blank for stock</div>
             ${parts.map((p, i) => html`
               <div key=${i} class="card" style="padding:8px;margin-bottom:6px;background:var(--slate-50)">
                 <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
@@ -4377,7 +4373,6 @@ function ReceiveReturnModal({ plant, me, lines, onClose, onSaved }) {
               <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Recorded in a scrap bucket (for reference / scrap sale) — not usable stock.</div>`}
 
             <button class="btn" disabled=${busy} style="width:100%;margin-top:8px" onClick=${saveAdhoc}>${busy ? 'Saving…' : '💾 Save receipt'}</button>
-          `}
         `}
 
         <button class="btn ghost" style="width:100%;margin-top:16px" onClick=${onClose}>Done</button>
