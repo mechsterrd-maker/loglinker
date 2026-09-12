@@ -4107,6 +4107,8 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
   const [wSpec, setWSpec] = useState('');
   const [wQty, setWQty] = useState('1');
   const [wKg, setWKg] = useState('');
+  const [wOffKg, setWOffKg] = useState('');   // optional weighed value recorded with an offcut
+  const [wScrapKg, setWScrapKg] = useState(''); // scrap weight
   const setPart = (i, patch) => setParts(a => a.map((p, idx) => idx === i ? { ...p, ...patch } : p));
   const addPart = () => setParts(a => [...a, { name: '', qty: '', uom: 'nos', project_id: '' }]);
   const rmPart = (i) => setParts(a => a.length <= 1 ? a : a.filter((_, idx) => idx !== i));
@@ -4159,6 +4161,7 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
           p_d1: parseFloat(wd1) || null, p_d2: parseFloat(wd2) || null, p_d3: parseFloat(wd3) || null,
           p_size_spec: wBuilt.size_spec || null, p_uom: wBuilt.uom || 'nos',
           p_unit_weight: wBuilt.unit_weight, p_rate_per_kg: null, p_qty: parseFloat(wQty),
+          p_category: 'raw_material', p_ref_note: parseFloat(wOffKg) > 0 ? 'weighed ' + fmtNum(parseFloat(wOffKg)) + ' kg' : null,
         });
         if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Offcut save failed');
       } else if (wMode === 'weight' && parseFloat(wKg) > 0) {
@@ -4166,9 +4169,17 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
         const { data, error } = await sb.rpc('rdc_receive_offcut', {
           p_line_id: line.id, p_code: (mat?.abbr || 'MAT') + '-OFC-KG', p_name: (mat?.short || wMat) + ' Offcut (kg)',
           p_material: wMat, p_section_type: 'other', p_d1: null, p_d2: null, p_d3: null, p_size_spec: 'kg',
-          p_uom: 'kg', p_unit_weight: 1, p_rate_per_kg: null, p_qty: parseFloat(wKg),
+          p_uom: 'kg', p_unit_weight: 1, p_rate_per_kg: null, p_qty: parseFloat(wKg), p_category: 'raw_material', p_ref_note: null,
         });
         if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Offcut save failed');
+      } else if (wMode === 'scrap' && parseFloat(wScrapKg) > 0) {
+        const mat = RM_MATERIALS.find(m => m.key === wMat);
+        const { data, error } = await sb.rpc('rdc_receive_offcut', {
+          p_line_id: line.id, p_code: (mat?.abbr || 'MAT') + '-SCRAP-KG', p_name: (mat?.short || wMat) + ' Scrap (kg)',
+          p_material: wMat, p_section_type: 'other', p_d1: null, p_d2: null, p_d3: null, p_size_spec: 'scrap',
+          p_uom: 'kg', p_unit_weight: 1, p_rate_per_kg: null, p_qty: parseFloat(wScrapKg), p_category: 'general', p_ref_note: 'scrap',
+        });
+        if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Scrap save failed');
       }
       // 3. The sent sheet has been consumed into parts — mark it received.
       if (pendingLine > 0) {
@@ -4307,11 +4318,16 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
                   <div style="font-size:10px;color:var(--slate-400);margin-top:3px">${wSec.dims.join('  ·  ')}</div>
                 </div>
               ` : wSec ? html`<div class="field"><label>Description</label><input type="text" value=${wSpec} onInput=${e => setWSpec(e.target.value)} placeholder=${wSec.spec || ''} /></div>` : ''}
-              <div class="field"><label>How many to add (${wBuilt.uom})${wBuilt.uom === 'mtr' ? ' — leftover length in metres' : ''}</label><input type="number" step="any" min=${0} value=${wQty} onInput=${e => setWQty(e.target.value)} /></div>
-              ${wUnitWeight != null && html`<div style="font-size:11px;color:var(--teal-700);margin:-4px 0 8px">${wBuilt.name} · ≈ ${fmtNum(wUnitWeight)} kg/${wBuilt.uom} → added to stock</div>`}
+              <div class="field-row">
+                <div class="field"><label>How many to add (${wBuilt.uom})${wBuilt.uom === 'mtr' ? ' — length in m' : ''}</label><input type="number" step="any" min=${0} value=${wQty} onInput=${e => setWQty(e.target.value)} /></div>
+                <div class="field"><label>Weighed (kg) <span style="font-weight:400;color:var(--slate-400)">· optional</span></label><input type="number" step="any" min=${0} value=${wOffKg} onInput=${e => setWOffKg(e.target.value)} placeholder="for reference" /></div>
+              </div>
+              ${wUnitWeight != null && html`<div style="font-size:11px;color:var(--teal-700);margin:-4px 0 8px">${wBuilt.name} · ≈ ${fmtNum(wUnitWeight)} kg/${wBuilt.uom} → added to stock${parseFloat(wOffKg) > 0 ? ' · weighed ' + fmtNum(parseFloat(wOffKg)) + ' kg noted' : ''}</div>`}
             `}
             ${wMode === 'weight' && html`<div class="field"><label>Weight to stock (kg)</label><input type="number" step="any" min=${0} value=${wKg} onInput=${e => setWKg(e.target.value)} /></div>`}
-            ${wMode === 'scrap' && html`<div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Scrap is recorded for reference — nothing is added to stock.</div>`}
+            ${wMode === 'scrap' && html`
+              <div class="field"><label>Scrap weight (kg)</label><input type="number" step="any" min=${0} value=${wScrapKg} onInput=${e => setWScrapKg(e.target.value)} placeholder="e.g. 12" /></div>
+              <div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Recorded in a scrap bucket (for reference / scrap sale) — not usable stock.</div>`}
 
             <button class="btn" disabled=${busy} style="width:100%;margin-top:8px" onClick=${saveAdhoc}>${busy ? 'Saving…' : '💾 Save receipt'}</button>
           `}
