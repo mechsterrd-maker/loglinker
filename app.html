@@ -4067,6 +4067,88 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
   const [busy, setBusy] = useState(false);
   const pendingLine = Math.max(Number(line.qty_sent || 0) - Number(line.qty_received || 0), 0);
 
+  // Ad-hoc receive (no formal plan) — the common laser-cut case.
+  const [mode, setMode] = useState('same');           // same | parts
+  const [rcvDate, setRcvDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [refNo, setRefNo] = useState('');
+  const [projects, setProjects] = useState([]);
+  const [parts, setParts] = useState([{ name: '', qty: '', uom: line.uom === 'nos' ? 'nos' : 'nos', project_id: '' }]);
+  const [wMode, setWMode] = useState('none');         // none | sheet | weight | scrap
+  const [wMat, setWMat] = useState('MS');
+  const [wThk, setWThk] = useState('');
+  const [wW, setWW] = useState('');
+  const [wL, setWL] = useState('');
+  const [wQty, setWQty] = useState('1');
+  const [wKg, setWKg] = useState('');
+  const setPart = (i, patch) => setParts(a => a.map((p, idx) => idx === i ? { ...p, ...patch } : p));
+  const addPart = () => setParts(a => [...a, { name: '', qty: '', uom: 'nos', project_id: '' }]);
+  const rmPart = (i) => setParts(a => a.length <= 1 ? a : a.filter((_, idx) => idx !== i));
+
+  useEffect(() => {
+    sb.from('mcp_projects').select('id, code, name').eq('plant_id', plant.id)
+      .order('code', { ascending: true, nullsFirst: false }).order('name')
+      .then(({ data }) => setProjects(data || []));
+  }, [plant.id]);
+
+  // Offcut weight (kg per sheet) from thickness × W × L × material density.
+  const wUnitWeight = (() => {
+    const mat = RM_MATERIALS.find(m => m.key === wMat);
+    const t = parseFloat(wThk), w = parseFloat(wW), l = parseFloat(wL);
+    if (!mat || !(t > 0 && w > 0 && l > 0)) return null;
+    return Math.round(t * w * l * mat.rho / 1e9 * 1000) / 1000;
+  })();
+
+  const askCompleteAndClose = async () => {
+    if (confirm('Saved.\n\nIs this returnable DC now fully COMPLETED?\n\nOK = close it (done)\nCancel = keep it open (still pending)')) {
+      await sb.rpc('close_rdc_line', { p_line_id: line.id, p_reopen: false });
+    }
+  };
+
+  const saveAdhoc = async () => {
+    setBusy(true);
+    try {
+      const note = (refNo ? 'Ref ' + refNo + ' · ' : '') + 'recd ' + rcvDate;
+      // 1. Parts → project components (each assigned to a project)
+      const validParts = parts.filter(p => (p.name || '').trim() && parseFloat(p.qty) > 0);
+      for (const p of validParts) {
+        if (!p.project_id) throw new Error('Pick a project for part "' + p.name.trim() + '"');
+        const { data, error } = await sb.rpc('pc_receive', {
+          p_project_id: p.project_id, p_name: p.name.trim(), p_qty: parseFloat(p.qty),
+          p_uom: p.uom || 'nos', p_stage: 'laser cut', p_location: (line.party_name || 'Vendor') + (refNo ? ' · ' + refNo : ''),
+        });
+        if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Part save failed');
+      }
+      // 2. Wastage / leftover → stock (offcut sheet or by weight); scrap adds nothing.
+      if (wMode === 'sheet' && parseFloat(wQty) > 0) {
+        const mat = RM_MATERIALS.find(m => m.key === wMat);
+        const code = (mat?.abbr || 'MAT') + '-OFC-' + [wThk, wW, wL].filter(Boolean).join('X');
+        const nm = (mat?.short || wMat) + ' Offcut ' + [wThk, wW, wL].filter(Boolean).join('×');
+        const { data, error } = await sb.rpc('rdc_receive_offcut', {
+          p_line_id: line.id, p_code: code, p_name: nm, p_material: wMat,
+          p_thk: parseFloat(wThk) || null, p_width: parseFloat(wW) || null, p_length: parseFloat(wL) || null,
+          p_uom: 'nos', p_unit_weight: wUnitWeight, p_rate_per_kg: null, p_qty: parseFloat(wQty),
+        });
+        if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Offcut save failed');
+      } else if (wMode === 'weight' && parseFloat(wKg) > 0) {
+        const mat = RM_MATERIALS.find(m => m.key === wMat);
+        const { data, error } = await sb.rpc('rdc_receive_offcut', {
+          p_line_id: line.id, p_code: (mat?.abbr || 'MAT') + '-OFC-KG', p_name: (mat?.short || wMat) + ' Offcut (kg)',
+          p_material: wMat, p_thk: null, p_width: null, p_length: null,
+          p_uom: 'kg', p_unit_weight: 1, p_rate_per_kg: null, p_qty: parseFloat(wKg),
+        });
+        if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Offcut save failed');
+      }
+      // 3. The sent sheet has been consumed into parts — mark it received.
+      if (pendingLine > 0) {
+        const { error } = await sb.rpc('receive_rdc_line', { p_line_id: line.id, p_qty: pendingLine });
+        if (error) throw error;
+      }
+      await askCompleteAndClose();
+      showToast('✓ Received' + (validParts.length ? ' · ' + validParts.length + ' part' + (validParts.length === 1 ? '' : 's') : ''));
+      onSaved && onSaved();
+    } catch (e) { showToast('Failed: ' + e.message); } finally { setBusy(false); }
+  };
+
   const reload = useCallback(async () => {
     if (!line.doc_id) { setPlan(null); return; }
     const { data: pl } = await sb.from('mcp_subcontract_plans').select('*').eq('plant_id', plant.id).eq('dc_doc_id', line.doc_id).maybeSingle();
@@ -4098,8 +4180,9 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
     if (q <= 0) { showToast('Enter a qty'); return; }
     setBusy(true);
     const { data, error } = await sb.rpc('receive_rdc_line', { p_line_id: line.id, p_qty: q });
+    if (error || data?.success === false) { setBusy(false); showToast('Failed'); return; }
+    await askCompleteAndClose();
     setBusy(false);
-    if (error || data?.success === false) { showToast('Failed'); return; }
     showToast('✓ Same material received back'); onSaved && onSaved();
   };
 
@@ -4133,15 +4216,67 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
                   <div style="font-size:11px;color:var(--slate-500)">sent ${fmtNum(m.qty_sent)} ${m.uom || ''}${m.qty_returned > 0 ? ' · returned ' + fmtNum(m.qty_returned) : ''}</div></div>
                 <button class="btn small ghost" style="white-space:nowrap" onClick=${() => setRetMat(m)}>↩ Return / scrap</button>
               </div>`)}
+          <div class="section-h" style="margin-top:14px">Same material back</div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="number" step="any" min=${0} value=${sameQty} placeholder=${'qty ' + fmtNum(pendingLine)} onInput=${e => setSameQty(e.target.value)} style="width:110px;padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />
+            <button class="btn small" disabled=${busy} onClick=${receiveSame}>✓ Received same material</button>
+          </div>
         ` : html`
-          <div style="font-size:12px;color:var(--slate-500);background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:10px;margin-bottom:12px">This returnable wasn't made from a subcontract plan, so there are no planned parts to receive. Record the same material back below. To receive it as <b>new parts</b> or return a <b>balance to stock/scrap</b>, create a Subcontract Plan for it.</div>
-        `}
+          <div class="field-row">
+            <div class="field"><label>Received on</label><${DateField} value=${rcvDate} onChange=${e => setRcvDate(e.target.value)} /></div>
+            <div class="field"><label>Their DC / invoice no</label><input type="text" value=${refNo} onInput=${e => setRefNo(e.target.value)} placeholder="for reference" /></div>
+          </div>
+          <div style="display:inline-flex;border:1px solid var(--slate-200);border-radius:6px;overflow:hidden;background:white;font-size:12px;font-weight:600;margin-bottom:12px">
+            ${[['same', '↔ Same back'], ['parts', '🧩 As parts + wastage']].map(([k, lbl]) => html`
+              <button type="button" onClick=${() => setMode(k)} style=${'padding:7px 12px;border:none;cursor:pointer;background:' + (mode === k ? 'var(--teal-600)' : 'white') + ';color:' + (mode === k ? 'white' : 'var(--slate-600)')}>${lbl}</button>`)}
+          </div>
 
-        <div class="section-h" style="margin-top:14px">Same material back</div>
-        <div style="display:flex;gap:6px;align-items:center">
-          <input type="number" step="any" min=${0} value=${sameQty} placeholder=${'qty ' + fmtNum(pendingLine)} onInput=${e => setSameQty(e.target.value)} style="width:110px;padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />
-          <button class="btn small" disabled=${busy} onClick=${receiveSame}>✓ Received same material</button>
-        </div>
+          ${mode === 'same' ? html`
+            <div style="font-size:11px;color:var(--slate-500);margin-bottom:6px">The same material came back as-is (uncut). Records it received.</div>
+            <div style="display:flex;gap:6px;align-items:center">
+              <input type="number" step="any" min=${0} value=${sameQty} placeholder=${'qty ' + fmtNum(pendingLine)} onInput=${e => setSameQty(e.target.value)} style="width:110px;padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />
+              <button class="btn small" disabled=${busy} onClick=${receiveSame}>✓ Received same</button>
+            </div>
+          ` : html`
+            <div class="section-h">Parts received — assign a project to each</div>
+            ${parts.map((p, i) => html`
+              <div key=${i} class="card" style="padding:8px;margin-bottom:6px;background:var(--slate-50)">
+                <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
+                  <input type="text" value=${p.name} onInput=${e => setPart(i, { name: e.target.value })} placeholder="Part name (e.g. Bracket-A)" style="flex:1;min-width:0;padding:7px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  <input type="number" step="any" min=${0} value=${p.qty} onInput=${e => setPart(i, { qty: e.target.value })} placeholder="Qty" style="width:64px;padding:7px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  ${parts.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => rmPart(i)} style="padding:2px 8px;font-size:11px">×</button>`}
+                </div>
+                <select value=${p.project_id} onChange=${e => setPart(i, { project_id: e.target.value })} style="width:100%;box-sizing:border-box;padding:7px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white;color:${p.project_id ? 'var(--slate-700)' : 'var(--slate-400)'}">
+                  <option value="">— Assign project —</option>
+                  ${projects.map(pr => html`<option key=${pr.id} value=${pr.id}>${(pr.code ? pr.code + ' · ' : '') + pr.name}</option>`)}
+                </select>
+              </div>`)}
+            <button type="button" class="btn small ghost" onClick=${addPart} style="border-style:dashed;color:var(--teal-700);width:100%;margin-bottom:12px">+ Add part</button>
+
+            <div class="section-h">Leftover / wastage</div>
+            <div style="display:inline-flex;border:1px solid var(--slate-200);border-radius:6px;overflow:hidden;background:white;font-size:11px;font-weight:600;margin-bottom:10px">
+              ${[['none', 'None'], ['sheet', '📐 Offcut sheet'], ['weight', '⚖ Weight'], ['scrap', '🗑 Scrap']].map(([k, lbl]) => html`
+                <button type="button" onClick=${() => setWMode(k)} style=${'padding:6px 10px;border:none;cursor:pointer;background:' + (wMode === k ? 'var(--teal-600)' : 'white') + ';color:' + (wMode === k ? 'white' : 'var(--slate-600)')}>${lbl}</button>`)}
+            </div>
+            ${(wMode === 'sheet' || wMode === 'weight') && html`
+              <div class="field-row">
+                <div class="field"><label>Material</label><select value=${wMat} onChange=${e => setWMat(e.target.value)}>${RM_MATERIALS.map(m => html`<option key=${m.key} value=${m.key}>${m.label}</option>`)}</select></div>
+                ${wMode === 'sheet' && html`<div class="field"><label>Thickness (mm)</label><input type="number" step="any" min=${0} value=${wThk} onInput=${e => setWThk(e.target.value)} /></div>`}
+              </div>`}
+            ${wMode === 'sheet' && html`
+              <div class="field-row">
+                <div class="field"><label>Width (mm)</label><input type="number" step="any" min=${0} value=${wW} onInput=${e => setWW(e.target.value)} placeholder="e.g. 600" /></div>
+                <div class="field"><label>Length (mm)</label><input type="number" step="any" min=${0} value=${wL} onInput=${e => setWL(e.target.value)} placeholder="e.g. 1200" /></div>
+              </div>
+              <div class="field"><label>How many offcut sheets</label><input type="number" step="any" min=${0} value=${wQty} onInput=${e => setWQty(e.target.value)} /></div>
+              ${wUnitWeight != null && html`<div style="font-size:11px;color:var(--teal-700);margin:-4px 0 8px">≈ ${fmtNum(wUnitWeight)} kg each → added to stock as an offcut sheet</div>`}
+            `}
+            ${wMode === 'weight' && html`<div class="field"><label>Weight to stock (kg)</label><input type="number" step="any" min=${0} value=${wKg} onInput=${e => setWKg(e.target.value)} /></div>`}
+            ${wMode === 'scrap' && html`<div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Scrap is recorded for reference — nothing is added to stock.</div>`}
+
+            <button class="btn" disabled=${busy} style="width:100%;margin-top:8px" onClick=${saveAdhoc}>${busy ? 'Saving…' : '💾 Save receipt'}</button>
+          `}
+        `}
 
         <button class="btn ghost" style="width:100%;margin-top:16px" onClick=${onClose}>Done</button>
       </div>
