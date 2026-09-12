@@ -18813,13 +18813,14 @@ function HrEmployees({ plant, me }) {
   const [search, setSearch] = useState('');
   const [edit, setEdit] = useState(null);       // employee row | { _new:true }
   const [enrollFor, setEnrollFor] = useState(null);
+  const [photoView, setPhotoView] = useState(null); // { url, name } — enrolled face shown larger
 
   const refresh = useCallback(async () => {
     setLoading(true);
     const [{ data: us }, { data: en }] = await Promise.all([
       sb.from('users').select('id, full_name, phone, blood_group, date_of_joining, monthly_salary, designation, employee_id, address, status, role, login_enabled')
         .eq('plant_id', plant.id).eq('status', 'active').order('full_name'),
-      sb.from('attendance_face_enrollments').select('user_id, descriptors, consent').eq('plant_id', plant.id),
+      sb.from('attendance_face_enrollments').select('user_id, descriptors, consent, photo_url').eq('plant_id', plant.id),
     ]);
     const m = {}; (en || []).forEach(r => { m[r.user_id] = r; }); setEnroll(m);
     // Employees = the workforce (hide the admin's own login account for clarity).
@@ -18842,18 +18843,27 @@ function HrEmployees({ plant, me }) {
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
         list.length === 0 ? html`<div class="card" style="text-align:center;padding:26px;color:var(--slate-500)">${emps.length === 0 ? 'No employees yet — tap “+ Add employee”.' : 'No match.'}</div>` :
         html`<div class="card" style="padding:0;overflow:hidden">
-          ${list.map(e => html`<div key=${e.id} style="display:flex;align-items:center;gap:10px;padding:11px 13px;border-bottom:1px solid var(--slate-100)">
-            <div style="width:38px;height:38px;border-radius:50%;background:var(--teal-50);color:var(--teal-700);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex-shrink:0">${(e.full_name || '?').slice(0, 1).toUpperCase()}</div>
+          ${list.map(e => { const en = enroll[e.id]; return html`<div key=${e.id} style="display:flex;align-items:center;gap:10px;padding:11px 13px;border-bottom:1px solid var(--slate-100)">
+            ${en && en.photo_url
+              ? html`<img src=${en.photo_url} alt=${e.full_name} onClick=${() => setPhotoView({ url: en.photo_url, name: e.full_name })} style="width:38px;height:44px;border-radius:8px;object-fit:cover;border:1.5px solid var(--emerald-300);flex-shrink:0;cursor:pointer" title="Tap to view larger" />`
+              : html`<div style="width:38px;height:38px;border-radius:50%;background:var(--teal-50);color:var(--teal-700);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex-shrink:0">${(e.full_name || '?').slice(0, 1).toUpperCase()}</div>`}
             <div style="flex:1;min-width:0" onClick=${() => setEdit(e)}>
               <div style="font-size:14px;font-weight:600;color:var(--slate-800)">${e.full_name}${e.blood_group ? html`<span style="font-size:11px;color:var(--rose-600);font-weight:700;margin-left:6px">${e.blood_group}</span>` : ''}</div>
               <div style="font-size:11.5px;color:var(--slate-500)">${e.phone || 'no phone'}${e.date_of_joining ? ' · joined ' + e.date_of_joining : ''}</div>
             </div>
             ${enrolled(e.id) ? html`<span class="badge emerald">✓ face</span>` : html`<span class="badge slate">no face</span>`}
             <button class="btn small ${enrolled(e.id) ? 'ghost' : ''}" onClick=${() => setEnrollFor(e)}>${enrolled(e.id) ? 'Re-enroll' : 'Enroll'}</button>
-          </div>`)}
+          </div>`; })}
         </div>`}
       ${edit && html`<${HrEmployeeModal} plant=${plant} me=${me} employee=${edit._new ? null : edit} onClose=${() => setEdit(null)} onSaved=${() => { setEdit(null); refresh(); }} onEnroll=${(row) => { setEdit(null); setEnrollFor(row); }} />`}
       ${enrollFor && html`<${FaceEnrollModal} plant=${plant} me=${me} user=${enrollFor} existing=${enroll[enrollFor.id]} onClose=${() => setEnrollFor(null)} onSaved=${() => { setEnrollFor(null); refresh(); }} />`}
+      ${photoView && html`<div class="modal-backdrop active" onClick=${ev => { if (ev.target === ev.currentTarget) setPhotoView(null); }}>
+        <div class="modal" style="max-width:320px;text-align:center">
+          <div class="modal-header"><div class="modal-title">${photoView.name}</div><button class="close-btn" onClick=${() => setPhotoView(null)}>×</button></div>
+          <img src=${photoView.url} alt=${photoView.name} style="width:100%;max-width:260px;border-radius:12px;border:1px solid var(--slate-200);margin:0 auto" />
+          <div style="font-size:11px;color:var(--slate-500);margin-top:8px">Reference photo taken at enrollment.</div>
+        </div>
+      </div>`}
     </div>
   `;
 }
@@ -19579,6 +19589,7 @@ function FaceAttendanceModule({ plant, me, locked }) {
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [enrollFor, setEnrollFor] = useState(null); // user being enrolled
+  const [photoView, setPhotoView] = useState(null); // { url, name } — enrolled face shown larger
   // kiosk state
   const [engine, setEngine] = useState('idle');     // idle | loading | running
   const [result, setResult] = useState(null);       // { ok, name, message }
@@ -19615,7 +19626,9 @@ function FaceAttendanceModule({ plant, me, locked }) {
     if (enRes.data && usRes.data) {
       const m = {}; enRes.data.forEach(r => { m[r.user_id] = r; });
       setEnroll(m); setUsers(usRes.data);
-      try { localStorage.setItem(KIOSK_CACHE_KEY, JSON.stringify({ enroll: m, users: usRes.data })); } catch (_) {}
+      // Cache without the reference photos — the kiosk matches on descriptors
+      // only, and photos would bloat the gate device's local storage.
+      try { const lean = {}; Object.entries(m).forEach(([k, r]) => { const { photo_url, ...rest } = r; lean[k] = rest; }); localStorage.setItem(KIOSK_CACHE_KEY, JSON.stringify({ enroll: lean, users: usRes.data })); } catch (_) {}
     } else {
       try {
         const c = JSON.parse(localStorage.getItem(KIOSK_CACHE_KEY) || 'null');
@@ -19953,17 +19966,20 @@ function FaceAttendanceModule({ plant, me, locked }) {
       </div>`}
 
       <div style="font-size:11px;color:var(--slate-500);margin-top:10px;padding:10px 12px;background:var(--slate-50);border-radius:8px;line-height:1.5">
-        🔒 <b>Privacy:</b> face data is a mathematical descriptor stored only for this plant, matched on this device — no images are uploaded. Delete anyone's enrollment anytime under People.
+        🔒 <b>Privacy:</b> recognition uses a mathematical descriptor stored only for this plant and matched on this device. One reference photo is also saved (with the worker's consent) so admins can see who is enrolled under People — the kiosk never uploads or matches on images. Delete anyone's enrollment (photo included) anytime under People.
         <br/>✅ <b>Anti-proxy:</b> the lock stays on the face while it moves and reads real 3D head motion (nose depth vs the eyes) — a flat printed or on-screen photo is planar and can't produce it, held still or waved. It confirms on the smallest natural movement. (A replayed video of a moving person can't be beaten by any camera-only app — for that keep a supervisor at the gate; PIN + audit are there too.)
         <br/>📴 <b>Works offline:</b> if the internet drops, punches are saved on the device (with the real time) and sync automatically when the connection returns — nothing is lost. Recognition itself runs on-device, so it keeps working too.
       </div>
     ` : html`
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
         html`<div class="card" style="padding:0;overflow:hidden">
-          ${users.map(u => { const e = enroll[u.id]; const done = e && e.consent && (e.descriptors||[]).length; return html`<div key=${u.id} style="display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--slate-100)">
+          ${users.map(u => { const e = enroll[u.id]; const done = e && e.consent && (e.descriptors||[]).length; const initials = (u.full_name||'?').split(' ').map(w=>w[0]).filter(Boolean).slice(0,2).join('').toUpperCase(); return html`<div key=${u.id} style="display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid var(--slate-100)">
+            ${e && e.photo_url
+              ? html`<img src=${e.photo_url} alt=${u.full_name} onClick=${() => setPhotoView({ url: e.photo_url, name: u.full_name })} style="width:44px;height:52px;object-fit:cover;border-radius:8px;border:1.5px solid var(--emerald-300);cursor:pointer;flex:none" title="Tap to view larger" />`
+              : html`<div style="width:44px;height:52px;border-radius:8px;background:${done?'var(--emerald-50)':'var(--slate-100)'};color:${done?'var(--emerald-700)':'var(--slate-400)'};display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;flex:none" title=${done?'Enrolled — no photo yet, re-enroll to capture one':'Not enrolled'}>${done?initials:'—'}</div>`}
             <div style="flex:1;min-width:0">
               <div style="font-size:14px;font-weight:600">${u.full_name}</div>
-              <div style="font-size:11px;color:var(--slate-500)">${roleLabel ? roleLabel(u.role) : u.role}${done ? ' · ' + (e.descriptors.length) + ' sample' + (e.descriptors.length===1?'':'s') + (e.pin?' · PIN set':'') : e && !e.consent ? ' · consent pending' : ''}</div>
+              <div style="font-size:11px;color:var(--slate-500)">${roleLabel ? roleLabel(u.role) : u.role}${done ? ' · ' + (e.descriptors.length) + ' sample' + (e.descriptors.length===1?'':'s') + (e.pin?' · PIN set':'') + (e.photo_url?'':' · no photo') : e && !e.consent ? ' · consent pending' : ''}</div>
             </div>
             ${done ? html`<span class="badge emerald">✓ face</span>` : html`<span class="badge slate">not enrolled</span>`}
             <button class="btn small" onClick=${() => setEnrollFor(u)}>${done ? 'Re-enroll' : 'Enroll'}</button>
@@ -19973,6 +19989,14 @@ function FaceAttendanceModule({ plant, me, locked }) {
     `}
 
     ${enrollFor && html`<${FaceEnrollModal} plant=${plant} me=${me} user=${enrollFor} existing=${enroll[enrollFor.id]} onClose=${() => setEnrollFor(null)} onSaved=${() => { setEnrollFor(null); refresh(); }} />`}
+
+    ${photoView && html`<div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) setPhotoView(null); }}>
+      <div class="modal" style="max-width:320px;text-align:center">
+        <div class="modal-header"><div class="modal-title">${photoView.name}</div><button class="close-btn" onClick=${() => setPhotoView(null)}>×</button></div>
+        <img src=${photoView.url} alt=${photoView.name} style="width:100%;max-width:260px;border-radius:12px;border:1px solid var(--slate-200);margin:0 auto" />
+        <div style="font-size:11px;color:var(--slate-500);margin-top:8px">Reference photo taken at enrollment.</div>
+      </div>
+    </div>`}
   `;
 }
 
@@ -19993,6 +20017,7 @@ function FaceEnrollModal({ plant, me, user, existing, onClose, onSaved }) {
   const [pin, setPin] = useState(existing?.pin || '');
   const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
   const [snap, setSnap] = useState(false);       // brief flash after a capture
+  const [photo, setPhoto] = useState(existing?.photo_url || null); // reference photo (straight-ahead snap) shown in the People master
   const [append, setAppend] = useState(false);   // "add a look" — merge with existing instead of replacing
   const videoRef = useRef(null); const streamRef = useRef(null); const faceRef = useRef(null); const capCanvRef = useRef(null);
   const hadFace = existing && Array.isArray(existing.descriptors) && existing.descriptors.length > 0;
@@ -20020,6 +20045,17 @@ function FaceEnrollModal({ plant, me, user, existing, onClose, onSaved }) {
       const det = await faceDetect(faceRef.current, frame);
       if (!det || !det.descriptor) { setErr('No face detected — hold steady, look at the camera in good light.'); return; }
       const next = [...samples, Array.from(det.descriptor)];
+      // Keep the straight-ahead frame as a small reference photo so admins can
+      // see who is enrolled in the People master (recognition still uses the
+      // math descriptor, not this image).
+      if (samples.length === 0) {
+        try {
+          const pw = 200, ph = Math.round(200 * (v.videoHeight / v.videoWidth)) || 250;
+          const pc = document.createElement('canvas'); pc.width = pw; pc.height = ph;
+          pc.getContext('2d').drawImage(v, 0, 0, pw, ph);
+          setPhoto(pc.toDataURL('image/jpeg', 0.72));
+        } catch (_) {}
+      }
       setSnap(true); setTimeout(() => setSnap(false), 180);
       if (next.length >= ENROLL_STEPS.length) { setSamples(next); stop(); setPhase('review'); }
       else { setSamples(next); setStep(next.length); }
@@ -20047,6 +20083,7 @@ function FaceEnrollModal({ plant, me, user, existing, onClose, onSaved }) {
         row.descriptors = samples;   // fresh enrol / full re-capture (replace)
       }
     }
+    if (photo) row.photo_url = photo;   // reference photo for the People master
     const { error } = await sb.from('attendance_face_enrollments').upsert(row, { onConflict: 'plant_id,user_id' });
     setBusy(false);
     if (error) { setErr(error.message); return; }
@@ -20077,7 +20114,10 @@ function FaceEnrollModal({ plant, me, user, existing, onClose, onSaved }) {
           </div>
           <button class="btn" style="width:100%;margin-top:6px" onClick=${capture}>📸 Capture snap ${samples.length + 1}</button>
         ` : html`
-          <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);text-align:center;padding:14px"><div style="font-size:30px">✓</div><div style="font-size:13px;color:var(--slate-700)">${samples.length >= ENROLL_STEPS.length ? (append ? 'New look captured — added alongside the existing face' : samples.length + ' face samples captured') : 'Face already enrolled'}</div></div>
+          <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);text-align:center;padding:14px">
+            ${photo ? html`<img src=${photo} alt="face" style="width:96px;height:120px;object-fit:cover;border-radius:10px;border:2px solid var(--emerald-300);margin:0 auto 8px;display:block" />` : html`<div style="font-size:30px">✓</div>`}
+            <div style="font-size:13px;color:var(--slate-700)">${samples.length >= ENROLL_STEPS.length ? (append ? 'New look captured — added alongside the existing face' : samples.length + ' face samples captured') : 'Face already enrolled'}</div>
+          </div>
           <label style="display:block;margin:14px 0 4px;font-size:12px;font-weight:600;color:var(--slate-700)">Backup PIN (optional)</label>
           <input inputmode="numeric" maxlength="6" value=${pin} onInput=${e => setPin(e.target.value.replace(/\D/g, ''))} placeholder="4–6 digits" style="width:100%;padding:9px 11px;border:1px solid var(--slate-300);border-radius:8px;font-size:15px;letter-spacing:3px;text-align:center" />
           <div style="font-size:11px;color:var(--slate-500);margin-top:4px">If the camera can't get a clean match, ${user.full_name.split(' ')[0]} can punch with this PIN. Leave blank to skip.</div>
