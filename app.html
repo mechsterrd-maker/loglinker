@@ -4111,12 +4111,20 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
       // 1. Parts → project components (each assigned to a project)
       const validParts = parts.filter(p => (p.name || '').trim() && parseFloat(p.qty) > 0);
       for (const p of validParts) {
-        if (!p.project_id) throw new Error('Pick a project for part "' + p.name.trim() + '"');
-        const { data, error } = await sb.rpc('pc_receive', {
-          p_project_id: p.project_id, p_name: p.name.trim(), p_qty: parseFloat(p.qty),
-          p_uom: p.uom || 'nos', p_stage: 'laser cut', p_location: (line.party_name || 'Vendor') + (refNo ? ' · ' + refNo : ''),
-        });
-        if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Part save failed');
+        if (p.project_id) {
+          // Tied to a project → project component.
+          const { data, error } = await sb.rpc('pc_receive', {
+            p_project_id: p.project_id, p_name: p.name.trim(), p_qty: parseFloat(p.qty),
+            p_uom: p.uom || 'nos', p_stage: 'laser cut', p_location: (line.party_name || 'Vendor') + (refNo ? ' · ' + refNo : ''),
+          });
+          if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Part save failed');
+        } else {
+          // No project → general stock.
+          const { data, error } = await sb.rpc('rdc_receive_part_stock', {
+            p_line_id: line.id, p_name: p.name.trim(), p_qty: parseFloat(p.qty), p_uom: p.uom || 'nos',
+          });
+          if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Part save failed');
+        }
       }
       // 2. Wastage / leftover → stock (offcut sheet or by weight); scrap adds nothing.
       if (wMode === 'sheet' && parseFloat(wQty) > 0) {
@@ -4238,7 +4246,7 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
               <button class="btn small" disabled=${busy} onClick=${receiveSame}>✓ Received same</button>
             </div>
           ` : html`
-            <div class="section-h">Parts received — assign a project to each</div>
+            <div class="section-h">Parts received — pick a project, or leave blank for stock</div>
             ${parts.map((p, i) => html`
               <div key=${i} class="card" style="padding:8px;margin-bottom:6px;background:var(--slate-50)">
                 <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
@@ -4247,7 +4255,7 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
                   ${parts.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => rmPart(i)} style="padding:2px 8px;font-size:11px">×</button>`}
                 </div>
                 <select value=${p.project_id} onChange=${e => setPart(i, { project_id: e.target.value })} style="width:100%;box-sizing:border-box;padding:7px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white;color:${p.project_id ? 'var(--slate-700)' : 'var(--slate-400)'}">
-                  <option value="">— Assign project —</option>
+                  <option value="">— No project (add to stock) —</option>
                   ${projects.map(pr => html`<option key=${pr.id} value=${pr.id}>${(pr.code ? pr.code + ' · ' : '') + pr.name}</option>`)}
                 </select>
               </div>`)}
