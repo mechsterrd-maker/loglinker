@@ -40303,6 +40303,9 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       if (uErr) throw uErr;
       setDoc(dd => ({ ...dd, items: nextItems }));
       setStockItems(local);
+      // Mark it received right away so the button turns into a confirmation and a
+      // second click can't re-post (accept_grn_reception is also guarded server-side).
+      setGrnReception({ received_at: new Date().toISOString(), users: { full_name: me?.full_name || 'you' }, shortage_detected: false });
       const naCount = its.filter((_, i) => itemDest[i]?.dest === 'not_accountable').length;
       showToast('✅ Saved · ' + grnLines.length + ' to stock' + (naCount ? ' · ' + naCount + ' not accountable' : ''));
       refresh();
@@ -40345,10 +40348,10 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     (async () => {
       const { data } = await sb.from('mcp_rdc_lines').select('*, doc:doc_id(doc_number)').eq('plant_id', plant.id).in('status', ['open', 'partial']).order('sent_on');
       let rows = data || [];
-      if (vname) {
-        const m = rows.filter(r => { const pn = (r.party_name || '').toLowerCase().trim(); return pn && (pn.includes(vname) || vname.includes(pn)); });
-        rows = m.length ? m : rows;
-      }
+      // STRICT vendor match — a bill may only close ITS OWN vendor's returnable
+      // DCs. No fallback to the whole list (that showed other suppliers' RDCs).
+      if (!vname) { setOpenRdcs([]); return; }
+      rows = rows.filter(r => { const pn = (r.party_name || '').toLowerCase().trim(); return pn && (pn.includes(vname) || vname.includes(pn)); });
       if (billProjects.size && rows.length) {
         const docIds = [...new Set(rows.map(r => r.doc_id).filter(Boolean))];
         if (docIds.length) {
@@ -40651,12 +40654,17 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
           </div>
         </div>
       `)}
-      ${canProcess && isInward && items.length > 0 && html`
+      ${canProcess && isInward && items.length > 0 && (grnReception ? html`
+        <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);margin-top:10px;text-align:center">
+          <div style="font-weight:700;color:var(--emerald-700)">✅ Saved — added to stock &amp; assigned</div>
+          <div style="font-size:11px;color:var(--slate-600);margin-top:2px">This bill is received. No need to save again.</div>
+        </div>
+      ` : html`
         <button class="btn" style="width:100%;margin-top:10px" disabled=${processing} onClick=${processAndSave}>
           ${processing ? 'Saving…' : '✅ Save — add to stock & assign projects'}
         </button>
         <div style="font-size:11px;color:var(--slate-500);margin-top:5px;text-align:center">Every line needs a project (or “assign later”) and a stock destination (or “not accountable”).</div>
-      `}
+      `)}
     `}
 
     ${['invoice_in','bill','invoice_out'].includes(doc.doc_type) && html`
