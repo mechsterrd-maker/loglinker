@@ -26728,17 +26728,17 @@ function SalesDocFilteredList({ recent, loading, META, onView }) {
 
     ${filtered.length === 0
       ? html`<div class="card"><div class="empty"><div class="icon">🔍</div><div style="font-size:13px">No documents match these filters.</div></div></div>`
-      : filtered.map(d => { const m = META[d.doc_type] || { ico:'📄', label:d.doc_type }; return html`
-        <div class="card" key=${d.id} style="margin-bottom:6px;padding:10px 12px;cursor:pointer" onClick=${() => onView(d)}>
+      : filtered.map(d => { const m = META[d.doc_type] || { ico:'📄', label:d.doc_type }; const cancelled = d.status === 'cancelled'; return html`
+        <div class="card" key=${d.id} style=${'margin-bottom:6px;padding:10px 12px;cursor:pointer' + (cancelled ? ';opacity:0.7;background:var(--slate-50)' : '')} onClick=${() => onView(d)}>
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
             <div style="flex:1;min-width:0">
-              <div style="font-size:13px;font-weight:600">${m.ico} ${d.doc_number}</div>
-              <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
+              <div style=${'font-size:13px;font-weight:600' + (cancelled ? ';text-decoration:line-through;color:var(--slate-400)' : '')}>${m.ico} ${d.doc_number}${cancelled ? html` <span class="badge rose" style="font-size:9px;text-decoration:none;-webkit-text-decoration:none">CANCELLED</span>` : ''}</div>
+              <div style=${'font-size:11px;color:var(--slate-500);margin-top:2px' + (cancelled ? ';text-decoration:line-through' : '')}>
                 ${m.label} · ${fmtDMY(d.doc_date)}${d.vendor_name_raw ? ' · ' + d.vendor_name_raw : ''} · ${Array.isArray(d.items) ? d.items.length : 0} item${(d.items?.length||0)===1?'':'s'}
               </div>
             </div>
             <div style="text-align:right;flex-shrink:0">
-              ${d.total_value && html`<div style="font-size:14px;font-weight:600">₹${fmtNum(d.total_value)}</div>`}
+              ${!cancelled && d.total_value && html`<div style="font-size:14px;font-weight:600">₹${fmtNum(d.total_value)}</div>`}
               <div style="font-size:11px;color:var(--teal-600);margin-top:2px">↗ Open</div>
             </div>
           </div>
@@ -27835,7 +27835,8 @@ function SalesDocPreview({ doc: docProp, plant, me, customers, vendors, onClose 
   // 24h after creation.
   const createdMs = doc.created_at ? new Date(doc.created_at).getTime() : 0;
   const within24h = createdMs && (Date.now() - createdMs) < 24 * 3600 * 1000;
-  const canEdit = within24h && (doc.created_by === me.id || ['plant_head', 'admin'].includes(me.role));
+  const isCancelled = doc.status === 'cancelled';
+  const canEdit = within24h && !isCancelled && (doc.created_by === me.id || ['plant_head', 'admin'].includes(me.role));
   const custId = doc.raw_extraction?.customer_id || doc.vendor_id;
   const cust = customers.find(c => c.id === custId) || (doc.raw_extraction?.customer || null);
   const items = Array.isArray(doc.items) ? doc.items : [];
@@ -27846,9 +27847,11 @@ function SalesDocPreview({ doc: docProp, plant, me, customers, vendors, onClose 
   return html`
     <div class="page-header" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
       <button class="btn ghost small" onClick=${onClose} style="padding:6px 10px;flex-shrink:0">← Back</button>
-      <div style="flex:1;min-width:0"><h1 style="font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${isInvoice ? '🧾 Tax Invoice' : '📦 Delivery Challan'} · ${doc.doc_number}</h1></div>
+      <div style="flex:1;min-width:0"><h1 style=${'font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis' + (isCancelled ? ';text-decoration:line-through;color:var(--slate-400)' : '')}>${isInvoice ? '🧾 Tax Invoice' : '📦 Delivery Challan'} · ${doc.doc_number}</h1></div>
+      ${isCancelled && html`<span class="badge rose" style="flex-shrink:0">CANCELLED</span>`}
       ${canEdit && html`<button class="btn small" onClick=${() => setEditing(true)} style="padding:6px 12px;flex-shrink:0;background:var(--teal-600);color:white" title="You can edit this for 24 hours after creating it">✏️ Edit</button>`}
     </div>
+    ${isCancelled && html`<div class="alert" style="background:var(--rose-50);border:1px solid var(--rose-200);color:var(--rose-700);font-size:12px;margin-bottom:8px">🚫 This document was <strong>cancelled</strong>. It is kept for reference only — its stock was returned and its number is free to reuse.</div>`}
     ${editing && html`<${DcEditModal} plant=${plant} me=${me} doc=${doc} onClose=${() => setEditing(false)} onSaved=${(updated) => { if (updated?._deleted) { setEditing(false); onClose(); } else { setDoc(updated); setEditing(false); } }} />`}
     <${DocFormatBar} plant=${plant} me=${me} doc=${doc} party=${cust} isInvoice=${isInvoice} onPrintDefault=${printIt} defaultView=${html`
     <style>
@@ -28036,14 +28039,14 @@ function DcEditModal({ plant, me, doc, onClose, onSaved }) {
     } finally { setBusy(false); }
   };
 
-  const doDelete = async () => {
-    if (!confirm('Delete ' + (doc.doc_number || 'this document') + '?\n\nThis permanently removes the challan and returns any issued stock. This cannot be undone.')) return;
+  const doCancel = async () => {
+    if (!confirm('Cancel / void ' + (doc.doc_number || 'this document') + '?\n\nIt stays in the list struck through for reference, any issued stock is returned, and the number becomes free to use again.')) return;
     setErr(''); setDeleting(true);
-    const { data, error } = await sb.rpc('delete_logistics_document', { p_doc_id: doc.id });
+    const { data, error } = await sb.rpc('cancel_logistics_document', { p_doc_id: doc.id });
     setDeleting(false);
-    if (error || data?.success === false) { setErr(error?.message || data?.error || 'Could not delete'); return; }
-    showToast('🗑 ' + (doc.doc_number || 'Document') + ' deleted');
-    onSaved({ ...doc, _deleted: true });
+    if (error || data?.success === false) { setErr(error?.message || data?.error || 'Could not cancel'); return; }
+    showToast('🚫 ' + (doc.doc_number || 'Document') + ' cancelled');
+    onSaved({ ...doc, status: 'cancelled' });
   };
 
   return html`
@@ -28098,7 +28101,7 @@ function DcEditModal({ plant, me, doc, onClose, onSaved }) {
 
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({ ...form, notes: e.target.value })}></textarea></div>
           <div style="display:flex;gap:8px">
-            <button type="button" class="btn danger" disabled=${busy || deleting} onClick=${doDelete} style="flex-shrink:0">${deleting ? 'Deleting…' : '🗑 Delete'}</button>
+            <button type="button" class="btn danger" disabled=${busy || deleting} onClick=${doCancel} style="flex-shrink:0">${deleting ? 'Cancelling…' : '🚫 Cancel DC'}</button>
             <button class="btn" disabled=${busy || deleting} style="flex:1">${busy ? 'Saving…' : '💾 Save changes'}</button>
           </div>
         </form>
