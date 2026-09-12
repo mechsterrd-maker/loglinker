@@ -27955,11 +27955,20 @@ function DcEditModal({ plant, me, doc, onClose, onSaved }) {
     notes: doc.notes || '',
   });
   const [items, setItems] = useState((Array.isArray(doc.items) ? doc.items : []).map(it => ({ ...it })));
+  const [projects, setProjects] = useState([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
+  useEffect(() => {
+    sb.from('mcp_projects').select('id, code, name').eq('plant_id', plant.id)
+      .order('code', { ascending: true, nullsFirst: false }).order('name')
+      .then(({ data }) => setProjects(data || []));
+  }, [plant.id]);
+
   const setItem = (i, patch) => setItems(arr => arr.map((x, idx) => idx === i ? { ...x, ...patch } : x));
   const removeItem = (i) => setItems(arr => arr.filter((_, idx) => idx !== i));
+  const addItem = () => setItems(arr => [...arr, { name: '', hsn: '', qty: '', uom: 'nos', project_id: '' }]);
+  const UOMS = ['nos', 'kg', 'mtr', 'ft', 'set', 'box', 'sqft', 'ltr', 'pair'];
 
   const taxable = items.reduce((s, it) => s + (parseFloat(it.amount) || 0), 0);
   const igst = !!raw.igst;
@@ -27969,15 +27978,20 @@ function DcEditModal({ plant, me, doc, onClose, onSaved }) {
   const submit = async (e) => {
     e.preventDefault(); setErr(''); setBusy(true);
     try {
-      const clean = items.filter(it => (it.name || '').trim() && parseFloat(it.qty) > 0).map(it => ({
-        ...it,
-        name: (it.name || '').trim(),
-        qty: parseFloat(it.qty),
-        uom: it.uom || 'nos',
-        hsn: it.hsn || null,
-        rate: isInvoice && it.rate ? parseFloat(it.rate) : (it.rate ?? null),
-        amount: isInvoice && it.amount ? parseFloat(it.amount) : (it.amount ?? null),
-      }));
+      const clean = items.filter(it => (it.name || '').trim() && parseFloat(it.qty) > 0).map(it => {
+        const proj = projects.find(p => p.id === it.project_id);
+        return {
+          ...it,
+          name: (it.name || '').trim(),
+          qty: parseFloat(it.qty),
+          uom: it.uom || 'nos',
+          hsn: it.hsn || null,
+          project_id: it.project_id || null,
+          project_name: proj ? ((proj.code ? proj.code + ' · ' : '') + proj.name) : (it.project_name || null),
+          rate: isInvoice && it.rate ? parseFloat(it.rate) : (it.rate ?? null),
+          amount: isInvoice && it.amount ? parseFloat(it.amount) : (it.amount ?? null),
+        };
+      });
       if (clean.length === 0) throw new Error('Keep at least one item with a quantity');
 
       const newRaw = { ...raw, vehicle_no: form.vehicle_no || null, eway_bill: form.eway_bill || null, po_reference: form.po_reference || null };
@@ -28033,20 +28047,30 @@ function DcEditModal({ plant, me, doc, onClose, onSaved }) {
                 <div key=${i} style="border:1px solid var(--slate-200);border-radius:6px;padding:8px;background:var(--slate-50)">
                   <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
                     <span style="font-size:11px;color:var(--teal-700);font-weight:600;min-width:16px">${i + 1}.</span>
-                    <input type="text" value=${it.name || ''} onInput=${e => setItem(i, { name: e.target.value })} placeholder="Item" style="flex:1;min-width:0;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                    <input type="text" value=${it.name || ''} onInput=${e => setItem(i, { name: e.target.value })} placeholder="Product / description" style="flex:1;min-width:0;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
                     ${it.stock_item_id && html`<span class="badge slate" style="font-size:9px" title="Stock line — qty change adjusts stock">📦</span>`}
-                    ${items.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => removeItem(i)} style="padding:2px 8px;font-size:11px">×</button>`}
+                    <button type="button" class="btn small danger" onClick=${() => removeItem(i)} style="padding:2px 8px;font-size:11px">×</button>
                   </div>
-                  <div style=${'display:grid;grid-template-columns:' + (isInvoice ? '0.7fr 0.6fr 0.5fr 0.8fr 0.8fr' : '1fr 0.7fr 0.6fr') + ';gap:6px'}>
+                  <div style=${'display:grid;grid-template-columns:' + (isInvoice ? '0.7fr 0.6fr 0.6fr 0.8fr 0.8fr' : '1fr 0.7fr 0.7fr') + ';gap:6px'}>
                     <input type="text" value=${it.hsn || ''} onInput=${e => setItem(i, { hsn: e.target.value })} placeholder="HSN" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
                     <input type="number" step="any" min=${0} value=${it.qty} onInput=${e => setItem(i, { qty: e.target.value })} placeholder="Qty" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
-                    <input type="text" value=${it.uom || 'nos'} onInput=${e => setItem(i, { uom: e.target.value })} placeholder="UoM" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                    <select value=${it.uom || 'nos'} onChange=${e => setItem(i, { uom: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white">
+                      ${UOMS.map(u => html`<option key=${u} value=${u}>${u}</option>`)}
+                      ${it.uom && !UOMS.includes(it.uom) && html`<option value=${it.uom}>${it.uom}</option>`}
+                    </select>
                     ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.rate || ''} onInput=${e => setItem(i, { rate: e.target.value, amount: ((parseFloat(e.target.value) || 0) * (parseFloat(it.qty) || 0)).toFixed(2) })} placeholder="Rate" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />`}
                     ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.amount || ''} onInput=${e => setItem(i, { amount: e.target.value })} placeholder="Amount" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;font-weight:600" />`}
+                  </div>
+                  <div style="margin-top:6px">
+                    <select value=${it.project_id || ''} onChange=${e => setItem(i, { project_id: e.target.value })} style="width:100%;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white;color:${it.project_id ? 'var(--slate-700)' : 'var(--slate-400)'}">
+                      <option value="">— No project —</option>
+                      ${projects.map(p => html`<option key=${p.id} value=${p.id}>${(p.code ? p.code + ' · ' : '') + p.name}</option>`)}
+                    </select>
                   </div>
                 </div>
               `)}
             </div>
+            <button type="button" class="btn small ghost" onClick=${addItem} style="margin-top:8px;width:100%;border-style:dashed;color:var(--teal-700)">+ Add product</button>
           </div>
 
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({ ...form, notes: e.target.value })}></textarea></div>
