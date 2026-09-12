@@ -4109,7 +4109,7 @@ function RdcReturns({ plant, me, activeUnit }) {
 // subcontract plan), return BALANCE material to stock or mark SCRAP (with weight),
 // or record the SAME material back — all in one place. Reuses the tested RPCs
 // sc_plan_receive / sc_material_return / receive_rdc_line.
-function ReceiveReturnModal({ plant, me, lines, onClose, onSaved }) {
+function ReceiveReturnModal({ plant, me, lines, prefillParts, linkDoc, onClose, onSaved }) {
   const allLines = Array.isArray(lines) ? lines : (lines ? [lines] : []);
   const linePending = (l) => Math.max(Number(l.qty_sent || 0) - Number(l.qty_received || 0), 0);
   const line = allLines.find(l => l.status === 'open' || l.status === 'partial') || allLines[0] || {}; // reference line (doc/unit)
@@ -4127,9 +4127,15 @@ function ReceiveReturnModal({ plant, me, lines, onClose, onSaved }) {
 
   // Ad-hoc receive (no formal plan) — the common laser-cut case.
   const [rcvDate, setRcvDate] = useState(() => new Date().toISOString().slice(0, 10));
-  const [refNo, setRefNo] = useState('');
+  const [refNo, setRefNo] = useState(() => linkDoc?.doc_number || '');
   const [projects, setProjects] = useState([]);
-  const [parts, setParts] = useState([{ name: '', qty: '', uom: line.uom === 'nos' ? 'nos' : 'nos', project_id: '' }]);
+  // When opened from an uploaded return bill, pre-fill the parts from its lines.
+  const [parts, setParts] = useState(() => {
+    const pf = (prefillParts || []).filter(p => (p.name || p.item_name) && parseFloat(p.qty) > 0);
+    return pf.length
+      ? pf.map(p => ({ name: (p.name || p.item_name || '').trim(), qty: '' + p.qty, uom: p.uom || 'nos', project_id: p.project_id || '' }))
+      : [{ name: '', qty: '', uom: 'nos', project_id: '' }];
+  });
   const guessMat = (nm) => { const s = (nm || '').toUpperCase(); if (/STAINLESS|\bSS\b/.test(s)) return 'SS'; if (/ALUM|\bAL\b/.test(s)) return 'Aluminium'; if (/BRASS/.test(s)) return 'Brass'; if (/COPPER|\bCU\b/.test(s)) return 'Copper'; if (/CAST\s*IRON|\bCI\b/.test(s)) return 'Cast Iron'; return 'MS'; };
   const guessSection = (nm) => { const s = (nm || '').toLowerCase(); if (/\brhs\b|rect.*tube/.test(s)) return 'rhs'; if (/\bshs\b|square.*tube/.test(s)) return 'shs'; if (/pipe|\bod\b/.test(s)) return 'pipe'; if (/angle/.test(s)) return 'angle'; if (/flat/.test(s)) return 'flat'; if (/round|\bdia\b/.test(s)) return 'round_bar'; if (/square\s*bar|\bsqr\b/.test(s)) return 'square_bar'; if (/rec\.?\s*bar|rect|block|\bbar\b/.test(s)) return 'block'; if (/sheet|coil/.test(s)) return 'sheet'; if (/plate/.test(s)) return 'plate'; return 'plate'; };
   const [wOffOn, setWOffOn] = useState(false);        // reusable sized offcut → stock
@@ -4227,6 +4233,15 @@ function ReceiveReturnModal({ plant, me, lines, onClose, onSaved }) {
           p_uom: 'kg', p_unit_weight: 1, p_rate_per_kg: null, p_qty: parseFloat(wScrapKg), p_category: 'general', p_ref_note: 'scrap',
         });
         if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Scrap save failed');
+      }
+      // Linked to an uploaded return bill: mark its lines inwarded + flag it so
+      // the bill screen won't also inward them (one route, no double entry).
+      if (linkDoc?.id) {
+        const nextItems = (Array.isArray(linkDoc.items) ? linkDoc.items : []).map(it => ({ ...it, inwarded_component: true }));
+        await sb.from('mcp_logistics_documents').update({
+          items: nextItems,
+          raw_extraction: { ...(linkDoc.raw_extraction || {}), rdc_received: true, rdc_doc_id: line.doc_id },
+        }).eq('id', linkDoc.id);
       }
       await askCompleteAndClose();
       showToast('✓ Received' + (validParts.length ? ' · ' + validParts.length + ' part' + (validParts.length === 1 ? '' : 's') : ''));
@@ -40147,6 +40162,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
   const [savingItem, setSavingItem] = useState(null);
   const [inwarding, setInwarding] = useState(false);
   const [openRdcs, setOpenRdcs] = useState([]); // returnable DCs still open for this doc's vendor
+  const [rdcRcv, setRdcRcv] = useState(null); // the RDC group being received against from this bill
   const [rdcQty, setRdcQty] = useState({});     // per-line qty typed for a partial receive
   const [isPlanner, setIsPlanner] = useState(false); // has this user authored a subcontract plan
   const [stockItems, setStockItems] = useState([]);  // existing stock items, to match received lines
@@ -40327,7 +40343,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     const vname = (doc.mcp_logistics_vendors?.name || doc.vendor_name_raw || '').toLowerCase().trim();
     const billProjects = new Set((Array.isArray(doc.items) ? doc.items : []).map(it => it.project_id).filter(Boolean));
     (async () => {
-      const { data } = await sb.from('mcp_rdc_lines').select('*').eq('plant_id', plant.id).in('status', ['open', 'partial']).order('sent_on');
+      const { data } = await sb.from('mcp_rdc_lines').select('*, doc:doc_id(doc_number)').eq('plant_id', plant.id).in('status', ['open', 'partial']).order('sent_on');
       let rows = data || [];
       if (vname) {
         const m = rows.filter(r => { const pn = (r.party_name || '').toLowerCase().trim(); return pn && (pn.includes(vname) || vname.includes(pn)); });
@@ -40551,7 +40567,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
           </div>
         ` : html`<div style="font-size:12px;color:var(--slate-500)">🔒 Only the planner, the person who posted this bill, and plant admin/head can assign projects or close returnable DCs.</div>`}
       </div>
-      ${canProcess && (() => {
+      ${canProcess && openRdcs.length === 0 && (() => {
         const ready = items.filter(x => x.project_id && !x.inwarded_component && parseFloat(x.qty) > 0).length;
         const done = items.filter(x => x.inwarded_component).length;
         return html`<div class="card" style="background:var(--teal-50);border-color:var(--teal-200);margin-bottom:6px">
@@ -40562,12 +40578,34 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       })()}
     `}
 
-    ${canProcess && isInward && (openRdcs.length > 0 || planTally.length > 0) && html`
-      <div class="card" style="background:#fff7ed;border-color:#fed7aa;margin-bottom:6px;display:flex;align-items:center;gap:10px">
-        <span style="font-size:20px">🔁</span>
-        <div style="font-size:12px;color:var(--slate-700)">This vendor has <b>${openRdcs.length || planTally.length} open returnable ${(openRdcs.length || planTally.length) === 1 ? 'item' : 'items'}</b>. Receiving & closing returnable DCs now lives in <b>one place</b>: <b>More → 🔁 Returnable DC tracker</b> — receive what came back and close it there.</div>
+    ${canProcess && isInward && doc.raw_extraction?.rdc_received && html`
+      <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);margin-bottom:6px;display:flex;align-items:center;gap:10px">
+        <span style="font-size:20px">✅</span>
+        <div style="font-size:12px;color:var(--emerald-700)">Received against a <b>Returnable DC</b> and closed — its parts are already inwarded. No further action needed here.</div>
       </div>
     `}
+
+    ${canProcess && isInward && !doc.raw_extraction?.rdc_received && openRdcs.length > 0 && (() => {
+      // Group the vendor's open RDC lines by DC — receiving from THIS bill runs the
+      // single RDC-receive route (inwards parts + closes the RDC + links this bill).
+      const gm = new Map();
+      for (const l of openRdcs) { const k = l.doc_id || l.id; if (!gm.has(k)) gm.set(k, { key: k, doc_number: l.doc?.doc_number, lines: [] }); gm.get(k).lines.push(l); }
+      const grps = [...gm.values()];
+      return html`
+        <div class="card" style="background:#fff7ed;border-color:#fed7aa;margin-bottom:6px">
+          <div style="font-weight:700;color:var(--amber-800);font-size:13px;margin-bottom:2px">🔁 Close a returnable DC with this bill</div>
+          <div style="font-size:11px;color:var(--slate-600);margin-bottom:8px">This vendor has open returnable material. Receiving here inwards these parts <b>and</b> closes the returnable DC in one step — so nothing is entered twice.</div>
+          <div style="display:flex;flex-direction:column;gap:6px">
+            ${grps.map(g => html`<button key=${g.key} class="btn" style="background:var(--amber-600);color:#fff" onClick=${() => setRdcRcv(g)}>📥 Receive &amp; close DC ${g.doc_number || '(returnable)'} · ${g.lines.length} item${g.lines.length === 1 ? '' : 's'}</button>`)}
+          </div>
+        </div>`;
+    })()}
+
+    ${rdcRcv && html`<${ReceiveReturnModal} plant=${plant} me=${me} lines=${rdcRcv.lines}
+      prefillParts=${Array.isArray(doc.items) ? doc.items : []}
+      linkDoc=${{ id: doc.id, doc_number: doc.doc_number, items: doc.items, raw_extraction: doc.raw_extraction }}
+      onClose=${() => setRdcRcv(null)}
+      onSaved=${() => { setRdcRcv(null); setDoc(d => ({ ...d, raw_extraction: { ...(d.raw_extraction || {}), rdc_received: true } })); showToast('✓ Received against returnable DC'); }} />`}
 
     ${items.length > 0 && html`
       <div class="section-h">Items · ${items.length}</div>
