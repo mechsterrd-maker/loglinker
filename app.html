@@ -4073,11 +4073,15 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
   const [refNo, setRefNo] = useState('');
   const [projects, setProjects] = useState([]);
   const [parts, setParts] = useState([{ name: '', qty: '', uom: line.uom === 'nos' ? 'nos' : 'nos', project_id: '' }]);
-  const [wMode, setWMode] = useState('none');         // none | sheet | weight | scrap
-  const [wMat, setWMat] = useState('MS');
-  const [wThk, setWThk] = useState('');
-  const [wW, setWW] = useState('');
-  const [wL, setWL] = useState('');
+  const guessMat = (nm) => { const s = (nm || '').toUpperCase(); if (/STAINLESS|\bSS\b/.test(s)) return 'SS'; if (/ALUM|\bAL\b/.test(s)) return 'Aluminium'; if (/BRASS/.test(s)) return 'Brass'; if (/COPPER|\bCU\b/.test(s)) return 'Copper'; if (/CAST\s*IRON|\bCI\b/.test(s)) return 'Cast Iron'; return 'MS'; };
+  const guessSection = (nm) => { const s = (nm || '').toLowerCase(); if (/\brhs\b|rect.*tube/.test(s)) return 'rhs'; if (/\bshs\b|square.*tube/.test(s)) return 'shs'; if (/pipe|\bod\b/.test(s)) return 'pipe'; if (/angle/.test(s)) return 'angle'; if (/flat/.test(s)) return 'flat'; if (/round|\bdia\b/.test(s)) return 'round_bar'; if (/square\s*bar|\bsqr\b/.test(s)) return 'square_bar'; if (/rec\.?\s*bar|rect|block|\bbar\b/.test(s)) return 'block'; if (/sheet|coil/.test(s)) return 'sheet'; if (/plate/.test(s)) return 'plate'; return 'plate'; };
+  const [wMode, setWMode] = useState('none');         // none | offcut | weight | scrap
+  const [wMat, setWMat] = useState(() => guessMat(line.item_name));
+  const [wSection, setWSection] = useState(() => guessSection(line.item_name));
+  const [wd1, setWd1] = useState('');
+  const [wd2, setWd2] = useState('');
+  const [wd3, setWd3] = useState('');
+  const [wSpec, setWSpec] = useState('');
   const [wQty, setWQty] = useState('1');
   const [wKg, setWKg] = useState('');
   const setPart = (i, patch) => setParts(a => a.map((p, idx) => idx === i ? { ...p, ...patch } : p));
@@ -4090,13 +4094,11 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
       .then(({ data }) => setProjects(data || []));
   }, [plant.id]);
 
-  // Offcut weight (kg per sheet) from thickness × W × L × material density.
-  const wUnitWeight = (() => {
-    const mat = RM_MATERIALS.find(m => m.key === wMat);
-    const t = parseFloat(wThk), w = parseFloat(wW), l = parseFloat(wL);
-    if (!mat || !(t > 0 && w > 0 && l > 0)) return null;
-    return Math.round(t * w * l * mat.rho / 1e9 * 1000) / 1000;
-  })();
+  // Build the offcut item (code/name/weight/uom) from the chosen shape — works
+  // for bar / plate / angle / pipe / RHS, not just sheets.
+  const wSec = RM_SECTIONS.find(s => s.key === wSection) || null;
+  const wBuilt = rmBuild(wMat, wSection, wd1, wd2, wd3, wSpec);
+  const wUnitWeight = wBuilt.unit_weight;
 
   const askCompleteAndClose = async () => {
     if (confirm('Saved.\n\nIs this returnable DC now fully COMPLETED?\n\nOK = close it (done)\nCancel = keep it open (still pending)')) {
@@ -4127,21 +4129,20 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
         }
       }
       // 2. Wastage / leftover → stock (offcut sheet or by weight); scrap adds nothing.
-      if (wMode === 'sheet' && parseFloat(wQty) > 0) {
-        const mat = RM_MATERIALS.find(m => m.key === wMat);
-        const code = (mat?.abbr || 'MAT') + '-OFC-' + [wThk, wW, wL].filter(Boolean).join('X');
-        const nm = (mat?.short || wMat) + ' Offcut ' + [wThk, wW, wL].filter(Boolean).join('×');
+      if (wMode === 'offcut' && parseFloat(wQty) > 0) {
+        if (!wBuilt.code) throw new Error('Enter the leftover size');
         const { data, error } = await sb.rpc('rdc_receive_offcut', {
-          p_line_id: line.id, p_code: code, p_name: nm, p_material: wMat,
-          p_thk: parseFloat(wThk) || null, p_width: parseFloat(wW) || null, p_length: parseFloat(wL) || null,
-          p_uom: 'nos', p_unit_weight: wUnitWeight, p_rate_per_kg: null, p_qty: parseFloat(wQty),
+          p_line_id: line.id, p_code: wBuilt.code, p_name: wBuilt.name, p_material: wMat, p_section_type: wSection,
+          p_d1: parseFloat(wd1) || null, p_d2: parseFloat(wd2) || null, p_d3: parseFloat(wd3) || null,
+          p_size_spec: wBuilt.size_spec || null, p_uom: wBuilt.uom || 'nos',
+          p_unit_weight: wBuilt.unit_weight, p_rate_per_kg: null, p_qty: parseFloat(wQty),
         });
         if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Offcut save failed');
       } else if (wMode === 'weight' && parseFloat(wKg) > 0) {
         const mat = RM_MATERIALS.find(m => m.key === wMat);
         const { data, error } = await sb.rpc('rdc_receive_offcut', {
           p_line_id: line.id, p_code: (mat?.abbr || 'MAT') + '-OFC-KG', p_name: (mat?.short || wMat) + ' Offcut (kg)',
-          p_material: wMat, p_thk: null, p_width: null, p_length: null,
+          p_material: wMat, p_section_type: 'other', p_d1: null, p_d2: null, p_d3: null, p_size_spec: 'kg',
           p_uom: 'kg', p_unit_weight: 1, p_rate_per_kg: null, p_qty: parseFloat(wKg),
         });
         if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Offcut save failed');
@@ -4263,21 +4264,28 @@ function ReceiveReturnModal({ plant, me, line, onClose, onSaved }) {
 
             <div class="section-h">Leftover / wastage</div>
             <div style="display:inline-flex;border:1px solid var(--slate-200);border-radius:6px;overflow:hidden;background:white;font-size:11px;font-weight:600;margin-bottom:10px">
-              ${[['none', 'None'], ['sheet', '📐 Offcut sheet'], ['weight', '⚖ Weight'], ['scrap', '🗑 Scrap']].map(([k, lbl]) => html`
+              ${[['none', 'None'], ['offcut', '📐 Offcut piece'], ['weight', '⚖ Weight'], ['scrap', '🗑 Scrap']].map(([k, lbl]) => html`
                 <button type="button" onClick=${() => setWMode(k)} style=${'padding:6px 10px;border:none;cursor:pointer;background:' + (wMode === k ? 'var(--teal-600)' : 'white') + ';color:' + (wMode === k ? 'white' : 'var(--slate-600)')}>${lbl}</button>`)}
             </div>
-            ${(wMode === 'sheet' || wMode === 'weight') && html`
-              <div class="field-row">
-                <div class="field"><label>Material</label><select value=${wMat} onChange=${e => setWMat(e.target.value)}>${RM_MATERIALS.map(m => html`<option key=${m.key} value=${m.key}>${m.label}</option>`)}</select></div>
-                ${wMode === 'sheet' && html`<div class="field"><label>Thickness (mm)</label><input type="number" step="any" min=${0} value=${wThk} onInput=${e => setWThk(e.target.value)} /></div>`}
-              </div>`}
-            ${wMode === 'sheet' && html`
-              <div class="field-row">
-                <div class="field"><label>Width (mm)</label><input type="number" step="any" min=${0} value=${wW} onInput=${e => setWW(e.target.value)} placeholder="e.g. 600" /></div>
-                <div class="field"><label>Length (mm)</label><input type="number" step="any" min=${0} value=${wL} onInput=${e => setWL(e.target.value)} placeholder="e.g. 1200" /></div>
+            ${(wMode === 'offcut' || wMode === 'weight') && html`
+              <div class="field"><label>Material</label><select value=${wMat} onChange=${e => setWMat(e.target.value)}>${RM_MATERIALS.map(m => html`<option key=${m.key} value=${m.key}>${m.label}</option>`)}</select></div>`}
+            ${wMode === 'offcut' && html`
+              <div class="field"><label>Shape / section</label>
+                <select value=${wSection} onChange=${e => { setWSection(e.target.value); setWd1(''); setWd2(''); setWd3(''); setWSpec(''); }}>
+                  ${RM_SECTIONS.map(s => html`<option key=${s.key} value=${s.key}>${s.label}</option>`)}
+                </select>
               </div>
-              <div class="field"><label>How many offcut sheets</label><input type="number" step="any" min=${0} value=${wQty} onInput=${e => setWQty(e.target.value)} /></div>
-              ${wUnitWeight != null && html`<div style="font-size:11px;color:var(--teal-700);margin:-4px 0 8px">≈ ${fmtNum(wUnitWeight)} kg each → added to stock as an offcut sheet</div>`}
+              ${wSec && wSec.dims.length > 0 ? html`
+                <div class="field"><label>Size</label>
+                  <div style="display:flex;gap:6px">
+                    ${wSec.dims.map((lbl, di) => html`
+                      <input key=${di} type="number" step="any" min=${0} value=${[wd1, wd2, wd3][di]} onInput=${e => { const v = e.target.value; di === 0 ? setWd1(v) : di === 1 ? setWd2(v) : setWd3(v); }} placeholder=${lbl} title=${lbl} style="flex:1;min-width:0;padding:8px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px" />`)}
+                  </div>
+                  <div style="font-size:10px;color:var(--slate-400);margin-top:3px">${wSec.dims.join('  ·  ')}</div>
+                </div>
+              ` : wSec ? html`<div class="field"><label>Description</label><input type="text" value=${wSpec} onInput=${e => setWSpec(e.target.value)} placeholder=${wSec.spec || ''} /></div>` : ''}
+              <div class="field"><label>How many to add (${wBuilt.uom})${wBuilt.uom === 'mtr' ? ' — leftover length in metres' : ''}</label><input type="number" step="any" min=${0} value=${wQty} onInput=${e => setWQty(e.target.value)} /></div>
+              ${wUnitWeight != null && html`<div style="font-size:11px;color:var(--teal-700);margin:-4px 0 8px">${wBuilt.name} · ≈ ${fmtNum(wUnitWeight)} kg/${wBuilt.uom} → added to stock</div>`}
             `}
             ${wMode === 'weight' && html`<div class="field"><label>Weight to stock (kg)</label><input type="number" step="any" min=${0} value=${wKg} onInput=${e => setWKg(e.target.value)} /></div>`}
             ${wMode === 'scrap' && html`<div style="font-size:11px;color:var(--slate-500);margin-bottom:10px">Scrap is recorded for reference — nothing is added to stock.</div>`}
