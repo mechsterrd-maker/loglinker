@@ -38099,12 +38099,27 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
       dim1: base.dim1 ?? '', dim2: base.dim2 ?? '', dim3: base.dim3 ?? '',
       unit_weight: base.unit_weight ?? '', rate_per_kg: base.rate_per_kg ?? '',
       spec: isSpecType ? (base.size_spec || '') : '',
+      pieces: Array.isArray(base.pieces) ? base.pieces : [],
     };
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const isRaw = form.category === 'raw_material';
   const rmSec = RM_SECTIONS.find(s => s.key === form.section_type) || null;
+  // Length-based steel (bars/rods/pipes measured in metre/feet) can be recorded
+  // as a breakdown of rods: e.g. 5 rods × 6 m + 3 rods × 2 m. Total length feeds
+  // the opening qty; weight = total length × kg-per-unit.
+  const isLengthItem = ['mtr', 'ft'].includes((form.uom || '').toLowerCase());
+  const [pieceMode, setPieceMode] = useState(() => Array.isArray(editTarget?.pieces) && editTarget.pieces.length > 0);
+  const pcs = Array.isArray(form.pieces) ? form.pieces : [];
+  const pcTotalLen = pcs.reduce((s, p) => s + (parseFloat(p.count) || 0) * (parseFloat(p.len) || 0), 0);
+  const pcTotalRods = pcs.reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
+  const uw = parseFloat(form.unit_weight) || 0;
+  const setPc = (i, patch) => setForm(f => ({ ...f, pieces: (f.pieces || []).map((x, idx) => idx === i ? { ...x, ...patch } : x) }));
+  const addPc = () => setForm(f => ({ ...f, pieces: [...(f.pieces || []), { count: '', len: '' }] }));
+  const rmPc = (i) => setForm(f => ({ ...f, pieces: (f.pieces || []).filter((_, idx) => idx !== i) }));
+  // Effective opening qty (metres) — from the rod breakdown when that mode is on.
+  const effectiveOpening = (isLengthItem && pieceMode) ? pcTotalLen : (parseFloat(form.opening_qty) || 0);
 
   // RM: auto-build code / name / stock-unit / weight from the picked material +
   // section + sizes. Runs only in RM mode and only when a section is chosen.
@@ -38138,6 +38153,14 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
         payload.rate_per_kg = num(form.rate_per_kg);
         // Keep unit_cost (₹ per stock unit) consistent with ₹/kg × unit-weight.
         if (payload.rate_per_kg != null && payload.unit_weight != null) payload.unit_cost = Math.round(payload.rate_per_kg * payload.unit_weight * 100) / 100;
+        // Rod breakdown (only when the item is measured by length and the user
+        // entered rows). Cleaned to {len,count} numbers; null clears it.
+        if (isLengthItem && pieceMode) {
+          const clean = (form.pieces || [])
+            .map(p => ({ len: parseFloat(p.len) || 0, count: parseFloat(p.count) || 0 }))
+            .filter(p => p.len > 0 && p.count > 0);
+          payload.pieces = clean.length ? clean : null;
+        }
       }
       if (!isEdit && activeUnit?.unit_id) payload.unit_id = activeUnit.unit_id;
       if (isEdit) {
@@ -38146,10 +38169,10 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
         showToast('Item updated');
       } else {
         // Create with current_qty=0; opening txn will increment it via constraint
-        const { data: newItem, error } = await sb.from('mcp_stocks_items').insert({ ...payload, current_qty: 0, opening_qty: parseFloat(form.opening_qty) || 0 }).select('id').single();
+        const { data: newItem, error } = await sb.from('mcp_stocks_items').insert({ ...payload, current_qty: 0, opening_qty: effectiveOpening }).select('id').single();
         if (error) throw error;
         // Log the opening txn (constraint trigger will mark opening_recorded_at)
-        const opening = parseFloat(form.opening_qty) || 0;
+        const opening = effectiveOpening;
         if (opening >= 0) {
           const { error: tErr } = await sb.from('mcp_stocks_transactions').insert({
             plant_id: plant.id, item_id: newItem.id, txn_type: 'opening',
@@ -38265,14 +38288,48 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
               </datalist>
             </div>
           `}
+          ${isRaw && isLengthItem && html`
+            <div class="card" style="background:var(--slate-50);border-color:var(--slate-200);padding:10px 12px;margin-bottom:10px">
+              <label style="display:flex;align-items:center;gap:7px;font-size:12px;font-weight:600;color:var(--slate-700);cursor:pointer;margin-bottom:${pieceMode ? '8px' : '0'}">
+                <input type="checkbox" checked=${pieceMode} onChange=${e => setPieceMode(e.target.checked)} />
+                Break into rods (count × length)${isEdit ? '' : ' — recommended for bars/pipes'}
+              </label>
+              ${pieceMode && html`
+                <div style="display:flex;flex-direction:column;gap:6px">
+                  <div style="display:flex;gap:6px;font-size:10px;color:var(--slate-500);font-weight:600;padding:0 2px">
+                    <span style="flex:1">No. of rods</span><span style="width:14px"></span><span style="flex:1">Length (${form.uom})</span><span style="flex:1;text-align:right">Weight</span><span style="width:22px"></span>
+                  </div>
+                  ${pcs.length === 0 ? html`<div style="font-size:11px;color:var(--slate-400);padding:2px">No sizes yet — tap “+ add size”.</div>` : ''}
+                  ${pcs.map((p, i) => html`
+                    <div key=${i} style="display:flex;gap:6px;align-items:center">
+                      <input type="number" min=${0} step=${1} value=${p.count} onInput=${e => setPc(i, { count: e.target.value })} placeholder="5" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                      <span style="width:14px;text-align:center;color:var(--slate-400)">×</span>
+                      <input type="number" min=${0} step="any" value=${p.len} onInput=${e => setPc(i, { len: e.target.value })} placeholder="6" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                      <span style="flex:1;text-align:right;font-size:11px;color:var(--slate-500)">${uw ? fmtNum(Math.round((parseFloat(p.count) || 0) * (parseFloat(p.len) || 0) * uw * 100) / 100) + ' kg' : '—'}</span>
+                      <button type="button" onClick=${() => rmPc(i)} title="Remove" style="width:22px;background:none;border:none;color:var(--rose-500);cursor:pointer;font-size:16px">×</button>
+                    </div>
+                  `)}
+                  <button type="button" class="btn small ghost" onClick=${addPc} style="align-self:flex-start;font-size:12px">+ add size</button>
+                  <div style="display:flex;justify-content:space-between;font-size:12px;font-weight:700;color:var(--teal-700);border-top:1px solid var(--slate-200);padding-top:6px;margin-top:2px">
+                    <span>${fmtNum(pcTotalRods)} rods · ${fmtNum(pcTotalLen)} ${form.uom}</span>
+                    <span>${uw ? '≈ ' + fmtNum(Math.round(pcTotalLen * uw * 100) / 100) + ' kg' : ''}</span>
+                  </div>
+                  ${isEdit && html`<div style="font-size:10px;color:var(--slate-400)">This is the recorded rod list. Issue-by-rods keeps it in step with stock (coming soon); for now it's a reference of what's on the floor.</div>`}
+                </div>
+              `}
+            </div>
+          `}
           <div class="field-row">
-            ${!isEdit ? html`
-              <div class="field"><label>Opening qty * <span style="font-weight:400;color:var(--amber-700);font-size:11px">· one-time</span></label><input type="number" required min=${0} step="0.001" value=${form.opening_qty} onChange=${e => setForm({...form, opening_qty: e.target.value})} placeholder="0" /></div>
-            ` : html`
-              <div class="field"><label>Current qty</label><input type="number" disabled value=${editTarget.current_qty} style="background:var(--slate-100);color:var(--slate-700);font-weight:600" /></div>
-            `}
+            ${!isEdit
+              ? ((isLengthItem && pieceMode)
+                  ? html`<div class="field"><label>Opening qty <span style="font-weight:400;color:var(--teal-700);font-size:11px">· auto from rods</span></label><input type="number" disabled value=${Math.round(pcTotalLen * 1000) / 1000} style="background:var(--slate-100);color:var(--slate-700);font-weight:600" /></div>`
+                  : html`<div class="field"><label>Opening qty * <span style="font-weight:400;color:var(--amber-700);font-size:11px">· one-time</span></label><input type="number" required min=${0} step="0.001" value=${form.opening_qty} onChange=${e => setForm({...form, opening_qty: e.target.value})} placeholder="0" /></div>`)
+              : html`<div class="field"><label>Current qty</label><input type="number" disabled value=${editTarget.current_qty} style="background:var(--slate-100);color:var(--slate-700);font-weight:600" /></div>`}
             <div class="field"><label>Reorder level</label><input type="number" step="0.001" value=${form.reorder_level || ''} onChange=${e => setForm({...form, reorder_level: e.target.value})} /></div>
           </div>
+          ${isRaw && uw > 0 && !isEdit && effectiveOpening > 0 && html`
+            <div style="font-size:12px;color:var(--teal-700);font-weight:600;margin:-4px 0 10px">⚖️ Total weight of opening: ${fmtNum(Math.round(effectiveOpening * uw * 100) / 100)} kg  <span style="color:var(--slate-400);font-weight:400">(${fmtNum(effectiveOpening)} ${form.uom} × ${fmtNum(uw)} kg/${form.uom})</span></div>
+          `}
           ${isRaw
             ? html`<div class="field"><label>Rate (₹ / kg)</label><input type="number" step="0.01" value=${form.rate_per_kg || ''} onChange=${e => setForm({...form, rate_per_kg: e.target.value})} placeholder="e.g. 62" /></div>`
             : html`<div class="field"><label>Unit cost (₹)</label><input type="number" step="0.01" value=${form.unit_cost || ''} onChange=${e => setForm({...form, unit_cost: e.target.value})} /></div>`}
@@ -38639,9 +38696,22 @@ function ItemDetail({ plant, me, item: initialItem, onClose, onEdit, onDeleted }
     <div class="card" style="margin-top:14px">
       <div class="card-title">DETAILS</div>
       <div class="card-row"><span class="label">Category</span><span class="value">${item.category || 'general'}</span></div>
+      ${item.unit_weight && parseFloat(item.unit_weight) > 0 && html`<div class="card-row"><span class="label">Total weight</span><span class="value" style="font-weight:600">${fmtNum(Math.round(parseFloat(item.current_qty || 0) * parseFloat(item.unit_weight) * 100) / 100)} kg <span style="color:var(--slate-400);font-weight:400;font-size:11px">(${fmtNum(item.unit_weight)} kg/${item.uom})</span></span></div>`}
       ${item.unit_cost && html`<div class="card-row"><span class="label">Unit cost</span><span class="value">₹${item.unit_cost}/${item.uom}</span></div>`}
       ${item.unit_cost && html`<div class="card-row"><span class="label">Stock value</span><span class="value">₹${(parseFloat(item.current_qty || 0) * parseFloat(item.unit_cost || 0)).toLocaleString('en-IN', {maximumFractionDigits:0})}</span></div>`}
     </div>
+
+    ${Array.isArray(item.pieces) && item.pieces.length > 0 && (() => {
+      const tot = item.pieces.reduce((s, p) => s + (parseFloat(p.count) || 0) * (parseFloat(p.len) || 0), 0);
+      const rods = item.pieces.reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
+      const uwv = parseFloat(item.unit_weight) || 0;
+      return html`<div class="card" style="margin-top:10px">
+        <div class="card-title">🪵 RODS ON FLOOR <span style="font-weight:400;color:var(--slate-400);font-size:10px">· recorded breakdown</span></div>
+        ${item.pieces.map((p, i) => html`<div key=${i} class="card-row"><span class="label">${fmtNum(p.count)} rod${(parseFloat(p.count)||0) === 1 ? '' : 's'} × ${fmtNum(p.len)} ${item.uom}</span><span class="value">${fmtNum(Math.round((parseFloat(p.count)||0) * (parseFloat(p.len)||0) * 1000)/1000)} ${item.uom}${uwv ? ' · ' + fmtNum(Math.round((parseFloat(p.count)||0) * (parseFloat(p.len)||0) * uwv * 100)/100) + ' kg' : ''}</span></div>`)}
+        <div class="card-row" style="border-top:1px solid var(--slate-200)"><span class="label" style="font-weight:700">${fmtNum(rods)} rods · total</span><span class="value" style="font-weight:700;color:var(--teal-700)">${fmtNum(Math.round(tot*1000)/1000)} ${item.uom}${uwv ? ' · ' + fmtNum(Math.round(tot*uwv*100)/100) + ' kg' : ''}</span></div>
+        ${Math.abs(tot - parseFloat(item.current_qty || 0)) > 0.001 && html`<div style="font-size:10px;color:var(--amber-700);margin-top:4px">⚠ The rod list (${fmtNum(Math.round(tot*1000)/1000)}) differs from current stock (${fmtNum(item.current_qty)}) — issue/receive since opening isn't yet reflected in the rod list. Edit the item to update the rods.</div>`}
+      </div>`;
+    })()}
 
     <div class="section-h">History · ${txns.length} transactions</div>
     ${txns.length === 0 ? html`
