@@ -27510,6 +27510,15 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [showOverride, setShowOverride] = useState(false); // shown after a stock shortfall
+  const [rodPickFor, setRodPickFor] = useState(null); // { idx, stock_item_id } — rod picker open for a line
+  // When a length stock item is picked, note whether it has a rod breakdown so we
+  // can offer "Pick rods" on that line.
+  const fetchRods = async (idx, id) => {
+    if (!id) { setForm(f => ({ ...f, items: f.items.map((x, i) => i === idx ? { ...x, _hasRods: false } : x) })); return; }
+    const { data } = await sb.from('mcp_stocks_items').select('pieces').eq('id', id).single();
+    const has = Array.isArray(data?.pieces) && data.pieces.length > 0;
+    setForm(f => ({ ...f, items: f.items.map((x, i) => i === idx ? { ...x, _hasRods: has } : x) }));
+  };
   const [projects, setProjects] = useState([]);
   const [planId, setPlanId] = useState('');       // set when this RDC came from a subcontract plan
   const [planTitle, setPlanTitle] = useState('');
@@ -27688,6 +27697,19 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
         created_by: me.id,
       }).select('*').single();
       if (error) throw error;
+      // Rod-picked lines: the DB trigger deducted stock by qty (metres); now keep
+      // each item's rod breakdown in step (remove issued rods, return offcuts).
+      const rodLines = validItems.filter(it => it.kind === 'stock' && it.stock_item_id && Array.isArray(it._rodRows) && it._rodRows.length);
+      if (rodLines.length) {
+        const byItem = {};
+        rodLines.forEach(it => { (byItem[it.stock_item_id] = byItem[it.stock_item_id] || []).push(...it._rodRows); });
+        for (const sid in byItem) {
+          try {
+            const { data: cur } = await sb.from('mcp_stocks_items').select('pieces').eq('id', sid).single();
+            await sb.from('mcp_stocks_items').update({ pieces: rodsApplyIssue(cur?.pieces, byItem[sid]) }).eq('id', sid);
+          } catch (_) { /* best-effort — the item page flags any rod-list drift */ }
+        }
+      }
       showToast((isInvoice ? '🧾 Invoice ' : (isReturnable ? '🔁 RDC ' : '📦 DC ')) + docNo + ' created');
       onSaved(doc);
     } catch (e) { setErr(e.message); } finally { setBusy(false); }
@@ -27774,14 +27796,14 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
                     ? html`<${PartPicker} plant=${plant} value=${it.part_id} onChange=${(id, p) => setItem(idx, { part_id: id, name: p ? (p.name || p.part_number || '') : it.name })} placeholder="🔍 Search & pick part…" />`
                     : it.kind === 'machine'
                     ? html`<${MachinePicker} plant=${plant} value=${it.machine_id} onChange=${(id, p) => setItem(idx, { machine_id: id, name: p ? (p.display_name || [p.make, p.model].filter(Boolean).join(' ') || p.code || '') : it.name })} placeholder="🔍 Search & pick machine…" />`
-                    : html`<${StockItemPicker} plant=${plant} value=${it.stock_item_id} category=${(DC_PICK_CATS.find(x => x.key === it.pickcat) || {}).cat || null} onChange=${(id, p) => setItem(idx, { stock_item_id: id, name: p ? (p.name || p.code || '') : it.name, uom: p?.uom || it.uom })} placeholder="🔍 Search & pick item…" />`}
+                    : html`<${StockItemPicker} plant=${plant} value=${it.stock_item_id} category=${(DC_PICK_CATS.find(x => x.key === it.pickcat) || {}).cat || null} onChange=${(id, p) => { setItem(idx, { stock_item_id: id, name: p ? (p.name || p.code || '') : it.name, uom: p?.uom || it.uom, _rodRows: null, _hasRods: false }); fetchRods(idx, id); }} placeholder="🔍 Search & pick item…" />`}
                 </div>
                 ${form.items.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => removeItem(idx)} style="padding:2px 8px;font-size:11px">×</button>`}
               </div>
               <input type="text" value=${it.name} onChange=${e => setItem(idx, { name: e.target.value })} placeholder="Item description" style="width:100%;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;box-sizing:border-box;margin-bottom:6px" />
               <div style=${'display:grid;grid-template-columns:'+(isInvoice?'0.7fr 0.6fr 0.5fr 0.8fr 0.8fr':'1fr 0.7fr 0.6fr')+';gap:6px'}>
                 <input type="text" value=${it.hsn} onChange=${e => setItem(idx, { hsn: e.target.value })} placeholder="HSN" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
-                <input type="number" step="any" min=${0} value=${it.qty} onChange=${e => { setItem(idx, { qty: e.target.value }); }} onBlur=${() => recalcAmount(idx)} placeholder="Qty *" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                <input type="number" step="any" min=${0} value=${it.qty} onChange=${e => { setItem(idx, { qty: e.target.value, _rodRows: null }); }} onBlur=${() => recalcAmount(idx)} placeholder="Qty *" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
                 ${it.kind === 'stock' && it.stock_item_id
                   ? html`<div title="Issued in the item's own stock unit — enter the quantity in ${it.uom || 'this unit'}" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:var(--slate-50);color:var(--slate-600);display:flex;align-items:center;justify-content:center;font-weight:600">${it.uom || '—'}</div>`
                   : html`<select value=${it.uom} onChange=${e => setItem(idx, { uom: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white" title="Unit">
@@ -27791,6 +27813,12 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
                 ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.amount} onChange=${e => setItem(idx, { amount: e.target.value })} placeholder="Amount ₹" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;font-weight:600" />`}
                 ${!isInvoice && html`<input type="number" step="any" min=${0} value=${it.approx_value} onChange=${e => setItem(idx, { approx_value: e.target.value })} placeholder="Approx value ₹" title="Approx value (shown on the DC)" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />`}
               </div>
+              ${it.kind === 'stock' && it.stock_item_id && ['mtr', 'ft'].includes((it.uom || '').toLowerCase()) && it._hasRods && html`
+                <div style="margin-top:6px">
+                  <button type="button" class="btn small" onClick=${() => setRodPickFor({ idx, stock_item_id: it.stock_item_id })} style="background:var(--teal-50);color:var(--teal-700);border:1px solid var(--teal-200);font-size:12px">🪵 ${Array.isArray(it._rodRows) && it._rodRows.length ? 'Rods picked · ' + fmtNum(parseFloat(it.qty) || 0) + ' ' + it.uom + ' — change' : 'Pick rods (whole / cut)'}</button>
+                  ${Array.isArray(it._rodRows) && it._rodRows.length ? html`<span style="font-size:11px;color:var(--slate-500);margin-left:8px">${it._rodRows.map(r => (r.cut ? fmtNum(r.count) + '×cut ' + fmtNum(r.cut) : fmtNum(r.count) + '×' + fmtNum(r.len)) + ' ' + it.uom).join(', ')}</span>` : ''}
+                </div>
+              `}
               ${projects.length > 0 && html`
                 <div style="display:flex;align-items:center;gap:6px;margin-top:6px">
                   <span style="font-size:11px;color:var(--slate-500);white-space:nowrap">📐 Project</span>
@@ -27805,6 +27833,10 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
           <button type="button" class="btn small ghost" onClick=${addItem} style="font-size:12px;align-self:flex-start">+ Add another item</button>
         </div>
       </div>
+
+      ${rodPickFor && html`<${RodPickModal} plant=${plant} itemId=${rodPickFor.stock_item_id}
+        onClose=${() => setRodPickFor(null)}
+        onApply=${({ metres, rows }) => { setItem(rodPickFor.idx, { qty: String(metres), _rodRows: rows }); setRodPickFor(null); }} />`}
 
       ${isInvoice && html`
         <div class="card" style="background:var(--slate-50);border-color:var(--slate-200);margin-top:14px">
@@ -38521,6 +38553,28 @@ function rodsAdd(pieces, rows) {
   (rows || []).forEach(r => { const c = Math.round(parseFloat(r.count) || 0); const l = parseFloat(r.len) || 0; if (l > 0) for (let k = 0; k < c; k++) all.push(l); });
   return rodsCollapse(all);
 }
+// Apply an explicit rod selection (rows of {len, count, cut}) to a rod list:
+// removes the chosen rods and returns any offcut (len − cut) to stock.
+function rodsApplyIssue(pieces, rows) {
+  const lengths = rodsExpand(pieces);
+  const offcuts = [];
+  for (const r of (rows || [])) {
+    const c = Math.round(parseFloat(r.count) || 0);
+    const l = Math.round((parseFloat(r.len) || 0) * 1000) / 1000;
+    const cut = parseFloat(r.cut) || 0;
+    if (c <= 0 || l <= 0) continue;
+    for (let k = 0; k < c; k++) { const idx = lengths.findIndex(x => Math.abs(x - l) < 0.0005); if (idx >= 0) lengths.splice(idx, 1); if (cut > 0 && (l - cut) > 0.0005) offcuts.push(Math.round((l - cut) * 1000) / 1000); }
+  }
+  return rodsCollapse([...lengths, ...offcuts]);
+}
+// Metres implied by a rod selection (cut pieces consume only the cut length).
+function rodsRowsMetres(rows) {
+  return (rows || []).reduce((s, r) => {
+    const c = parseFloat(r.count) || 0, l = parseFloat(r.len) || 0, cut = parseFloat(r.cut) || 0;
+    return s + c * ((r.mode === 'cut' || cut > 0) ? cut : l);
+  }, 0);
+}
+
 // Consume `metres` longest-first; cut the longest rod when the remaining need is
 // smaller than it (the offcut is kept). Returns the resulting rod list.
 function rodsConsumeMetres(pieces, metres) {
@@ -38759,6 +38813,98 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
           <button class="btn" disabled=${loading} style="background:${isInward ? 'var(--emerald-600)' : 'var(--rose-600)'};color:white">${loading ? 'Saving…' : (isInward ? '+ Add to stock' : '− Issue stock')}</button>
         </form>
+      </div>
+    </div>
+  `;
+}
+
+// Reusable rod picker — pick whole rods or cut pieces from a length item's rod
+// list. Returns { metres, rows } so a caller (e.g. the DC issue form) can set the
+// line qty and update the item's rod breakdown after the issue.
+function RodPickModal({ plant, itemId, onClose, onApply }) {
+  const [item, setItem] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([{ len: '', count: '', cut: '', mode: 'whole' }]);
+  const [err, setErr] = useState('');
+
+  useEffect(() => { (async () => {
+    const { data } = await sb.from('mcp_stocks_items').select('id, code, name, uom, unit_weight, current_qty, pieces').eq('id', itemId).single();
+    setItem(data || null); setLoading(false);
+  })(); }, [itemId]);
+
+  const uom = item?.uom || 'mtr';
+  const uw = parseFloat(item?.unit_weight) || 0;
+  const availByLen = {};
+  (item?.pieces || []).forEach(p => { const l = Math.round((parseFloat(p.len) || 0) * 1000) / 1000; if (l > 0) availByLen[l] = (availByLen[l] || 0) + Math.round(parseFloat(p.count) || 0); });
+  const availLens = Object.keys(availByLen).map(Number).sort((a, b) => b - a);
+  const totM = Math.round(rodsRowsMetres(rows) * 1000) / 1000;
+
+  const setRod = (i, patch) => setRows(rs => rs.map((x, idx) => idx === i ? { ...x, ...patch } : x));
+  const setRodMode = (i, m) => setRows(rs => rs.map((x, idx) => idx === i ? { ...x, mode: m, cut: m === 'whole' ? '' : x.cut, count: (x.count && parseInt(x.count) > 0) ? x.count : (m === 'cut' ? '1' : x.count) } : x));
+  const addRod = () => setRows(rs => [...rs, { len: '', count: '', cut: '', mode: 'whole' }]);
+  const rmRod = (i) => setRows(rs => rs.length <= 1 ? rs : rs.filter((_, idx) => idx !== i));
+
+  const apply = () => {
+    setErr('');
+    const reqByLen = {};
+    rows.forEach(r => { const c = Math.round(parseFloat(r.count) || 0), l = Math.round((parseFloat(r.len) || 0) * 1000) / 1000; if (c > 0 && l > 0) reqByLen[l] = (reqByLen[l] || 0) + c; });
+    for (const l in reqByLen) { if (reqByLen[l] > (availByLen[l] || 0)) { setErr('Only ' + (availByLen[l] || 0) + ' rod(s) of ' + fmtNum(l) + ' ' + uom + ' on the floor'); return; } }
+    for (const r of rows) { const cut = parseFloat(r.cut) || 0, l = parseFloat(r.len) || 0; if (cut > 0 && cut > l + 0.0005) { setErr('Cut length can’t exceed the rod length'); return; } }
+    if (!(totM > 0)) { setErr('Pick at least one rod'); return; }
+    onApply({ metres: totM, rows: rows.filter(r => (parseFloat(r.count) || 0) > 0 && (parseFloat(r.len) || 0) > 0).map(r => ({ len: r.len, count: r.count, cut: r.mode === 'cut' ? r.cut : '' })) });
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:440px">
+        <div class="modal-header"><div class="modal-title">🪵 Pick rods${item ? ' · ' + item.name : ''}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>`
+          : !item ? html`<div style="font-size:13px;color:var(--slate-500)">Item not found.</div>`
+          : availLens.length === 0 ? html`<div style="font-size:13px;color:var(--amber-700)">No rod breakdown recorded for this item yet. Type the length directly in the Qty box, or edit the item to add its rods.</div>`
+          : html`
+            <div style="font-size:11px;color:var(--slate-600);margin-bottom:8px">On the floor: ${availLens.map(l => html`<span style="display:inline-block;background:var(--slate-100);border-radius:10px;padding:1px 8px;margin:0 4px 4px 0">${fmtNum(availByLen[l])} × ${fmtNum(l)} ${uom}</span>`)}</div>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              ${rows.map((r, i) => {
+                const rl = parseFloat(r.len) || 0, cnt = parseFloat(r.count) || 0, cutL = parseFloat(r.cut) || 0;
+                const rowM = r.mode === 'cut' ? cnt * cutL : cnt * rl;
+                return html`
+                <div key=${i} style="border:1px solid var(--slate-200);border-radius:8px;padding:8px;background:var(--slate-50)">
+                  <div style="display:flex;gap:5px;align-items:center;margin-bottom:6px">
+                    <select value=${r.len} onChange=${e => setRod(i, { len: e.target.value })} style="flex:1;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px;background:#fff">
+                      <option value="">Pick a size…</option>
+                      ${availLens.map(l => html`<option key=${l} value=${l}>${fmtNum(l)} ${uom} · ${fmtNum(availByLen[l])} on floor</option>`)}
+                    </select>
+                    ${rows.length > 1 && html`<button type="button" onClick=${() => rmRod(i)} title="Remove" style="background:none;border:none;color:var(--rose-500);cursor:pointer;font-size:18px;padding:0 4px">×</button>`}
+                  </div>
+                  <div style="display:flex;gap:6px;margin-bottom:6px">
+                    <button type="button" onClick=${() => setRodMode(i, 'whole')} style=${'flex:1;padding:6px;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid ' + (r.mode !== 'cut' ? 'var(--teal-600);background:var(--teal-600);color:#fff' : 'var(--slate-200);background:#fff;color:var(--slate-600)')}>Whole rod(s)</button>
+                    <button type="button" onClick=${() => setRodMode(i, 'cut')} style=${'flex:1;padding:6px;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid ' + (r.mode === 'cut' ? 'var(--teal-600);background:var(--teal-600);color:#fff' : 'var(--slate-200);background:#fff;color:var(--slate-600)')}>Cut a piece</button>
+                  </div>
+                  ${r.mode === 'cut' ? html`
+                    <div style="display:flex;gap:5px;align-items:center;font-size:13px;color:var(--slate-600)">
+                      <span>Cut</span>
+                      <input type="number" min=${0} step="any" value=${r.cut} onInput=${e => setRod(i, { cut: e.target.value })} placeholder="0.5" style="width:72px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                      <span>${uom} ×</span>
+                      <input type="text" inputmode="numeric" value=${r.count} onInput=${e => setRod(i, { count: e.target.value.replace(/[^0-9]/g, '') })} placeholder="1" style="width:52px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                      <span>pc</span>
+                    </div>
+                    ${rl > 0 && cutL > 0 && cutL < rl && html`<div style="font-size:11px;color:var(--slate-500);margin-top:4px">↩ offcut ${fmtNum(Math.round((rl - cutL) * 1000) / 1000)} ${uom} × ${fmtNum(cnt || 1)} returns to stock</div>`}
+                  ` : html`
+                    <div style="display:flex;gap:5px;align-items:center;font-size:13px;color:var(--slate-600)">
+                      <span>Issue</span>
+                      <input type="text" inputmode="numeric" value=${r.count} onInput=${e => setRod(i, { count: e.target.value.replace(/[^0-9]/g, '') })} placeholder="1" style="width:60px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                      <span>whole rod${cnt === 1 ? '' : 's'}${rl ? ' of ' + fmtNum(rl) + ' ' + uom : ''}</span>
+                    </div>
+                  `}
+                  ${rowM > 0 && html`<div style="font-size:11px;font-weight:600;color:var(--teal-700);margin-top:4px">= ${fmtNum(Math.round(rowM * 1000) / 1000)} ${uom}${uw ? ' · ' + fmtNum(Math.round(rowM * uw * 100) / 100) + ' kg' : ''}</div>`}
+                </div>`;
+              })}
+              <button type="button" class="btn small ghost" onClick=${addRod} style="align-self:flex-start;font-size:12px">+ add another</button>
+              <div style="font-size:13px;font-weight:700;color:var(--teal-700);border-top:1px solid var(--slate-200);padding-top:6px">Total: ${fmtNum(totM)} ${uom}${uw ? ' · ≈ ' + fmtNum(Math.round(totM * uw * 100) / 100) + ' kg' : ''}</div>
+              <button type="button" class="btn" onClick=${apply} disabled=${!(totM > 0)} style="margin-top:4px">Use ${fmtNum(totM)} ${uom}</button>
+            </div>
+          `}
       </div>
     </div>
   `;
