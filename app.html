@@ -37434,8 +37434,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits }) {
   const [txnDateTo, setTxnDateTo] = useState('');
   const [txnRows, setTxnRows] = useState(null);   // server-fetched rows when a date range is set (whole history)
   const [txnLoading, setTxnLoading] = useState(false);
-  const [scrapPick, setScrapPick] = useState(false); // "Move to scrap" — pick an item first
-  const [scrapItem, setScrapItem] = useState(null);  // full item chosen for a scrap entry
+  const [scrapOpen, setScrapOpen] = useState(false); // "Move to scrap yard" entry + register
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [activeItem, setActiveItem] = useState(null);
@@ -37789,7 +37788,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits }) {
 
       <div class="section-h">Items · ${filteredItems.length}<span style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn small" style="background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white" onClick=${() => setVoiceOpen(true)} title="Voice issue — Tamil / Hindi / English">🎙️ Voice Issue</button>
-        <button class="btn small" style="background:var(--rose-50);color:var(--rose-600);border:1px solid var(--rose-200)" onClick=${() => setScrapPick(true)} title="Move stock to scrap">🗑 Move to scrap</button>
+        <button class="btn small" style="background:var(--rose-50);color:var(--rose-600);border:1px solid var(--rose-200)" onClick=${() => setScrapOpen(true)} title="Record wastage to scrap yard">🗑 Move to scrap</button>
         <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('item'); }}>+ Add</button>
       </span></div>
 
@@ -37993,19 +37992,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits }) {
     ${modal === 'pick_part_for_stock' && html`<${PickPartForStockModal} plant=${plant} stockItems=${items} onPick=${(p) => { setEditTarget(p); setModal('track_stock'); }} onClose=${() => setModal(null)} />`}
     ${modal === 'track_stock' && editTarget && html`<${TrackStockForPartModal} plant=${plant} me=${me} part=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="stock_issue" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
-    ${scrapPick && html`
-      <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) setScrapPick(false); }}>
-        <div class="modal" style="max-width:420px">
-          <div class="modal-header"><div class="modal-title">🗑 Move to scrap</div><button class="close-btn" onClick=${() => setScrapPick(false)}>×</button></div>
-          <div style="font-size:12px;color:var(--slate-600);margin-bottom:10px">Pick the material to move to scrap. You can enter it by quantity, weight or rods, and add a note (size, reason).</div>
-          <${StockItemPicker} plant=${plant} value=${null} placeholder="🔍 Search & pick material…" onChange=${async (id) => {
-            if (!id) return;
-            const { data } = await sb.from('mcp_stocks_items').select('*').eq('id', id).single();
-            if (data) { setScrapItem({ ...data, _txnHint: 'scrap' }); setScrapPick(false); }
-          }} />
-        </div>
-      </div>`}
-    ${scrapItem && html`<${TxnModal} plant=${plant} me=${me} item=${scrapItem} isAdmin=${isAdmin} onClose=${() => setScrapItem(null)} onSaved=${() => { setScrapItem(null); refresh(); }} />`}
+    ${scrapOpen && html`<${ScrapEntryModal} plant=${plant} me=${me} activeUnit=${activeUnit} onClose=${() => setScrapOpen(false)} onSaved=${() => refresh()} />`}
     ${priceTarget && html`<${QuickPriceModal} item=${priceTarget} onClose=${() => setPriceTarget(null)} onSaved=${() => { setPriceTarget(null); refresh(); }} />`}
     ${splitTarget && html`<${SplitUnitModal} item=${splitTarget} units=${units} unitNameOf=${unitNameOf} onClose=${() => setSplitTarget(null)} onSaved=${() => { setSplitTarget(null); clearSelect(); refresh(); }} />`}
   `;
@@ -38960,6 +38947,131 @@ function RodPickModal({ plant, itemId, onClose, onApply }) {
               <button type="button" class="btn" onClick=${apply} disabled=${!(totM > 0)} style="margin-top:4px">Use ${fmtNum(totM)} ${uom}</button>
             </div>
           `}
+      </div>
+    </div>
+  `;
+}
+
+// Scrap-yard entry + register. Records wastage from processed RM (offcuts, end
+// pieces, rejects) by material / size / weight / qty with notes, and shows the
+// running scrap log. Optionally also deducts a tracked stock item.
+function ScrapEntryModal({ plant, me, activeUnit, onClose, onSaved }) {
+  const today = new Date().toISOString().slice(0, 10);
+  const [form, setForm] = useState({ scrap_date: today, material: 'MS', size_spec: '', weight_kg: '', qty: '', notes: '' });
+  const [srcItem, setSrcItem] = useState(null); // optional tracked item to also deduct
+  const [deduct, setDeduct] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [recent, setRecent] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [fromD, setFromD] = useState('');
+  const [toD, setToD] = useState('');
+
+  const load = async () => {
+    setLoading(true);
+    let q = sb.from('mcp_scrap_log').select('*, item:source_item_id(code,name), u:logged_by(full_name)')
+      .eq('plant_id', plant.id).order('scrap_date', { ascending: false }).order('created_at', { ascending: false }).limit(300);
+    if (fromD) q = q.gte('scrap_date', fromD);
+    if (toD) q = q.lte('scrap_date', toD);
+    const { data } = await q; setRecent(data || []); setLoading(false);
+  };
+  useEffect(() => { load(); }, [fromD, toD]);
+
+  const matLabel = (k) => (RM_MATERIALS.find(m => m.key === k) || {}).label || k || 'Other';
+
+  const save = async () => {
+    setErr('');
+    const w = parseFloat(form.weight_kg) || 0;
+    const qn = parseFloat(form.qty) || 0;
+    if (!(w > 0) && !(qn > 0)) { setErr('Enter a weight (kg) and/or a quantity'); return; }
+    setBusy(true);
+    try {
+      const { error } = await sb.from('mcp_scrap_log').insert({
+        plant_id: plant.id, unit_id: activeUnit?.unit_id || null,
+        scrap_date: form.scrap_date || today,
+        material: form.material || null, size_spec: (form.size_spec || '').trim() || null,
+        weight_kg: w || null, qty: qn || null, uom: srcItem?.uom || null,
+        source_item_id: (deduct && srcItem) ? srcItem.id : null,
+        notes: (form.notes || '').trim() || null, logged_by: me.id,
+      });
+      if (error) throw error;
+      // Optionally reduce a tracked stock item too (scrap taken from live stock).
+      if (deduct && srcItem) {
+        const dq = qn > 0 ? qn : (srcItem.unit_weight ? Math.round((w / parseFloat(srcItem.unit_weight)) * 1000) / 1000 : 0);
+        if (dq > 0) await sb.from('mcp_stocks_transactions').insert({ plant_id: plant.id, item_id: srcItem.id, txn_type: 'scrap', qty: dq, reference: 'Scrap yard', notes: (form.notes || '').trim() || ('Scrap · ' + (form.size_spec || '')), performed_by: me.id });
+      }
+      showToast('🗑 Scrap recorded');
+      setForm(f => ({ ...f, size_spec: '', weight_kg: '', qty: '', notes: '' })); setSrcItem(null); setDeduct(false);
+      load(); onSaved && onSaved();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  const del = async (id) => { if (!confirm('Delete this scrap entry?')) return; await sb.from('mcp_scrap_log').delete().eq('id', id); load(); };
+
+  const totWeight = recent.reduce((s, r) => s + (parseFloat(r.weight_kg) || 0), 0);
+  const byMat = {}; recent.forEach(r => { const m = matLabel(r.material); byMat[m] = (byMat[m] || 0) + (parseFloat(r.weight_kg) || 0); });
+  // group recent by day
+  const days = []; const byDay = new Map();
+  recent.forEach(r => { const d = r.scrap_date; if (!byDay.has(d)) { byDay.set(d, []); days.push(d); } byDay.get(d).push(r); });
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header"><div class="modal-title">🗑 Move to scrap yard</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+
+        <div class="card" style="background:var(--slate-50);border-color:var(--slate-200);margin-bottom:12px">
+          <div style="font-size:12px;color:var(--slate-600);margin-bottom:8px">Record wastage from processed material (sheet offcuts, end pieces, rejects) going to the scrap yard.</div>
+          <div class="field-row">
+            <div class="field"><label>Date</label><${DateField} value=${form.scrap_date} onChange=${e => setForm({ ...form, scrap_date: e.target.value })} /></div>
+            <div class="field"><label>Material</label>
+              <select value=${form.material} onChange=${e => setForm({ ...form, material: e.target.value })}>
+                ${RM_MATERIALS.map(m => html`<option key=${m.key} value=${m.key}>${m.label}</option>`)}
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>Size / description</label><input type="text" value=${form.size_spec} onInput=${e => setForm({ ...form, size_spec: e.target.value })} placeholder="e.g. 3mm sheet offcuts 300×200, bar ends" /></div>
+          <div class="field-row">
+            <div class="field"><label>Weight (kg)</label><input type="number" step="any" min=${0} value=${form.weight_kg} onInput=${e => setForm({ ...form, weight_kg: e.target.value })} placeholder="e.g. 12.5" /></div>
+            <div class="field"><label>Quantity (pcs, optional)</label><input type="number" step="any" min=${0} value=${form.qty} onInput=${e => setForm({ ...form, qty: e.target.value })} placeholder="e.g. 8" /></div>
+          </div>
+          <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onInput=${e => setForm({ ...form, notes: e.target.value })} placeholder="reason, job / project, who processed it…"></textarea></div>
+
+          <label style="display:flex;align-items:flex-start;gap:8px;font-size:12px;color:var(--slate-700);cursor:pointer;margin:2px 0 8px">
+            <input type="checkbox" checked=${deduct} onChange=${e => setDeduct(e.target.checked)} style="margin-top:2px" />
+            <span>This scrap is still in tracked stock — also <b>reduce a stock item</b> by this amount.</span>
+          </label>
+          ${deduct && html`<div style="margin-bottom:8px"><${StockItemPicker} plant=${plant} value=${srcItem?.id || null} placeholder="🔍 Pick the stock item to reduce…" onChange=${async (id) => { if (!id) { setSrcItem(null); return; } const { data } = await sb.from('mcp_stocks_items').select('id, code, name, uom, unit_weight, current_qty').eq('id', id).single(); setSrcItem(data || null); }} /></div>`}
+
+          <button class="btn" disabled=${busy} style="width:100%;background:var(--rose-600);color:#fff" onClick=${save}>${busy ? 'Saving…' : '🗑 Record scrap'}</button>
+        </div>
+
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <div class="section-h" style="margin:0">Scrap yard · register</div>
+          <div style="font-size:12px;font-weight:700;color:var(--rose-600)">${fmtNum(Math.round(totWeight * 100) / 100)} kg</div>
+        </div>
+        <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">
+          <${DateField} value=${fromD} onChange=${e => setFromD(e.target.value)} placeholder="From" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px" />
+          <${DateField} value=${toD} onChange=${e => setToD(e.target.value)} placeholder="To" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px" />
+          ${(fromD || toD) && html`<button class="btn small ghost" onClick=${() => { setFromD(''); setToD(''); }} style="font-size:12px">Clear</button>`}
+        </div>
+        ${Object.keys(byMat).length > 0 && html`<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px">${Object.entries(byMat).map(([m, w]) => html`<span style="font-size:11px;background:var(--slate-100);border-radius:10px;padding:2px 8px">${m}: ${fmtNum(Math.round(w * 100) / 100)} kg</span>`)}</div>`}
+
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>`
+          : recent.length === 0 ? html`<div class="empty" style="padding:16px"><div style="font-size:13px;color:var(--slate-500)">No scrap recorded${(fromD || toD) ? ' in this range' : ' yet'}.</div></div>`
+          : days.map(d => html`<div key=${d}>
+              <div style="font-size:11px;font-weight:700;color:var(--slate-600);background:var(--slate-100);padding:4px 8px;border-radius:5px;margin:8px 0 4px">${new Date(d).toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' })}</div>
+              ${byDay.get(d).map(r => html`<div key=${r.id} style="display:flex;align-items:center;gap:8px;padding:7px 4px;border-bottom:1px solid var(--slate-100)">
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:13px;font-weight:600">${matLabel(r.material)}${r.size_spec ? ' · ' + r.size_spec : ''}</div>
+                  <div style="font-size:11px;color:var(--slate-500)">${r.item ? (r.item.name || r.item.code) + ' · ' : ''}${r.u?.full_name || ''}${r.notes ? ' · ' + r.notes : ''}</div>
+                </div>
+                <div style="text-align:right;flex-shrink:0">
+                  <div style="font-size:13px;font-weight:700;color:var(--rose-600)">${r.weight_kg ? fmtNum(r.weight_kg) + ' kg' : ''}${r.qty ? (r.weight_kg ? ' · ' : '') + fmtNum(r.qty) + ' pc' : ''}</div>
+                </div>
+                <button type="button" onClick=${() => del(r.id)} title="Delete" style="background:none;border:none;color:var(--slate-300);cursor:pointer;font-size:15px">×</button>
+              </div>`)}
+            </div>`)}
       </div>
     </div>
   `;
