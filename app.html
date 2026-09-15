@@ -38549,9 +38549,12 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
   const hasRods = Array.isArray(item.pieces) && item.pieces.length > 0;
   const [mode, setMode] = useState('metre');   // metre | weight | rods
   const [wt, setWt] = useState('');            // kg entered in weight mode
-  const [rodRows, setRodRows] = useState([{ len: '', count: '', cut: '' }]);
+  const [rodRows, setRodRows] = useState([{ len: '', count: '', cut: '', mode: 'whole' }]);
   const setRod = (i, patch) => setRodRows(rs => rs.map((x, idx) => idx === i ? { ...x, ...patch } : x));
-  const addRod = () => setRodRows(rs => [...rs, { len: '', count: '', cut: '' }]);
+  const addRod = () => setRodRows(rs => [...rs, { len: '', count: '', cut: '', mode: 'whole' }]);
+  // Switch a row between issuing whole rods and cutting a piece. 'whole' clears
+  // the cut length; 'cut' defaults the piece count to 1 so a single cut is easy.
+  const setRodMode = (i, m) => setRodRows(rs => rs.map((x, idx) => idx === i ? { ...x, mode: m, cut: m === 'whole' ? '' : x.cut, count: (x.count && parseInt(x.count) > 0) ? x.count : (m === 'cut' ? '1' : x.count) } : x));
   const rmRod = (i) => setRodRows(rs => rs.length <= 1 ? rs : rs.filter((_, idx) => idx !== i));
 
   const TYPE_GROUPS = [
@@ -38698,30 +38701,54 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
                 ${uw > 0 ? html`<div style="font-size:11px;color:var(--slate-500);margin-top:3px">= ${fmtNum(qtyM)} ${item.uom}  (${fmtNum(uw)} kg/${item.uom})</div>` : html`<div style="font-size:11px;color:var(--amber-700);margin-top:3px">Set this item's kg/${item.uom} first to convert weight.</div>`}
               </div>
             ` : html`
-              <div class="field"><label>${isInward ? 'Rods received' : 'Rods issued'} (count × length${isInward ? '' : ' · optional cut'})</label>
+              <div class="field"><label>${isInward ? 'Rods received' : 'Rods issued'}</label>
                 ${!isInward && availLens.length > 0 && html`<div style="font-size:11px;color:var(--slate-600);margin-bottom:6px">On the floor: ${availLens.map(l => html`<span style="display:inline-block;background:var(--slate-100);border-radius:10px;padding:1px 8px;margin:0 4px 4px 0">${fmtNum(availByLen[l])} × ${fmtNum(l)} ${item.uom}</span>`)}</div>`}
                 ${!isInward && availLens.length === 0 && html`<div style="font-size:11px;color:var(--amber-700);margin-bottom:6px">No rod breakdown recorded for this item yet — use Metre or Weight, or edit the item to add rods.</div>`}
-                <div style="display:flex;flex-direction:column;gap:6px">
-                  <div style="display:flex;gap:5px;font-size:10px;color:var(--slate-500);font-weight:600">
-                    <span style="width:60px">Rods (whole)</span><span style="width:14px"></span><span style="flex:1;min-width:60px">Length</span>${!isInward ? html`<span style="width:70px">Cut ${item.uom} (opt)</span>` : ''}
-                  </div>
-                  ${rodRows.map((r, i) => html`
-                    <div key=${i} style="display:flex;gap:5px;align-items:center;flex-wrap:wrap">
-                      <input type="text" inputmode="numeric" value=${r.count} onInput=${e => setRod(i, { count: e.target.value.replace(/[^0-9]/g, '') })} placeholder="rods" style="width:60px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
-                      <span style="color:var(--slate-400)">×</span>
-                      ${!isInward && availLens.length ? html`
-                        <select value=${r.len} onChange=${e => setRod(i, { len: e.target.value })} style="padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px">
-                          <option value="">length…</option>
-                          ${availLens.map(l => html`<option key=${l} value=${l}>${fmtNum(l)} ${item.uom} (${fmtNum(availByLen[l])})</option>`)}
+                <div style="display:flex;flex-direction:column;gap:8px">
+                  ${!isInward ? rodRows.map((r, i) => {
+                    const rl = parseFloat(r.len) || 0, cnt = parseFloat(r.count) || 0, cutL = parseFloat(r.cut) || 0;
+                    const rowM = r.mode === 'cut' ? cnt * cutL : cnt * rl;
+                    return html`
+                    <div key=${i} style="border:1px solid var(--slate-200);border-radius:8px;padding:8px;background:var(--slate-50)">
+                      <div style="display:flex;gap:5px;align-items:center;margin-bottom:6px">
+                        <select value=${r.len} onChange=${e => setRod(i, { len: e.target.value })} style="flex:1;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px;background:#fff">
+                          <option value="">Pick a size…</option>
+                          ${availLens.map(l => html`<option key=${l} value=${l}>${fmtNum(l)} ${item.uom} · ${fmtNum(availByLen[l])} on floor</option>`)}
                         </select>
-                      ` : html`<input type="number" min=${0} step="any" value=${r.len} onInput=${e => setRod(i, { len: e.target.value })} placeholder=${'len ' + item.uom} style="width:86px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />`}
-                      ${!isInward && html`<input type="number" min=${0} step="any" value=${r.cut} onInput=${e => setRod(i, { cut: e.target.value })} placeholder="cut" title="Issue a cut piece of this length from each rod; the offcut returns to stock" style="width:70px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />`}
+                        ${rodRows.length > 1 && html`<button type="button" onClick=${() => rmRod(i)} title="Remove" style="background:none;border:none;color:var(--rose-500);cursor:pointer;font-size:18px;padding:0 4px">×</button>`}
+                      </div>
+                      <div style="display:flex;gap:6px;margin-bottom:6px">
+                        <button type="button" onClick=${() => setRodMode(i, 'whole')} style=${'flex:1;padding:6px;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid ' + (r.mode !== 'cut' ? 'var(--teal-600);background:var(--teal-600);color:#fff' : 'var(--slate-200);background:#fff;color:var(--slate-600)')}>Whole rod(s)</button>
+                        <button type="button" onClick=${() => setRodMode(i, 'cut')} style=${'flex:1;padding:6px;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid ' + (r.mode === 'cut' ? 'var(--teal-600);background:var(--teal-600);color:#fff' : 'var(--slate-200);background:#fff;color:var(--slate-600)')}>Cut a piece</button>
+                      </div>
+                      ${r.mode === 'cut' ? html`
+                        <div style="display:flex;gap:5px;align-items:center;font-size:13px;color:var(--slate-600)">
+                          <span>Cut</span>
+                          <input type="number" min=${0} step="any" value=${r.cut} onInput=${e => setRod(i, { cut: e.target.value })} placeholder="0.5" style="width:72px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                          <span>${item.uom} ×</span>
+                          <input type="text" inputmode="numeric" value=${r.count} onInput=${e => setRod(i, { count: e.target.value.replace(/[^0-9]/g, '') })} placeholder="1" style="width:52px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                          <span>pc</span>
+                        </div>
+                        ${rl > 0 && cutL > 0 && cutL < rl && html`<div style="font-size:11px;color:var(--slate-500);margin-top:4px">↩ offcut ${fmtNum(Math.round((rl - cutL) * 1000) / 1000)} ${item.uom} × ${fmtNum(cnt || 1)} returns to stock</div>`}
+                      ` : html`
+                        <div style="display:flex;gap:5px;align-items:center;font-size:13px;color:var(--slate-600)">
+                          <span>Issue</span>
+                          <input type="text" inputmode="numeric" value=${r.count} onInput=${e => setRod(i, { count: e.target.value.replace(/[^0-9]/g, '') })} placeholder="1" style="width:60px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                          <span>whole rod${cnt === 1 ? '' : 's'}${rl ? ' of ' + fmtNum(rl) + ' ' + item.uom : ''}</span>
+                        </div>
+                      `}
+                      ${rowM > 0 && html`<div style="font-size:11px;font-weight:600;color:var(--teal-700);margin-top:4px">= ${fmtNum(Math.round(rowM * 1000) / 1000)} ${item.uom}${uw ? ' · ' + fmtNum(Math.round(rowM * uw * 100) / 100) + ' kg' : ''}</div>`}
+                    </div>`;
+                  }) : rodRows.map((r, i) => html`
+                    <div key=${i} style="display:flex;gap:5px;align-items:center">
+                      <input type="text" inputmode="numeric" value=${r.count} onInput=${e => setRod(i, { count: e.target.value.replace(/[^0-9]/g, '') })} placeholder="rods" style="width:64px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                      <span style="color:var(--slate-400)">×</span>
+                      <input type="number" min=${0} step="any" value=${r.len} onInput=${e => setRod(i, { len: e.target.value })} placeholder=${'length ' + item.uom} style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
                       ${rodRows.length > 1 && html`<button type="button" onClick=${() => rmRod(i)} title="Remove" style="background:none;border:none;color:var(--rose-500);cursor:pointer;font-size:16px">×</button>`}
                     </div>
                   `)}
-                  <button type="button" class="btn small ghost" onClick=${addRod} style="align-self:flex-start;font-size:12px">+ add rod line</button>
-                  ${!isInward && html`<div style="font-size:10.5px;color:var(--slate-500);line-height:1.4">💡 Rods must be whole numbers. To issue a part-length (e.g. <b>500&nbsp;mm = 0.5&nbsp;${item.uom}</b>): keep <b>Rods = 1</b>, pick the rod, and type <b>0.5</b> in <b>Cut</b> — the offcut returns to stock. Or just use <b>📏 Metre</b> and type 0.5.</div>`}
-                  <div style="font-size:12px;font-weight:700;color:var(--teal-700)">${fmtNum(qtyM)} ${item.uom}${uw ? ' · ≈ ' + fmtNum(Math.round(qtyM * uw * 100) / 100) + ' kg' : ''}${(!isInward && rodRows.some(r => (parseFloat(r.cut) || 0) > 0)) ? ' · offcuts return to stock' : ''}</div>
+                  <button type="button" class="btn small ghost" onClick=${addRod} style="align-self:flex-start;font-size:12px">+ ${isInward ? 'add size' : 'add another'}</button>
+                  <div style="font-size:13px;font-weight:700;color:var(--teal-700);border-top:1px solid var(--slate-200);padding-top:6px">Total: ${fmtNum(qtyM)} ${item.uom}${uw ? ' · ≈ ' + fmtNum(Math.round(qtyM * uw * 100) / 100) + ' kg' : ''}</div>
                 </div>
               </div>
             `}
