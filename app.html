@@ -38503,6 +38503,38 @@ function ReceiveFromDocPicker({ plant, me, pendingReceptions, onClose, onSaved }
   `;
 }
 
+// ---- Rod-list (pieces) helpers for length-based steel ----
+// pieces = [{ len, count }]. These keep the rod list in step with stock as
+// material is issued (whole rods or cut pieces with an offcut returned) or added.
+function rodsExpand(pieces) {
+  const out = [];
+  (pieces || []).forEach(p => { const c = Math.round(parseFloat(p.count) || 0); const l = parseFloat(p.len) || 0; if (l > 0) for (let k = 0; k < c; k++) out.push(l); });
+  return out;
+}
+function rodsCollapse(lengths) {
+  const m = new Map();
+  (lengths || []).forEach(l => { const k = Math.round((parseFloat(l) || 0) * 1000) / 1000; if (k > 0.0005) m.set(k, (m.get(k) || 0) + 1); });
+  return [...m.entries()].sort((a, b) => b[0] - a[0]).map(([len, count]) => ({ len, count }));
+}
+function rodsAdd(pieces, rows) {
+  const all = rodsExpand(pieces);
+  (rows || []).forEach(r => { const c = Math.round(parseFloat(r.count) || 0); const l = parseFloat(r.len) || 0; if (l > 0) for (let k = 0; k < c; k++) all.push(l); });
+  return rodsCollapse(all);
+}
+// Consume `metres` longest-first; cut the longest rod when the remaining need is
+// smaller than it (the offcut is kept). Returns the resulting rod list.
+function rodsConsumeMetres(pieces, metres) {
+  let need = Math.round((parseFloat(metres) || 0) * 1000) / 1000;
+  const rods = rodsExpand(pieces).sort((a, b) => b - a);
+  const out = [];
+  for (const l of rods) {
+    if (need <= 0.0005) { out.push(l); continue; }
+    if (l <= need + 0.0005) { need = Math.round((need - l) * 1000) / 1000; }
+    else { out.push(Math.round((l - need) * 1000) / 1000); need = 0; }
+  }
+  return rodsCollapse(out);
+}
+
 function TxnModal({ plant, me, item, onClose, onSaved }) {
   const [form, setForm] = useState({
     txn_type: item._txnHint || 'grn',
@@ -38510,6 +38542,17 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  // Length-based steel: allow entry by metre / weight / rods, and keep the rod
+  // breakdown in step with stock as material moves.
+  const isLen = ['mtr', 'ft'].includes((item.uom || '').toLowerCase());
+  const uw = parseFloat(item.unit_weight) || 0;
+  const hasRods = Array.isArray(item.pieces) && item.pieces.length > 0;
+  const [mode, setMode] = useState('metre');   // metre | weight | rods
+  const [wt, setWt] = useState('');            // kg entered in weight mode
+  const [rodRows, setRodRows] = useState([{ len: '', count: '', cut: '' }]);
+  const setRod = (i, patch) => setRodRows(rs => rs.map((x, idx) => idx === i ? { ...x, ...patch } : x));
+  const addRod = () => setRodRows(rs => [...rs, { len: '', count: '', cut: '' }]);
+  const rmRod = (i) => setRodRows(rs => rs.length <= 1 ? rs : rs.filter((_, idx) => idx !== i));
 
   const TYPE_GROUPS = [
     { label: 'Inward', types: [
@@ -38527,22 +38570,69 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
   ];
 
   const isInward = ['grn','return','opening','adjustment_in'].includes(form.txn_type);
-  const newQty = (() => {
-    const q = parseFloat(form.qty || 0);
-    return parseFloat(item.current_qty || 0) + (isInward ? q : -q);
-  })();
+  // Available rods per length (for issuing by rods)
+  const availByLen = {};
+  (item.pieces || []).forEach(p => { const l = Math.round((parseFloat(p.len) || 0) * 1000) / 1000; if (l > 0) availByLen[l] = (availByLen[l] || 0) + Math.round(parseFloat(p.count) || 0); });
+  const availLens = Object.keys(availByLen).map(Number).sort((a, b) => b - a);
+  // Metres implied by the rod builder (cut pieces consume only the cut length when issuing)
+  const rodMetres = rodRows.reduce((s, r) => {
+    const c = parseFloat(r.count) || 0, l = parseFloat(r.len) || 0, cut = parseFloat(r.cut) || 0;
+    const per = (!isInward && cut > 0) ? cut : l;
+    return s + c * per;
+  }, 0);
+  // Effective quantity in metres, from whichever entry mode is active.
+  const qtyM = !isLen ? (parseFloat(form.qty) || 0)
+    : mode === 'weight' ? (uw > 0 ? Math.round(((parseFloat(wt) || 0) / uw) * 1000) / 1000 : 0)
+    : mode === 'rods' ? Math.round(rodMetres * 1000) / 1000
+    : (parseFloat(form.qty) || 0);
+  const newQty = parseFloat(item.current_qty || 0) + (isInward ? qtyM : -qtyM);
 
   const submit = async (e) => {
     e.preventDefault();
     setError(''); setLoading(true);
     try {
-      const q = parseFloat(form.qty);
-      if (!q || q <= 0) throw new Error('Quantity must be > 0');
+      const q = Math.round((isLen ? qtyM : (parseFloat(form.qty) || 0)) * 1000) / 1000;
+      if (!q || q <= 0) throw new Error(isLen && mode === 'rods' ? 'Add at least one rod' : 'Quantity must be > 0');
+      // Rods-mode issue: never issue more rods of a length than are on the floor.
+      if (isLen && mode === 'rods' && !isInward) {
+        const reqByLen = {};
+        rodRows.forEach(r => { const c = Math.round(parseFloat(r.count) || 0), l = Math.round((parseFloat(r.len) || 0) * 1000) / 1000; if (c > 0 && l > 0) reqByLen[l] = (reqByLen[l] || 0) + c; });
+        for (const l in reqByLen) { if (reqByLen[l] > (availByLen[l] || 0)) throw new Error('Only ' + (availByLen[l] || 0) + ' rod(s) of ' + fmtNum(l) + ' ' + item.uom + ' on the floor'); }
+        rodRows.forEach(r => { const cut = parseFloat(r.cut) || 0, l = parseFloat(r.len) || 0; if (cut > 0 && cut > l + 0.0005) throw new Error('Cut length can’t exceed the rod length'); });
+      }
       if (!isInward && q > parseFloat(item.current_qty || 0)) {
         if (!confirm('This will leave stock at ' + fmtNum(parseFloat(item.current_qty || 0) - q) + '. Continue?')) {
           setLoading(false); return;
         }
       }
+
+      // Work out the resulting rod list (kept in step with stock).
+      let newPieces = Array.isArray(item.pieces) ? item.pieces : null;
+      let piecesChanged = false;
+      if (isLen) {
+        if (mode === 'rods') {
+          if (isInward) {
+            newPieces = rodsAdd(item.pieces, rodRows.filter(r => (parseFloat(r.count) || 0) > 0 && (parseFloat(r.len) || 0) > 0).map(r => ({ len: r.len, count: r.count })));
+          } else {
+            const lengths = rodsExpand(item.pieces);
+            const offcuts = [];
+            for (const r of rodRows) {
+              const c = Math.round(parseFloat(r.count) || 0), l = Math.round((parseFloat(r.len) || 0) * 1000) / 1000, cut = parseFloat(r.cut) || 0;
+              if (c <= 0 || l <= 0) continue;
+              for (let k = 0; k < c; k++) { const idx = lengths.findIndex(x => Math.abs(x - l) < 0.0005); if (idx >= 0) lengths.splice(idx, 1); if (cut > 0 && (l - cut) > 0.0005) offcuts.push(Math.round((l - cut) * 1000) / 1000); }
+            }
+            newPieces = rodsCollapse([...lengths, ...offcuts]);
+          }
+          piecesChanged = true;
+        } else if (!isInward && hasRods) {
+          // metre / weight issue → consume longest-first (auto-cut, offcut kept)
+          newPieces = rodsConsumeMetres(item.pieces, q);
+          piecesChanged = true;
+        }
+        // inward by metre/weight: rods can't be inferred — leave the list, the
+        // item page shows a "rod list differs" note until it's edited.
+      }
+
       const { error } = await sb.from('mcp_stocks_transactions').insert({
         plant_id: plant.id,
         item_id: item.id,
@@ -38553,7 +38643,12 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
         performed_by: me.id,
       });
       if (error) throw error;
-      showToast((isInward ? '+ ' : '− ') + fmtNum(q) + ' ' + item.uom + ' recorded');
+      if (isLen && piecesChanged) {
+        // Best-effort: keep the rod list in step. A failure here doesn't undo the
+        // stock move; the item page will flag any drift.
+        await sb.from('mcp_stocks_items').update({ pieces: newPieces }).eq('id', item.id);
+      }
+      showToast((isInward ? '+ ' : '− ') + fmtNum(q) + ' ' + item.uom + (uw ? ' · ' + fmtNum(Math.round(q * uw * 100) / 100) + ' kg' : '') + ' recorded');
       onSaved();
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
@@ -38567,8 +38662,9 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
         </div>
         <div class="card" style="background:var(--slate-50);margin-bottom:14px">
           <div class="card-row"><span class="label">Item</span><span class="value">${item.code} · ${item.name}</span></div>
-          <div class="card-row"><span class="label">Current</span><span class="value mono">${fmtNum(item.current_qty)} ${item.uom}</span></div>
-          ${form.qty && parseFloat(form.qty) > 0 && html`
+          <div class="card-row"><span class="label">Current</span><span class="value mono">${fmtNum(item.current_qty)} ${item.uom}${uw ? ' · ' + fmtNum(Math.round(parseFloat(item.current_qty || 0) * uw * 100) / 100) + ' kg' : ''}</span></div>
+          ${qtyM > 0 && html`
+            <div class="card-row"><span class="label">${isInward ? 'Adding' : 'Issuing'}</span><span class="value mono" style="color:${isInward ? 'var(--emerald-700)' : 'var(--rose-600)'}">${isInward ? '+' : '−'}${fmtNum(qtyM)} ${item.uom}${uw ? ' · ' + fmtNum(Math.round(qtyM * uw * 100) / 100) + ' kg' : ''}</span></div>
             <div class="card-row"><span class="label">After</span><span class="value mono" style="color:${isInward ? 'var(--emerald-700)' : 'var(--rose-600)'};font-weight:600">${fmtNum(newQty)} ${item.uom}</span></div>
           `}
         </div>
@@ -38583,7 +38679,51 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
               `)}
             </select>
           </div>
-          <div class="field"><label>Quantity * (${item.uom})</label><input type="number" step="0.001" min=${0.001} required value=${form.qty} onChange=${e => setForm({...form, qty: e.target.value})} autoFocus /></div>
+          ${isLen ? html`
+            <div class="field"><label>Enter by</label>
+              <div style="display:flex;gap:6px">
+                ${[['metre', '📏 Metre'], ['weight', '⚖️ Weight'], ['rods', '🪵 Rods']].map(([m, lbl]) => html`
+                  <button type="button" key=${m} class="btn small" onClick=${() => setMode(m)} style=${'flex:1;font-size:12px;' + (mode === m ? 'background:var(--teal-600);color:#fff' : 'background:var(--slate-50);color:var(--slate-600);border:1px solid var(--slate-200)')}>${lbl}</button>
+                `)}
+              </div>
+            </div>
+            ${mode === 'metre' ? html`
+              <div class="field"><label>Quantity * (${item.uom})</label>
+                <input type="number" step="0.001" min=${0.001} required value=${form.qty} onInput=${e => setForm({ ...form, qty: e.target.value })} autoFocus />
+                ${uw > 0 && qtyM > 0 && html`<div style="font-size:11px;color:var(--slate-500);margin-top:3px">≈ ${fmtNum(Math.round(qtyM * uw * 100) / 100)} kg</div>`}
+              </div>
+            ` : mode === 'weight' ? html`
+              <div class="field"><label>Weight * (kg)</label>
+                <input type="number" step="any" min=${0} required value=${wt} onInput=${e => setWt(e.target.value)} autoFocus placeholder=${uw ? 'e.g. ' + fmtNum(Math.round(uw * 6 * 100) / 100) : 'kg'} />
+                ${uw > 0 ? html`<div style="font-size:11px;color:var(--slate-500);margin-top:3px">= ${fmtNum(qtyM)} ${item.uom}  (${fmtNum(uw)} kg/${item.uom})</div>` : html`<div style="font-size:11px;color:var(--amber-700);margin-top:3px">Set this item's kg/${item.uom} first to convert weight.</div>`}
+              </div>
+            ` : html`
+              <div class="field"><label>${isInward ? 'Rods received' : 'Rods issued'} (count × length${isInward ? '' : ' · optional cut'})</label>
+                ${!isInward && availLens.length > 0 && html`<div style="font-size:11px;color:var(--slate-600);margin-bottom:6px">On the floor: ${availLens.map(l => html`<span style="display:inline-block;background:var(--slate-100);border-radius:10px;padding:1px 8px;margin:0 4px 4px 0">${fmtNum(availByLen[l])} × ${fmtNum(l)} ${item.uom}</span>`)}</div>`}
+                ${!isInward && availLens.length === 0 && html`<div style="font-size:11px;color:var(--amber-700);margin-bottom:6px">No rod breakdown recorded for this item yet — use Metre or Weight, or edit the item to add rods.</div>`}
+                <div style="display:flex;flex-direction:column;gap:6px">
+                  ${rodRows.map((r, i) => html`
+                    <div key=${i} style="display:flex;gap:5px;align-items:center;flex-wrap:wrap">
+                      <input type="number" min=${0} step=${1} value=${r.count} onInput=${e => setRod(i, { count: e.target.value })} placeholder="rods" style="width:60px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                      <span style="color:var(--slate-400)">×</span>
+                      ${!isInward && availLens.length ? html`
+                        <select value=${r.len} onChange=${e => setRod(i, { len: e.target.value })} style="padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px">
+                          <option value="">length…</option>
+                          ${availLens.map(l => html`<option key=${l} value=${l}>${fmtNum(l)} ${item.uom} (${fmtNum(availByLen[l])})</option>`)}
+                        </select>
+                      ` : html`<input type="number" min=${0} step="any" value=${r.len} onInput=${e => setRod(i, { len: e.target.value })} placeholder=${'len ' + item.uom} style="width:86px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />`}
+                      ${!isInward && html`<input type="number" min=${0} step="any" value=${r.cut} onInput=${e => setRod(i, { cut: e.target.value })} placeholder="cut" title="Issue a cut piece of this length from each rod; the offcut returns to stock" style="width:70px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />`}
+                      ${rodRows.length > 1 && html`<button type="button" onClick=${() => rmRod(i)} title="Remove" style="background:none;border:none;color:var(--rose-500);cursor:pointer;font-size:16px">×</button>`}
+                    </div>
+                  `)}
+                  <button type="button" class="btn small ghost" onClick=${addRod} style="align-self:flex-start;font-size:12px">+ add rod line</button>
+                  <div style="font-size:12px;font-weight:700;color:var(--teal-700)">${fmtNum(qtyM)} ${item.uom}${uw ? ' · ≈ ' + fmtNum(Math.round(qtyM * uw * 100) / 100) + ' kg' : ''}${(!isInward && rodRows.some(r => (parseFloat(r.cut) || 0) > 0)) ? ' · offcuts return to stock' : ''}</div>
+                </div>
+              </div>
+            `}
+          ` : html`
+            <div class="field"><label>Quantity * (${item.uom})</label><input type="number" step="0.001" min=${0.001} required value=${form.qty} onChange=${e => setForm({...form, qty: e.target.value})} autoFocus /></div>
+          `}
           <div class="field"><label>Reference</label><input type="text" value=${form.reference} onChange=${e => setForm({...form, reference: e.target.value})} placeholder=${isInward ? 'GRN# / Invoice / DC#' : 'Job# / DC# / Reason'} /></div>
           <div class="field"><label>Notes</label><textarea rows=${2} value=${form.notes} onChange=${e => setForm({...form, notes: e.target.value})}></textarea></div>
           <button class="btn" disabled=${loading} style="background:${isInward ? 'var(--emerald-600)' : 'var(--rose-600)'};color:white">${loading ? 'Saving…' : (isInward ? '+ Add to stock' : '− Issue stock')}</button>
