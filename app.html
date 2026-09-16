@@ -27511,6 +27511,16 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
     return () => { cancelled = true; };
   }, [plant?.id, kind, unitId]);
   const unitName = (accessibleUnits.find(u => u.unit_id === unitId) || {}).unit_name || '';
+  // Manual numbering: auto-fill the number box with the unit format
+  // (e.g. MMPL/U1/DC/26-27/0001). Updates when the unit changes; leaves it alone
+  // once the user has typed their own number.
+  const suggestedRef = useRef('');
+  useEffect(() => {
+    if (!plant?.manual_doc_numbering || !unitPreview) return;
+    setForm(f => (!f.doc_number || f.doc_number === suggestedRef.current)
+      ? (suggestedRef.current = unitPreview, { ...f, doc_number: unitPreview })
+      : f);
+  }, [unitPreview, plant?.manual_doc_numbering]);
   const isInvoice = kind === 'invoice';
   const isReturnable = kind === 'rdc';
   // DC / RDC can be issued to a vendor (sending material out) as well as a
@@ -27766,8 +27776,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
       ${manualNum ? html`
         <label style="font-size:11px;font-weight:600;color:var(--slate-600)">${isInvoice ? 'Invoice' : (isReturnable ? 'RDC' : 'DC')} number *</label>
         <input type="text" required value=${form.doc_number} onInput=${e => setForm({ ...form, doc_number: e.target.value })} placeholder="Type the number" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--slate-300);border-radius:6px;font-size:15px;font-weight:700;font-family:monospace;background:white;margin-top:3px" />
-        ${unitPreview && html`<div style="margin-top:5px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="font-size:11px;color:var(--slate-500)">${unitName ? unitName + ' format:' : 'Suggested:'}</span><button type="button" onClick=${() => setForm(f => ({ ...f, doc_number: unitPreview }))} style="font-size:12px;font-family:monospace;font-weight:700;color:var(--teal-700);background:var(--teal-50);border:1px solid var(--teal-200);border-radius:6px;padding:3px 8px;cursor:pointer" title="Tap to use this number">${unitPreview} ↵</button></div>`}
-        <div style="font-size:11px;color:var(--slate-500);margin-top:3px">Manual numbering — you type it. Tap the suggestion to use the ${unitName || 'unit'} format, then edit if needed.</div>
+        <div style="font-size:11px;color:var(--slate-500);margin-top:4px">Auto-filled with the ${unitName || 'unit'} format${unitPreview ? '' : ''} — edit it if your number is different.${unitPreview ? html` <button type="button" onClick=${() => setForm(f => ({ ...f, doc_number: unitPreview }))} style="font-size:11px;color:var(--teal-700);background:none;border:none;text-decoration:underline;cursor:pointer;padding:0">reset to ${unitName || 'unit'} format</button>` : ''}</div>
       ` : html`
         <div style="font-size:18px;font-weight:700;color:var(--slate-900);font-family:monospace">${unitPreview || previewNumber}</div>
         <div style="font-size:11px;color:var(--slate-500);margin-top:2px">Next number${unitName ? ' for ' + unitName : ''} — assigned when you save. Separate running series per unit.</div>
