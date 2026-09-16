@@ -5412,7 +5412,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'tooling'}><${ToolingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'face_attendance'}><${FaceAttendanceModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'jobwork'}><${SubContractingModule} plant=${plant} me=${me} /></${Page}>
-      <${Page} active=${pageTab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} /></${Page}>
+      <${Page} active=${pageTab === 'sales_docs'}><${SalesDocMakerModule} plant=${plant} me=${me} navAction=${navAction} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} /></${Page}>
       <${Page} active=${pageTab === 'doc_formats'}><${DocFormatsModule} plant=${plant} me=${me} /></${Page}>
       <${Page} active=${pageTab === 'projects'}><${ProjectTracker} plant=${plant} me=${me} myPerms=${myPerms} go=${go} /></${Page}>
       <${Page} active=${pageTab === 'cutting'}><${CuttingPlanner} plant=${plant} me=${me} /></${Page}>
@@ -23551,15 +23551,20 @@ function ProjectTracker({ plant, me, myPerms, go }) {
   const [createOpen, setCreateOpen] = useState(false);
   const [activeProject, setActiveProject] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [units, setUnits] = useState([]);
+  const [unitFilter, setUnitFilter] = useState('all'); // 'all' | unit_id — projects are shown across all units the user can see
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    const [p, c, u] = await Promise.all([
-      unitScope(sb.from('mcp_projects').select('*, customer:customer_id(name), owner:owner_user_id(full_name)').eq('plant_id', plant.id).order('code', { ascending: true, nullsFirst: false }).order('name')),
+    // Projects are shown across ALL units the user can access (no active-unit
+    // scoping) — a unit filter below lets them narrow to one unit or see all.
+    const [p, c, u, un] = await Promise.all([
+      sb.from('mcp_projects').select('*, customer:customer_id(name), owner:owner_user_id(full_name)').eq('plant_id', plant.id).order('code', { ascending: true, nullsFirst: false }).order('name'),
       sb.from('mcp_sched_customers').select('id, name').eq('plant_id', plant.id).order('name'),
       sb.from('users').select('id, full_name').eq('plant_id', plant.id).order('full_name'),
+      sb.from('units').select('id, name, code').eq('plant_id', plant.id).order('created_at'),
     ]);
-    setProjects(p.data || []); setCustomers(c.data || []); setUsers(u.data || []);
+    setProjects(p.data || []); setCustomers(c.data || []); setUsers(u.data || []); setUnits(un.data || []);
     setLoading(false);
     setActiveProject(prev => prev ? (p.data || []).find(x => x.id === prev.id) || prev : prev);
   }, [plant.id]);
@@ -23572,10 +23577,14 @@ function ProjectTracker({ plant, me, myPerms, go }) {
     return () => sb.removeChannel(ch);
   }, [plant.id, refresh]);
 
-  const active = projects.filter(p => p.status === 'in_progress' || p.status === 'planning' || p.status === 'on_hold');
-  let list = projects;
+  const unitName = (uid) => { const u = units.find(x => x.id === uid); return u ? (u.code ? u.code + ' · ' + u.name : u.name) : (uid ? 'Unit' : 'Shared'); };
+  const multiUnit = units.length > 1;
+  // Unit scope first (across-units view with an optional per-unit filter).
+  const unitProjects = unitFilter === 'all' ? projects : projects.filter(p => p.unit_id === unitFilter);
+  const active = unitProjects.filter(p => p.status === 'in_progress' || p.status === 'planning' || p.status === 'on_hold');
+  let list = unitProjects;
   if (filter === 'active') list = active;
-  else if (filter === 'completed') list = projects.filter(p => p.status === 'completed');
+  else if (filter === 'completed') list = unitProjects.filter(p => p.status === 'completed');
   // Organise by job number (natural/numeric): 315, 327, 327.4, 341, 341B, 352 …
   // with non-numbered jobs (site names etc.) after the numbered ones.
   list = [...list].sort((a, b) => String(a.name || a.code || '').localeCompare(String(b.name || b.code || ''), undefined, { numeric: true, sensitivity: 'base' }));
@@ -23606,6 +23615,11 @@ function ProjectTracker({ plant, me, myPerms, go }) {
       <button class=${'auth-tab'+(filter==='completed'?' active':'')} onClick=${()=>setFilter('completed')}>Completed</button>
       <button class=${'auth-tab'+(filter==='all'?' active':'')} onClick=${()=>setFilter('all')}>All</button>
     </div>
+    ${multiUnit && html`
+      <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;gap:6px">
+        <button class=${'auth-tab small'+(unitFilter==='all'?' active':'')} style="font-size:11px;padding:3px 10px" onClick=${()=>setUnitFilter('all')}>All units · ${projects.length}</button>
+        ${units.map(u => html`<button key=${u.id} class=${'auth-tab small'+(unitFilter===u.id?' active':'')} style="font-size:11px;padding:3px 10px" onClick=${()=>setUnitFilter(u.id)}>${u.code ? u.code + ' · ' : ''}${u.name} · ${projects.filter(p=>p.unit_id===u.id).length}</button>`)}
+      </div>`}
     <div class="section-h">Projects · ${list.length}${(me?.role==='plant_head'||me?.role==='admin') && html`<button class="btn small ghost" onClick=${()=>setCreateOpen(true)}>+ New project</button>`}</div>
     ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
       list.length===0 ? html`<div class="card"><div class="empty"><div class="icon">📐</div><div style="font-size:13px">No projects ${filter==='all'?'yet':'in this filter'}. Tap + New project.</div></div></div>` :
@@ -23613,7 +23627,7 @@ function ProjectTracker({ plant, me, myPerms, go }) {
         <div class="card" key=${p.id} onClick=${()=>setActiveProject(p)} style="margin-bottom:6px;padding:12px 14px;cursor:pointer">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
             <div style="flex:1;min-width:0">
-              <div style="font-size:13px;font-weight:600">${p.code?p.code+' · ':''}${p.name}</div>
+              <div style="font-size:13px;font-weight:600">${p.code?p.code+' · ':''}${p.name}${multiUnit ? html`<span style="font-size:10px;font-weight:600;color:var(--teal-700);background:var(--teal-50);border:1px solid var(--teal-200);border-radius:8px;padding:1px 6px;margin-left:6px">${p.unit_id ? unitName(p.unit_id) : 'Shared'}</span>` : ''}</div>
               <div style="font-size:11px;color:var(--slate-500);margin-top:2px">
                 ${p.customer?.name||p.customer_name||'—'}${p.site_location?' · '+p.site_location:''}${p.target_date?' · due '+p.target_date:''}${p.owner?.full_name?' · '+p.owner.full_name:''}
               </div>
@@ -27108,7 +27122,7 @@ function SalesDocFilteredList({ recent, loading, META, onView }) {
   `;
 }
 
-function SalesDocMakerModule({ plant, me, navAction }) {
+function SalesDocMakerModule({ plant, me, navAction, activeUnit, accessibleUnits }) {
   const [tab, setTab] = useState('list'); // list | new_dc | new_invoice | new_po | new_packing
   // Home shortcuts (DC / PO) deep-link straight to the right sub-tab. Pages stay
   // mounted, so react to the one-shot navAction signal whenever its ts changes.
@@ -27234,7 +27248,7 @@ function SalesDocMakerModule({ plant, me, navAction }) {
         (More → Commercial → Doc Formats), not inside DC creation. */ ''}
 
     ${(tab === 'new_dc' || tab === 'new_rdc' || tab === 'new_invoice') && html`
-      <${SalesDocCreateForm} key=${docKind} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber} customers=${customers} vendors=${vendors}
+      <${SalesDocCreateForm} key=${docKind} plant=${plant} me=${me} kind=${docKind} previewNumber=${previewNumber} customers=${customers} vendors=${vendors} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits}
         onCounterChanged=${() => {
           // The "Set starting number" panel inside the form just bumped the
           // counter; re-peek so the cached value reflects the new starting #.
@@ -27475,7 +27489,20 @@ const DC_PICK_CATS = [
   { key: 'machines',     label: '🏭 Machines',     kind: 'machine', cat: null },
   { key: 'part',         label: '🔧 Part',         kind: 'part',    cat: null },
 ];
-function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors = [], onCounterChanged, onSaved, onCancel }) {
+function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors = [], onCounterChanged, onSaved, onCancel, activeUnit, accessibleUnits = [] }) {
+  // Which unit this document belongs to — drives the unit code in the number
+  // (e.g. MMPL/U1/DC/…) and is stamped on the doc / print. Defaults to the
+  // active unit; can be changed here.
+  const [unitId, setUnitId] = useState(activeUnit?.unit_id || (accessibleUnits[0]?.unit_id) || '');
+  const [unitPreview, setUnitPreview] = useState('');
+  useEffect(() => {
+    if (!plant?.id) { setUnitPreview(''); return; }
+    let cancelled = false;
+    sb.rpc('peek_next_logistics_doc_number', { p_plant_id: plant.id, p_doc_kind: kind, p_unit_id: unitId || null })
+      .then(({ data }) => { if (!cancelled) setUnitPreview(data || ''); });
+    return () => { cancelled = true; };
+  }, [plant?.id, kind, unitId]);
+  const unitName = (accessibleUnits.find(u => u.unit_id === unitId) || {}).unit_name || '';
   const isInvoice = kind === 'invoice';
   const isReturnable = kind === 'rdc';
   // DC / RDC can be issued to a vendor (sending material out) as well as a
@@ -27618,7 +27645,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
       } else {
         // Allocate the next number atomically (this commits it — even if save fails, the number is consumed)
         const { data: allocated, error: numErr } = await sb.rpc('get_next_logistics_doc_number', {
-          p_plant_id: plant.id, p_doc_kind: kind, p_date: form.doc_date,
+          p_plant_id: plant.id, p_doc_kind: kind, p_date: form.doc_date, p_unit_id: unitId || null,
         });
         if (numErr) throw numErr;
         docNo = allocated;
@@ -27663,6 +27690,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
 
       const { data: doc, error } = await sb.from('mcp_logistics_documents').insert({
         plant_id: plant.id,
+        unit_id: unitId || null,
         doc_type: isInvoice ? 'invoice_out' : (isReturnable ? 'dc_out_returnable' : 'dc_out'),
         doc_number: docNo,
         doc_date: form.doc_date,
@@ -27680,6 +27708,8 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
         raw_extraction: {
           party_type: useVendor ? 'vendor' : 'customer',
           customer_id: useVendor ? null : form.customer_id,
+          unit_id: unitId || null,
+          unit_name: unitName || null,
           place_of_supply: form.place_of_supply || null,
           vehicle_no: form.vehicle_no || null,
           eway_bill: form.eway_bill || null,
@@ -27718,13 +27748,20 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   return html`
     <div class="card" style="margin-bottom:14px;padding:14px;background:var(--teal-50);border-color:var(--teal-200)">
       <div style="font-size:11px;font-weight:700;color:var(--teal-700);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">${isInvoice ? '🧾 New tax invoice' : (isReturnable ? '🔁 New returnable DC' : '📦 New delivery challan')}</div>
+      ${accessibleUnits.length > 1 && html`
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+          <span style="font-size:11px;font-weight:600;color:var(--slate-600);white-space:nowrap">🏭 Unit</span>
+          <select value=${unitId} onChange=${e => setUnitId(e.target.value)} style="flex:1;padding:6px 8px;border:1px solid var(--teal-300);border-radius:6px;font-size:13px;font-weight:600;background:white">
+            ${accessibleUnits.map(u => html`<option key=${u.unit_id} value=${u.unit_id}>${u.unit_name}</option>`)}
+          </select>
+        </div>`}
       ${manualNum ? html`
         <label style="font-size:11px;font-weight:600;color:var(--slate-600)">${isInvoice ? 'Invoice' : (isReturnable ? 'RDC' : 'DC')} number *</label>
         <input type="text" required value=${form.doc_number} onInput=${e => setForm({ ...form, doc_number: e.target.value })} placeholder="Type the number" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--slate-300);border-radius:6px;font-size:15px;font-weight:700;font-family:monospace;background:white;margin-top:3px" />
         <div style="font-size:11px;color:var(--slate-500);margin-top:3px">Manual numbering — you type it. The auto series is paused for this plant.</div>
       ` : html`
-        <div style="font-size:18px;font-weight:700;color:var(--slate-900);font-family:monospace">${previewNumber}</div>
-        <div style="font-size:11px;color:var(--slate-500);margin-top:2px">Next number — assigned atomically when you save. Continuous per plant per financial year.</div>
+        <div style="font-size:18px;font-weight:700;color:var(--slate-900);font-family:monospace">${unitPreview || previewNumber}</div>
+        <div style="font-size:11px;color:var(--slate-500);margin-top:2px">Next number${unitName ? ' for ' + unitName : ''} — assigned when you save. Separate running series per unit.</div>
         ${(me?.role === 'plant_head' || me?.role === 'admin') && html`<${SetStartingNumberPanel} plant=${plant} kind=${kind} onChanged=${onCounterChanged} />`}
       `}
     </div>
@@ -28262,6 +28299,7 @@ function SalesDocPreview({ doc: docProp, plant, me, customers, vendors, onClose 
         <div style="font-size:22px;font-weight:800;letter-spacing:0.5px">${plant.legal_name || plant.name}</div>
         ${plant.address && html`<div style="font-size:11px;color:#444;margin-top:2px">${plant.address}${plant.city?', '+plant.city:''}${plant.state?', '+plant.state:''}${plant.pincode?' - '+plant.pincode:''}</div>`}
         ${plant.gstin && html`<div style="font-size:11px;color:#444;margin-top:2px">GSTIN: <strong>${plant.gstin}</strong></div>`}
+        ${doc.raw_extraction?.unit_name && html`<div style="font-size:12px;color:#000;margin-top:3px;font-weight:700">${doc.raw_extraction.unit_name}</div>`}
       </div>
 
       <div style="text-align:center;font-size:14px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:14px">
