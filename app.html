@@ -22335,6 +22335,8 @@ function rtBuildDocCtx({ doc, plant, party, isInvoice }) {
   const fmtRtDate = v => { const s = String(v || ''); return /^\d{4}-\d{2}-\d{2}/.test(s) ? fmtDMY(s) : s; };
   const docFields = {
     doc_number:        doc.doc_number,
+    unit_name:         raw.unit_name || '',
+    unit_id:           raw.unit_id || doc.unit_id || '',
     doc_date:          fmtRtDate(doc.doc_date),
     due_date:          fmtRtDate(raw.delivery_date || raw.expected_return_date || ''),
     po_number:         raw.po_reference || '',
@@ -22519,13 +22521,19 @@ function rtRenderDocument(template, ctx) {
     // doesn't double up.
     const copyLineRe = /Original\s*\/\s*Duplicate(?:\s*\/\s*Triplicate)?(?:\s*\/\s*(?:File|Office|Extra)\s*Copy)?/i;
     const copies = (ctx.doc && ctx.doc.__copies) || ['Original Copy', 'Duplicate Copy'];
+    // Which unit this document belongs to — stamped top-left so it always shows
+    // on the print, even if the (custom) template doesn't reference it.
+    const unitNm = ctx.doc && ctx.doc.unit_name;
+    const unitBadge = unitNm ? ('<div style="position:absolute;top:12px;left:12px;font-size:12px;font-weight:bold;' +
+      "font-family:'Times New Roman',Times,serif;color:#000;background:#fff;padding:2px 9px;" +
+      'border:1.5px solid #000;border-radius:3px;z-index:5;white-space:nowrap">🏭 ' + rtEsc(unitNm) + '</div>') : '';
     const bodies = copies.map((label, i) => {
       const c = body.replace(copyLineRe, '');
       const badge = '<div style="position:absolute;top:12px;right:12px;font-size:14px;font-weight:bold;' +
         "font-family:'Times New Roman',Times,serif;color:#000;background:#fff;padding:2px 9px;" +
         'border:1.5px solid #000;border-radius:3px;z-index:5;white-space:nowrap">' + rtEsc(label) + '</div>';
       const last = i === copies.length - 1;
-      return '<div class="doc-copy" style="position:relative' + (last ? ';page-break-after:auto;break-after:auto' : '') + '">' + badge + c + '</div>';
+      return '<div class="doc-copy" style="position:relative' + (last ? ';page-break-after:auto;break-after:auto' : '') + '">' + badge + unitBadge + c + '</div>';
     }).join('');
     return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + rtEsc(docTitle) + '</title>' +
       '<style>@page{size:' + pageSize + ' ' + orient + ';margin:8mm}' +
@@ -27758,7 +27766,8 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
       ${manualNum ? html`
         <label style="font-size:11px;font-weight:600;color:var(--slate-600)">${isInvoice ? 'Invoice' : (isReturnable ? 'RDC' : 'DC')} number *</label>
         <input type="text" required value=${form.doc_number} onInput=${e => setForm({ ...form, doc_number: e.target.value })} placeholder="Type the number" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--slate-300);border-radius:6px;font-size:15px;font-weight:700;font-family:monospace;background:white;margin-top:3px" />
-        <div style="font-size:11px;color:var(--slate-500);margin-top:3px">Manual numbering — you type it. The auto series is paused for this plant.</div>
+        ${unitPreview && html`<div style="margin-top:5px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="font-size:11px;color:var(--slate-500)">${unitName ? unitName + ' format:' : 'Suggested:'}</span><button type="button" onClick=${() => setForm(f => ({ ...f, doc_number: unitPreview }))} style="font-size:12px;font-family:monospace;font-weight:700;color:var(--teal-700);background:var(--teal-50);border:1px solid var(--teal-200);border-radius:6px;padding:3px 8px;cursor:pointer" title="Tap to use this number">${unitPreview} ↵</button></div>`}
+        <div style="font-size:11px;color:var(--slate-500);margin-top:3px">Manual numbering — you type it. Tap the suggestion to use the ${unitName || 'unit'} format, then edit if needed.</div>
       ` : html`
         <div style="font-size:18px;font-weight:700;color:var(--slate-900);font-family:monospace">${unitPreview || previewNumber}</div>
         <div style="font-size:11px;color:var(--slate-500);margin-top:2px">Next number${unitName ? ' for ' + unitName : ''} — assigned when you save. Separate running series per unit.</div>
