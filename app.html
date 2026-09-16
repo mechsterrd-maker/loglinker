@@ -26988,6 +26988,33 @@ function SalesDocFilteredList({ recent, loading, META, onView }) {
   const [period, setPeriod] = useState('all');
   const [partyFilter, setPartyFilter] = useState('all');
   const [sortBy, setSortBy] = useState('newest');
+  // Returnable-DC return status (open / partial / closed) for a colour cue.
+  const [rdcStatus, setRdcStatus] = useState({});
+  useEffect(() => {
+    const ids = recent.filter(d => d.doc_type === 'dc_out_returnable' && d.status !== 'cancelled').map(d => d.id);
+    if (!ids.length) { setRdcStatus({}); return; }
+    let cancelled = false;
+    (async () => {
+      const { data } = await sb.from('mcp_rdc_lines').select('doc_id, status, qty_received').in('doc_id', ids);
+      const agg = {};
+      (data || []).forEach(l => {
+        const g = agg[l.doc_id] || (agg[l.doc_id] = { total: 0, done: 0, anyRecv: false });
+        g.total++;
+        const closed = ['received', 'closed'].includes(l.status);
+        if (closed) g.done++;
+        if (closed || l.status === 'partial' || parseFloat(l.qty_received || 0) > 0) g.anyRecv = true;
+      });
+      const map = {};
+      Object.entries(agg).forEach(([id, g]) => { map[id] = (g.total > 0 && g.done === g.total) ? 'closed' : (g.anyRecv ? 'partial' : 'open'); });
+      if (!cancelled) setRdcStatus(map);
+    })();
+    return () => { cancelled = true; };
+  }, [recent]);
+  const RDC_STY = {
+    open:    { bg: 'var(--amber-50)',   bd: 'var(--amber-400)',   badge: 'amber',   label: 'OPEN' },
+    partial: { bg: '#eff6ff',           bd: '#3b82f6',            badge: '',        label: 'PARTIAL' },
+    closed:  { bg: 'var(--emerald-50)', bd: 'var(--emerald-400)', badge: 'emerald', label: 'CLOSED' },
+  };
 
   const TYPE_PILLS = [
     { key:'all',                ico:'📃', label:'All' },
@@ -27108,14 +27135,20 @@ function SalesDocFilteredList({ recent, loading, META, onView }) {
       </div>
       ${totalValue > 0 && html`<div style="font-size:12px;color:var(--slate-600)">Total · <b style="color:var(--slate-900)">₹${fmtNum(totalValue.toFixed(0))}</b></div>`}
     </div>
+    ${(docType === 'all' || docType === 'dc_out_returnable') && Object.keys(rdcStatus).length > 0 && html`
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin:0 4px 8px;font-size:10px;color:var(--slate-500)">
+        <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:11px;height:11px;border-radius:3px;background:var(--amber-50);border-left:3px solid var(--amber-400)"></span>RDC open</span>
+        <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:11px;height:11px;border-radius:3px;background:#eff6ff;border-left:3px solid #3b82f6"></span>partly returned</span>
+        <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:11px;height:11px;border-radius:3px;background:var(--emerald-50);border-left:3px solid var(--emerald-400)"></span>closed</span>
+      </div>`}
 
     ${filtered.length === 0
       ? html`<div class="card"><div class="empty"><div class="icon">🔍</div><div style="font-size:13px">No documents match these filters.</div></div></div>`
-      : filtered.map(d => { const m = META[d.doc_type] || { ico:'📄', label:d.doc_type }; const cancelled = d.status === 'cancelled'; return html`
-        <div class="card" key=${d.id} style=${'margin-bottom:6px;padding:10px 12px;cursor:pointer' + (cancelled ? ';opacity:0.7;background:var(--slate-50)' : '')} onClick=${() => onView(d)}>
+      : filtered.map(d => { const m = META[d.doc_type] || { ico:'📄', label:d.doc_type }; const cancelled = d.status === 'cancelled'; const rst = (!cancelled && d.doc_type === 'dc_out_returnable') ? RDC_STY[rdcStatus[d.id]] : null; return html`
+        <div class="card" key=${d.id} style=${'margin-bottom:6px;padding:10px 12px;cursor:pointer' + (cancelled ? ';opacity:0.7;background:var(--slate-50)' : (rst ? ';background:' + rst.bg + ';border-left:4px solid ' + rst.bd : ''))} onClick=${() => onView(d)}>
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
             <div style="flex:1;min-width:0">
-              <div style=${'font-size:13px;font-weight:600' + (cancelled ? ';text-decoration:line-through;color:var(--slate-400)' : '')}>${m.ico} ${d.doc_number}${cancelled ? html` <span class="badge rose" style="font-size:9px;text-decoration:none;-webkit-text-decoration:none">CANCELLED</span>` : ''}</div>
+              <div style=${'font-size:13px;font-weight:600' + (cancelled ? ';text-decoration:line-through;color:var(--slate-400)' : '')}>${m.ico} ${d.doc_number}${cancelled ? html` <span class="badge rose" style="font-size:9px;text-decoration:none;-webkit-text-decoration:none">CANCELLED</span>` : (rst ? html` <span class="badge ${rst.badge}" style="font-size:9px">${rst.label}</span>` : '')}</div>
               <div style=${'font-size:11px;color:var(--slate-500);margin-top:2px' + (cancelled ? ';text-decoration:line-through' : '')}>
                 ${m.label} · ${fmtDMY(d.doc_date)}${d.vendor_name_raw ? ' · ' + d.vendor_name_raw : ''} · ${Array.isArray(d.items) ? d.items.length : 0} item${(d.items?.length||0)===1?'':'s'}
               </div>
