@@ -37661,7 +37661,13 @@ function Stocks({ plant, me, activeUnit, accessibleUnits }) {
     const parts = [];
     const w = parseFloat(i.unit_weight) || 0;
     if (w > 0) parts.push(fmtNum(Math.round(parseFloat(i.current_qty || 0) * w * 100) / 100) + ' kg');
-    if (Array.isArray(i.pieces) && i.pieces.length) { const rods = i.pieces.reduce((s, p) => s + (parseFloat(p.count) || 0), 0); if (rods > 0) parts.push(fmtNum(rods) + ' rod' + (rods === 1 ? '' : 's')); }
+    if (Array.isArray(i.pieces) && i.pieces.length && i.pieces[0]) {
+      const cnt = i.pieces.reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
+      if (cnt > 0) {
+        if (i.pieces[0].w != null) parts.push(fmtNum(cnt) + ' pc' + (cnt === 1 ? '' : 's') + ' · ' + i.pieces.length + ' size' + (i.pieces.length === 1 ? '' : 's'));
+        else parts.push(fmtNum(cnt) + ' rod' + (cnt === 1 ? '' : 's'));
+      }
+    }
     return parts.join(' · ');
   };
 
@@ -38791,6 +38797,38 @@ function rodsConsumeMetres(pieces, metres) {
   return rodsCollapse(out);
 }
 
+// ---- Sheet/plate (2D) piece helpers ----
+// pieces for a sheet item = [{ w, l, count }] (mm). Cutting a piece leaves
+// offcut rectangles the operator records, so stock shows every size on hand.
+function sheetIsSheetItem(item) {
+  return ['nos', 'sheet'].includes((item.uom || '').toLowerCase()) && (parseFloat(item.dim2) || 0) > 0 && (parseFloat(item.dim3) || 0) > 0;
+}
+// Available sheet pieces — from the stored breakdown, else derived from the base
+// size × current stock (first time, before any cut).
+function sheetPieces(item) {
+  if (Array.isArray(item.pieces) && item.pieces.length && item.pieces[0] && item.pieces[0].w != null) {
+    return sheetCollapse(item.pieces);
+  }
+  const w = parseFloat(item.dim2) || 0, l = parseFloat(item.dim3) || 0, c = Math.round(parseFloat(item.current_qty) || 0);
+  return (w > 0 && l > 0 && c > 0) ? [{ w: Math.min(w, l), l: Math.max(w, l), count: c }] : [];
+}
+// Merge same-size pieces (orientation-independent), largest area first.
+function sheetCollapse(list) {
+  const m = new Map();
+  (list || []).forEach(p => {
+    const a = Math.round(parseFloat(p.w) || 0), b = Math.round(parseFloat(p.l) || 0), c = Math.round(parseFloat(p.count) || 0);
+    if (a > 0 && b > 0 && c > 0) { const w = Math.min(a, b), l = Math.max(a, b); const k = w + 'x' + l; const e = m.get(k) || { w, l, count: 0 }; e.count += c; m.set(k, e); }
+  });
+  return [...m.values()].sort((x, y) => (y.w * y.l) - (x.w * x.l));
+}
+function sheetKey(p) { const w = Math.min(Math.round(p.w), Math.round(p.l)), l = Math.max(Math.round(p.w), Math.round(p.l)); return w + 'x' + l; }
+function sheetLabel(p) { return fmtNum(Math.min(p.w, p.l)) + '×' + fmtNum(Math.max(p.w, p.l)); }
+function sheetRemove(pieces, w, l, n) {
+  const key = Math.min(w, l) + 'x' + Math.max(w, l);
+  return sheetCollapse((pieces || []).map(p => sheetKey(p) === key ? { ...p, count: Math.max(0, p.count - n) } : p));
+}
+function sheetTotalCount(pieces) { return (pieces || []).reduce((s, p) => s + (Math.round(parseFloat(p.count) || 0)), 0); }
+
 function TxnModal({ plant, me, item, onClose, onSaved }) {
   const [form, setForm] = useState({
     txn_type: item._txnHint || 'grn',
@@ -38812,6 +38850,20 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
   // the cut length; 'cut' defaults the piece count to 1 so a single cut is easy.
   const setRodMode = (i, m) => setRodRows(rs => rs.map((x, idx) => idx === i ? { ...x, mode: m, cut: m === 'whole' ? '' : x.cut, count: (x.count && parseInt(x.count) > 0) ? x.count : (m === 'cut' ? '1' : x.count) } : x));
   const rmRod = (i) => setRodRows(rs => rs.length <= 1 ? rs : rs.filter((_, idx) => idx !== i));
+
+  // Sheet/plate (2D): issue a whole sheet or cut a piece and keep the offcut(s).
+  const isSheet = !isLen && sheetIsSheetItem(item);
+  const shBase = sheetPieces(item);
+  const shKeys = shBase.map(sheetKey);
+  const shByKey = {}; shBase.forEach(p => { shByKey[sheetKey(p)] = p; });
+  const [shMode, setShMode] = useState('cut');   // whole | cut
+  const [shSrc, setShSrc] = useState(shKeys[0] || '');
+  const [shWhole, setShWhole] = useState('1');
+  const [cutW, setCutW] = useState(''); const [cutL, setCutL] = useState(''); const [cutN, setCutN] = useState('1');
+  const [offRows, setOffRows] = useState([{ w: '', l: '', count: '1' }]);
+  const setOff = (i, patch) => setOffRows(rs => rs.map((x, idx) => idx === i ? { ...x, ...patch } : x));
+  const addOff = () => setOffRows(rs => [...rs, { w: '', l: '', count: '1' }]);
+  const rmOff = (i) => setOffRows(rs => rs.length <= 1 ? rs : rs.filter((_, idx) => idx !== i));
 
   const TYPE_GROUPS = [
     { label: 'Inward', types: [
@@ -38850,6 +38902,39 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
     e.preventDefault();
     setError(''); setLoading(true);
     try {
+      // ---- Sheet/plate: issue a whole sheet or cut a piece (offcut kept) ----
+      if (isSheet && !isInward) {
+        let pieces = sheetPieces(item);
+        let issuedQty, note;
+        const [sw, sl] = (shSrc || '').split('x').map(Number);
+        if (!(sw > 0 && sl > 0)) throw new Error('Pick the sheet size on the floor');
+        const availOf = (pieces.find(p => sheetKey(p) === sheetKey({ w: sw, l: sl })) || {}).count || 0;
+        if (shMode === 'cut') {
+          const cw = Math.round(parseFloat(cutW) || 0), cl = Math.round(parseFloat(cutL) || 0), cn = Math.round(parseFloat(cutN) || 0) || 1;
+          if (!(cw > 0 && cl > 0)) throw new Error('Enter the cut size (width × length in mm)');
+          if (Math.min(cw, cl) > Math.min(sw, sl) + 0.5 || Math.max(cw, cl) > Math.max(sw, sl) + 0.5) throw new Error('The cut piece is bigger than the sheet');
+          if (availOf < 1) throw new Error('No ' + sheetLabel({ w: sw, l: sl }) + ' sheet on the floor');
+          pieces = sheetRemove(pieces, sw, sl, 1);
+          const offs = offRows.filter(r => (parseFloat(r.w) || 0) > 0 && (parseFloat(r.l) || 0) > 0 && (parseInt(r.count) || 0) > 0).map(r => ({ w: +r.w, l: +r.l, count: +r.count }));
+          pieces = sheetCollapse([...pieces, ...offs]);
+          issuedQty = cn;
+          note = 'Cut ' + cn + ' × ' + sheetLabel({ w: cw, l: cl }) + ' from ' + sheetLabel({ w: sw, l: sl }) + (offs.length ? '; offcut ' + offs.map(o => o.count + '×' + sheetLabel(o)).join(', ') : '') + (form.notes ? ' · ' + form.notes : '');
+        } else {
+          const n = Math.round(parseFloat(shWhole) || 0);
+          if (!(n > 0)) throw new Error('Enter how many sheets');
+          if (n > availOf && !confirm('Only ' + availOf + ' of ' + sheetLabel({ w: sw, l: sl }) + ' on the floor. Continue?')) { setLoading(false); return; }
+          pieces = sheetRemove(pieces, sw, sl, n);
+          issuedQty = n;
+          note = 'Issued ' + n + ' × ' + sheetLabel({ w: sw, l: sl }) + (form.notes ? ' · ' + form.notes : '');
+        }
+        const { error: se } = await sb.from('mcp_stocks_transactions').insert({ plant_id: plant.id, item_id: item.id, txn_type: form.txn_type, qty: issuedQty, reference: form.reference || null, notes: note, performed_by: me.id });
+        if (se) throw se;
+        // Authoritative: the piece list and the stock count come from the cut.
+        await sb.from('mcp_stocks_items').update({ pieces, current_qty: sheetTotalCount(pieces) }).eq('id', item.id);
+        showToast('✓ Sheet ' + (shMode === 'cut' ? 'cut & offcut kept' : 'issued'));
+        onSaved(); setLoading(false); return;
+      }
+
       const q = Math.round((isLen ? qtyM : (parseFloat(form.qty) || 0)) * 1000) / 1000;
       if (!q || q <= 0) throw new Error(isLen && mode === 'rods' ? 'Add at least one rod' : 'Quantity must be > 0');
       // Rods-mode issue: never issue more rods of a length than are on the floor.
@@ -39008,6 +39093,45 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
                 </div>
               </div>
             `}
+          ` : (isSheet && !isInward) ? html`
+            <div class="field"><label>Sheets on the floor</label>
+              ${shBase.length === 0 ? html`<div style="font-size:11px;color:var(--amber-700)">No sheet sizes recorded yet.</div>`
+                : html`<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">${shBase.map(p => html`<span style="font-size:11px;background:var(--slate-100);border-radius:10px;padding:1px 8px">${fmtNum(p.count)} × ${sheetLabel(p)} mm</span>`)}</div>`}
+              <div style="display:flex;gap:6px;margin-bottom:8px">
+                <button type="button" onClick=${() => setShMode('whole')} style=${'flex:1;padding:7px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid ' + (shMode !== 'cut' ? 'var(--teal-600);background:var(--teal-600);color:#fff' : 'var(--slate-200);background:#fff;color:var(--slate-600)')}>Whole sheet(s)</button>
+                <button type="button" onClick=${() => setShMode('cut')} style=${'flex:1;padding:7px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid ' + (shMode === 'cut' ? 'var(--teal-600);background:var(--teal-600);color:#fff' : 'var(--slate-200);background:#fff;color:var(--slate-600)')}>✂ Cut a piece</button>
+              </div>
+              <label style="font-size:11px;font-weight:600;color:var(--slate-600)">Cut from</label>
+              <select value=${shSrc} onChange=${e => setShSrc(e.target.value)} style="width:100%;box-sizing:border-box;padding:8px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px;background:white;margin:2px 0 8px">
+                ${shBase.map(p => html`<option key=${sheetKey(p)} value=${sheetKey(p)}>${sheetLabel(p)} mm · ${fmtNum(p.count)} on floor</option>`)}
+              </select>
+              ${shMode === 'cut' ? html`
+                <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
+                  <span style="font-size:12px;color:var(--slate-600)">Cut piece</span>
+                  <input type="number" min=${0} value=${cutW} onInput=${e => setCutW(e.target.value)} placeholder="width" style="width:74px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                  <span style="color:var(--slate-400)">×</span>
+                  <input type="number" min=${0} value=${cutL} onInput=${e => setCutL(e.target.value)} placeholder="length" style="width:74px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                  <span style="font-size:11px;color:var(--slate-400)">mm ×</span>
+                  <input type="text" inputmode="numeric" value=${cutN} onInput=${e => setCutN(e.target.value.replace(/[^0-9]/g, ''))} style="width:44px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                </div>
+                <label style="font-size:11px;font-weight:600;color:var(--slate-600)">Offcut(s) back to stock</label>
+                <div style="display:flex;flex-direction:column;gap:5px;margin-top:3px">
+                  ${offRows.map((r, i) => html`<div key=${i} style="display:flex;gap:5px;align-items:center">
+                    <input type="number" min=${0} value=${r.w} onInput=${e => setOff(i, { w: e.target.value })} placeholder="width" style="width:70px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                    <span style="color:var(--slate-400)">×</span>
+                    <input type="number" min=${0} value=${r.l} onInput=${e => setOff(i, { l: e.target.value })} placeholder="length" style="width:70px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                    <span style="font-size:11px;color:var(--slate-400)">mm ×</span>
+                    <input type="text" inputmode="numeric" value=${r.count} onInput=${e => setOff(i, { count: e.target.value.replace(/[^0-9]/g, '') })} style="width:42px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                    ${offRows.length > 1 && html`<button type="button" onClick=${() => rmOff(i)} style="background:none;border:none;color:var(--rose-500);cursor:pointer;font-size:16px">×</button>`}
+                  </div>`)}
+                  <button type="button" class="btn small ghost" onClick=${addOff} style="align-self:flex-start;font-size:12px">+ another offcut</button>
+                </div>
+                <div style="font-size:10.5px;color:var(--slate-500);margin-top:5px">Cutting a corner piece leaves an L-shape — enter the usable rectangle(s) you keep (e.g. cut 500×500 from 1260×2500 → keep 760×2500 and 500×2000). Leave blank if there's no usable offcut.</div>
+              ` : html`
+                <label style="font-size:11px;font-weight:600;color:var(--slate-600)">How many whole sheets</label>
+                <input type="text" inputmode="numeric" value=${shWhole} onInput=${e => setShWhole(e.target.value.replace(/[^0-9]/g, ''))} style="width:100%;box-sizing:border-box;padding:8px;border:1px solid var(--slate-200);border-radius:6px;font-size:14px;margin-top:2px" />
+              `}
+            </div>
           ` : html`
             <div class="field"><label>Quantity * (${item.uom})</label><input type="number" step="0.001" min=${0.001} required value=${form.qty} onChange=${e => setForm({...form, qty: e.target.value})} autoFocus /></div>
           `}
@@ -39344,7 +39468,17 @@ function ItemDetail({ plant, me, item: initialItem, onClose, onEdit, onDeleted }
       ${item.unit_cost && html`<div class="card-row"><span class="label">Stock value</span><span class="value">₹${(parseFloat(item.current_qty || 0) * parseFloat(item.unit_cost || 0)).toLocaleString('en-IN', {maximumFractionDigits:0})}</span></div>`}
     </div>
 
-    ${Array.isArray(item.pieces) && item.pieces.length > 0 && (() => {
+    ${Array.isArray(item.pieces) && item.pieces.length > 0 && item.pieces[0] && item.pieces[0].w != null && (() => {
+      const sp = sheetCollapse(item.pieces);
+      const totCount = sheetTotalCount(sp);
+      return html`<div class="card" style="margin-top:10px">
+        <div class="card-title">▭ SHEETS ON FLOOR <span style="font-weight:400;color:var(--slate-400);font-size:10px">· sizes in stock (mm)</span></div>
+        ${sp.map((p, i) => html`<div key=${i} class="card-row"><span class="label">${sheetLabel(p)} mm</span><span class="value" style="font-weight:600">${fmtNum(p.count)} pc${p.count === 1 ? '' : 's'}</span></div>`)}
+        <div class="card-row" style="border-top:1px solid var(--slate-200)"><span class="label" style="font-weight:700">Total pieces</span><span class="value" style="font-weight:700;color:var(--teal-700)">${fmtNum(totCount)}</span></div>
+      </div>`;
+    })()}
+
+    ${Array.isArray(item.pieces) && item.pieces.length > 0 && item.pieces[0] && item.pieces[0].len != null && (() => {
       const tot = item.pieces.reduce((s, p) => s + (parseFloat(p.count) || 0) * (parseFloat(p.len) || 0), 0);
       const rods = item.pieces.reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
       const uwv = parseFloat(item.unit_weight) || 0;
