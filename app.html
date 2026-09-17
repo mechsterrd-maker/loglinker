@@ -22394,6 +22394,9 @@ function rtBuildDocCtx({ doc, plant, party, isInvoice }) {
   // Print dates in Indian DD/MM/YYYY. Idempotent: only reformats an ISO
   // (YYYY-MM-DD) value, so an already-formatted or {{…|date}} value passes through.
   const fmtRtDate = v => { const s = String(v || ''); return /^\d{4}-\d{2}-\d{2}/.test(s) ? fmtDMY(s) : s; };
+  // Print only the project NUMBER (code) — the part before " · " in a stored
+  // "CODE · Name" project reference. A bare name (no code) is left as-is.
+  const projNum = v => String(v || '').split(' · ')[0].trim();
   const docFields = {
     doc_number:        doc.doc_number,
     unit_name:         raw.unit_name || '',
@@ -22425,10 +22428,10 @@ function rtBuildDocCtx({ doc, plant, party, isInvoice }) {
     round_off:         raw.round_off || 0,
     amount_in_words:   raw.amount_in_words || '',
     // Project reference: the document-level tag, else the distinct per-item
-    // projects. Available to templates as {{doc.project_name}} / {{doc.project_ref}}
-    // and force-printed as a banner by rtRenderDocument even if the template omits it.
-    project_name:      (raw.project_name || [...new Set(items.map(it => it.project_name).filter(Boolean))].join(', ')) || '',
-    project_ref:       (raw.project_name || [...new Set(items.map(it => it.project_name).filter(Boolean))].join(', ')) || '',
+    // projects. Printed as the project NUMBER only (the code before " · "), not
+    // the full name. Available to templates as {{doc.project_name}} / {{doc.project_ref}}.
+    project_name:      (projNum(raw.project_name) || [...new Set(items.map(it => projNum(it.project_name)).filter(Boolean))].join(', ')) || '',
+    project_ref:       (projNum(raw.project_name) || [...new Set(items.map(it => projNum(it.project_name)).filter(Boolean))].join(', ')) || '',
     total_qty:         items.reduce((s, it) => s + (parseFloat(it.qty) || 0), 0),
     total_approx_value: items.reduce((s, it) => s + (parseFloat(it.approx_value) || 0), 0),
     total_packages:    pt.packages || items.reduce((s, it) => s + (parseInt(it.packages) || 0), 0),
@@ -22457,7 +22460,7 @@ function rtBuildDocCtx({ doc, plant, party, isInvoice }) {
   // Show the project inside each item's description (per-item, else the doc-level
   // project), and make sure an approx weight is present (qty × unit weight) so a
   // template's weight column fills even on older items.
-  const docProj = docFields.project_name;
+  const docProj = docFields.project_name;   // already number-only
   // Older docs stored the item name as "AUTO-CODE · Editable Name" (the picker
   // used to bake the stock/part code in). Print only the editable name. Strip a
   // leading segment only when it's a single code-like token (no spaces), so a
@@ -22469,7 +22472,7 @@ function rtBuildDocCtx({ doc, plant, party, isInvoice }) {
     return /\s/.test(s.slice(0, i).trim()) ? s : s.slice(i + 3);
   };
   const rows = items.map(it => {
-    const proj = it.project_name || docProj || '';
+    const proj = projNum(it.project_name) || docProj || '';
     const gw = (it.gross_weight != null && it.gross_weight !== '')
       ? it.gross_weight
       : (it.unit_weight != null ? Math.round(parseFloat(it.unit_weight) * (parseFloat(it.qty) || 0) * 1000) / 1000 : it.gross_weight);
@@ -28385,7 +28388,8 @@ function SalesDocPreview({ doc: docProp, plant, me, customers, vendors, onClose 
   const cust = customers.find(c => c.id === custId) || (doc.raw_extraction?.customer || null);
   const items = Array.isArray(doc.items) ? doc.items : [];
   const igst = !!doc.raw_extraction?.igst;
-  const docProject = doc.raw_extraction?.project_name || [...new Set(items.map(it => it.project_name).filter(Boolean))].join(', ');
+  const projNum = v => String(v || '').split(' · ')[0].trim();  // project number only
+  const docProject = projNum(doc.raw_extraction?.project_name) || [...new Set(items.map(it => projNum(it.project_name)).filter(Boolean))].join(', ');
   const printIt = () => window.print();
 
   return html`
@@ -28452,7 +28456,7 @@ function SalesDocPreview({ doc: docProp, plant, me, customers, vendors, onClose 
           ${items.map((it, i) => html`
             <tr key=${i} style="border:1px solid #000">
               <td style="padding:6px;border:1px solid #000;text-align:center">${i+1}</td>
-              <td style="padding:6px;border:1px solid #000">${it.name}${it.project_name ? html`<div style="font-size:10px;color:#555;margin-top:2px">📐 ${it.project_name}</div>` : ''}</td>
+              <td style="padding:6px;border:1px solid #000">${it.name}${it.project_name ? html`<div style="font-size:10px;color:#555;margin-top:2px">📐 ${projNum(it.project_name)}</div>` : ''}</td>
               <td style="padding:6px;border:1px solid #000;text-align:center">${it.hsn||''}</td>
               <td style="padding:6px;border:1px solid #000;text-align:right">${it.qty}</td>
               <td style="padding:6px;border:1px solid #000;text-align:center">${it.uom||''}</td>
