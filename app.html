@@ -38012,12 +38012,13 @@ function Stocks({ plant, me, activeUnit, accessibleUnits }) {
             // fall into an "Ungrouped" bucket sorted last.
             const bySub = {};
             for (const i of list) {
-              const s = cat === 'raw_material'
-                ? ((RM_SECTIONS.find(x => x.key === i.section_type) || {}).label || (i.section_type ? i.section_type.charAt(0).toUpperCase() + i.section_type.slice(1) : '—'))
-                : ((i.subcategory || '').trim() || '—');
+              const s = cat === 'raw_material' ? rmTypeLabel(i) : ((i.subcategory || '').trim() || '—');
               (bySub[s] = bySub[s] || []).push(i);
             }
-            const subEntries = Object.entries(bySub).sort((a,b) => (a[0] === '—') - (b[0] === '—') || a[0].localeCompare(b[0]));
+            const subEntries = Object.entries(bySub).sort((a,b) => {
+              if (cat === 'raw_material') { const ia = RM_TYPE_ORDER.indexOf(a[0]), ib = RM_TYPE_ORDER.indexOf(b[0]); return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a[0].localeCompare(b[0]); }
+              return (a[0] === '—') - (b[0] === '—') || a[0].localeCompare(b[0]);
+            });
             const hasSub = subEntries.some(([s]) => s !== '—');
             return html`
             <details key=${cat} open style="margin-bottom:8px">
@@ -38037,16 +38038,14 @@ function Stocks({ plant, me, activeUnit, accessibleUnits }) {
           `;})}
         ` : categoryFilter === 'raw_material' ? html`
           ${(() => {
-            // Group raw material by section type (Angle, Flat, Plate, Sheet, Pipe…).
-            const secLabel = (k) => (RM_SECTIONS.find(s => s.key === k) || {}).label || (k ? k.charAt(0).toUpperCase() + k.slice(1) : 'Other');
+            // Group raw material by shop type (Coil, Sheet, Angle, Plate, Pipe…).
             const groups = {};
-            for (const i of filteredItems) { const k = i.section_type || 'other'; (groups[k] = groups[k] || []).push(i); }
-            const order = RM_SECTIONS.map(s => s.key);
-            const keys = Object.keys(groups).sort((a, b) => { const ia = order.indexOf(a), ib = order.indexOf(b); return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b); });
+            for (const i of filteredItems) { const k = rmTypeLabel(i); (groups[k] = groups[k] || []).push(i); }
+            const keys = Object.keys(groups).sort((a, b) => { const ia = RM_TYPE_ORDER.indexOf(a), ib = RM_TYPE_ORDER.indexOf(b); return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b); });
             return keys.map(k => html`
               <details key=${k} open style="margin-bottom:6px">
                 <summary style="cursor:pointer;padding:9px 12px;background:var(--slate-100);border-radius:10px;font-weight:700;font-size:13px;display:flex;justify-content:space-between;align-items:center">
-                  <span>🔩 ${secLabel(k)}</span>
+                  <span>🔩 ${k}</span>
                   <span style="background:var(--teal-600);color:white;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px">${groups[k].length}</span>
                 </summary>
                 <div style="margin-top:4px">${groups[k].map(i => html`<${ItemRow} i=${i} />`)}</div>
@@ -38323,6 +38322,29 @@ const RM_SECTIONS = [
   { key:'consumable', label:'Consumable',       abbr:'CON',  unit:'nos', dims:[], spec:'e.g. 3.15mm Welding rod',     calc:null },
   { key:'other',      label:'Other',            abbr:'OTH',  unit:'nos', dims:[], spec:'Describe the material',       calc:null },
 ];
+// Group a raw-material item into a simple shop type (Coil, Sheet, Angle, Pipe…).
+// Uses the section type when set, else reads the item name so imported/legacy
+// items (mostly section_type 'other'/null) still land in the right bucket.
+const RM_SEC_SIMPLE = { angle:'Angle', flat:'Flat', round_bar:'Round bar', square_bar:'Square bar', block:'Block', rhs:'RHS (rect tube)', shs:'SHS (square tube)', pipe:'Pipe / Tube', plate:'Plate', sheet:'Sheet', channel:'Channel', beam:'Beam' };
+const RM_TYPE_ORDER = ['Coil','Sheet','Plate','Angle','Channel','Beam','Flat','Pipe / Tube','RHS (rect tube)','SHS (square tube)','Round bar','Square bar','Block','Rod / Bar','Profile','Other'];
+function rmTypeLabel(item) {
+  const st = item.section_type;
+  if (st && st !== 'other' && RM_SEC_SIMPLE[st]) return RM_SEC_SIMPLE[st];
+  const n = (item.name || item.code || '').toUpperCase();
+  if (/COIL/.test(n)) return 'Coil';
+  if (/SHEET|CHEQUERED/.test(n)) return 'Sheet';
+  if (/PLATE/.test(n)) return 'Plate';
+  if (/ANGLE/.test(n)) return 'Angle';
+  if (/CHANNEL|ISMC/.test(n)) return 'Channel';
+  if (/BEAM|ISMB|\bNPB\b|BEEM/.test(n)) return 'Beam';
+  if (/FLAT/.test(n)) return 'Flat';
+  if (/PIPE|TUBE/.test(n)) return 'Pipe / Tube';
+  if (/PROFILE/.test(n)) return 'Profile';
+  if (/\bROD\b|ROUND ROD|SQ ROD|HEX ROD|\bBAR\b/.test(n)) return 'Rod / Bar';
+  if (/\bRHS\b/.test(n)) return 'RHS (rect tube)';
+  if (/\bSHS\b/.test(n)) return 'SHS (square tube)';
+  return 'Other';
+}
 // Build code / name / size / unit-weight / stock-unit from the RM selections.
 function rmBuild(materialKey, sectionKey, d1, d2, d3, spec) {
   const M = RM_MATERIALS.find(m => m.key === materialKey) || RM_MATERIALS[RM_MATERIALS.length - 1];
