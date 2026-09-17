@@ -38828,6 +38828,30 @@ function sheetRemove(pieces, w, l, n) {
   return sheetCollapse((pieces || []).map(p => sheetKey(p) === key ? { ...p, count: Math.max(0, p.count - n) } : p));
 }
 function sheetTotalCount(pieces) { return (pieces || []).reduce((s, p) => s + (Math.round(parseFloat(p.count) || 0)), 0); }
+// Auto-calculate the leftover rectangles after cutting `cn` pieces of cw×cl from
+// a W×L sheet — same guillotine ("long right" + "below") split the 2D cutting
+// planner uses, with an optional blade kerf. Returns { placed, offcuts:[{w,l,count}] }.
+function sheetCutRemainder(W, L, cw, cl, cn, kerf) {
+  kerf = Math.max(0, parseFloat(kerf) || 0);
+  let free = [{ x: 0, y: 0, w: W, h: L }];
+  let placed = 0;
+  while (placed < cn) {
+    let idx = -1, useW = 0, useH = 0;
+    for (let i = 0; i < free.length; i++) {
+      const r = free[i];
+      if (cw <= r.w + 1e-6 && cl <= r.h + 1e-6) { idx = i; useW = cw; useH = cl; break; }
+      if (cl <= r.w + 1e-6 && cw <= r.h + 1e-6) { idx = i; useW = cl; useH = cw; break; } // rotated fit
+    }
+    if (idx < 0) break;
+    const r = free[idx]; free.splice(idx, 1);
+    const rightW = r.w - useW - kerf, belowH = r.h - useH - kerf;
+    if (rightW > 0.5) free.push({ x: r.x + useW + kerf, y: r.y, w: rightW, h: r.h });
+    if (belowH > 0.5) free.push({ x: r.x, y: r.y + useH + kerf, w: useW, h: belowH });
+    placed++;
+  }
+  const offcuts = sheetCollapse(free.filter(r => r.w >= 1 && r.h >= 1).map(r => ({ w: Math.round(r.w), l: Math.round(r.h), count: 1 })));
+  return { placed, offcuts };
+}
 
 function TxnModal({ plant, me, item, onClose, onSaved }) {
   const [form, setForm] = useState({
@@ -38860,10 +38884,20 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
   const [shSrc, setShSrc] = useState(shKeys[0] || '');
   const [shWhole, setShWhole] = useState('1');
   const [cutW, setCutW] = useState(''); const [cutL, setCutL] = useState(''); const [cutN, setCutN] = useState('1');
-  const [offRows, setOffRows] = useState([{ w: '', l: '', count: '1' }]);
-  const setOff = (i, patch) => setOffRows(rs => rs.map((x, idx) => idx === i ? { ...x, ...patch } : x));
-  const addOff = () => setOffRows(rs => [...rs, { w: '', l: '', count: '1' }]);
-  const rmOff = (i) => setOffRows(rs => rs.length <= 1 ? rs : rs.filter((_, idx) => idx !== i));
+  const [kerf, setKerf] = useState('0');          // blade width (mm), removed by each cut
+  const [offcutDest, setOffcutDest] = useState('stock'); // stock | scrap — where the leftover goes
+  // Auto-calculated leftover of the current cut (guillotine remainder).
+  const shCut = (() => {
+    const [sw, sl] = (shSrc || '').split('x').map(Number);
+    const cw = Math.round(parseFloat(cutW) || 0), cl = Math.round(parseFloat(cutL) || 0), cn = Math.round(parseFloat(cutN) || 0) || 1;
+    if (!(sw > 0 && sl > 0 && cw > 0 && cl > 0)) return { valid: false, offcuts: [], sw, sl, cw, cl, cn };
+    const fits = Math.min(cw, cl) <= Math.min(sw, sl) + 0.5 && Math.max(cw, cl) <= Math.max(sw, sl) + 0.5;
+    const rem = fits ? sheetCutRemainder(sw, sl, cw, cl, cn, kerf) : { placed: 0, offcuts: [] };
+    return { valid: fits, offcuts: rem.offcuts, sw, sl, cw, cl, cn };
+  })();
+  // Weight of an offcut piece by area share of the full sheet (for scrap).
+  const shFullArea = (parseFloat(item.dim2) || 0) * (parseFloat(item.dim3) || 0);
+  const sheetPieceKg = (w, l) => (shFullArea > 0 && uw > 0) ? Math.round((w * l / shFullArea) * uw * 100) / 100 : null;
 
   const TYPE_GROUPS = [
     { label: 'Inward', types: [
@@ -38915,10 +38949,11 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
           if (Math.min(cw, cl) > Math.min(sw, sl) + 0.5 || Math.max(cw, cl) > Math.max(sw, sl) + 0.5) throw new Error('The cut piece is bigger than the sheet');
           if (availOf < 1) throw new Error('No ' + sheetLabel({ w: sw, l: sl }) + ' sheet on the floor');
           pieces = sheetRemove(pieces, sw, sl, 1);
-          const offs = offRows.filter(r => (parseFloat(r.w) || 0) > 0 && (parseFloat(r.l) || 0) > 0 && (parseInt(r.count) || 0) > 0).map(r => ({ w: +r.w, l: +r.l, count: +r.count }));
-          pieces = sheetCollapse([...pieces, ...offs]);
+          // Auto-calculate the leftover (guillotine remainder) — no manual entry.
+          const offs = sheetCutRemainder(sw, sl, cw, cl, cn, kerf).offcuts;
+          if (offcutDest !== 'scrap') pieces = sheetCollapse([...pieces, ...offs]);  // offcut back to stock (scrap logged after)
           issuedQty = cn;
-          note = 'Cut ' + cn + ' × ' + sheetLabel({ w: cw, l: cl }) + ' from ' + sheetLabel({ w: sw, l: sl }) + (offs.length ? '; offcut ' + offs.map(o => o.count + '×' + sheetLabel(o)).join(', ') : '') + (form.notes ? ' · ' + form.notes : '');
+          note = 'Cut ' + cn + ' × ' + sheetLabel({ w: cw, l: cl }) + ' from ' + sheetLabel({ w: sw, l: sl }) + (offs.length ? '; ' + (offcutDest === 'scrap' ? 'scrap' : 'offcut') + ' ' + offs.map(o => o.count + '×' + sheetLabel(o)).join(', ') : '') + (form.notes ? ' · ' + form.notes : '');
         } else {
           const n = Math.round(parseFloat(shWhole) || 0);
           if (!(n > 0)) throw new Error('Enter how many sheets');
@@ -38931,7 +38966,14 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
         if (se) throw se;
         // Authoritative: the piece list and the stock count come from the cut.
         await sb.from('mcp_stocks_items').update({ pieces, current_qty: sheetTotalCount(pieces) }).eq('id', item.id);
-        showToast('✓ Sheet ' + (shMode === 'cut' ? 'cut & offcut kept' : 'issued'));
+        // Offcut sent to scrap → log it in the scrap yard.
+        if (shMode === 'cut' && offcutDest === 'scrap') {
+          const rem2 = sheetCutRemainder(...(() => { const [sw2, sl2] = (shSrc || '').split('x').map(Number); return [sw2, sl2, Math.round(parseFloat(cutW) || 0), Math.round(parseFloat(cutL) || 0), Math.round(parseFloat(cutN) || 0) || 1, kerf]; })());
+          for (const o of rem2.offcuts) {
+            await sb.from('mcp_scrap_log').insert({ plant_id: plant.id, unit_id: item.unit_id || null, scrap_date: new Date().toISOString().slice(0, 10), material: item.material || null, size_spec: sheetLabel(o) + ' mm', weight_kg: sheetPieceKg(o.w, o.l) ? sheetPieceKg(o.w, o.l) * o.count : null, qty: o.count, notes: 'Sheet cut offcut · ' + item.code, logged_by: me.id }).catch(() => {});
+          }
+        }
+        showToast('✓ Sheet ' + (shMode === 'cut' ? (offcutDest === 'scrap' ? 'cut · offcut to scrap' : 'cut · offcut to stock') : 'issued'));
         onSaved(); setLoading(false); return;
       }
 
@@ -39113,20 +39155,25 @@ function TxnModal({ plant, me, item, onClose, onSaved }) {
                   <input type="number" min=${0} value=${cutL} onInput=${e => setCutL(e.target.value)} placeholder="length" style="width:74px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
                   <span style="font-size:11px;color:var(--slate-400)">mm ×</span>
                   <input type="text" inputmode="numeric" value=${cutN} onInput=${e => setCutN(e.target.value.replace(/[^0-9]/g, ''))} style="width:44px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                  <span style="font-size:11px;color:var(--slate-400)">pc</span>
                 </div>
-                <label style="font-size:11px;font-weight:600;color:var(--slate-600)">Offcut(s) back to stock</label>
-                <div style="display:flex;flex-direction:column;gap:5px;margin-top:3px">
-                  ${offRows.map((r, i) => html`<div key=${i} style="display:flex;gap:5px;align-items:center">
-                    <input type="number" min=${0} value=${r.w} onInput=${e => setOff(i, { w: e.target.value })} placeholder="width" style="width:70px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
-                    <span style="color:var(--slate-400)">×</span>
-                    <input type="number" min=${0} value=${r.l} onInput=${e => setOff(i, { l: e.target.value })} placeholder="length" style="width:70px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
-                    <span style="font-size:11px;color:var(--slate-400)">mm ×</span>
-                    <input type="text" inputmode="numeric" value=${r.count} onInput=${e => setOff(i, { count: e.target.value.replace(/[^0-9]/g, '') })} style="width:42px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
-                    ${offRows.length > 1 && html`<button type="button" onClick=${() => rmOff(i)} style="background:none;border:none;color:var(--rose-500);cursor:pointer;font-size:16px">×</button>`}
-                  </div>`)}
-                  <button type="button" class="btn small ghost" onClick=${addOff} style="align-self:flex-start;font-size:12px">+ another offcut</button>
+                <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
+                  <span style="font-size:11px;color:var(--slate-500)">Blade / kerf</span>
+                  <input type="number" min=${0} value=${kerf} onInput=${e => setKerf(e.target.value)} style="width:56px;padding:5px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                  <span style="font-size:11px;color:var(--slate-400)">mm (removed by each cut)</span>
                 </div>
-                <div style="font-size:10.5px;color:var(--slate-500);margin-top:5px">Cutting a corner piece leaves an L-shape — enter the usable rectangle(s) you keep (e.g. cut 500×500 from 1260×2500 → keep 760×2500 and 500×2000). Leave blank if there's no usable offcut.</div>
+                <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);padding:8px 10px;margin-bottom:8px">
+                  <div style="font-size:11px;font-weight:700;color:var(--teal-700);margin-bottom:3px">↩ Auto-calculated leftover</div>
+                  ${!shCut.valid ? html`<div style="font-size:11px;color:var(--slate-500)">Enter a cut size that fits the sheet.</div>`
+                    : shCut.offcuts.length === 0 ? html`<div style="font-size:11px;color:var(--slate-500)">No usable leftover — the cut uses the whole sheet.</div>`
+                    : html`<div style="display:flex;flex-direction:column;gap:2px">${shCut.offcuts.map(o => html`<div style="font-size:12px;color:var(--slate-700);display:flex;justify-content:space-between"><span>${o.count} × ${sheetLabel(o)} mm</span>${sheetPieceKg(o.w, o.l) ? html`<span style="color:var(--slate-400);font-size:11px">≈ ${fmtNum(sheetPieceKg(o.w, o.l) * o.count)} kg</span>` : ''}</div>`)}</div>`}
+                </div>
+                <label style="font-size:11px;font-weight:600;color:var(--slate-600)">Leftover goes to</label>
+                <div style="display:flex;gap:6px;margin-top:3px">
+                  <button type="button" onClick=${() => setOffcutDest('stock')} style=${'flex:1;padding:7px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid ' + (offcutDest !== 'scrap' ? 'var(--emerald-500);background:var(--emerald-50);color:var(--emerald-700)' : 'var(--slate-200);background:#fff;color:var(--slate-500)')}>📦 Back to stock</button>
+                  <button type="button" onClick=${() => setOffcutDest('scrap')} style=${'flex:1;padding:7px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid ' + (offcutDest === 'scrap' ? 'var(--rose-400);background:var(--rose-50);color:var(--rose-600)' : 'var(--slate-200);background:#fff;color:var(--slate-500)')}>🗑 To scrap</button>
+                </div>
+                <div style="font-size:10.5px;color:var(--slate-500);margin-top:5px">The leftover is worked out automatically (guillotine cut) and ${offcutDest === 'scrap' ? 'sent to the scrap yard' : 'added back to stock as its own size(s)'}.</div>
               ` : html`
                 <label style="font-size:11px;font-weight:600;color:var(--slate-600)">How many whole sheets</label>
                 <input type="text" inputmode="numeric" value=${shWhole} onInput=${e => setShWhole(e.target.value.replace(/[^0-9]/g, ''))} style="width:100%;box-sizing:border-box;padding:8px;border:1px solid var(--slate-200);border-radius:6px;font-size:14px;margin-top:2px" />
