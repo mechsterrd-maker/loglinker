@@ -37593,6 +37593,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits }) {
   const [txnRows, setTxnRows] = useState(null);   // server-fetched rows when a date range is set (whole history)
   const [txnLoading, setTxnLoading] = useState(false);
   const [scrapOpen, setScrapOpen] = useState(false); // "Move to scrap yard" entry + register
+  const [reportsOpen, setReportsOpen] = useState(false); // 📊 Stock Reports (statement / movement / low / scrap)
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [activeItem, setActiveItem] = useState(null);
@@ -37868,6 +37869,11 @@ function Stocks({ plant, me, activeUnit, accessibleUnits }) {
               <div style="font-size:24px">🗑</div>
               <div style="font-size:13px;font-weight:700;margin-top:4px;color:var(--rose-700)">Scrap Yard</div>
               <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Separate scrap store · sections + weight · empty with records</div>
+            </button>
+            <button class="card" style="text-align:left;padding:14px;cursor:pointer;background:var(--indigo-50,#eef2ff);border-color:var(--indigo-200,#c7d2fe)" onClick=${() => setReportsOpen(true)}>
+              <div style="font-size:24px">📊</div>
+              <div style="font-size:13px;font-weight:700;margin-top:4px;color:#3730a3">Stock Reports</div>
+              <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Stock statement · movement · low stock · scrap · Print / Excel / WhatsApp</div>
             </button>
           </div>
 
@@ -38193,6 +38199,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits }) {
     ${modal === 'track_stock' && editTarget && html`<${TrackStockForPartModal} plant=${plant} me=${me} part=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="stock_issue" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
     ${scrapOpen && html`<${ScrapEntryModal} plant=${plant} me=${me} activeUnit=${activeUnit} onClose=${() => setScrapOpen(false)} onSaved=${() => refresh()} />`}
+    ${reportsOpen && html`<${StockReports} plant=${plant} me=${me} units=${units} multiUnit=${multiUnit} unitNameOf=${unitNameOf} items=${items} onClose=${() => setReportsOpen(false)} />`}
     ${priceTarget && html`<${QuickPriceModal} item=${priceTarget} onClose=${() => setPriceTarget(null)} onSaved=${() => { setPriceTarget(null); refresh(); }} />`}
     ${splitTarget && html`<${SplitUnitModal} item=${splitTarget} units=${units} unitNameOf=${unitNameOf} onClose=${() => setSplitTarget(null)} onSaved=${() => { setSplitTarget(null); clearSelect(); refresh(); }} />`}
   `;
@@ -39345,6 +39352,261 @@ function RodPickModal({ plant, itemId, onClose, onApply }) {
 // running scrap log. Optionally also deducts a tracked stock item.
 // Compute the weight of one "by section" scrap row from its dims + length/pieces.
 // Reuses rmBuild so it matches how stock items are weighed.
+// ============ STOCK REPORTS — stock statement, movement, low stock, scrap ============
+// Download any text as a file (CSV / txt) without a server round-trip.
+function rptDownload(name, text, mime) {
+  try {
+    const blob = new Blob([text], { type: mime || 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+  } catch (e) { alert('Could not download: ' + e.message); }
+}
+// A report model → CSV (blocks, group labels, subtotals and totals all flattened).
+function rptToCsv(report) {
+  const esc = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  const lines = [];
+  lines.push([report.title]); if (report.subtitle) lines.push([report.subtitle]); lines.push([]);
+  report.blocks.forEach(b => {
+    if (b.title) lines.push([b.title]);
+    lines.push(b.headers.map(h => h.label));
+    if (!b.sections.length || b.sections.every(s => !s.rows.length)) lines.push([b.empty || 'Nothing to show.']);
+    b.sections.forEach(sec => {
+      if (sec.label) lines.push([sec.label]);
+      sec.rows.forEach(r => lines.push(r.map(c => c.t)));
+      if (sec.subtotal) lines.push(sec.subtotal.map(c => c.t));
+    });
+    if (b.totals) lines.push(b.totals.map(c => c.t));
+    lines.push([]);
+  });
+  return lines.map(r => r.map(esc).join(',')).join('\r\n');
+}
+// A report model → printable standalone HTML (its own Print / Save-PDF button).
+function rptToHtml(report, plant) {
+  const esc = ppapEsc;
+  let body = '';
+  report.blocks.forEach(b => {
+    if (report.blocks.length > 1 && b.title) body += '<h2>' + esc(b.title) + '</h2>';
+    const cols = b.headers.length;
+    body += '<table><thead><tr>' + b.headers.map(h => '<th class="' + (h.isNum ? 'num' : '') + '">' + esc(h.label) + '</th>').join('') + '</tr></thead><tbody>';
+    if (!b.sections.length || b.sections.every(s => !s.rows.length)) body += '<tr><td colspan="' + cols + '" style="color:#777">' + esc(b.empty || 'Nothing to show.') + '</td></tr>';
+    b.sections.forEach(sec => {
+      if (sec.label) body += '<tr class="grp"><td colspan="' + cols + '">' + esc(sec.label) + '</td></tr>';
+      sec.rows.forEach(r => { body += '<tr>' + r.map(c => '<td class="' + (c.align === 'right' ? 'num' : '') + '">' + esc(c.t) + '</td>').join('') + '</tr>'; });
+      if (sec.subtotal) body += '<tr class="sub">' + sec.subtotal.map(c => '<td class="' + (c.align === 'right' ? 'num' : '') + '">' + esc(c.t) + '</td>').join('') + '</tr>';
+    });
+    if (b.totals) body += '<tr class="tot">' + b.totals.map(c => '<td class="' + (c.align === 'right' ? 'num' : '') + '">' + esc(c.t) + '</td>').join('') + '</tr>';
+    body += '</tbody></table>';
+  });
+  return '<!doctype html><html><head><meta charset="utf-8"><title>' + esc(report.title) + '</title><style>'
+    + 'body{font-family:Arial,Helvetica,sans-serif;color:#111;margin:20px;font-size:12px}'
+    + 'h1{font-size:18px;margin:0 0 2px}h2{font-size:14px;margin:16px 0 4px}.sub{color:#555;font-size:11px;margin:0 0 12px}'
+    + 'table{width:100%;border-collapse:collapse;margin:0 0 12px}th,td{border:1px solid #999;padding:4px 6px;text-align:left;vertical-align:top}'
+    + 'th{background:#e5e7eb}.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}'
+    + 'tr.grp td{background:#f3f4f6;font-weight:bold}tr.sub td{background:#fafafa;font-weight:600}tr.tot td{font-weight:bold;background:#f1f5f9;border-top:2px solid #333}'
+    + '@media print{.noprint{display:none}}'
+    + '</style></head><body>'
+    + '<h1>' + esc(plant.legal_name || plant.name || 'Stock report') + '</h1>'
+    + '<div class="sub"><b>' + esc(report.title) + '</b>' + (report.subtitle ? ' &nbsp;&middot;&nbsp; ' + esc(report.subtitle) : '') + '</div>'
+    + body
+    + '<div class="sub">Generated ' + esc(new Date().toLocaleString('en-GB')) + '</div>'
+    + '<button class="noprint" onclick="window.print()" style="padding:8px 16px;font-size:13px;cursor:pointer">Print / Save as PDF</button>'
+    + '</body></html>';
+}
+
+function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose }) {
+  const today = new Date().toISOString().slice(0, 10);
+  const monthStart = today.slice(0, 8) + '01';
+  const [rpt, setRpt] = useState('current'); // current | movement | low | scrap
+  const [unitId, setUnitId] = useState('all');
+  const [fromD, setFromD] = useState(monthStart);
+  const [toD, setToD] = useState(today);
+  const [mvTx, setMvTx] = useState(null);
+  const [mvLoading, setMvLoading] = useState(false);
+  const [scrapPile, setScrapPile] = useState(null);
+  const [scrapClears, setScrapClears] = useState(null);
+  const [scrapLoading, setScrapLoading] = useState(false);
+
+  const CATL = { raw_material: 'Raw Material', die_spares: 'Die Spares', consumables: 'Consumables', tools: 'Tools', packing: 'Packing', bought_out: 'Bought-out', general: 'General' };
+  const catLabel = (i) => CATL[i.category] || (i.category || 'General');
+  const matLabel = (k) => (RM_MATERIALS.find(m => m.key === k) || {}).label || k || 'Other';
+  const secLabel = (k) => (RM_SECTIONS.find(s => s.key === k) || {}).label || 'Other';
+  const showUnit = multiUnit && unitId === 'all';
+  const scopeItems = items.filter(i => unitId === 'all' || i.unit_id === unitId);
+  const INWARD = ['grn', 'return', 'opening', 'adjustment_in', 'jobwork_in'];
+  const dmy = (d) => d ? String(d).slice(0, 10).split('-').reverse().join('/') : '';
+
+  const C = (t, a) => ({ t: (t == null ? '' : String(t)), align: a || 'left' });
+  const N = (n, dec) => { const d = dec == null ? 2 : dec; if (n == null || n === '' || !isFinite(Number(n))) return { t: '', n: 0, align: 'right' }; const v = Math.round(Number(n) * Math.pow(10, d)) / Math.pow(10, d); return { t: fmtNum(v), n: Number(n), align: 'right' }; };
+  const MON = (n) => ({ t: (Number(n) ? '₹' + Math.round(Number(n)).toLocaleString('en-IN') : ''), n: Number(n) || 0, align: 'right' });
+
+  useEffect(() => {
+    if (rpt !== 'movement') return;
+    let cancel = false; setMvLoading(true); setMvTx(null);
+    sb.from('mcp_stocks_transactions').select('item_id,txn_type,qty,created_at').eq('plant_id', plant.id).lte('created_at', toD + 'T23:59:59.999Z').order('created_at', { ascending: true }).limit(50000)
+      .then(({ data }) => { if (!cancel) { setMvTx(data || []); setMvLoading(false); } });
+    return () => { cancel = true; };
+  }, [rpt, toD]);
+
+  useEffect(() => {
+    if (rpt !== 'scrap') return;
+    let cancel = false; setScrapLoading(true);
+    Promise.all([
+      sb.from('mcp_scrap_log').select('section_type,material,weight_kg,qty').eq('plant_id', plant.id).is('cleared_at', null),
+      sb.from('mcp_scrap_clearances').select('cleared_date,total_weight_kg,total_qty,entry_count,notes').eq('plant_id', plant.id).order('cleared_date', { ascending: false }).limit(200),
+    ]).then(([a, b]) => { if (!cancel) { setScrapPile(a.data || []); setScrapClears(b.data || []); setScrapLoading(false); } });
+    return () => { cancel = true; };
+  }, [rpt]);
+
+  const unitTag = unitId === 'all' ? (multiUnit ? 'All units' : '') : unitNameOf(unitId);
+
+  const buildCurrent = () => {
+    const arr = scopeItems.filter(i => Math.abs(parseFloat(i.current_qty) || 0) > 0);
+    const groups = {}; arr.forEach(i => { const k = catLabel(i); (groups[k] = groups[k] || []).push(i); });
+    const headers = [{ label: 'Code' }, { label: 'Item' }].concat(showUnit ? [{ label: 'Unit' }] : []).concat([{ label: 'Qty', isNum: true }, { label: 'UOM' }, { label: 'Weight kg', isNum: true }, { label: 'Rate', isNum: true }, { label: 'Value', isNum: true }]);
+    let gW = 0, gV = 0, gN = 0;
+    const sections = Object.keys(groups).sort().map(k => {
+      const list = groups[k].slice().sort((a, b) => String(a.code || a.name || '').localeCompare(String(b.code || b.name || '')));
+      let sW = 0, sV = 0;
+      const rows = list.map(i => {
+        const q = parseFloat(i.current_qty) || 0, uw = parseFloat(i.unit_weight) || 0, w = uw ? q * uw : 0, rate = parseFloat(i.unit_cost) || 0, val = q * rate;
+        sW += w; sV += val;
+        const cells = [C(i.code || ''), C(i.name || i.code || '')];
+        if (showUnit) cells.push(C(unitNameOf(i.unit_id)));
+        cells.push(N(q, 3), C(i.uom || ''), w ? N(w, 2) : C(''), rate ? N(rate, 2) : C(''), val ? MON(val) : C(''));
+        return cells;
+      });
+      gW += sW; gV += sV; gN += list.length;
+      const sub = [C(''), C('Subtotal · ' + list.length)];
+      if (showUnit) sub.push(C(''));
+      sub.push(C(''), C(''), N(sW, 2), C(''), MON(sV));
+      return { label: k + ' · ' + list.length + ' item' + (list.length === 1 ? '' : 's'), rows, subtotal: sub };
+    });
+    const totals = [C(''), C('GRAND TOTAL · ' + gN)];
+    if (showUnit) totals.push(C(''));
+    totals.push(C(''), C(''), N(gW, 2), C(''), MON(gV));
+    return {
+      title: 'Stock Statement', subtitle: [unitTag, 'as on ' + dmy(today)].filter(Boolean).join(' · '),
+      waText: '*' + (plant.name || '') + ' — Stock Statement*\n' + (unitTag ? unitTag + '\n' : '') + 'As on ' + dmy(today) + '\nItems: ' + gN + '\nTotal weight: ' + fmtNum(Math.round(gW)) + ' kg\nTotal value: ₹' + Math.round(gV).toLocaleString('en-IN'),
+      blocks: [{ headers, sections, totals, empty: 'No items in stock.' }],
+    };
+  };
+
+  const buildMovement = () => {
+    const agg = {};
+    (mvTx || []).forEach(t => {
+      const d = (t.created_at || '').slice(0, 10); const inw = INWARD.includes(t.txn_type); const q = Math.abs(parseFloat(t.qty) || 0);
+      const a = agg[t.item_id] || (agg[t.item_id] = { open: 0, inn: 0, out: 0 });
+      if (d < fromD) a.open += inw ? q : -q;
+      else if (d <= toD) { if (inw) a.inn += q; else a.out += q; }
+    });
+    const rowsData = scopeItems.map(i => { const a = agg[i.id] || { open: 0, inn: 0, out: 0 }; return { i, open: a.open, inn: a.inn, out: a.out, close: a.open + a.inn - a.out }; })
+      .filter(r => Math.abs(r.open) > 1e-9 || r.inn > 1e-9 || r.out > 1e-9 || Math.abs(r.close) > 1e-9);
+    const groups = {}; rowsData.forEach(r => { const k = catLabel(r.i); (groups[k] = groups[k] || []).push(r); });
+    const headers = [{ label: 'Code' }, { label: 'Item' }].concat(showUnit ? [{ label: 'Unit' }] : []).concat([{ label: 'UOM' }, { label: 'Opening', isNum: true }, { label: 'Received', isNum: true }, { label: 'Issued', isNum: true }, { label: 'Closing', isNum: true }]);
+    const sections = Object.keys(groups).sort().map(k => {
+      const list = groups[k].sort((a, b) => String(a.i.code || a.i.name || '').localeCompare(String(b.i.code || b.i.name || '')));
+      const rows = list.map(r => { const cells = [C(r.i.code || ''), C(r.i.name || r.i.code || '')]; if (showUnit) cells.push(C(unitNameOf(r.i.unit_id))); cells.push(C(r.i.uom || ''), N(r.open, 3), N(r.inn, 3), N(r.out, 3), N(r.close, 3)); return cells; });
+      return { label: k + ' · ' + list.length, rows, subtotal: null };
+    });
+    return {
+      title: 'Stock Movement', subtitle: [unitTag, dmy(fromD) + ' → ' + dmy(toD)].filter(Boolean).join(' · '),
+      waText: '*' + (plant.name || '') + ' — Stock Movement*\n' + (unitTag ? unitTag + '\n' : '') + dmy(fromD) + ' → ' + dmy(toD) + '\nItems moved: ' + rowsData.length,
+      blocks: [{ headers, sections, totals: null, empty: 'No stock moved in this period.' }],
+    };
+  };
+
+  const buildLow = () => {
+    const list = scopeItems.filter(i => i.reorder_level != null && i.reorder_level !== '' && (parseFloat(i.current_qty) || 0) <= parseFloat(i.reorder_level))
+      .map(i => ({ i, cur: parseFloat(i.current_qty) || 0, ro: parseFloat(i.reorder_level) || 0 }))
+      .sort((a, b) => (b.ro - b.cur) - (a.ro - a.cur));
+    const headers = [{ label: 'Code' }, { label: 'Item' }].concat(showUnit ? [{ label: 'Unit' }] : []).concat([{ label: 'Current', isNum: true }, { label: 'Reorder at', isNum: true }, { label: 'Short by', isNum: true }, { label: 'UOM' }]);
+    const rows = list.map(r => { const cells = [C(r.i.code || ''), C(r.i.name || r.i.code || '')]; if (showUnit) cells.push(C(unitNameOf(r.i.unit_id))); const short = Math.max(0, r.ro - r.cur); cells.push(N(r.cur, 3), N(r.ro, 3), N(short, 3), C(r.i.uom || '')); return cells; });
+    return {
+      title: 'Low Stock', subtitle: [unitTag, list.length + ' item' + (list.length === 1 ? '' : 's') + ' at/below reorder'].filter(Boolean).join(' · '),
+      waText: '*' + (plant.name || '') + ' — Low Stock*\n' + (unitTag ? unitTag + '\n' : '') + (list.length ? list.slice(0, 25).map(r => '• ' + (r.i.name || r.i.code) + ': ' + fmtNum(r.cur) + '/' + fmtNum(r.ro) + ' ' + (r.i.uom || '')).join('\n') + (list.length > 25 ? ('\n…+' + (list.length - 25) + ' more') : '') : 'Nothing is low. 👍'),
+      blocks: [{ headers, sections: [{ label: null, rows, subtotal: null }], totals: null, empty: 'Nothing is low — every item is above its reorder level. 👍' }],
+    };
+  };
+
+  const buildScrap = () => {
+    const pile = scrapPile || [];
+    const bySec = {}; pile.forEach(r => { const k = secLabel(r.section_type) + '||' + matLabel(r.material); (bySec[k] = bySec[k] || { sec: secLabel(r.section_type), mat: matLabel(r.material), w: 0, q: 0 }); bySec[k].w += parseFloat(r.weight_kg) || 0; bySec[k].q += parseFloat(r.qty) || 0; });
+    const pileRows = Object.values(bySec).sort((a, b) => b.w - a.w).map(g => [C(g.sec), C(g.mat), N(g.w, 2), g.q ? N(g.q, 0) : C('')]);
+    const totW = pile.reduce((s, r) => s + (parseFloat(r.weight_kg) || 0), 0), totQ = pile.reduce((s, r) => s + (parseFloat(r.qty) || 0), 0);
+    const pileBlock = { title: 'In the yard now', headers: [{ label: 'Section' }, { label: 'Material' }, { label: 'Weight kg', isNum: true }, { label: 'Pieces', isNum: true }], sections: [{ label: null, rows: pileRows, subtotal: null }], totals: [C('TOTAL'), C(''), N(totW, 2), totQ ? N(totQ, 0) : C('')], empty: 'Scrap yard is empty.' };
+    const clr = scrapClears || [];
+    const clrRows = clr.map(c => [C(dmy(c.cleared_date)), N(c.total_weight_kg, 2), c.total_qty ? N(c.total_qty, 0) : C(''), C(c.entry_count || ''), C(c.notes || '')]);
+    const clrTotW = clr.reduce((s, c) => s + (parseFloat(c.total_weight_kg) || 0), 0);
+    const clrBlock = { title: 'Clearance history (scrap taken out)', headers: [{ label: 'Date' }, { label: 'Weight kg', isNum: true }, { label: 'Pieces', isNum: true }, { label: 'Lines', isNum: true }, { label: 'Note' }], sections: [{ label: null, rows: clrRows, subtotal: null }], totals: [C('TOTAL CLEARED'), N(clrTotW, 2), C(''), C(''), C('')], empty: 'No clearances yet.' };
+    return {
+      title: 'Scrap Yard Report', subtitle: unitTag || '',
+      waText: '*' + (plant.name || '') + ' — Scrap Yard*\nIn yard: ' + fmtNum(Math.round(totW * 100) / 100) + ' kg' + (totQ ? (' · ' + fmtNum(totQ) + ' pc') : '') + '\nCleared to date: ' + fmtNum(Math.round(clrTotW)) + ' kg over ' + clr.length + ' clearance' + (clr.length === 1 ? '' : 's'),
+      blocks: [pileBlock, clrBlock],
+    };
+  };
+
+  const loading = (rpt === 'movement' && (mvLoading || mvTx == null)) || (rpt === 'scrap' && (scrapLoading || scrapPile == null));
+  const report = rpt === 'current' ? buildCurrent() : rpt === 'movement' ? buildMovement() : rpt === 'low' ? buildLow() : buildScrap();
+
+  const doPrint = () => { ppapOpenDoc(rptToHtml(report, plant)); };
+  const doCsv = () => { rptDownload(report.title.replace(/\s+/g, '_') + '_' + today + '.csv', rptToCsv(report), 'text/csv;charset=utf-8'); };
+  const doWa = () => { window.open('https://wa.me/?text=' + encodeURIComponent(report.waText || report.title), '_blank'); };
+
+  const blockTrs = (b) => {
+    const out = [];
+    if (!b.sections.length || b.sections.every(s => !s.rows.length)) { out.push(html`<tr key="empty"><td colspan=${b.headers.length} style="padding:12px;color:var(--slate-400);font-size:12px">${b.empty || 'Nothing to show.'}</td></tr>`); return out; }
+    b.sections.forEach((sec, si) => {
+      if (sec.label) out.push(html`<tr key=${'g' + si} style="background:var(--slate-100)"><td colspan=${b.headers.length} style="padding:5px 8px;font-weight:700;font-size:11px;color:var(--slate-600)">${sec.label}</td></tr>`);
+      sec.rows.forEach((r, ri) => out.push(html`<tr key=${si + '-' + ri} style="border-bottom:1px solid var(--slate-100)">${r.map((c, ci) => html`<td key=${ci} style=${'padding:5px 8px;font-size:12px;' + (c.align === 'right' ? 'text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap' : '')}>${c.t}</td>`)}</tr>`));
+      if (sec.subtotal) out.push(html`<tr key=${'s' + si} style="background:var(--slate-50)">${sec.subtotal.map((c, ci) => html`<td key=${ci} style=${'padding:5px 8px;font-size:11px;font-weight:600;' + (c.align === 'right' ? 'text-align:right;font-variant-numeric:tabular-nums' : '')}>${c.t}</td>`)}</tr>`);
+    });
+    if (b.totals) out.push(html`<tr key="tot" style="background:var(--slate-100);border-top:2px solid var(--slate-400)">${b.totals.map((c, ci) => html`<td key=${ci} style=${'padding:6px 8px;font-size:12px;font-weight:700;' + (c.align === 'right' ? 'text-align:right;font-variant-numeric:tabular-nums' : '')}>${c.t}</td>`)}</tr>`);
+    return out;
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:820px">
+        <div class="modal-header"><div class="modal-title">📊 Stock Reports</div><button class="close-btn" onClick=${onClose}>×</button></div>
+
+        <div class="auth-tabs" style="margin-bottom:10px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
+          <button class=${'auth-tab' + (rpt === 'current' ? ' active' : '')} onClick=${() => setRpt('current')}>Stock statement</button>
+          <button class=${'auth-tab' + (rpt === 'movement' ? ' active' : '')} onClick=${() => setRpt('movement')}>Movement</button>
+          <button class=${'auth-tab' + (rpt === 'low' ? ' active' : '')} onClick=${() => setRpt('low')}>Low stock</button>
+          <button class=${'auth-tab' + (rpt === 'scrap' ? ' active' : '')} onClick=${() => setRpt('scrap')}>Scrap yard</button>
+        </div>
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+          ${multiUnit && html`<select value=${unitId} onChange=${e => setUnitId(e.target.value)} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:#fff">
+            <option value="all">All units</option>
+            ${units.map(u => html`<option key=${u.unit_id} value=${u.unit_id}>${u.unit_name}</option>`)}
+          </select>`}
+          ${rpt === 'movement' && html`<div style="display:flex;gap:4px;align-items:center"><${DateField} value=${fromD} onChange=${e => setFromD(e.target.value)} /><span style="color:var(--slate-400)">→</span><${DateField} value=${toD} onChange=${e => setToD(e.target.value)} /></div>`}
+          <div style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">
+            <button class="btn small ghost" onClick=${doPrint} title="Open a printable page (Save as PDF)">🖨 Print / PDF</button>
+            <button class="btn small ghost" onClick=${doCsv} title="Download a spreadsheet (Excel / CSV)">📊 Excel</button>
+            <button class="btn small ghost" onClick=${doWa} title="Share a summary on WhatsApp">🟢 WhatsApp</button>
+          </div>
+        </div>
+
+        <div style="font-size:13px;font-weight:700;margin-bottom:1px">${report.title}</div>
+        ${report.subtitle && html`<div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">${report.subtitle}</div>`}
+
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` : report.blocks.map((b, bi) => html`<div key=${bi} style="margin-bottom:14px">
+          ${report.blocks.length > 1 && b.title && html`<div style="font-size:12px;font-weight:700;color:var(--slate-700);margin:6px 0 4px">${b.title}</div>`}
+          <div style="overflow-x:auto;border:1px solid var(--slate-200);border-radius:8px">
+            <table style="width:100%;border-collapse:collapse">
+              <thead><tr style="background:var(--slate-50)">${b.headers.map((h, hi) => html`<th key=${hi} style=${'padding:6px 8px;font-size:11px;font-weight:700;color:var(--slate-600);' + (h.isNum ? 'text-align:right' : 'text-align:left')}>${h.label}</th>`)}</tr></thead>
+              <tbody>${blockTrs(b)}</tbody>
+            </table>
+          </div>
+        </div>`)}
+      </div>
+    </div>
+  `;
+}
+
 function scrapSectionCalc(r) {
   const S = RM_SECTIONS.find(s => s.key === r.section_type) || null;
   const canAuto = !!(S && S.calc); // section has a weight formula (angle/flat/round/… )
