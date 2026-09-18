@@ -37863,6 +37863,11 @@ function Stocks({ plant, me, activeUnit, accessibleUnits }) {
               <div style="font-size:13px;font-weight:700;margin-top:4px">Full Ledger</div>
               <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${transactions.length} txns · all filters</div>
             </button>
+            <button class="card" style="text-align:left;padding:14px;cursor:pointer;background:var(--rose-50);border-color:var(--rose-200)" onClick=${() => setScrapOpen(true)}>
+              <div style="font-size:24px">🗑</div>
+              <div style="font-size:13px;font-weight:700;margin-top:4px;color:var(--rose-700)">Scrap Yard</div>
+              <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Separate scrap store · sections + weight · empty with records</div>
+            </button>
           </div>
 
           ${lowStock.length > 0 && html`
@@ -37961,7 +37966,6 @@ function Stocks({ plant, me, activeUnit, accessibleUnits }) {
 
       <div class="section-h">Items · ${filteredItems.length}<span style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn small" style="background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white" onClick=${() => setVoiceOpen(true)} title="Voice issue — Tamil / Hindi / English">🎙️ Voice Issue</button>
-        <button class="btn small" style="background:var(--rose-50);color:var(--rose-600);border:1px solid var(--rose-200)" onClick=${() => setScrapOpen(true)} title="Record wastage to scrap yard">🗑 Move to scrap</button>
         <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('item'); }}>+ Add</button>
       </span></div>
 
@@ -39338,115 +39342,230 @@ function RodPickModal({ plant, itemId, onClose, onApply }) {
 // Scrap-yard entry + register. Records wastage from processed RM (offcuts, end
 // pieces, rejects) by material / size / weight / qty with notes, and shows the
 // running scrap log. Optionally also deducts a tracked stock item.
+// Compute the weight of one "by section" scrap row from its dims + length/pieces.
+// Reuses rmBuild so it matches how stock items are weighed.
+function scrapSectionCalc(r) {
+  const S = RM_SECTIONS.find(s => s.key === r.section_type) || null;
+  if (!S) return { weight: 0, size_spec: (r.spec || '').trim(), unit: 'nos', hasAuto: false };
+  const built = rmBuild(r.material, r.section_type, r.d1, r.d2, r.d3, r.spec);
+  const uw = built.unit_weight; // kg/metre (length) or kg/piece (sheet/plate), or null
+  const pieces = parseFloat(r.pieces) || 0;
+  let weight = 0, spec = built.size_spec;
+  if (S.unit === 'mtr') {
+    const len = parseFloat(r.length) || 0;
+    if (uw != null && len > 0) weight = uw * len * (pieces || 1);
+    if (len > 0) spec += ' × ' + len + 'm';
+    if (pieces > 1) spec += ' × ' + pieces + 'pc';
+  } else {
+    if (uw != null) weight = uw * (pieces || 1);
+    if (pieces > 1) spec += ' × ' + pieces + 'pc';
+  }
+  return { weight: weight ? Math.round(weight * 1000) / 1000 : 0, size_spec: spec.trim(), unit: S.unit, hasAuto: uw != null };
+}
+
 function ScrapEntryModal({ plant, me, activeUnit, onClose, onSaved }) {
   const today = new Date().toISOString().slice(0, 10);
+  const [tab, setTab] = useState('yard'); // 'yard' (current pile) | 'history' (past clearances)
   const [scrapDate, setScrapDate] = useState(today);
-  const [rows, setRows] = useState([{ material: 'MS', size_spec: '', weight_kg: '', qty: '', notes: '' }]);
+  const blankRow = () => ({ mode: 'section', material: 'MS', section_type: 'flat', d1: '', d2: '', d3: '', spec: '', length: '', pieces: '', weight_kg: '', qty: '', size_spec: '', notes: '' });
+  const [rows, setRows] = useState([blankRow()]);
   const setRow = (i, patch) => setRows(rs => rs.map((x, idx) => idx === i ? { ...x, ...patch } : x));
-  const addRow = () => setRows(rs => [...rs, { material: 'MS', size_spec: '', weight_kg: '', qty: '', notes: '' }]);
+  const addRow = () => setRows(rs => [...rs, blankRow()]);
   const rmRow = (i) => setRows(rs => rs.length <= 1 ? rs : rs.filter((_, idx) => idx !== i));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
-  const [recent, setRecent] = useState([]);
+  const [open, setOpen] = useState([]);        // current (not-yet-cleared) pile
   const [loading, setLoading] = useState(true);
-  const [fromD, setFromD] = useState('');
-  const [toD, setToD] = useState('');
+  const [clearances, setClearances] = useState([]);
+  const [clrLoading, setClrLoading] = useState(false);
+  const [clrOpenId, setClrOpenId] = useState(null); // expanded clearance → its entries
+  const [clrEntries, setClrEntries] = useState({}); // id -> entries[]
+  const [clearing, setClearing] = useState(false);
 
-  const load = async () => {
+  // The current pile = every scrap entry not yet emptied out.
+  const loadOpen = async () => {
     setLoading(true);
-    let q = sb.from('mcp_scrap_log').select('*, item:source_item_id(code,name), u:logged_by(full_name)')
-      .eq('plant_id', plant.id).order('scrap_date', { ascending: false }).order('created_at', { ascending: false }).limit(300);
-    if (fromD) q = q.gte('scrap_date', fromD);
-    if (toD) q = q.lte('scrap_date', toD);
-    const { data } = await q; setRecent(data || []); setLoading(false);
+    const { data } = await sb.from('mcp_scrap_log').select('*, u:logged_by(full_name)')
+      .eq('plant_id', plant.id).is('cleared_at', null)
+      .order('scrap_date', { ascending: false }).order('created_at', { ascending: false }).limit(500);
+    setOpen(data || []); setLoading(false);
   };
-  useEffect(() => { load(); }, [fromD, toD]);
+  const loadClearances = async () => {
+    setClrLoading(true);
+    const { data } = await sb.from('mcp_scrap_clearances').select('*, u:cleared_by(full_name)')
+      .eq('plant_id', plant.id).order('cleared_date', { ascending: false }).order('created_at', { ascending: false }).limit(200);
+    setClearances(data || []); setClrLoading(false);
+  };
+  useEffect(() => { loadOpen(); }, []);
+  useEffect(() => { if (tab === 'history') loadClearances(); }, [tab]);
 
   const matLabel = (k) => (RM_MATERIALS.find(m => m.key === k) || {}).label || k || 'Other';
+  const secLabel = (k) => (RM_SECTIONS.find(s => s.key === k) || {}).label || 'Other';
+  // Effective weight/qty preview for a row (used for the button + validation).
+  const rowWeight = (r) => r.mode === 'section' ? (scrapSectionCalc(r).hasAuto ? scrapSectionCalc(r).weight : (parseFloat(r.weight_kg) || 0)) : (parseFloat(r.weight_kg) || 0);
+  const rowQty = (r) => r.mode === 'section' ? (parseFloat(r.pieces) || 0) : (parseFloat(r.qty) || 0);
+  const validRows = rows.filter(r => rowWeight(r) > 0 || rowQty(r) > 0);
 
   const save = async () => {
     setErr('');
-    const valid = rows.filter(r => (parseFloat(r.weight_kg) || 0) > 0 || (parseFloat(r.qty) || 0) > 0);
-    if (!valid.length) { setErr('Add at least one line with a weight (kg) and/or a quantity'); return; }
+    if (!validRows.length) { setErr('Add at least one line with a weight (kg) and/or a quantity.'); return; }
     setBusy(true);
     try {
-      const inserts = valid.map(r => ({
-        plant_id: plant.id, unit_id: activeUnit?.unit_id || null,
-        scrap_date: scrapDate || today,
-        material: r.material || null, size_spec: (r.size_spec || '').trim() || null,
-        weight_kg: (parseFloat(r.weight_kg) || 0) || null, qty: (parseFloat(r.qty) || 0) || null,
-        notes: (r.notes || '').trim() || null, logged_by: me.id,
-      }));
+      const inserts = validRows.map(r => {
+        if (r.mode === 'section') {
+          const c = scrapSectionCalc(r);
+          const w = c.hasAuto ? c.weight : (parseFloat(r.weight_kg) || 0);
+          return {
+            plant_id: plant.id, unit_id: activeUnit?.unit_id || null, scrap_date: scrapDate || today,
+            material: r.material || null, section_type: r.section_type || null,
+            size_spec: (c.size_spec || '').trim() || null,
+            weight_kg: w || null, qty: (parseFloat(r.pieces) || 0) || null, uom: c.unit,
+            notes: (r.notes || '').trim() || null, logged_by: me.id,
+          };
+        }
+        return {
+          plant_id: plant.id, unit_id: activeUnit?.unit_id || null, scrap_date: scrapDate || today,
+          material: r.material || null, section_type: null,
+          size_spec: (r.size_spec || '').trim() || null,
+          weight_kg: (parseFloat(r.weight_kg) || 0) || null, qty: (parseFloat(r.qty) || 0) || null,
+          notes: (r.notes || '').trim() || null, logged_by: me.id,
+        };
+      });
       const { error } = await sb.from('mcp_scrap_log').insert(inserts);
       if (error) throw error;
-      showToast('🗑 ' + inserts.length + ' scrap line' + (inserts.length === 1 ? '' : 's') + ' recorded');
-      setRows([{ material: 'MS', size_spec: '', weight_kg: '', qty: '', notes: '' }]);
-      load(); onSaved && onSaved();
+      showToast('🗑 ' + inserts.length + ' scrap line' + (inserts.length === 1 ? '' : 's') + ' added to the yard');
+      setRows([blankRow()]);
+      loadOpen(); onSaved && onSaved();
     } catch (e) { setErr(e.message); } finally { setBusy(false); }
   };
 
-  const del = async (id) => { if (!confirm('Delete this scrap entry?')) return; await sb.from('mcp_scrap_log').delete().eq('id', id); load(); };
+  const del = async (id) => { if (!confirm('Delete this scrap entry?')) return; await sb.from('mcp_scrap_log').delete().eq('id', id); loadOpen(); onSaved && onSaved(); };
 
-  const totWeight = recent.reduce((s, r) => s + (parseFloat(r.weight_kg) || 0), 0);
-  const byMat = {}; recent.forEach(r => { const m = matLabel(r.material); byMat[m] = (byMat[m] || 0) + (parseFloat(r.weight_kg) || 0); });
-  // group recent by day
+  const emptyYard = async () => {
+    if (open.length === 0) { setErr('The scrap yard is already empty — nothing to clear.'); return; }
+    const note = prompt('Empty the scrap yard now?\n\nThis records the current pile (' + fmtNum(Math.round(totWeight * 100) / 100) + ' kg) as a clearance and starts the pile fresh. The old records stay in History.\n\nOptional note (buyer / rate / bill no.):', '');
+    if (note === null) return; // cancelled
+    setErr(''); setClearing(true);
+    try {
+      const { error } = await sb.rpc('empty_scrap_yard', { p_plant_id: plant.id, p_unit_id: null, p_notes: note || null, p_cleared_date: today });
+      if (error) throw error;
+      showToast('🧹 Scrap yard emptied — recorded in History');
+      loadOpen(); if (tab === 'history') loadClearances(); onSaved && onSaved();
+    } catch (e) { setErr(e.message); } finally { setClearing(false); }
+  };
+
+  const toggleClearance = async (c) => {
+    if (clrOpenId === c.id) { setClrOpenId(null); return; }
+    setClrOpenId(c.id);
+    if (!clrEntries[c.id]) {
+      const { data } = await sb.from('mcp_scrap_log').select('*, u:logged_by(full_name)')
+        .eq('clearance_id', c.id).order('scrap_date', { ascending: false }).order('created_at', { ascending: false });
+      setClrEntries(prev => ({ ...prev, [c.id]: data || [] }));
+    }
+  };
+
+  // Totals + category breakdown of the CURRENT pile.
+  const totWeight = open.reduce((s, r) => s + (parseFloat(r.weight_kg) || 0), 0);
+  const totQty = open.reduce((s, r) => s + (parseFloat(r.qty) || 0), 0);
+  const bySec = {}; open.forEach(r => { const k = secLabel(r.section_type); bySec[k] = bySec[k] || { w: 0, q: 0 }; bySec[k].w += (parseFloat(r.weight_kg) || 0); bySec[k].q += (parseFloat(r.qty) || 0); });
+  const byMat = {}; open.forEach(r => { const m = matLabel(r.material); byMat[m] = (byMat[m] || 0) + (parseFloat(r.weight_kg) || 0); });
+  // group current pile by day
   const days = []; const byDay = new Map();
-  recent.forEach(r => { const d = r.scrap_date; if (!byDay.has(d)) { byDay.set(d, []); days.push(d); } byDay.get(d).push(r); });
+  open.forEach(r => { const d = r.scrap_date; if (!byDay.has(d)) { byDay.set(d, []); days.push(d); } byDay.get(d).push(r); });
 
   return html`
     <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal" style="max-width:560px">
-        <div class="modal-header"><div class="modal-title">🗑 Move to scrap yard</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        <div class="modal-header"><div class="modal-title">🗑 Scrap Yard</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        <div style="font-size:12px;color:var(--slate-500);margin:-4px 0 10px">A separate store for wastage — offcuts, end pieces, rejects. Add by section (auto weight) or by weight only. Empty it whenever you sell/clear scrap; old records are kept.</div>
         ${err && html`<div class="alert error">${err}</div>`}
 
+        <div class="auth-tabs" style="margin-bottom:12px">
+          <button class=${'auth-tab' + (tab === 'yard' ? ' active' : '')} onClick=${() => setTab('yard')}>In the yard now</button>
+          <button class=${'auth-tab' + (tab === 'history' ? ' active' : '')} onClick=${() => setTab('history')}>Clearance history</button>
+        </div>
+
+        ${tab === 'yard' && html`
         <div class="card" style="background:var(--slate-50);border-color:var(--slate-200);margin-bottom:12px">
-          <div style="font-size:12px;color:var(--slate-600);margin-bottom:8px">Record wastage from processed material (sheet offcuts, end pieces, rejects) going to the scrap yard. Add as many lines as you need.</div>
           <div class="field" style="max-width:220px"><label>Date (for all lines)</label><${DateField} value=${scrapDate} onChange=${e => setScrapDate(e.target.value)} /></div>
 
           <div style="display:flex;flex-direction:column;gap:8px;margin-top:4px">
             ${rows.map((r, i) => {
-              const w = parseFloat(r.weight_kg) || 0, q = parseFloat(r.qty) || 0;
+              const S = RM_SECTIONS.find(s => s.key === r.section_type) || null;
+              const c = r.mode === 'section' ? scrapSectionCalc(r) : null;
               return html`<div key=${i} style="border:1px solid var(--slate-200);border-radius:8px;padding:8px;background:#fff">
                 <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
                   <span style="font-size:11px;font-weight:700;color:var(--rose-500);min-width:16px">${i + 1}.</span>
-                  <select value=${r.material} onChange=${e => setRow(i, { material: e.target.value })} style="flex:1;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px;background:#fff">
-                    ${RM_MATERIALS.map(m => html`<option key=${m.key} value=${m.key}>${m.label}</option>`)}
-                  </select>
+                  <div style="display:flex;gap:0;border:1px solid var(--slate-200);border-radius:6px;overflow:hidden;flex:1">
+                    <button type="button" onClick=${() => setRow(i, { mode: 'section' })} style=${'flex:1;padding:6px;font-size:11px;font-weight:600;border:none;cursor:pointer;' + (r.mode === 'section' ? 'background:var(--rose-600);color:#fff' : 'background:#fff;color:var(--slate-600)')}>Section → auto weight</button>
+                    <button type="button" onClick=${() => setRow(i, { mode: 'weight' })} style=${'flex:1;padding:6px;font-size:11px;font-weight:600;border:none;cursor:pointer;' + (r.mode === 'weight' ? 'background:var(--rose-600);color:#fff' : 'background:#fff;color:var(--slate-600)')}>Weight only</button>
+                  </div>
                   ${rows.length > 1 && html`<button type="button" onClick=${() => rmRow(i)} title="Remove line" style="background:none;border:none;color:var(--rose-500);cursor:pointer;font-size:18px;padding:0 4px">×</button>`}
                 </div>
-                <input type="text" value=${r.size_spec} onInput=${e => setRow(i, { size_spec: e.target.value })} placeholder="Size / description — e.g. 3mm sheet offcuts 300×200" style="width:100%;box-sizing:border-box;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px;margin-bottom:6px" />
+
                 <div style="display:flex;gap:6px;margin-bottom:6px">
-                  <input type="number" step="any" min=${0} value=${r.weight_kg} onInput=${e => setRow(i, { weight_kg: e.target.value })} placeholder="Weight kg" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
-                  <input type="number" step="any" min=${0} value=${r.qty} onInput=${e => setRow(i, { qty: e.target.value })} placeholder="Qty pcs" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                  <select value=${r.material} onChange=${e => setRow(i, { material: e.target.value })} style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px;background:#fff">
+                    ${RM_MATERIALS.map(m => html`<option key=${m.key} value=${m.key}>${m.label}</option>`)}
+                  </select>
+                  ${r.mode === 'section' && html`<select value=${r.section_type} onChange=${e => setRow(i, { section_type: e.target.value })} style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px;background:#fff">
+                    ${RM_SECTIONS.map(s => html`<option key=${s.key} value=${s.key}>${s.label}</option>`)}
+                  </select>`}
                 </div>
+
+                ${r.mode === 'section' ? html`
+                  ${S && S.dims.length > 0 && html`<div style="display:flex;gap:6px;margin-bottom:6px">
+                    ${S.dims.map((dl, di) => html`<input key=${di} type="number" step="any" min=${0} value=${r['d' + (di + 1)]} onInput=${e => setRow(i, { ['d' + (di + 1)]: e.target.value })} placeholder=${dl} style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />`)}
+                  </div>`}
+                  ${S && S.dims.length === 0 && html`<input type="text" value=${r.spec} onInput=${e => setRow(i, { spec: e.target.value })} placeholder=${S.spec || 'Describe the material'} style="width:100%;box-sizing:border-box;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px;margin-bottom:6px" />`}
+                  <div style="display:flex;gap:6px;margin-bottom:6px">
+                    ${S && S.unit === 'mtr' && html`<input type="number" step="any" min=${0} value=${r.length} onInput=${e => setRow(i, { length: e.target.value })} placeholder="Length (m)" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />`}
+                    <input type="number" step="any" min=${0} value=${r.pieces} onInput=${e => setRow(i, { pieces: e.target.value })} placeholder=${S && S.unit === 'mtr' ? 'No. of pieces' : 'No. of pieces'} style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                    ${c && !c.hasAuto && html`<input type="number" step="any" min=${0} value=${r.weight_kg} onInput=${e => setRow(i, { weight_kg: e.target.value })} placeholder="Weight kg (manual)" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />`}
+                  </div>
+                  ${c && html`<div style="font-size:12px;font-weight:700;color:${c.hasAuto && c.weight ? 'var(--teal-700)' : 'var(--slate-400)'};margin-bottom:6px">${c.hasAuto ? (c.weight ? '≈ ' + fmtNum(c.weight) + ' kg auto-calculated' : 'Enter size + length/pieces for auto weight') : 'This section takes a manual weight (typed above)'}</div>`}
+                ` : html`
+                  <input type="text" value=${r.size_spec} onInput=${e => setRow(i, { size_spec: e.target.value })} placeholder="Size / description — e.g. 3mm sheet offcuts 300×200" style="width:100%;box-sizing:border-box;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px;margin-bottom:6px" />
+                  <div style="display:flex;gap:6px;margin-bottom:6px">
+                    <input type="number" step="any" min=${0} value=${r.weight_kg} onInput=${e => setRow(i, { weight_kg: e.target.value })} placeholder="Weight kg" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                    <input type="number" step="any" min=${0} value=${r.qty} onInput=${e => setRow(i, { qty: e.target.value })} placeholder="Qty pcs" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                  </div>
+                `}
                 <input type="text" value=${r.notes} onInput=${e => setRow(i, { notes: e.target.value })} placeholder="Note (reason / job / project) — optional" style="width:100%;box-sizing:border-box;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
               </div>`;
             })}
           </div>
           <button type="button" class="btn small ghost" onClick=${addRow} style="align-self:flex-start;font-size:12px;margin:8px 0">+ add another line</button>
 
-          <button class="btn" disabled=${busy} style="width:100%;background:var(--rose-600);color:#fff" onClick=${save}>${busy ? 'Saving…' : '🗑 Record ' + rows.filter(r => (parseFloat(r.weight_kg) || 0) > 0 || (parseFloat(r.qty) || 0) > 0).length + ' scrap line(s)'}</button>
+          <button class="btn" disabled=${busy} style="width:100%;background:var(--rose-600);color:#fff" onClick=${save}>${busy ? 'Saving…' : '🗑 Add ' + validRows.length + ' line' + (validRows.length === 1 ? '' : 's') + ' to the yard'}</button>
         </div>
 
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-          <div class="section-h" style="margin:0">Scrap yard · register</div>
-          <div style="font-size:12px;font-weight:700;color:var(--rose-600)">${fmtNum(Math.round(totWeight * 100) / 100)} kg</div>
+          <div class="section-h" style="margin:0">In the yard now</div>
+          <div style="text-align:right">
+            <div style="font-size:14px;font-weight:700;color:var(--rose-600)">${fmtNum(Math.round(totWeight * 100) / 100)} kg</div>
+            ${totQty > 0 && html`<div style="font-size:11px;color:var(--slate-500)">${fmtNum(totQty)} pcs</div>`}
+          </div>
         </div>
-        <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">
-          <${DateField} value=${fromD} onChange=${e => setFromD(e.target.value)} placeholder="From" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px" />
-          <${DateField} value=${toD} onChange=${e => setToD(e.target.value)} placeholder="To" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px" />
-          ${(fromD || toD) && html`<button class="btn small ghost" onClick=${() => { setFromD(''); setToD(''); }} style="font-size:12px">Clear</button>`}
-        </div>
-        ${Object.keys(byMat).length > 0 && html`<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px">${Object.entries(byMat).map(([m, w]) => html`<span style="font-size:11px;background:var(--slate-100);border-radius:10px;padding:2px 8px">${m}: ${fmtNum(Math.round(w * 100) / 100)} kg</span>`)}</div>`}
+
+        ${Object.keys(bySec).length > 0 && html`<div style="margin-bottom:8px">
+          <div style="font-size:10px;font-weight:700;letter-spacing:.3px;color:var(--slate-400);margin-bottom:4px">BY SECTION / CATEGORY</div>
+          <div style="display:flex;gap:5px;flex-wrap:wrap">${Object.entries(bySec).sort((a, b) => b[1].w - a[1].w).map(([k, v]) => html`<span style="font-size:11px;background:#fff;border:1px solid var(--slate-200);border-radius:10px;padding:2px 8px">${k}: <strong>${fmtNum(Math.round(v.w * 100) / 100)} kg</strong>${v.q ? ' · ' + fmtNum(v.q) + ' pc' : ''}</span>`)}</div>
+        </div>`}
+        ${Object.keys(byMat).length > 0 && html`<div style="margin-bottom:10px">
+          <div style="font-size:10px;font-weight:700;letter-spacing:.3px;color:var(--slate-400);margin-bottom:4px">BY MATERIAL</div>
+          <div style="display:flex;gap:5px;flex-wrap:wrap">${Object.entries(byMat).sort((a, b) => b[1] - a[1]).map(([m, w]) => html`<span style="font-size:11px;background:var(--slate-100);border-radius:10px;padding:2px 8px">${m}: ${fmtNum(Math.round(w * 100) / 100)} kg</span>`)}</div>
+        </div>`}
+
+        ${open.length > 0 && html`<button class="btn small" disabled=${clearing} style="width:100%;background:var(--slate-800);color:#fff;margin-bottom:12px" onClick=${emptyYard}>${clearing ? 'Emptying…' : '🧹 Empty scrap yard (record & start fresh)'}</button>`}
 
         ${loading ? html`<div class="loader"><div class="spinner"></div></div>`
-          : recent.length === 0 ? html`<div class="empty" style="padding:16px"><div style="font-size:13px;color:var(--slate-500)">No scrap recorded${(fromD || toD) ? ' in this range' : ' yet'}.</div></div>`
+          : open.length === 0 ? html`<div class="empty" style="padding:16px"><div style="font-size:13px;color:var(--slate-500)">The scrap yard is empty. Add a line above, or check Clearance history for past scrap.</div></div>`
           : days.map(d => html`<div key=${d}>
               <div style="font-size:11px;font-weight:700;color:var(--slate-600);background:var(--slate-100);padding:4px 8px;border-radius:5px;margin:8px 0 4px">${new Date(d).toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' })}</div>
               ${byDay.get(d).map(r => html`<div key=${r.id} style="display:flex;align-items:center;gap:8px;padding:7px 4px;border-bottom:1px solid var(--slate-100)">
                 <div style="flex:1;min-width:0">
-                  <div style="font-size:13px;font-weight:600">${matLabel(r.material)}${r.size_spec ? ' · ' + r.size_spec : ''}</div>
-                  <div style="font-size:11px;color:var(--slate-500)">${r.item ? (r.item.name || r.item.code) + ' · ' : ''}${r.u?.full_name || ''}${r.notes ? ' · ' + r.notes : ''}</div>
+                  <div style="font-size:13px;font-weight:600">${matLabel(r.material)}${r.section_type ? ' ' + secLabel(r.section_type) : ''}${r.size_spec ? ' · ' + r.size_spec : ''}</div>
+                  <div style="font-size:11px;color:var(--slate-500)">${r.u?.full_name || ''}${r.notes ? ' · ' + r.notes : ''}</div>
                 </div>
                 <div style="text-align:right;flex-shrink:0">
                   <div style="font-size:13px;font-weight:700;color:var(--rose-600)">${r.weight_kg ? fmtNum(r.weight_kg) + ' kg' : ''}${r.qty ? (r.weight_kg ? ' · ' : '') + fmtNum(r.qty) + ' pc' : ''}</div>
@@ -39454,6 +39573,44 @@ function ScrapEntryModal({ plant, me, activeUnit, onClose, onSaved }) {
                 <button type="button" onClick=${() => del(r.id)} title="Delete" style="background:none;border:none;color:var(--slate-300);cursor:pointer;font-size:15px">×</button>
               </div>`)}
             </div>`)}
+        `}
+
+        ${tab === 'history' && html`
+        <div style="font-size:12px;color:var(--slate-500);margin-bottom:10px">Every time the yard is emptied it is saved here with its date, total weight and section-wise split — so older scrap is always trackable, even after selling.</div>
+        ${clrLoading ? html`<div class="loader"><div class="spinner"></div></div>`
+          : clearances.length === 0 ? html`<div class="empty" style="padding:16px"><div style="font-size:13px;color:var(--slate-500)">No clearances yet. When you empty the yard, each clearance is recorded here.</div></div>`
+          : clearances.map(c => {
+              const bd = Array.isArray(c.breakdown) ? c.breakdown : [];
+              const bySecC = {}; bd.forEach(x => { const k = secLabel(x.section_type); bySecC[k] = (bySecC[k] || 0) + (parseFloat(x.weight_kg) || 0); });
+              const opened = clrOpenId === c.id;
+              return html`<div key=${c.id} style="border:1px solid var(--slate-200);border-radius:10px;background:#fff;margin-bottom:8px;overflow:hidden">
+                <div style="display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer" onClick=${() => toggleClearance(c)}>
+                  <div style="width:34px;height:34px;border-radius:8px;background:var(--slate-100);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0">🧹</div>
+                  <div style="flex:1;min-width:0">
+                    <div style="font-size:13px;font-weight:700">${new Date(c.cleared_date).toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' })}</div>
+                    <div style="font-size:11px;color:var(--slate-500)">${c.entry_count || 0} line${(c.entry_count === 1) ? '' : 's'}${c.u?.full_name ? ' · ' + c.u.full_name : ''}${c.notes ? ' · ' + c.notes : ''}</div>
+                  </div>
+                  <div style="text-align:right;flex-shrink:0">
+                    <div style="font-size:14px;font-weight:700;color:var(--rose-600)">${fmtNum(Math.round((parseFloat(c.total_weight_kg) || 0) * 100) / 100)} kg</div>
+                    ${(parseFloat(c.total_qty) || 0) > 0 && html`<div style="font-size:11px;color:var(--slate-500)">${fmtNum(c.total_qty)} pcs</div>`}
+                  </div>
+                  <span style="color:var(--slate-400);font-size:12px">${opened ? '▲' : '▼'}</span>
+                </div>
+                ${Object.keys(bySecC).length > 0 && html`<div style="display:flex;gap:5px;flex-wrap:wrap;padding:0 14px 10px">${Object.entries(bySecC).sort((a, b) => b[1] - a[1]).map(([k, w]) => html`<span style="font-size:11px;background:var(--slate-100);border-radius:10px;padding:2px 8px">${k}: ${fmtNum(Math.round(w * 100) / 100)} kg</span>`)}</div>`}
+                ${opened && html`<div style="border-top:1px solid var(--slate-100);padding:6px 14px 12px">
+                  ${!clrEntries[c.id] ? html`<div style="font-size:12px;color:var(--slate-400);padding:8px 0">Loading lines…</div>`
+                    : clrEntries[c.id].length === 0 ? html`<div style="font-size:12px;color:var(--slate-400);padding:8px 0">No line detail stored.</div>`
+                    : clrEntries[c.id].map(r => html`<div key=${r.id} style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--slate-50)">
+                        <div style="flex:1;min-width:0">
+                          <div style="font-size:12px;font-weight:600">${matLabel(r.material)}${r.section_type ? ' ' + secLabel(r.section_type) : ''}${r.size_spec ? ' · ' + r.size_spec : ''}</div>
+                          <div style="font-size:10px;color:var(--slate-400)">${new Date(r.scrap_date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })}${r.u?.full_name ? ' · ' + r.u.full_name : ''}${r.notes ? ' · ' + r.notes : ''}</div>
+                        </div>
+                        <div style="font-size:12px;font-weight:700;color:var(--rose-600);flex-shrink:0">${r.weight_kg ? fmtNum(r.weight_kg) + ' kg' : ''}${r.qty ? (r.weight_kg ? ' · ' : '') + fmtNum(r.qty) + ' pc' : ''}</div>
+                      </div>`)}
+                </div>`}
+              </div>`;
+            })}
+        `}
       </div>
     </div>
   `;
