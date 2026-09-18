@@ -39347,21 +39347,24 @@ function RodPickModal({ plant, itemId, onClose, onApply }) {
 // Reuses rmBuild so it matches how stock items are weighed.
 function scrapSectionCalc(r) {
   const S = RM_SECTIONS.find(s => s.key === r.section_type) || null;
-  if (!S) return { weight: 0, size_spec: (r.spec || '').trim(), unit: 'nos', hasAuto: false };
+  const canAuto = !!(S && S.calc); // section has a weight formula (angle/flat/round/… )
+  if (!S) return { weight: 0, size_spec: (r.spec || '').trim(), unit: 'nos', hasAuto: false, canAuto: false };
   const built = rmBuild(r.material, r.section_type, r.d1, r.d2, r.d3, r.spec);
   const uw = built.unit_weight; // kg/metre (length) or kg/piece (sheet/plate), or null
   const pieces = parseFloat(r.pieces) || 0;
   let weight = 0, spec = built.size_spec;
   if (S.unit === 'mtr') {
-    const len = parseFloat(r.length) || 0;
+    // Length is entered in mm (offcuts are measured in mm on the floor).
+    const lenMm = parseFloat(r.length) || 0;
+    const len = lenMm / 1000;
     if (uw != null && len > 0) weight = uw * len * (pieces || 1);
-    if (len > 0) spec += ' × ' + len + 'm';
+    if (lenMm > 0) spec += ' × ' + lenMm + 'mm';
     if (pieces > 1) spec += ' × ' + pieces + 'pc';
   } else {
     if (uw != null) weight = uw * (pieces || 1);
     if (pieces > 1) spec += ' × ' + pieces + 'pc';
   }
-  return { weight: weight ? Math.round(weight * 1000) / 1000 : 0, size_spec: spec.trim(), unit: S.unit, hasAuto: uw != null };
+  return { weight: weight ? Math.round(weight * 1000) / 1000 : 0, size_spec: spec.trim(), unit: S.unit, hasAuto: uw != null, canAuto };
 }
 
 function ScrapEntryModal({ plant, me, activeUnit, onClose, onSaved }) {
@@ -39403,7 +39406,7 @@ function ScrapEntryModal({ plant, me, activeUnit, onClose, onSaved }) {
   const matLabel = (k) => (RM_MATERIALS.find(m => m.key === k) || {}).label || k || 'Other';
   const secLabel = (k) => (RM_SECTIONS.find(s => s.key === k) || {}).label || 'Other';
   // Effective weight/qty preview for a row (used for the button + validation).
-  const rowWeight = (r) => r.mode === 'section' ? (scrapSectionCalc(r).hasAuto ? scrapSectionCalc(r).weight : (parseFloat(r.weight_kg) || 0)) : (parseFloat(r.weight_kg) || 0);
+  const rowWeight = (r) => { if (r.mode !== 'section') return parseFloat(r.weight_kg) || 0; const c = scrapSectionCalc(r); return c.canAuto ? c.weight : (parseFloat(r.weight_kg) || 0); };
   const rowQty = (r) => r.mode === 'section' ? (parseFloat(r.pieces) || 0) : (parseFloat(r.qty) || 0);
   const validRows = rows.filter(r => rowWeight(r) > 0 || rowQty(r) > 0);
 
@@ -39415,7 +39418,7 @@ function ScrapEntryModal({ plant, me, activeUnit, onClose, onSaved }) {
       const inserts = validRows.map(r => {
         if (r.mode === 'section') {
           const c = scrapSectionCalc(r);
-          const w = c.hasAuto ? c.weight : (parseFloat(r.weight_kg) || 0);
+          const w = c.canAuto ? c.weight : (parseFloat(r.weight_kg) || 0);
           return {
             plant_id: plant.id, unit_id: activeUnit?.unit_id || null, scrap_date: scrapDate || today,
             material: r.material || null, section_type: r.section_type || null,
@@ -39519,11 +39522,11 @@ function ScrapEntryModal({ plant, me, activeUnit, onClose, onSaved }) {
                   </div>`}
                   ${S && S.dims.length === 0 && html`<input type="text" value=${r.spec} onInput=${e => setRow(i, { spec: e.target.value })} placeholder=${S.spec || 'Describe the material'} style="width:100%;box-sizing:border-box;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px;margin-bottom:6px" />`}
                   <div style="display:flex;gap:6px;margin-bottom:6px">
-                    ${S && S.unit === 'mtr' && html`<input type="number" step="any" min=${0} value=${r.length} onInput=${e => setRow(i, { length: e.target.value })} placeholder="Length (m)" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />`}
-                    <input type="number" step="any" min=${0} value=${r.pieces} onInput=${e => setRow(i, { pieces: e.target.value })} placeholder=${S && S.unit === 'mtr' ? 'No. of pieces' : 'No. of pieces'} style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
-                    ${c && !c.hasAuto && html`<input type="number" step="any" min=${0} value=${r.weight_kg} onInput=${e => setRow(i, { weight_kg: e.target.value })} placeholder="Weight kg (manual)" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />`}
+                    ${S && S.unit === 'mtr' && html`<input type="number" step="any" min=${0} value=${r.length} onInput=${e => setRow(i, { length: e.target.value })} placeholder="Length (mm)" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />`}
+                    <input type="number" step="any" min=${0} value=${r.pieces} onInput=${e => setRow(i, { pieces: e.target.value })} placeholder="No. of pieces" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                    ${c && !c.canAuto && html`<input type="number" step="any" min=${0} value=${r.weight_kg} onInput=${e => setRow(i, { weight_kg: e.target.value })} placeholder="Weight kg (manual)" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />`}
                   </div>
-                  ${c && html`<div style="font-size:12px;font-weight:700;color:${c.hasAuto && c.weight ? 'var(--teal-700)' : 'var(--slate-400)'};margin-bottom:6px">${c.hasAuto ? (c.weight ? '≈ ' + fmtNum(c.weight) + ' kg auto-calculated' : 'Enter size + length/pieces for auto weight') : 'This section takes a manual weight (typed above)'}</div>`}
+                  ${c && html`<div style="font-size:12px;font-weight:700;color:${c.canAuto && c.weight ? 'var(--teal-700)' : 'var(--slate-400)'};margin-bottom:6px">${c.canAuto ? (c.weight ? '≈ ' + fmtNum(c.weight) + ' kg auto-calculated' : 'Enter the sizes' + (S && S.unit === 'mtr' ? ' + length (mm)' : '') + ' to auto-calculate the weight') : 'This section takes a manual weight (typed above)'}</div>`}
                 ` : html`
                   <input type="text" value=${r.size_spec} onInput=${e => setRow(i, { size_spec: e.target.value })} placeholder="Size / description — e.g. 3mm sheet offcuts 300×200" style="width:100%;box-sizing:border-box;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px;margin-bottom:6px" />
                   <div style="display:flex;gap:6px;margin-bottom:6px">
