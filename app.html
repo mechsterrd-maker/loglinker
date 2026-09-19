@@ -37982,15 +37982,29 @@ function Stocks({ plant, me, activeUnit, accessibleUnits }) {
           const totVal = filteredItems.reduce((s, i) => s + (parseFloat(i.current_qty || 0) * parseFloat(i.unit_cost || 0)), 0);
           const anyVal = filteredItems.some(i => i.unit_cost);
           const canSep = multiUnit && isAdmin; // show select-checkboxes for unit reassignment
-          const labelColspan = 4 + (canSep ? 1 : 0) + (multiUnit ? 1 : 0);
+          // Category / Unit columns are redundant once you've filtered to one, so
+          // show them only when viewing "All" (category tab) / "All units".
+          const colCat = categoryFilter === 'all';
+          const colUnit = multiUnit && unitFilter === 'all';
+          // Per-metre (per-unit) weight of a material, and its piece / rod count.
+          const uwOf = (i) => parseFloat(i.unit_weight) || 0;
+          const pcsOf = (i) => {
+            const pcs = Array.isArray(i.pieces) ? i.pieces : [];
+            const n = pcs.reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
+            if (n > 0) return n;
+            if (['nos', 'no', 'no.', 'nos.', 'pcs', 'pc', 'pcs.', 'pieces', 'ea', 'each'].includes((i.uom || '').toLowerCase())) return parseFloat(i.current_qty) || 0;
+            return null;
+          };
+          const labelColspan = (canSep ? 1 : 0) + 1 + (colCat ? 1 : 0) + (colUnit ? 1 : 0) + 1 + 1 + 1;
           return html`<div style="overflow-x:auto;border:1px solid var(--slate-200);border-radius:10px;-webkit-overflow-scrolling:touch">
             <table style="width:100%;border-collapse:collapse;font-size:12.5px">
               <thead><tr style="background:var(--slate-50);position:sticky;top:0">
                 ${canSep ? html`<th style="padding:8px 6px;width:28px"></th>` : ''}
                 <th style="text-align:left;padding:8px 10px;font-weight:700;color:var(--slate-600)">Item</th>
-                <th style="text-align:left;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Category</th>
-                ${multiUnit ? html`<th style="text-align:left;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Unit</th>` : ''}
+                ${colCat ? html`<th style="text-align:left;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Category</th>` : ''}
+                ${colUnit ? html`<th style="text-align:left;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Unit</th>` : ''}
                 <th style="text-align:right;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">In stock</th>
+                <th style="text-align:right;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Pcs / Rods</th>
                 <th style="text-align:right;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Rate</th>
                 <th style="text-align:right;padding:8px 10px;font-weight:700;color:var(--slate-600);white-space:nowrap">Value</th>
               </tr></thead>
@@ -37999,15 +38013,20 @@ function Stocks({ plant, me, activeUnit, accessibleUnits }) {
                   const isLow = i.reorder_level && i.current_qty <= i.reorder_level;
                   const val = (parseFloat(i.current_qty || 0) * parseFloat(i.unit_cost || 0));
                   const sel = selectedIds.has(i.id);
+                  const uw = uwOf(i);
+                  const totW = uw > 0 ? Math.round(parseFloat(i.current_qty || 0) * uw * 100) / 100 : 0;
+                  const pcs = pcsOf(i);
                   return html`<tr key=${i.id} onClick=${() => setActiveItem(i)} style=${'border-top:1px solid var(--slate-100);cursor:pointer' + (sel ? ';background:var(--teal-50)' : '')}>
                     ${canSep ? html`<td style="padding:7px 6px;text-align:center" onClick=${(e) => { e.stopPropagation(); toggleSelect(i.id); }}><input type="checkbox" checked=${sel} onClick=${(e) => e.stopPropagation()} onChange=${() => toggleSelect(i.id)} /></td>` : ''}
                     <td style="padding:7px 10px">
                       <div style="font-weight:600">${i.name || i.code}</div>
                       ${i.code ? html`<div style="font-size:10px;color:var(--slate-400);font-family:'Geist Mono',monospace">${i.code}</div>` : ''}
+                      ${uw > 0 ? html`<div style="font-size:10px;color:var(--teal-600);font-weight:600">${fmtNum(uw)} kg/${i.uom}</div>` : ''}
                     </td>
-                    <td style="padding:7px 10px;color:var(--slate-500);white-space:nowrap">${lbl(i.category || 'general')}${i.subcategory ? html`<div style="font-size:10px;color:var(--slate-400)">${i.subcategory}</div>` : ''}</td>
-                    ${multiUnit ? html`<td style="padding:7px 10px;white-space:nowrap"><span class="badge" style="font-size:10px;background:var(--slate-100);color:var(--slate-600)">${unitNameOf(i.unit_id)}</span></td>` : ''}
-                    <td style="padding:7px 10px;text-align:right;white-space:nowrap"><span style=${'font-weight:700;color:' + (isLow ? 'var(--rose-600)' : 'var(--slate-800)')}>${fmtNum(i.current_qty)}</span> <span style="color:var(--slate-400);font-size:11px">${i.uom}</span>${(() => { const ex = stockExtras(i); return ex ? html`<div style="font-size:9px;color:var(--teal-600)">${ex}</div>` : ''; })()}${isLow ? html`<div style="font-size:9px;color:var(--rose-600);font-weight:600">LOW</div>` : (!i.opening_recorded_at ? html`<div style="font-size:9px;color:var(--amber-700);font-weight:600">NO OPENING</div>` : '')}</td>
+                    ${colCat ? html`<td style="padding:7px 10px;color:var(--slate-500);white-space:nowrap">${lbl(i.category || 'general')}${i.subcategory ? html`<div style="font-size:10px;color:var(--slate-400)">${i.subcategory}</div>` : ''}</td>` : ''}
+                    ${colUnit ? html`<td style="padding:7px 10px;white-space:nowrap"><span class="badge" style="font-size:10px;background:var(--slate-100);color:var(--slate-600)">${unitNameOf(i.unit_id)}</span></td>` : ''}
+                    <td style="padding:7px 10px;text-align:right;white-space:nowrap"><span style=${'font-weight:700;color:' + (isLow ? 'var(--rose-600)' : 'var(--slate-800)')}>${fmtNum(i.current_qty)}</span> <span style="color:var(--slate-400);font-size:11px">${i.uom}</span>${totW > 0 ? html`<div style="font-size:9px;color:var(--teal-600)">${fmtNum(totW)} kg</div>` : ''}${isLow ? html`<div style="font-size:9px;color:var(--rose-600);font-weight:600">LOW</div>` : (!i.opening_recorded_at ? html`<div style="font-size:9px;color:var(--amber-700);font-weight:600">NO OPENING</div>` : '')}</td>
+                    <td style="padding:7px 10px;text-align:right;white-space:nowrap;font-weight:600;color:var(--slate-700)">${pcs != null ? fmtNum(pcs) : '—'}</td>
                     <td style="padding:7px 10px;text-align:right;color:var(--slate-500);white-space:nowrap">${i.unit_cost
                       ? '₹' + fmtNum(i.unit_cost)
                       : (isAdmin
