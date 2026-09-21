@@ -41945,6 +41945,26 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     sb.from('mcp_stocks_items').select('id, code, name, uom, category').eq('plant_id', plant.id)
       .then(({ data }) => setStockItems(data || []));
   }, [plant?.id, me?.id]);
+
+  // Document-level "link this whole bill to a project" + cost category — a quick
+  // pathway right after upload, good for service bills (transport, machining).
+  const linkDocProject = async (pid) => {
+    const its = Array.isArray(doc?.items) ? doc.items : [];
+    // Stamp the project on the lines too when none is set yet, so it flows into
+    // per-line rollups; if the lines already carry projects, leave them.
+    const anyLineProj = its.some(it => it.project_id);
+    const newItems = (!anyLineProj && its.length) ? its.map(it => ({ ...it, project_id: pid || null })) : its;
+    const { error } = await sb.from('mcp_logistics_documents').update({ project_id: pid || null, items: newItems }).eq('id', doc.id);
+    if (error) { showToast('Could not link project'); return; }
+    setDoc(d => ({ ...d, project_id: pid || null, items: newItems }));
+    showToast(pid ? '📐 Bill linked to project' : 'Project link cleared');
+  };
+  const setDocCat = async (cat) => {
+    const { error } = await sb.from('mcp_logistics_documents').update({ cost_category: cat }).eq('id', doc.id);
+    if (error) { showToast('Could not save category'); return; }
+    setDoc(d => ({ ...d, cost_category: cat }));
+  };
+
   // Seed per-line destinations from any project already assigned to the items.
   useEffect(() => {
     const its = Array.isArray(doc?.items) ? doc.items : [];
@@ -42279,6 +42299,24 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       <div class="card-row"><span class="label">Date</span><span class="value">${fmtDMY(doc.doc_date)}</span></div>
       ${doc.due_date && html`<div class="card-row"><span class="label">Due</span><span class="value" style=${overdue ? 'color:var(--rose-500)' : ''}>${overdue ? '⚠️ ' : ''}${doc.due_date}</span></div>`}
     </div>
+
+    ${canProcess && PC_COST_DOC_TYPES.includes(doc.doc_type) && html`
+      <div class="card" style="margin-top:14px;background:var(--teal-50);border-color:var(--teal-200)">
+        <div class="card-title" style="color:var(--teal-800)">📐 Link to project & cost type</div>
+        <div class="field"><label>Project</label>
+          <select value=${doc.project_id || ''} onChange=${e => linkDocProject(e.target.value)}>
+            <option value="">— No project —</option>
+            ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+          </select>
+        </div>
+        <div class="field"><label>Cost category</label>
+          <select value=${doc.cost_category || (PC_JW_TYPES.includes(doc.doc_type) ? 'machining' : 'purchase')} onChange=${e => setDocCat(e.target.value)}>
+            ${PC_CATS.map(c => html`<option key=${c} value=${c}>${PC_CAT_LABEL[c]}</option>`)}
+          </select>
+        </div>
+        <div style="font-size:11px;color:var(--slate-500)">Links the whole bill to one project — ideal for transport / machining / service bills. For a material bill split across jobs, set each line's project below instead.</div>
+      </div>
+    `}
 
     <div class="card" style="margin-top:14px">
       <div class="card-title">Amounts</div>
