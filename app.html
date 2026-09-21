@@ -3543,7 +3543,7 @@ function BomEditorModal({ plant, me, editTarget, onClose, onSaved }) {
 // Admin issues it as a Returnable DC, receives bills against the planned products;
 // the RDC closes when the plan is fulfilled. Leftover sheet recorded on return.
 const SC_STATUS = { draft:{c:'',l:'Draft'}, issued:{c:'amber',l:'Issued'}, receiving:{c:'amber',l:'Receiving'}, completed:{c:'emerald',l:'Completed'}, cancelled:{c:'',l:'Cancelled'} };
-function SubcontractPlans({ plant, me, activeUnit, go }) {
+function SubcontractPlans({ plant, me, activeUnit, go, navAction }) {
   const [plans, setPlans] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('open');
@@ -3558,20 +3558,39 @@ function SubcontractPlans({ plant, me, activeUnit, go }) {
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
 
+  // Sidebar Job Work sub-items deep-link to an exact status (Sent → issued,
+  // In Progress / Partial Received → receiving, Completed → completed, Pending
+  // → draft). Land on the list (not a plan detail) with that filter applied.
+  useEffect(() => {
+    if (navAction && navAction.tab === 'subcontract_plans' && navAction.sub && navAction.sub.startsWith('st_')) {
+      setActiveId(null);
+      setFilter(navAction.sub.slice(3));
+    }
+  }, [navAction?.ts]);
+
   if (activeId) return html`<${PlanDetail} plant=${plant} me=${me} planId=${activeId} go=${go} onBack=${() => { setActiveId(null); refresh(); }} />`;
 
-  const shown = plans.filter(p => filter === 'all' ? true : filter === 'done' ? p.status === 'completed' : (p.status !== 'completed' && p.status !== 'cancelled'));
+  const shown = plans.filter(p =>
+    filter === 'all' ? true :
+    filter === 'done' ? p.status === 'completed' :
+    filter === 'open' ? (p.status !== 'completed' && p.status !== 'cancelled') :
+    p.status === filter); // exact SC status from a deep-link
+  const exactFilter = !['open', 'done', 'all'].includes(filter);
 
   return html`
     <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
       <div><h1>🧾 Subcontract Plans</h1><div class="sub">Plan → Returnable DC → receive against plan → auto-close</div></div>
       <button class="btn small" onClick=${() => setNewOpen(true)}>+ New plan</button>
     </div>
-    <div class="auth-tabs" style="margin-bottom:12px">
+    <div class="auth-tabs" style="margin-bottom:${exactFilter ? '8px' : '12px'}">
       <button class=${'auth-tab' + (filter === 'open' ? ' active' : '')} onClick=${() => setFilter('open')}>Open</button>
       <button class=${'auth-tab' + (filter === 'done' ? ' active' : '')} onClick=${() => setFilter('done')}>Completed</button>
       <button class=${'auth-tab' + (filter === 'all' ? ' active' : '')} onClick=${() => setFilter('all')}>All</button>
     </div>
+    ${exactFilter && html`<div style="margin-bottom:12px"><span style="display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;color:var(--teal-800);background:var(--teal-50);border:1px solid var(--teal-200);border-radius:999px;padding:4px 10px">
+      Showing: ${(SC_STATUS[filter] || { l: filter }).l}
+      <button onClick=${() => setFilter('open')} style="border:none;background:none;color:var(--teal-700);cursor:pointer;font-size:13px;line-height:1;padding:0">✕</button>
+    </span></div>`}
     ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
       shown.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🧾</div><div style="font-size:13px">No plans yet. Tap + New plan.</div></div></div>` :
       shown.map(p => { const b = SC_STATUS[p.status] || { c: '', l: p.status }; return html`
@@ -5512,7 +5531,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'fettling'}><${FettlingModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'rdc_returns'}><${RdcReturns} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'project_history'}><${ProjectMaterialHistory} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
-      <${Page} active=${pageTab === 'subcontract_plans'}><${SubcontractPlans} plant=${plant} me=${me} activeUnit=${activeUnit} go=${go} /></${Page}>
+      <${Page} active=${pageTab === 'subcontract_plans'}><${SubcontractPlans} plant=${plant} me=${me} activeUnit=${activeUnit} go=${go} navAction=${navAction} /></${Page}>
       <${Page} active=${pageTab === 'bom'}><${BomModule} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'more'}><${More} plant=${plant} me=${me} myPerms=${myPerms} user=${user} logout=${logout} setTab=${setTab} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} tab=${tab} /></${Page}>
       <${Page} active=${denied}><${AccessDenied} moduleKey=${tab} /></${Page}>
@@ -5677,17 +5696,17 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, go, logout, 
     ]},
     { key:'dc', title:'DC / Challan', icon:'📄', tab:'sales_docs', items:[
       { label:'Create DC',   tab:'sales_docs', sub:'new_dc' },
-      { label:'DC Pending',  tab:'sales_docs', sub:'list' },
-      { label:'DC Sent',     tab:'sales_docs', sub:'list' },
-      { label:'DC Received', tab:'rdc_returns' },
-      { label:'DC Closed',   tab:'rdc_returns' },
+      { label:'DC Pending',  tab:'sales_docs', sub:'dc_pending' },
+      { label:'DC Sent',     tab:'sales_docs', sub:'dc_sent' },
+      { label:'DC Received', tab:'sales_docs', sub:'dc_received' },
+      { label:'DC Closed',   tab:'sales_docs', sub:'dc_closed' },
     ]},
     { key:'jobwork', title:'Job Work', icon:'🔧', tab:'subcontract_plans', items:[
-      { label:'Job Work Sent',   tab:'subcontract_plans' },
-      { label:'In Progress',     tab:'subcontract_plans' },
-      { label:'Partial Received',tab:'subcontract_plans' },
-      { label:'Completed',       tab:'subcontract_plans' },
-      { label:'Pending',         tab:'subcontract_plans' },
+      { label:'Job Work Sent',   tab:'subcontract_plans', sub:'st_issued' },
+      { label:'In Progress',     tab:'subcontract_plans', sub:'st_receiving' },
+      { label:'Partial Received',tab:'subcontract_plans', sub:'st_receiving' },
+      { label:'Completed',       tab:'subcontract_plans', sub:'st_completed' },
+      { label:'Pending',         tab:'subcontract_plans', sub:'st_draft' },
     ]},
     { key:'bills', title:'Bills', icon:'🧾', tab:'documents', items:[
       { label:'Upload Bill',  tab:'chat', sub:'upload_bill' },
@@ -5709,7 +5728,7 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, go, logout, 
   ].filter(it => isOn(it.key));
 
   // "More modules" holds the long tail — anything not already surfaced above.
-  const surfaced = new Set(['home','stocks','sales_docs','rdc_returns','subcontract_plans','documents','chat','movements','masters','reports', fab?'projects':'production','quality','actions']);
+  const surfaced = new Set(['home','stocks','sales_docs','subcontract_plans','documents','chat','movements','masters','reports', fab?'projects':'production','quality','actions']);
   const moreGroups = visibleMoreGroups(plant, myPerms)
     .map(g => ({ ...g, items: g.items.filter(it => !surfaced.has(it.key)) }))
     .filter(g => g.items.length > 0);
@@ -27412,12 +27431,17 @@ function ExpenseModal({ plant, me, vendors, projects, editTarget, onClose, onSav
 // Marvel find an old DC / PO by number, party name, item name, date range
 // or doc type without scrolling. Filters work in-memory against the
 // up-to-500-row recent window the module already fetches.
-function SalesDocFilteredList({ recent, loading, META, onView }) {
+function SalesDocFilteredList({ recent, loading, META, onView, initialStatus, statusNonce }) {
   const [q, setQ] = useState('');
   const [docType, setDocType] = useState('all');
   const [period, setPeriod] = useState('all');
   const [partyFilter, setPartyFilter] = useState('all');
   const [sortBy, setSortBy] = useState('newest');
+  // DC pipeline status filter (all | pending | sent | received | closed).
+  // Seeded/overridden by a sidebar deep-link (DC Pending / Sent / Received /
+  // Closed); statusNonce re-applies it even if the list is already mounted.
+  const [statusFilter, setStatusFilter] = useState(initialStatus || 'all');
+  useEffect(() => { if (initialStatus) setStatusFilter(initialStatus); }, [initialStatus, statusNonce]);
   // Returnable-DC return status (open / partial / closed) for a colour cue.
   const [rdcStatus, setRdcStatus] = useState({});
   useEffect(() => {
@@ -27482,10 +27506,25 @@ function SalesDocFilteredList({ recent, loading, META, onView }) {
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [recent]);
 
+  // Map a challan to its pipeline stage. Returnable DCs use the live return
+  // status (open=sent, partial=received, closed); one-way DCs are 'sent' once
+  // issued ('pending' only while a draft/unapproved status is set).
+  const pipelineOf = (d) => {
+    if (d.status === 'cancelled') return 'cancelled';
+    if (d.doc_type === 'dc_out_returnable') {
+      const s = rdcStatus[d.id];
+      if (s === 'closed') return 'closed';
+      if (s === 'partial') return 'received';
+      return 'sent';
+    }
+    return (d.status === 'pending' || d.status === 'draft') ? 'pending' : 'sent';
+  };
+
   // Apply filters + search + sort in memory.
   const filtered = useMemo(() => {
     const qn = q.trim().toLowerCase();
     let out = recent;
+    if (statusFilter !== 'all') out = out.filter(d => ['dc_out', 'dc_out_returnable'].includes(d.doc_type) && pipelineOf(d) === statusFilter);
     if (docType !== 'all') out = out.filter(d => d.doc_type === docType);
     if (range)              out = out.filter(d => d.doc_date >= range.from && d.doc_date <= range.to);
     if (partyFilter !== 'all') out = out.filter(d => d.vendor_name_raw === partyFilter);
@@ -27508,7 +27547,7 @@ function SalesDocFilteredList({ recent, loading, META, onView }) {
     else if (sortBy === 'amount_asc')  out = [...out].sort((a, b) => (a.total_value || 0) - (b.total_value || 0));
     else /* newest */                  out = [...out].sort((a, b) => (b.doc_date || '').localeCompare(a.doc_date || ''));
     return out;
-  }, [recent, q, docType, range, partyFilter, sortBy]);
+  }, [recent, q, docType, range, partyFilter, sortBy, statusFilter, rdcStatus]);
 
   const countByType = useMemo(() => {
     const m = { all: recent.length };
@@ -27517,7 +27556,7 @@ function SalesDocFilteredList({ recent, loading, META, onView }) {
   }, [recent]);
 
   const totalValue = filtered.reduce((s, d) => s + (parseFloat(d.total_value) || 0), 0);
-  const anyFilterActive = q.trim() || docType !== 'all' || period !== 'all' || partyFilter !== 'all';
+  const anyFilterActive = q.trim() || docType !== 'all' || period !== 'all' || partyFilter !== 'all' || statusFilter !== 'all';
 
   if (loading) return html`<div class="loader"><div class="spinner"></div></div>`;
   if (recent.length === 0) return html`<div class="card"><div class="empty"><div class="icon">📤</div><div style="font-size:13px">No documents made yet. Tap a + tab above to create a DC, Invoice, PO or Packing list.</div></div></div>`;
@@ -27533,6 +27572,16 @@ function SalesDocFilteredList({ recent, loading, META, onView }) {
         <button key=${p.key} type="button" onClick=${() => setDocType(p.key)}
           style=${'flex:0 0 auto;padding:6px 12px;border-radius:999px;border:1px solid '+(docType===p.key?'var(--teal-500)':'var(--slate-200)')+';background:'+(docType===p.key?'var(--teal-50)':'white')+';color:'+(docType===p.key?'var(--teal-800)':'var(--slate-700)')+';font-size:11px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap'}>
           ${p.ico} ${p.label}${countByType[p.key] != null ? ' · ' + countByType[p.key] : ''}
+        </button>
+      `)}
+    </div>
+
+    <div style="display:flex;gap:6px;margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;align-items:center">
+      <span style="flex:0 0 auto;font-size:10px;font-weight:700;color:var(--slate-400);text-transform:uppercase;letter-spacing:.4px">DC status</span>
+      ${[['all','All'],['pending','Pending'],['sent','Sent'],['received','Received'],['closed','Closed']].map(([k, lbl]) => html`
+        <button key=${k} type="button" onClick=${() => setStatusFilter(k)}
+          style=${'flex:0 0 auto;padding:5px 11px;border-radius:999px;border:1px solid '+(statusFilter===k?'var(--teal-500)':'var(--slate-200)')+';background:'+(statusFilter===k?'var(--teal-50)':'white')+';color:'+(statusFilter===k?'var(--teal-800)':'var(--slate-600)')+';font-size:11px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap'}>
+          ${lbl}
         </button>
       `)}
     </div>
@@ -27555,7 +27604,7 @@ function SalesDocFilteredList({ recent, loading, META, onView }) {
         <option value="amount_desc">Amount ↓</option>
         <option value="amount_asc">Amount ↑</option>
       </select>
-      ${anyFilterActive && html`<button type="button" onClick=${() => { setQ(''); setDocType('all'); setPeriod('all'); setPartyFilter('all'); }}
+      ${anyFilterActive && html`<button type="button" onClick=${() => { setQ(''); setDocType('all'); setPeriod('all'); setPartyFilter('all'); setStatusFilter('all'); }}
         style="padding:6px 10px;border:1px solid var(--rose-300);background:var(--rose-50);color:var(--rose-700);border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;font-family:inherit">✕ Clear</button>`}
     </div>
 
@@ -27595,10 +27644,17 @@ function SalesDocFilteredList({ recent, loading, META, onView }) {
 
 function SalesDocMakerModule({ plant, me, navAction, activeUnit, accessibleUnits }) {
   const [tab, setTab] = useState('list'); // list | new_dc | new_invoice | new_po | new_packing
-  // Home shortcuts (DC / PO) deep-link straight to the right sub-tab. Pages stay
-  // mounted, so react to the one-shot navAction signal whenever its ts changes.
+  const [listStatus, setListStatus] = useState('all'); // DC pipeline filter for the list
+  // Home / sidebar shortcuts deep-link straight to the right sub-tab. A
+  // 'dc_<status>' sub opens the Recent list already filtered to that DC stage
+  // (Pending / Sent / Received / Closed). Pages stay mounted, so react to the
+  // one-shot navAction signal whenever its ts changes.
+  const TAB_SUBS = ['list', 'new_dc', 'new_rdc', 'new_invoice', 'new_po', 'new_packing'];
   useEffect(() => {
-    if (navAction && navAction.tab === 'sales_docs' && navAction.sub) setTab(navAction.sub);
+    if (!navAction || navAction.tab !== 'sales_docs' || !navAction.sub) return;
+    const s = navAction.sub;
+    if (s.startsWith('dc_')) { setTab('list'); setListStatus(s.slice(3)); }
+    else if (TAB_SUBS.includes(s)) { setTab(s); if (s === 'list') setListStatus('all'); }
   }, [navAction?.ts]);
   // docKind derived directly from tab (no separate state). Holding it as
   // useState caused the form to render one cycle stale: tab updated to
@@ -27735,7 +27791,7 @@ function SalesDocMakerModule({ plant, me, navAction, activeUnit, accessibleUnits
         onSaved=${(doc) => { setPreviewByKind(prev => { const next = { ...prev }; delete next[docKind]; return next; }); setTab('list'); refresh(); setView(doc); }} onCancel=${() => setTab('list')} />
     `}
 
-    ${tab === 'list' && html`<${SalesDocFilteredList} recent=${recent} loading=${loading} META=${META} onView=${setView} />`}
+    ${tab === 'list' && html`<${SalesDocFilteredList} recent=${recent} loading=${loading} META=${META} onView=${setView} initialStatus=${listStatus} statusNonce=${navAction?.ts} />`}
   `;
 }
 
