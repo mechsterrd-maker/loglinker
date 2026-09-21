@@ -9213,6 +9213,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
   // Project Detail, stage_id rides along too so the bill lands on that stage.
   const [attachmentStage, setAttachmentStage] = useState('');
   const [projects, setProjects] = useState([]); // active projects in this plant
+  const [billWizardDoc, setBillWizardDoc] = useState(null); // pops after a bill is read → link project + category
   const [uploading, setUploading] = useState(false);
   const [notifPerm, setNotifPerm] = useState(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
   const [taskFromMsg, setTaskFromMsg] = useState(null);
@@ -9427,6 +9428,21 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
       .subscribe();
     return () => { sb.removeChannel(channel); };
   }, [activeGroup]);
+
+  // After a bill image is enqueued, poll its extraction; when the doc is ready,
+  // pop the wizard to link it to a project + set cost category (whole or per item).
+  const watchBillExtraction = (queueId) => {
+    let tries = 0;
+    const iv = setInterval(async () => {
+      tries++;
+      const { data } = await sb.from('mcp_logistics_extraction_queue').select('status, result_doc_id').eq('id', queueId).maybeSingle();
+      if (data && data.status === 'completed' && data.result_doc_id) {
+        clearInterval(iv);
+        const { data: d } = await sb.from('mcp_logistics_documents').select('*').eq('id', data.result_doc_id).maybeSingle();
+        if (d && PC_COST_DOC_TYPES.includes(d.doc_type)) setBillWizardDoc(d);
+      } else if ((data && data.status === 'failed') || tries > 40) { clearInterval(iv); }
+    }, 3000);
+  };
 
   // Live extraction status updates (refetch messages for the active group when extraction completes)
   useEffect(() => {
@@ -9879,6 +9895,8 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
               }),
             }).catch(e => console.warn('Extract call failed (will retry on next image):', e));
           }
+          // Poll for the extracted bill, then pop the link-to-project wizard.
+          watchBillExtraction(queueId);
         }
       } catch (e) {
         console.warn('Enqueue failed:', e);
@@ -10220,6 +10238,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
             `}
         </div>
         ${taskFromMsg && html`<${AssignTaskFromMsgModal} plant=${plant} me=${me} message=${taskFromMsg} group=${activeGroup} onClose=${() => setTaskFromMsg(null)} onSaved=${() => setTaskFromMsg(null)} />`}
+        ${billWizardDoc && html`<${BillLinkWizard} plant=${plant} me=${me} doc=${billWizardDoc} onClose=${() => setBillWizardDoc(null)} onSaved=${() => setBillWizardDoc(null)} />`}
         ${newTaskInGroup && html`<${QuickTaskInGroupModal} plant=${plant} me=${me} group=${activeGroup} onClose=${() => setNewTaskInGroup(false)} onSaved=${() => setNewTaskInGroup(false)} />`}
         ${meetingMenu && html`<${MeetingStartMenu} plant=${plant} onClose=${() => setMeetingMenu(false)} onStart=${(url, title) => { setMeetingMenu(false); postMeetingLink(url, title); if (url.includes('meet.jit.si')) setActiveMeeting(url); }} />`}
         ${activeMeeting && html`<${EmbeddedJitsiMeeting} url=${activeMeeting} me=${me} onClose=${() => setActiveMeeting(null)} />`}
@@ -20711,7 +20730,7 @@ function ProjectCostingModule({ plant, me, activeUnit }) {
         for (const it of itsWithProj) {
           const b = by[it.project_id]; if (!b) continue;
           const v = Number(it.amount || 0); b.billSpend += v;
-          b.items.push({ kind: 'bill', catKey: pcBillCat(d), docId: d.id, label: PC_DOC_LABEL[d.doc_type] || d.doc_type, ref: d.doc_number, party: d.vendor_name_raw, amount: v, date: d.doc_date });
+          b.items.push({ kind: 'bill', catKey: it.cost_category || pcBillCat(d), docId: d.id, label: PC_DOC_LABEL[d.doc_type] || d.doc_type, ref: d.doc_number, party: d.vendor_name_raw, amount: v, date: d.doc_date });
         }
       } else if (d.project_id) {
         // Bill tagged to a project at the document level.
@@ -24018,7 +24037,8 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
       if (!rel.length) return;
       const sub = rel.reduce((s, it) => s + (parseFloat(it.amount) || 0), 0);
       exTotal += sub;
-      const catKey = dd.cost_category || (PC_JW_TYPES.includes(dd.doc_type) ? 'machining'
+      const relCat = (rel.find(it => it.cost_category) || {}).cost_category;
+      const catKey = relCat || dd.cost_category || (PC_JW_TYPES.includes(dd.doc_type) ? 'machining'
         : ['dc_out', 'dc_out_returnable', 'dc_in'].includes(dd.doc_type) ? 'other' : 'purchase');
       exDocs.push({ id: dd.id, doc_type: dd.doc_type, doc_number: dd.doc_number, doc_date: dd.doc_date, vendor: dd.vendor_name_raw, items: rel, subtotal: sub, cost_category: dd.cost_category, catKey });
     });
@@ -41896,6 +41916,92 @@ function ReturnableSlaModal({ line, onClose, onSaved }) {
           ${line.sla_days && html`<button class="btn ghost" disabled=${saving} onClick=${clear}>Clear SLA</button>`}
           <button class="btn" disabled=${saving || !days || days < 1} onClick=${save} style="flex:1">${saving ? 'Saving…' : 'Save SLA'}</button>
         </div>
+      </div>
+    </div>
+  `;
+}
+
+// Pops up right after a bill is read from an upload: link the whole bill to one
+// project + cost category, or split its items across different projects/categories.
+function BillLinkWizard({ plant, me, doc, onClose, onSaved }) {
+  const [projects, setProjects] = useState([]);
+  const [mode, setMode] = useState('whole'); // whole | split
+  const isCost = PC_COST_DOC_TYPES.includes(doc.doc_type);
+  const defCat = doc.cost_category || (PC_JW_TYPES.includes(doc.doc_type) ? 'machining' : 'purchase');
+  const [wholeProj, setWholeProj] = useState(doc.project_id || '');
+  const [wholeCat, setWholeCat] = useState(defCat);
+  const [rows, setRows] = useState(() => (Array.isArray(doc.items) ? doc.items : []).map(it => ({ ...it, project_id: it.project_id || '', cost_category: it.cost_category || '' })));
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    sb.from('mcp_projects').select('id, code, name, status').eq('plant_id', plant.id).neq('status', 'cancelled')
+      .order('code', { ascending: true, nullsFirst: false }).order('name').then(({ data }) => setProjects(data || []));
+  }, []);
+
+  const setRow = (i, patch) => setRows(rs => rs.map((x, idx) => idx === i ? { ...x, ...patch } : x));
+  const SEL = 'flex:1;min-width:130px;padding:7px;border:1px solid var(--slate-200);border-radius:6px;font-size:13px;background:#fff';
+  const projSel = (val, onCh, ph) => html`<select value=${val} onChange=${onCh} style=${SEL}>
+    <option value="">${ph || '— No project —'}</option>
+    ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+  </select>`;
+  const catSel = (val, onCh) => html`<select value=${val} onChange=${onCh} style=${SEL}>
+    ${PC_CATS.map(c => html`<option key=${c} value=${c}>${PC_CAT_LABEL[c]}</option>`)}
+  </select>`;
+
+  const save = async () => {
+    setSaving(true);
+    let payload;
+    if (mode === 'whole') {
+      const items = rows.map(it => { const { project_id, cost_category, ...rest } = it; return { ...rest, project_id: wholeProj || null, cost_category: null }; });
+      payload = { project_id: wholeProj || null, cost_category: isCost ? (wholeCat || null) : null, items };
+    } else {
+      const items = rows.map(it => ({ ...it, project_id: it.project_id || null, cost_category: (isCost && it.project_id) ? (it.cost_category || defCat) : null }));
+      const projs = [...new Set(items.map(x => x.project_id).filter(Boolean))];
+      payload = { project_id: projs.length === 1 ? projs[0] : null, cost_category: null, items };
+    }
+    const { error } = await sb.from('mcp_logistics_documents').update(payload).eq('id', doc.id);
+    setSaving(false);
+    if (error) { showToast('Could not save: ' + error.message); return; }
+    showToast('📐 Bill linked to project');
+    onSaved && onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header"><div class="modal-title">📐 Link this bill to a project</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        <div class="card" style="background:var(--slate-50);border-color:var(--slate-200);margin-bottom:12px">
+          <div style="font-size:13px;font-weight:700">${doc.vendor_name_raw || 'Bill'} <span style="color:var(--slate-400);font-weight:400">₹${fmtNum(doc.total_value || 0)}</span></div>
+          <div style="font-size:11px;color:var(--slate-500)">${(doc.doc_type || '').replace(/_/g, ' ')}${doc.doc_number ? ' · ' + doc.doc_number : ''}${doc.doc_date ? ' · ' + fmtDMY(doc.doc_date) : ''} · ${rows.length} item${rows.length === 1 ? '' : 's'}</div>
+        </div>
+
+        ${rows.length > 1 && html`<div class="auth-tabs" style="margin-bottom:12px">
+          <button class=${'auth-tab' + (mode === 'whole' ? ' active' : '')} onClick=${() => setMode('whole')}>Whole bill → one project</button>
+          <button class=${'auth-tab' + (mode === 'split' ? ' active' : '')} onClick=${() => setMode('split')}>Split items by project</button>
+        </div>`}
+
+        ${mode === 'whole' ? html`
+          <div class="field"><label>Project</label>${projSel(wholeProj, e => setWholeProj(e.target.value))}</div>
+          ${isCost && html`<div class="field"><label>Cost category</label>${catSel(wholeCat, e => setWholeCat(e.target.value))}</div>`}
+          <div style="font-size:11px;color:var(--slate-500);margin-bottom:12px">Links the whole bill and all its items to this project.</div>
+        ` : html`
+          <div style="font-size:12px;color:var(--slate-600);margin-bottom:8px">Set each item's project${isCost ? ' and cost type' : ''}. Leave a project blank to skip that item.</div>
+          <div style="max-height:44vh;overflow-y:auto;border:1px solid var(--slate-200);border-radius:10px;margin-bottom:12px">
+            ${rows.map((it, i) => html`<div key=${i} style="padding:9px 10px;${i > 0 ? 'border-top:1px solid var(--slate-100);' : ''}">
+              <div style="font-size:12.5px;font-weight:600;margin-bottom:5px">${it.name || 'Item'}${it.qty ? ' × ' + fmtNum(it.qty) + ' ' + (it.uom || 'nos') : ''}<span style="color:var(--slate-400);font-weight:400">${it.amount ? ' · ₹' + fmtNum(it.amount) : ''}</span></div>
+              <div style="display:flex;gap:6px;flex-wrap:wrap">
+                ${projSel(it.project_id, e => setRow(i, { project_id: e.target.value }), '— No project —')}
+                ${isCost && catSel(it.cost_category || defCat, e => setRow(i, { cost_category: e.target.value }))}
+              </div>
+            </div>`)}
+          </div>
+        `}
+
+        <div style="display:flex;gap:8px">
+          <button class="btn ghost" style="flex:1" onClick=${onClose}>Skip for now</button>
+          <button class="btn" style="flex:2" disabled=${saving} onClick=${save}>${saving ? 'Saving…' : '📐 Link bill'}</button>
+        </div>
+        <div style="font-size:11px;color:var(--slate-400);text-align:center;margin-top:8px">You can change this later on the bill or in the project.</div>
       </div>
     </div>
   `;
