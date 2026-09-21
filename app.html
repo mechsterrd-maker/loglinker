@@ -5480,7 +5480,7 @@ function Shell({ user, plant, me, myPerms, tab, setTab, logout, reload, accessib
       <${Page} active=${pageTab === 'maintenance'}><${Maintenance} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'stocks'}><${Stocks} plant=${plant} me=${me} activeUnit=${activeUnit} accessibleUnits=${accessibleUnits} navAction=${navAction} /></${Page}>
       <${Page} active=${pageTab === 'actions'}><${ActionHub} plant=${plant} me=${me} activeUnit=${activeUnit} navAction=${navAction} /></${Page}>
-      <${Page} active=${pageTab === 'documents'}><${Documents} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
+      <${Page} active=${pageTab === 'documents'}><${Documents} plant=${plant} me=${me} activeUnit=${activeUnit} navAction=${navAction} /></${Page}>
       <${Page} active=${pageTab === 'schedules'}><${Schedules} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'movements'}><${MovementsPage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
       <${Page} active=${pageTab === 'trace'}><${TracePage} plant=${plant} me=${me} activeUnit=${activeUnit} /></${Page}>
@@ -5710,8 +5710,8 @@ function TopNavDesktop({ plant, me, myPerms, initials, tab, setTab, go, logout, 
     ]},
     { key:'bills', title:'Bills', icon:'🧾', tab:'documents', items:[
       { label:'Upload Bill',  tab:'chat', sub:'upload_bill' },
-      { label:'Pending Bills',tab:'documents' },
-      { label:'Closed Bills', tab:'documents' },
+      { label:'Pending Bills',tab:'documents', sub:'bills_pending' },
+      { label:'Closed Bills', tab:'documents', sub:'bills_closed' },
     ]},
   ].map(g => ({ ...g, items: g.items.filter(it => isOn(it.tab)) }))
    .filter(g => isOn(g.tab) && g.items.length > 0);
@@ -41662,7 +41662,7 @@ function GroupCreateModal({ plant, me, user, onClose, onSaved }) {
 }
 
 // ============= DOCUMENTS / BILLS / VENDORS =============
-function Documents({ plant, me, activeUnit }) {
+function Documents({ plant, me, activeUnit, navAction }) {
   const [docs, setDocs] = useState([]);
   const [vendors, setVendors] = useState([]);
   const [jobworkStock, setJobworkStock] = useState([]);
@@ -41671,6 +41671,7 @@ function Documents({ plant, me, activeUnit }) {
   const [view, setView] = useState('dashboard'); // dashboard | vendors | jobwork | returnables | interunit
   const [typeFilter, setTypeFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState('open');
+  const [billsOnly, setBillsOnly] = useState(false); // sidebar "Pending/Closed Bills" → payables only
   const [search, setSearch] = useState('');
   // Returnables-tab-only filters
   const [retSearch, setRetSearch] = useState('');
@@ -41712,6 +41713,16 @@ function Documents({ plant, me, activeUnit }) {
 
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
+
+  // Sidebar Bills sub-items: Pending Bills → unpaid payables, Closed Bills →
+  // paid. Land on the Documents list, restricted to bills/invoices, with the
+  // matching payment status. One-shot via the navAction timestamp.
+  useEffect(() => {
+    if (!navAction || navAction.tab !== 'documents' || !navAction.sub) return;
+    const s = navAction.sub;
+    if (s === 'bills_pending') { setView('dashboard'); setBillsOnly(true); setTypeFilter('all'); setStatusFilter('open'); }
+    else if (s === 'bills_closed') { setView('dashboard'); setBillsOnly(true); setTypeFilter('all'); setStatusFilter('paid'); }
+  }, [navAction?.ts]);
 
   // "Upload Bill" handoff: a queue id was stashed → poll it, then open the
   // extracted document straight in the processor (DocumentDetail).
@@ -41767,6 +41778,7 @@ function Documents({ plant, me, activeUnit }) {
 
   // Filter docs
   let filteredDocs = docs;
+  if (billsOnly) filteredDocs = filteredDocs.filter(d => ['invoice_in','bill'].includes(d.doc_type));
   if (typeFilter !== 'all') filteredDocs = filteredDocs.filter(d => d.doc_type === typeFilter);
   if (statusFilter === 'open') filteredDocs = filteredDocs.filter(d => ['pending','approved','partial'].includes(d.status));
   else if (statusFilter === 'overdue') filteredDocs = filteredDocs.filter(d => ['pending','approved','partial'].includes(d.status) && d.due_date && new Date(d.due_date) < new Date());
@@ -41846,11 +41858,15 @@ function Documents({ plant, me, activeUnit }) {
       </div>
 
       <div class="auth-tabs" style="margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
-        <button class=${'auth-tab' + (typeFilter === 'all' ? ' active' : '')} onClick=${() => setTypeFilter('all')}>All</button>
+        <button class=${'auth-tab' + (typeFilter === 'all' ? ' active' : '')} onClick=${() => { setTypeFilter('all'); setBillsOnly(false); }}>All</button>
         ${Object.entries(docTypeLabels).map(([k,l]) => html`
-          <button key=${k} class=${'auth-tab' + (typeFilter === k ? ' active' : '')} onClick=${() => setTypeFilter(k)}>${l}</button>
+          <button key=${k} class=${'auth-tab' + (typeFilter === k ? ' active' : '')} onClick=${() => { setTypeFilter(k); setBillsOnly(false); }}>${l}</button>
         `)}
       </div>
+      ${billsOnly && html`<div style="margin-bottom:10px"><span style="display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;color:var(--teal-800);background:var(--teal-50);border:1px solid var(--teal-200);border-radius:999px;padding:4px 10px">
+        🧾 Bills &amp; invoices only
+        <button onClick=${() => setBillsOnly(false)} style="border:none;background:none;color:var(--teal-700);cursor:pointer;font-size:13px;line-height:1;padding:0">✕</button>
+      </span></div>`}
 
       <div class="auth-tabs" style="margin-bottom:14px">
         <button class=${'auth-tab' + (statusFilter === 'open' ? ' active' : '')} onClick=${() => setStatusFilter('open')}>Open</button>
