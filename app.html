@@ -18718,6 +18718,23 @@ function computeQuoteBreakup(matCost, processTotal, qty, ld) {
 // Unit-scoped like the rest of the app.
 const PC_COST_DOC_TYPES = ['invoice_in', 'bill', 'job_work_dc_in', 'job_work_dc_out', 'dc_in'];
 const PC_DOC_LABEL = { invoice_in:'Invoice', bill:'Bill', job_work_dc_in:'JW return', job_work_dc_out:'JW out', dc_in:'DC in' };
+// Cost categories a project's bills/expenses roll up into.
+const PC_CATS = ['purchase', 'transport', 'machining', 'tools', 'consumables', 'other'];
+const PC_CAT_LABEL = { purchase:'Purchase', transport:'Transport', machining:'Machining', tools:'Tools', consumables:'Consumables', other:'Other' };
+const PC_CAT_COLOR = { purchase:'var(--teal-600)', transport:'#0369a1', machining:'#7c3aed', tools:'#b45309', consumables:'#be123c', other:'var(--slate-500)' };
+const PC_JW_TYPES = ['job_work_dc_in', 'job_work_dc_out'];
+// Default category when a bill hasn't been tagged: job-work → machining, else purchase.
+function pcBillCat(d) { return d.cost_category || (PC_JW_TYPES.includes(d.doc_type) ? 'machining' : 'purchase'); }
+// Best-guess category for a project expense / petty-cash line from its free text.
+function pcExpCat(catText) {
+  const s = (catText || '').toLowerCase();
+  if (/transport|freight|lorry|cartage|courier|logistic/.test(s)) return 'transport';
+  if (/consumable|welding|electrode|gas|grinding wheel|paint/.test(s)) return 'consumables';
+  if (/\btool|tooling|insert|drill bit|tap\b/.test(s)) return 'tools';
+  if (/machin|job ?work|cnc|turning|milling/.test(s)) return 'machining';
+  if (/purchase|material|raw|steel|metal/.test(s)) return 'purchase';
+  return 'other';
+}
 function pcINR(n) {
   n = Number(n || 0); const a = Math.abs(n);
   if (a >= 1e7) return '₹' + (n / 1e7).toFixed(2) + ' Cr';
@@ -20664,7 +20681,7 @@ function ProjectCostingModule({ plant, me, activeUnit }) {
     setLoading(true);
     const [p, d, e, pc] = await Promise.all([
       unitScope(sb.from('mcp_projects').select('id, code, name, customer_name, status, order_value, unit_id').eq('plant_id', plant.id)).order('created_at', { ascending: false }),
-      unitScope(sb.from('mcp_logistics_documents').select('id, project_id, doc_type, doc_number, vendor_name_raw, total_value, doc_date, unit_id').eq('plant_id', plant.id).not('project_id', 'is', null)).limit(3000),
+      unitScope(sb.from('mcp_logistics_documents').select('id, project_id, doc_type, doc_number, vendor_name_raw, total_value, doc_date, unit_id, cost_category').eq('plant_id', plant.id).not('project_id', 'is', null)).limit(3000),
       unitScope(sb.from('mcp_expenses').select('id, project_id, amount, category, vendor_name, description, expense_date, unit_id').eq('plant_id', plant.id).not('project_id', 'is', null)).limit(3000),
       unitScope(sb.from('mcp_petty_cash_txns').select('id, project_id, amount, category, vendor_name, description, txn_date, txn_type, unit_id').eq('plant_id', plant.id).eq('txn_type', 'expense').not('project_id', 'is', null)).limit(3000),
     ]);
@@ -20674,6 +20691,13 @@ function ProjectCostingModule({ plant, me, activeUnit }) {
   useEffect(() => { refresh(); }, [refresh]);
   useAutoRefresh(refresh);
 
+  // Re-tag a bill's cost category (updates the doc, then the local copy).
+  const setBillCat = async (docId, cat) => {
+    setDocs(ds => ds.map(d => d.id === docId ? { ...d, cost_category: cat } : d));
+    const { error } = await sb.from('mcp_logistics_documents').update({ cost_category: cat }).eq('id', docId);
+    if (error) { showToast('Could not save category'); refresh(); }
+  };
+
   // Roll every cost source up per project into a uniform line-item shape.
   const rows = useMemo(() => {
     const by = {};
@@ -20681,21 +20705,24 @@ function ProjectCostingModule({ plant, me, activeUnit }) {
     for (const d of docs) {
       const b = by[d.project_id]; if (!b || !PC_COST_DOC_TYPES.includes(d.doc_type)) continue;
       const v = Number(d.total_value || 0); b.billSpend += v;
-      b.items.push({ kind: 'bill', label: PC_DOC_LABEL[d.doc_type] || d.doc_type, ref: d.doc_number, party: d.vendor_name_raw, amount: v, date: d.doc_date });
+      b.items.push({ kind: 'bill', catKey: pcBillCat(d), docId: d.id, label: PC_DOC_LABEL[d.doc_type] || d.doc_type, ref: d.doc_number, party: d.vendor_name_raw, amount: v, date: d.doc_date });
     }
     for (const e of expenses) {
       const b = by[e.project_id]; if (!b) continue;
       const v = Number(e.amount || 0); b.expSpend += v;
-      b.items.push({ kind: 'expense', label: 'Expense', ref: e.category, party: e.vendor_name || e.description, amount: v, date: e.expense_date });
+      b.items.push({ kind: 'expense', catKey: pcExpCat(e.category), label: 'Expense', ref: e.category, party: e.vendor_name || e.description, amount: v, date: e.expense_date });
     }
     for (const t of petty) {
       const b = by[t.project_id]; if (!b) continue;
       const v = Number(t.amount || 0); b.pettySpend += v;
-      b.items.push({ kind: 'petty', label: 'Petty cash', ref: t.category, party: t.vendor_name || t.description, amount: v, date: t.txn_date });
+      b.items.push({ kind: 'petty', catKey: pcExpCat(t.category), label: 'Petty cash', ref: t.category, party: t.vendor_name || t.description, amount: v, date: t.txn_date });
     }
     return Object.values(by).map(b => {
       b.items.sort((x, y) => (y.date || '').localeCompare(x.date || ''));
-      return { ...b, spend: b.billSpend + b.expSpend + b.pettySpend };
+      // Spend by cost category for this project.
+      const byCat = {};
+      for (const it of b.items) byCat[it.catKey || 'other'] = (byCat[it.catKey || 'other'] || 0) + it.amount;
+      return { ...b, spend: b.billSpend + b.expSpend + b.pettySpend, byCat };
     });
   }, [projects, docs, expenses, petty]);
 
@@ -20725,7 +20752,6 @@ function ProjectCostingModule({ plant, me, activeUnit }) {
   const drillRow = drill ? rows.find(r => r.project.id === drill) : null;
   if (drillRow) {
     const p = drillRow.project; const st = STATUS[p.status] || { c:'', l:p.status };
-    const maxAmt = Math.max(1, ...drillRow.items.map(i => i.amount));
     return html`
       <div class="page-header" style="display:flex;align-items:flex-start;gap:10px">
         <button class="btn small ghost" onClick=${() => setDrill(null)} style="flex-shrink:0">← Back</button>
@@ -20733,25 +20759,45 @@ function ProjectCostingModule({ plant, me, activeUnit }) {
           <div class="sub">${p.customer_name || 'No customer'} · <span class="badge ${st.c}" style="font-size:10px">${st.l}</span></div>
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:14px">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:12px">
         <${PerfKpi} num=${pcINR(drillRow.spend)} label="Total spend" tone="rose" big=${true} sub="${drillRow.items.length} entries" />
         <${PerfKpi} num=${pcINR(drillRow.billSpend)} label="Bills / invoices" tone="slate" />
-        <${PerfKpi} num=${pcINR(drillRow.expSpend)} label="Expenses" tone="slate" />
-        <${PerfKpi} num=${pcINR(drillRow.pettySpend)} label="Petty cash" tone="slate" />
+        <${PerfKpi} num=${pcINR(drillRow.expSpend + drillRow.pettySpend)} label="Expenses + petty" tone="slate" />
       </div>
-      <div class="section-h">Cost entries · ${drillRow.items.length}</div>
+
+      <div class="section-h" style="margin-bottom:6px">Spend by category</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+        ${PC_CATS.filter(k => (drillRow.byCat[k] || 0) > 0).map(k => html`<div key=${k} style="border:1px solid var(--slate-200);border-left:4px solid ${PC_CAT_COLOR[k]};border-radius:8px;padding:7px 12px;min-width:104px">
+          <div style="font-size:10px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;color:${PC_CAT_COLOR[k]}">${PC_CAT_LABEL[k]}</div>
+          <div style="font-size:15px;font-weight:700;color:var(--slate-800)">${pcINR(drillRow.byCat[k])}</div>
+        </div>`)}
+        ${Object.keys(drillRow.byCat).length === 0 && html`<div style="font-size:12px;color:var(--slate-400)">No spend yet.</div>`}
+      </div>
+
+      <div class="section-h">Cost entries · ${drillRow.items.length} <span style="font-weight:400;color:var(--slate-400);font-size:11px">· tap a bill's category to change it</span></div>
       ${drillRow.items.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🧾</div>No bills or expenses linked to this project yet.</div></div>` :
-        html`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">
-          <thead><tr style="background:var(--slate-50);text-align:left">${['Date','Type','Party','Ref',''].map(h => html`<th style="padding:7px 8px;font-weight:600;color:var(--slate-600);white-space:nowrap">${h}</th>`)}<th style="padding:7px 8px;font-weight:600;color:var(--slate-600);text-align:right">Amount</th></tr></thead>
-          <tbody>${drillRow.items.map((it, i) => html`<tr key=${i} style="border-top:1px solid var(--slate-100)">
-            <td style="padding:6px 8px;white-space:nowrap">${it.date ? fmtDMY(it.date) : '—'}</td>
-            <td style="padding:6px 8px"><span class="badge ${it.kind === 'bill' ? '' : it.kind === 'expense' ? 'amber' : 'teal'}" style="font-size:10px">${it.label}</span></td>
-            <td style="padding:6px 8px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${it.party || '—'}</td>
-            <td style="padding:6px 8px;color:var(--slate-500)">${it.ref || '—'}</td>
-            <td style="padding:6px 8px;width:40%"><div style="height:8px;background:var(--slate-100);border-radius:3px;overflow:hidden"><div style=${'height:100%;border-radius:3px;width:' + (it.amount / maxAmt * 100) + '%;background:var(--teal-400)'}></div></div></td>
-            <td style="padding:6px 8px;text-align:right;font-weight:600;white-space:nowrap">${pcINR(it.amount)}</td>
-          </tr>`)}</tbody>
-        </table></div>`}
+        PC_CATS.filter(catKey => drillRow.items.some(it => (it.catKey || 'other') === catKey)).map(catKey => {
+          const items = drillRow.items.filter(it => (it.catKey || 'other') === catKey);
+          const sub = items.reduce((s, it) => s + it.amount, 0);
+          return html`<div key=${catKey} style="margin-bottom:12px">
+            <div style="display:flex;justify-content:space-between;align-items:center;background:var(--slate-100);padding:6px 10px;border-radius:8px 8px 0 0;border-left:4px solid ${PC_CAT_COLOR[catKey]}">
+              <span style="font-size:12px;font-weight:700;color:${PC_CAT_COLOR[catKey]}">${PC_CAT_LABEL[catKey]} · ${items.length}</span>
+              <span style="font-size:12px;font-weight:700">${pcINR(sub)}</span>
+            </div>
+            <div style="border:1px solid var(--slate-200);border-top:none;border-radius:0 0 8px 8px;overflow:hidden">
+              ${items.map((it, i) => html`<div key=${i} style="display:flex;align-items:center;gap:8px;padding:7px 10px;${i > 0 ? 'border-top:1px solid var(--slate-100);' : ''}">
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${it.party || '—'}</div>
+                  <div style="font-size:10.5px;color:var(--slate-500)">${it.label}${it.ref ? ' · ' + it.ref : ''}${it.date ? ' · ' + fmtDMY(it.date) : ''}</div>
+                </div>
+                ${it.kind === 'bill' ? html`<select value=${it.catKey} onChange=${e => setBillCat(it.docId, e.target.value)} style="font-size:11px;padding:3px 6px;border:1px solid var(--slate-200);border-radius:6px;background:#fff;flex-shrink:0">
+                  ${PC_CATS.map(c => html`<option key=${c} value=${c}>${PC_CAT_LABEL[c]}</option>`)}
+                </select>` : ''}
+                <div style="font-size:13px;font-weight:700;white-space:nowrap;flex-shrink:0;min-width:60px;text-align:right">${pcINR(it.amount)}</div>
+              </div>`)}
+            </div>
+          </div>`;
+        })}
     `;
   }
 
