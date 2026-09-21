@@ -20744,6 +20744,8 @@ function ProjectCostingModule({ plant, me, activeUnit }) {
   const totalItems = rows.reduce((s, r) => s + r.items.length, 0);
   const projWithSpend = rows.filter(r => r.items.length > 0).length;
   const srcTotals = rows.reduce((a, r) => ({ bill: a.bill + r.billSpend, exp: a.exp + r.expSpend, petty: a.petty + r.pettySpend }), { bill: 0, exp: 0, petty: 0 });
+  // Company-wide spend by cost category (across all projects).
+  const catTotals = {}; rows.forEach(r => { for (const k in r.byCat) catTotals[k] = (catTotals[k] || 0) + r.byCat[k]; });
 
   const STATUS = { planning:{c:'',l:'Planning'}, in_progress:{c:'amber',l:'In progress'}, on_hold:{c:'rose',l:'On hold'}, completed:{c:'emerald',l:'Completed'}, cancelled:{c:'',l:'Cancelled'} };
 
@@ -20820,6 +20822,15 @@ function ProjectCostingModule({ plant, me, activeUnit }) {
       </select>
     </div>
     <input type="search" value=${search} onInput=${e => setSearch(e.target.value)} placeholder="Search project or customer…" style="width:100%;padding:9px 12px;border:1px solid var(--slate-200);border-radius:9px;margin-bottom:12px;font-family:inherit" />
+
+    ${PC_CATS.some(k => (catTotals[k] || 0) > 0) && html`
+      <div class="section-h" style="margin-bottom:6px">Spend by category · all projects</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+        ${PC_CATS.filter(k => (catTotals[k] || 0) > 0).map(k => html`<div key=${k} style="flex:1;min-width:110px;border:1px solid var(--slate-200);border-left:4px solid ${PC_CAT_COLOR[k]};border-radius:10px;padding:8px 12px">
+          <div style="font-size:10px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;color:${PC_CAT_COLOR[k]}">${PC_CAT_LABEL[k]}</div>
+          <div style="font-size:16px;font-weight:700;color:var(--slate-800);white-space:nowrap">${pcINR(catTotals[k])}</div>
+        </div>`)}
+      </div>`}
 
     <div class="section-h">Projects · ${list.length}</div>
     ${list.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📐</div>No projects match.</div></div>` :
@@ -23968,9 +23979,9 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
       sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, total_value, stage_id, created_at').eq('project_id', project.id).eq('hide_from_project', false).order('created_at',{ascending:false}).limit(40),
       sb.from('mcp_project_components').select('*').eq('project_id', project.id).order('created_at'),
       // Accurate expenses: any bill with a line item assigned to this project…
-      sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, items, project_id').eq('plant_id', plant.id).contains('items', [{ project_id: project.id }]).limit(300),
+      sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, items, project_id, cost_category').eq('plant_id', plant.id).contains('items', [{ project_id: project.id }]).limit(300),
       // …plus bills tagged to this project at the document level.
-      sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, items, project_id').eq('project_id', project.id).limit(300),
+      sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, items, project_id, cost_category').eq('project_id', project.id).limit(300),
     ]);
     const all = m.data || [];
     const tops = all.filter(x => !x.parent_id);
@@ -23993,13 +24004,22 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
       if (!rel.length) return;
       const sub = rel.reduce((s, it) => s + (parseFloat(it.amount) || 0), 0);
       exTotal += sub;
-      exDocs.push({ id: dd.id, doc_type: dd.doc_type, doc_number: dd.doc_number, doc_date: dd.doc_date, vendor: dd.vendor_name_raw, items: rel, subtotal: sub });
+      const catKey = dd.cost_category || (PC_JW_TYPES.includes(dd.doc_type) ? 'machining'
+        : ['dc_out', 'dc_out_returnable', 'dc_in'].includes(dd.doc_type) ? 'other' : 'purchase');
+      exDocs.push({ id: dd.id, doc_type: dd.doc_type, doc_number: dd.doc_number, doc_date: dd.doc_date, vendor: dd.vendor_name_raw, items: rel, subtotal: sub, cost_category: dd.cost_category, catKey });
     });
     exDocs.sort((a, b) => new Date(b.doc_date || 0) - new Date(a.doc_date || 0));
     setExpenses({ total: exTotal, docs: exDocs });
   }, [project.id, plant.id]);
   useEffect(()=>{ reload(); }, [reload]);
   useEffect(()=>{ setProgressDraft(project.progress_pct||0); setWeightDraft(project.actual_weight_kg||''); }, [project.id]);
+
+  // Re-tag a bill's cost category from the project expenses list.
+  const setBillCat = async (docId, cat) => {
+    setExpenses(x => ({ ...x, docs: x.docs.map(d => d.id === docId ? { ...d, cost_category: cat, catKey: cat } : d) }));
+    const { error } = await sb.from('mcp_logistics_documents').update({ cost_category: cat }).eq('id', docId);
+    if (error) { showToast('Could not save category'); reload(); }
+  };
 
   const saveField = async (field, value) => {
     setSavingField(field);
@@ -24134,21 +24154,48 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
       ${expensesOpen && html`
         <div style="border-top:1px solid var(--slate-100)">
           ${expenses.docs.length === 0 ? html`<div style="padding:14px;font-size:12px;color:var(--slate-400)">No bills assigned to this project yet. Assign bill items to this project in the bill processor.</div>` :
-            expenses.docs.map(dd => html`
-              <div key=${dd.id} style="padding:12px 14px;border-top:1px solid var(--slate-100)">
-                <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
-                  <div style="font-size:12px;font-weight:700;color:var(--slate-800)">🧾 ${(dd.doc_type || 'document').replace(/_/g, ' ')} · ${dd.vendor || '—'}</div>
-                  <div style="font-size:13px;font-weight:700;color:var(--teal-700);white-space:nowrap">₹${fmtNum(dd.subtotal)}</div>
-                </div>
-                <div style="font-size:10px;color:var(--slate-400);margin-bottom:6px">${dd.doc_number || 'no number'}${dd.doc_date ? ' · ' + fmtDMY(dd.doc_date) : ''}</div>
-                ${dd.items.map((it, k) => html`
-                  <div key=${k} style="display:flex;justify-content:space-between;gap:10px;font-size:12px;color:var(--slate-600);padding:2px 0">
-                    <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">• ${it.name || 'item'}${it.qty ? ' × ' + fmtNum(it.qty) + ' ' + (it.uom || 'nos') : ''}</span>
-                    <span style="white-space:nowrap;color:var(--slate-500)">${it.amount ? '₹' + fmtNum(it.amount) : '—'}</span>
-                  </div>
-                `)}
-              </div>
-            `)}
+            (() => {
+              const byCat = {}; expenses.docs.forEach(dd => { const k = dd.catKey || 'other'; byCat[k] = (byCat[k] || 0) + (dd.subtotal || 0); });
+              const cats = PC_CATS.filter(k => expenses.docs.some(dd => (dd.catKey || 'other') === k));
+              return html`
+                ${PC_CATS.some(k => (byCat[k] || 0) > 0) && html`<div style="display:flex;gap:6px;flex-wrap:wrap;padding:10px 14px;border-bottom:1px solid var(--slate-100);background:var(--slate-50)">
+                  ${PC_CATS.filter(k => (byCat[k] || 0) > 0).map(k => html`<div key=${k} style="border:1px solid var(--slate-200);border-left:3px solid ${PC_CAT_COLOR[k]};border-radius:8px;padding:5px 10px;background:#fff">
+                    <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.3px;color:${PC_CAT_COLOR[k]}">${PC_CAT_LABEL[k]}</div>
+                    <div style="font-size:13px;font-weight:700">₹${fmtNum(byCat[k])}</div>
+                  </div>`)}
+                </div>`}
+                ${cats.map(catKey => {
+                  const docs = expenses.docs.filter(dd => (dd.catKey || 'other') === catKey);
+                  const csub = docs.reduce((s, dd) => s + (dd.subtotal || 0), 0);
+                  return html`<div key=${catKey}>
+                    <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 14px;background:var(--slate-100);border-top:1px solid var(--slate-100);border-left:3px solid ${PC_CAT_COLOR[catKey]}">
+                      <span style="font-size:11px;font-weight:700;color:${PC_CAT_COLOR[catKey]}">${PC_CAT_LABEL[catKey]} · ${docs.length}</span>
+                      <span style="font-size:12px;font-weight:700">₹${fmtNum(csub)}</span>
+                    </div>
+                    ${docs.map(dd => html`
+                      <div key=${dd.id} style="padding:12px 14px;border-top:1px solid var(--slate-100)">
+                        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+                          <div style="font-size:12px;font-weight:700;color:var(--slate-800)">🧾 ${(dd.doc_type || 'document').replace(/_/g, ' ')} · ${dd.vendor || '—'}</div>
+                          <div style="font-size:13px;font-weight:700;color:var(--teal-700);white-space:nowrap">₹${fmtNum(dd.subtotal)}</div>
+                        </div>
+                        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin:4px 0 6px">
+                          <div style="font-size:10px;color:var(--slate-400)">${dd.doc_number || 'no number'}${dd.doc_date ? ' · ' + fmtDMY(dd.doc_date) : ''}</div>
+                          ${!restricted && html`<select value=${dd.catKey} onChange=${e => setBillCat(dd.id, e.target.value)} title="Cost category" style="font-size:11px;padding:3px 6px;border:1px solid var(--slate-200);border-radius:6px;background:#fff;flex-shrink:0">
+                            ${PC_CATS.map(c => html`<option key=${c} value=${c}>${PC_CAT_LABEL[c]}</option>`)}
+                          </select>`}
+                        </div>
+                        ${dd.items.map((it, k) => html`
+                          <div key=${k} style="display:flex;justify-content:space-between;gap:10px;font-size:12px;color:var(--slate-600);padding:2px 0">
+                            <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">• ${it.name || 'item'}${it.qty ? ' × ' + fmtNum(it.qty) + ' ' + (it.uom || 'nos') : ''}</span>
+                            <span style="white-space:nowrap;color:var(--slate-500)">${it.amount ? '₹' + fmtNum(it.amount) : '—'}</span>
+                          </div>
+                        `)}
+                      </div>
+                    `)}
+                  </div>`;
+                })}
+              `;
+            })()}
         </div>
       `}
     </div>
