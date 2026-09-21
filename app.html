@@ -5749,196 +5749,177 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
   // Respects Preview-as-role (myPerms is the effective/preview perms).
   const _hg = moduleAccessGuard(myPerms);
   const canSee = (k) => !_hg.enforce || !RBAC_MODULE_KEYS.has(k) || _hg.canView(k);
-  const [stats, setStats] = useState({ units: 0, users: 1, machines: 0, dies: 0, shotsToday: 0, openActions: 0, openNcrs: 0, openBreakdowns: 0, lowStock: 0 });
+  const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
   const fab = isFab(plant);
-  // "+ New Project" shortcut on Home is gated to admin / plant_head (per Marvel's decision).
   const canCreateProject = me?.role === 'plant_head' || me?.role === 'admin';
   const [showNewProject, setShowNewProject] = useState(false);
 
-  // Reload when the active unit changes so the overview always reflects the unit
-  // you're viewing (not a stale or plant-wide snapshot).
   useEffect(() => { loadStats(); }, [activeUnit?.unit_id]);
 
   const loadStats = async () => {
     setLoading(true);
-    const today = new Date(); today.setHours(0,0,0,0);
-    const uid = activeUnit?.unit_id || null;          // scope unit-specific stats to the active unit
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const uid = activeUnit?.unit_id || null;
     const byUnit = (q) => uid ? q.eq('unit_id', uid) : q;
-    const [u, us, m, d, s, a, n, b, st] = await Promise.all([
-      sb.from('units').select('id', { count:'exact', head:true }),
-      sb.from('users').select('id', { count:'exact', head:true }),
-      byUnit(sb.from('machines').select('id', { count:'exact', head:true })),
-      byUnit(sb.from('mcp_pdc_dies').select('id', { count:'exact', head:true })),
-      byUnit(sb.from('mcp_pdc_shots').select('id', { count:'exact', head:true }).gte('recorded_at', today.toISOString())),
-      byUnit(sb.from('actions').select('id', { count:'exact', head:true }).eq('status', 'open')),
-      byUnit(sb.from('mcp_quality_ncrs').select('id', { count:'exact', head:true }).neq('status', 'closed').neq('status', 'cancelled')),
-      byUnit(sb.from('mcp_maintenance_breakdowns').select('id', { count:'exact', head:true }).neq('status', 'resolved').neq('status', 'cancelled')),
-      byUnit(sb.from('mcp_stocks_items').select('id, current_qty, reorder_level').not('reorder_level', 'is', null)),
-    ]);
-    const lowStockCount = (st.data || []).filter(i => parseFloat(i.current_qty || 0) <= parseFloat(i.reorder_level || 0)).length;
-    setStats({
-      units: u.count || 0,
-      users: us.count || 0,
-      machines: m.count || 0,
-      dies: d.count || 0,
-      shotsToday: s.count || 0,
-      openActions: a.count || 0,
-      openNcrs: n.count || 0,
-      openBreakdowns: b.count || 0,
-      lowStock: lowStockCount,
-    });
+    const EMPTY = { catCount: {}, lowStock: 0, outStock: 0, machines: 0, totalItems: 0, dcRet: 0, dcReg: 0, dcJw: 0, billsPending: 0, rOpen: 0, rPartial: 0, rReceived: 0, rClosed: 0, rOverdue: 0, recent: [] };
+    try {
+      const [items, mCount, dcDocs, rdc, recentDocs, recentTxns] = await Promise.all([
+        byUnit(sb.from('mcp_stocks_items').select('category, current_qty, reorder_level')).limit(5000),
+        byUnit(sb.from('machines').select('id', { count: 'exact', head: true })),
+        byUnit(sb.from('mcp_logistics_documents').select('doc_type, status, extraction_status').in('doc_type', ['dc_out', 'dc_out_returnable', 'job_work_dc_in', 'invoice_in', 'bill'])).limit(5000),
+        sb.from('mcp_rdc_lines').select('status, expected_return_date').eq('plant_id', plant.id).limit(5000),
+        byUnit(sb.from('mcp_logistics_documents').select('doc_type, doc_number, vendor_name_raw, created_at')).order('created_at', { ascending: false }).limit(6),
+        byUnit(sb.from('mcp_stocks_transactions').select('txn_type, qty, created_at, reference')).order('created_at', { ascending: false }).limit(6),
+      ]);
+      const its = items.data || [];
+      const catCount = {}; its.forEach(i => { const c = i.category || 'general'; catCount[c] = (catCount[c] || 0) + 1; });
+      const withRe = its.filter(i => i.reorder_level != null && i.reorder_level !== '');
+      const lowStock = withRe.filter(i => parseFloat(i.current_qty || 0) <= parseFloat(i.reorder_level || 0)).length;
+      const outStock = withRe.filter(i => parseFloat(i.current_qty || 0) <= 0).length;
+      const dd = dcDocs.data || [];
+      const dcRet = dd.filter(d => d.doc_type === 'dc_out_returnable' && d.status !== 'cancelled').length;
+      const dcReg = dd.filter(d => d.doc_type === 'dc_out' && d.status !== 'cancelled').length;
+      const dcJw = dd.filter(d => d.doc_type === 'job_work_dc_in').length;
+      const billsPending = dd.filter(d => ['invoice_in', 'bill'].includes(d.doc_type) && d.extraction_status && d.extraction_status !== 'completed').length;
+      const rd = rdc.data || [];
+      const rOpen = rd.filter(r => r.status === 'open').length;
+      const rPartial = rd.filter(r => r.status === 'partial').length;
+      const rReceived = rd.filter(r => r.status === 'received').length;
+      const rClosed = rd.filter(r => r.status === 'closed').length;
+      const rOverdue = rd.filter(r => (r.status === 'open' || r.status === 'partial') && r.expected_return_date && r.expected_return_date < todayStr).length;
+      const evDocs = (recentDocs.data || []).map(d => ({ t: d.created_at, icon: '🧾', text: (d.doc_type || 'doc').replace(/_/g, ' ') + (d.vendor_name_raw ? ' · ' + d.vendor_name_raw : ''), ref: d.doc_number || '' }));
+      const evTxns = (recentTxns.data || []).map(t => ({ t: t.created_at, icon: ['grn', 'return', 'opening', 'adjustment_in', 'jobwork_in'].includes(t.txn_type) ? '📥' : '📤', text: (t.txn_type || '').replace(/_/g, ' ') + ' ' + fmtNum(Math.abs(t.qty || 0)), ref: t.reference || '' }));
+      const recent = [...evDocs, ...evTxns].sort((a, b) => new Date(b.t) - new Date(a.t)).slice(0, 7);
+      setStats({ catCount, lowStock, outStock, machines: mCount.count || 0, totalItems: its.length, dcRet, dcReg, dcJw, billsPending, rOpen, rPartial, rReceived, rClosed, rOverdue, recent });
+    } catch (e) { setStats(EMPTY); }
     setLoading(false);
   };
 
-  const greeting = me.full_name.split(' ')[0];
-  const alerts = stats.openNcrs + stats.openBreakdowns + stats.lowStock;
+  const hour = new Date().getHours();
+  const greetWord = hour < 12 ? 'Good Morning' : hour < 17 ? 'Good Afternoon' : 'Good Evening';
+  const greeting = (me.full_name || me.email || 'there').split(' ')[0];
+  const S = stats || { catCount: {}, lowStock: 0, outStock: 0, machines: 0, totalItems: 0, dcRet: 0, dcReg: 0, dcJw: 0, billsPending: 0, rOpen: 0, rPartial: 0, rReceived: 0, rClosed: 0, rOverdue: 0, recent: [] };
+  const alertsN = S.lowStock + S.rOpen + S.rOverdue + S.billsPending;
 
   return html`
     <${HomeInstallBanner} />
     <div class="page-header">
       <div>
-        <h1>Hi, ${greeting}</h1>
-        <div class="sub">${plant.name} · ${plant.city}</div>
+        <h1>${greetWord}, ${greeting}</h1>
+        <div class="sub">Manage your materials, DCs, job works and bills efficiently.</div>
       </div>
     </div>
 
     ${(() => {
-      // Cleaner, lighter status strip — replaces the big teal Plant Pulse hero.
-      const isActive = fab ? stats.openActions > 0 : stats.shotsToday > 0;
-      const isSetup = stats.units === 0;
-      const state = isSetup ? 'Setup' : (isActive ? 'Active' : 'Idle');
-      const dot = isSetup ? 'var(--slate-400)' : (isActive ? 'var(--emerald-500)' : 'var(--amber-400)');
-      return html`
-      <div class="home-status">
-        <div class="hs-pulse">
-          <div class="hs-label">Plant pulse · today</div>
-          <div class="hs-state"><span class="hs-dot" style=${'background:' + dot}></span>${state}</div>
+      const QA = [
+        { label: 'Create DC', emoji: '📄', bg: 'var(--teal-50)', bd: 'var(--teal-200)', col: 'var(--teal-800)', on: () => navTo('sales_docs', 'new_dc'), see: 'sales_docs' },
+        { label: 'Stock Entry', emoji: '📦', bg: 'var(--emerald-50)', bd: 'var(--emerald-200)', col: 'var(--emerald-800)', on: () => navTo('stocks'), see: 'stocks' },
+        { label: 'Issue Material', emoji: '📤', bg: '#fff7ed', bd: '#fed7aa', col: '#b45309', on: () => navTo('stocks'), see: 'stocks' },
+        { label: 'Stock Return', emoji: '↩️', bg: '#eef2ff', bd: '#c7d2fe', col: '#4338ca', on: () => navTo('stocks'), see: 'stocks' },
+        { label: 'Upload Bill', emoji: '🧾', bg: '#fdf2f8', bd: '#fbcfe8', col: '#be185d', on: () => navTo('chat', 'upload_bill'), see: 'chat' },
+        { label: 'Create Job Work', emoji: '🔧', bg: 'var(--teal-50)', bd: 'var(--teal-200)', col: 'var(--teal-800)', on: () => navTo('subcontract_plans'), see: 'subcontract_plans' },
+      ].filter(a => canSee(a.see));
+      return html`<div class="card" style="padding:14px;margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+          <span style="font-size:18px">⚡</span>
+          <div><div style="font-size:14px;font-weight:800">Quick Actions</div><div style="font-size:11px;color:var(--slate-500)">Start your daily tasks</div></div>
         </div>
-        <div class="hs-stats">
-          ${fab
-            ? html`<div class="hstat" onClick=${() => navTo('actions')}><div class="n">${stats.openActions}</div><div class="l">Open tasks</div></div>`
-            : html`<div class="hstat" onClick=${() => setTab('production')}><div class="n">${stats.shotsToday}</div><div class="l">Shots today</div></div>`}
-          <div class="hstat" onClick=${() => setTab('masters')}><div class="n">${stats.machines}</div><div class="l">Machines</div></div>
-          <div class=${'hstat' + (alerts > 0 ? ' warn' : '')} onClick=${() => setTab(fab ? 'quality' : 'stocks')}><div class="n">${alerts}</div><div class="l">Alerts</div></div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:10px">
+          ${QA.map(a => html`<button key=${a.label} onClick=${a.on} style=${'display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:16px 8px;border:1px solid ' + a.bd + ';background:' + a.bg + ';border-radius:12px;cursor:pointer;font-family:inherit'}>
+            <span style="font-size:22px">${a.emoji}</span>
+            <span style=${'font-size:12px;font-weight:700;text-align:center;color:' + a.col}>${a.label}</span>
+          </button>`)}
         </div>
       </div>`;
     })()}
 
-    ${alerts > 0 && html`
-      <!-- Promoted to the top: what needs attention, so it's seen before the fold. -->
-      <div class="attn-strip">
-        ${stats.openNcrs > 0 && html`
-          <div class="attn-item rose" onClick=${() => setTab('quality')}>
-            <span style="font-size:18px">⚠️</span>
-            <div class="ai-main"><div class="ai-title">${stats.openNcrs} open NCR${stats.openNcrs > 1 ? 's' : ''}</div><div class="ai-sub">Quality · tap to investigate</div></div>
-            <span class="badge rose">Quality</span>
-          </div>`}
-        ${stats.openBreakdowns > 0 && html`
-          <div class="attn-item amber" onClick=${() => setTab('maintenance')}>
-            <span style="font-size:18px">🔧</span>
-            <div class="ai-main"><div class="ai-title">${stats.openBreakdowns} active breakdown${stats.openBreakdowns > 1 ? 's' : ''}</div><div class="ai-sub">Maintenance · tap to resolve</div></div>
-            <span class="badge amber">Maintenance</span>
-          </div>`}
-        ${stats.lowStock > 0 && html`
-          <div class="attn-item amber" onClick=${() => setTab('stocks')}>
-            <span style="font-size:18px">📦</span>
-            <div class="ai-main"><div class="ai-title">${stats.lowStock} item${stats.lowStock > 1 ? 's' : ''} low on stock</div><div class="ai-sub">Stocks · tap to reorder</div></div>
-            <span class="badge amber">Stocks</span>
-          </div>`}
-      </div>
-    `}
+    ${loading && !stats ? html`<div class="loader"><div class="spinner"></div></div>` : html`
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px">
 
-    ${fab && canCreateProject && html`
-      <!-- Project-centric flow for fab: the primary CTA on Home is "Start a project".
-           Everything else (bills, DCs, expenses, jobwork) hangs off a project, so
-           creating one is the natural starting point — not buried in the More menu.
-           Lightened from the old teal gradient to a clean white card w/ teal accent. -->
-      <div class="home-cta" onClick=${() => setShowNewProject(true)}>
-        <div class="cta-ico">📐</div>
-        <div style="flex:1;min-width:0">
-          <div class="cta-title">Start a new project</div>
-          <div class="cta-sub">Customer · quantity · target date · assign your team</div>
+      <!-- Stock Overview -->
+      <div class="card" style="padding:14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">📦</span><span style="font-size:14px;font-weight:800">Stock Overview</span></div>
+          <button class="btn small ghost" onClick=${() => navTo('stocks')} style="font-size:11px">View Stock →</button>
         </div>
-        <div class="cta-plus">+</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          ${[['Raw Material', '🪨', 'raw_material', 'var(--teal-50)'], ['Consumables', '🧴', 'consumables', '#faf5ff'], ['Tools', '🔧', 'tools', '#fff7ed'], ['General', '🧩', 'general', 'var(--slate-50)']].map(c => html`
+            <div key=${c[2]} onClick=${() => navTo('stocks')} style=${'flex:1;min-width:110px;background:' + c[3] + ';border:1px solid var(--slate-200);border-radius:10px;padding:12px;cursor:pointer'}>
+              <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;font-weight:700;color:var(--slate-600)">${c[0]}</span><span style="font-size:16px">${c[1]}</span></div>
+              <div style="font-size:22px;font-weight:800;margin-top:4px">${fmtNum(S.catCount[c[2]] || 0)}</div>
+              <div style="font-size:10px;color:var(--slate-400)">items</div>
+            </div>`)}
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
+          <div onClick=${() => navTo('stocks')} style="flex:1;min-width:150px;background:var(--rose-50);border:1px solid var(--rose-200);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer">
+            <span style="width:30px;height:30px;border-radius:50%;background:var(--rose-100);display:flex;align-items:center;justify-content:center;font-size:15px">⚠️</span>
+            <div><div style="font-size:11px;color:var(--slate-600);font-weight:600">Low Stock Items</div><div style="font-size:18px;font-weight:800;color:var(--rose-700)">${S.lowStock}</div></div>
+          </div>
+          <div onClick=${() => navTo('stocks')} style="flex:1;min-width:150px;background:var(--rose-50);border:1px solid var(--rose-200);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer">
+            <span style="width:30px;height:30px;border-radius:50%;background:var(--rose-100);display:flex;align-items:center;justify-content:center;font-size:15px">⛔</span>
+            <div><div style="font-size:11px;color:var(--slate-600);font-weight:600">Out of Stock</div><div style="font-size:18px;font-weight:800;color:var(--rose-700)">${S.outStock}</div></div>
+          </div>
+        </div>
       </div>
-    `}
 
-    <div class="card" style="margin-bottom:14px;padding:12px 14px">
-      <div style="font-size:11px;font-weight:700;color:var(--slate-500);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px">⚡ Quick Entry</div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(78px,1fr));gap:6px">
+      <!-- Job Work / Returnable DC status -->
+      <div class="card" style="padding:14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+          <div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">🔧</span><span style="font-size:14px;font-weight:800">Job Work / Returnable DC</span></div>
+          <button class="btn small ghost" onClick=${() => navTo('subcontract_plans')} style="font-size:11px">View All →</button>
+        </div>
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:4px">
+          ${[['Sent', S.rOpen, '#0284c7'], ['Partial', S.rPartial, '#b45309'], ['Received', S.rReceived, '#059669'], ['Closed', S.rClosed, '#64748b']].map(p => html`
+            <div key=${p[0]} style="flex:1;text-align:center">
+              <div style=${'width:44px;height:44px;border-radius:50%;background:' + p[2] + '22;color:' + p[2] + ';display:flex;align-items:center;justify-content:center;font-weight:800;margin:0 auto;font-size:16px'}>${p[1]}</div>
+              <div style="font-size:10.5px;color:var(--slate-500);margin-top:5px">${p[0]}</div>
+            </div>`)}
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:14px">
+          <span style="font-size:11px;background:var(--slate-100);border-radius:10px;padding:3px 9px">Returnable DCs: <b>${S.dcRet}</b></span>
+          <span style="font-size:11px;background:var(--slate-100);border-radius:10px;padding:3px 9px">Regular DCs: <b>${S.dcReg}</b></span>
+          <span style="font-size:11px;background:var(--slate-100);border-radius:10px;padding:3px 9px">Job-work in: <b>${S.dcJw}</b></span>
+          ${S.rOverdue > 0 && html`<span style="font-size:11px;background:var(--rose-50);color:var(--rose-700);border-radius:10px;padding:3px 9px">Overdue return: <b>${S.rOverdue}</b></span>`}
+        </div>
+      </div>
+
+      <!-- Recent Activity -->
+      <div class="card" style="padding:14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">🕘</span><span style="font-size:14px;font-weight:800">Recent Activity</span></div>
+        </div>
+        ${S.recent.length === 0 ? html`<div style="font-size:12px;color:var(--slate-400);padding:10px 0">Nothing recent yet.</div>` :
+          S.recent.map((e, i) => html`<div key=${i} style="display:flex;align-items:center;gap:10px;padding:8px 0;${i > 0 ? 'border-top:1px solid var(--slate-100)' : ''}">
+            <span style="font-size:15px">${e.icon}</span>
+            <div style="flex:1;min-width:0"><div style="font-size:12.5px;font-weight:600;text-transform:capitalize;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${e.text}</div><div style="font-size:10px;color:var(--slate-400)">${e.ref ? e.ref + ' · ' : ''}${fmtDate(e.t)}</div></div>
+          </div>`)}
+      </div>
+
+      <!-- Important Alerts -->
+      <div class="card" style="padding:14px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="font-size:18px">🔔</span><span style="font-size:14px;font-weight:800">Important Alerts</span>
+        </div>
         ${(() => {
-          // Tile catalog — single source of truth. Each key is the override
-          // identifier stored in plants.quick_entry_tiles.
-          const CATALOG = {
-            actions:         { tab:'actions',         sub:'new', emoji:'✅', label:'Task' },
-            chat:            { tab:'chat',                       emoji:'💬', label:'Chat' },
-            attendance:      { tab:'attendance',                 emoji:'📅', label:'Attendance' },
-            self_attendance: { tab:'self_attendance',            emoji:'📍', label:'Punch IN' },
-            attendance_setup:{ tab:'attendance_setup',           emoji:'⚙️', label:'Att. Setup' },
-            petty_cash:      { tab:'petty_cash',                 emoji:'💰', label:'Petty Cash' },
-            projects:    { tab:'projects',                      emoji:'📐', label:'Projects' },
-            new_dc:      { tab:'sales_docs', sub:'new_dc',      emoji:'📦', label:'DC' },
-            new_po:      { tab:'sales_docs', sub:'new_po',      emoji:'🛒', label:'PO' },
-            subcontract_plans: { tab:'subcontract_plans',      emoji:'🧾', label:'Planner' },
-            upload_bill: { tab:'chat',       sub:'upload_bill', emoji:'📄', label:'Upload Bill' },
-            production:  { tab:'production',                    emoji:'📋', label:'Log Production' },
-            quality:     { tab:'quality',                       emoji:'⚠️', label:'NCR' },
-            maintenance: { tab:'maintenance',                   emoji:'🔧', label:'Breakdown' },
-            tpm:         { tab:'tpm',                           emoji:'🛠', label:'TPM Check' },
-            documents:   { tab:'documents',                     emoji:'📄', label:'Upload Bill' },
-            stocks:      { tab:'stocks',                        emoji:'📦', label:'Stocks' },
-            masters:     { tab:'masters',                       emoji:'🗂', label:'Masters' },
-          };
-          const fabDefault = ['projects','new_dc','subcontract_plans','upload_bill','actions','chat'];
-          const nonFabDefault = ['production','quality','maintenance','tpm','documents','chat','stocks','masters'];
-          const override = Array.isArray(plant?.quick_entry_tiles) && plant.quick_entry_tiles.length > 0 ? plant.quick_entry_tiles : null;
-          const keys = (override || (fab ? fabDefault : nonFabDefault)).filter(canSee);
-          return keys.map(k => CATALOG[k]).filter(Boolean).map((b, i) => html`
-          <button key=${b.tab + (b.sub||'') + i} onClick=${() => navTo(b.tab, b.sub)}
-            style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:10px 4px;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:8px;cursor:pointer;font-family:inherit;transition:all 0.1s"
-            onMouseOver=${e => { e.currentTarget.style.background = 'var(--teal-50)'; e.currentTarget.style.borderColor = 'var(--teal-300)'; }}
-            onMouseOut=${e => { e.currentTarget.style.background = 'var(--slate-50)'; e.currentTarget.style.borderColor = 'var(--slate-200)'; }}>
-            <span style="font-size:20px">${b.emoji}</span>
-            <span style="font-size:11px;font-weight:600;color:var(--slate-700)">${b.label}</span>
-          </button>
-        `);
+          const AL = [
+            { n: S.rOverdue, text: 'Job works / returns overdue', tone: 'var(--rose-600)', bg: 'var(--rose-50)', on: () => navTo('subcontract_plans') },
+            { n: S.rOpen, text: 'DCs awaiting material return', tone: '#b45309', bg: '#fff7ed', on: () => navTo('subcontract_plans') },
+            { n: S.billsPending, text: 'Bills still being read', tone: '#b45309', bg: '#fff7ed', on: () => navTo('documents') },
+            { n: S.lowStock, text: 'Materials below minimum stock', tone: 'var(--rose-600)', bg: 'var(--rose-50)', on: () => navTo('stocks') },
+          ].filter(a => a.n > 0);
+          if (!AL.length) return html`<div style="font-size:12px;color:var(--emerald-600);padding:10px 0">✅ Nothing needs attention right now.</div>`;
+          return AL.map((a, i) => html`<div key=${i} onClick=${a.on} style="display:flex;align-items:center;gap:10px;padding:9px 0;cursor:pointer;${i > 0 ? 'border-top:1px solid var(--slate-100)' : ''}">
+            <span style=${'min-width:24px;height:24px;border-radius:6px;background:' + a.bg + ';color:' + a.tone + ';display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px'}>${a.n}</span>
+            <div style="flex:1;font-size:12.5px;color:var(--slate-700)">${a.text}</div>
+            <span style="color:var(--slate-300)">›</span>
+          </div>`);
         })()}
       </div>
-    </div>
+
+    </div>`}
+
     ${showNewProject && html`<${NewProjectModal} plant=${plant} me=${me} onClose=${() => setShowNewProject(false)} onCreated=${(id) => { setShowNewProject(false); navTo('projects'); }} />`}
-
-    ${canSee('petty_cash') && html`<${PettyCashHomeCard} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />`}
-
-    <div class="dashboard-grid">
-      <div class="dashboard-col-main">
-        <${DailyDigest} me=${me} setTab=${setTab} />
-        ${!fab && html`<${TodaysProductionCard} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />`}
-        ${!fab && html`<${ScheduleStatusCard} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />`}
-        ${!fab && html`<${StagePendingBanner} plant=${plant} me=${me} setTab=${setTab} activeUnit=${activeUnit} />`}
-      </div>
-
-      <div class="dashboard-col-side">
-        <${TopConcernsCard} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />
-        ${!fab && html`<${SupplierChaseBanner} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />`}
-        ${!fab && html`<${MaterialBurnRateCard} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />`}
-        ${!fab && html`<${StageLagCard} plant=${plant} me=${me} setTab=${setTab} activeUnit=${activeUnit} />`}
-        <${StockAlerts} plant=${plant} setTab=${setTab} activeUnit=${activeUnit} />
-      </div>
-    </div>
-
-    <div class="section-h" style="margin-top:24px;display:flex;justify-content:space-between;align-items:center">
-      <span>Setup snapshot</span>
-      <button class="btn small ghost" onClick=${() => setTab('masters')} style="font-size:11px;padding:4px 10px">🗂 Manage masters →</button>
-    </div>
-    <div class="stat-grid stats-4-wide" style="grid-template-columns:repeat(4,1fr);gap:8px">
-      <div class="stat" style="padding:8px;cursor:pointer" onClick=${() => setTab('masters')}><div class="stat-num" style="font-size:16px">${stats.units}</div><div class="stat-label" style="font-size:10px">Units</div></div>
-      <div class="stat" style="padding:8px;cursor:pointer" onClick=${() => setTab('masters')}><div class="stat-num" style="font-size:16px">${stats.users}</div><div class="stat-label" style="font-size:10px">Team</div></div>
-      <div class="stat" style="padding:8px;cursor:pointer" onClick=${() => setTab('masters')}><div class="stat-num" style="font-size:16px">${stats.machines}</div><div class="stat-label" style="font-size:10px">Machines</div></div>
-      ${fab
-        ? html`<div class="stat" style="padding:8px;cursor:pointer" onClick=${() => setTab('actions')}><div class="stat-num" style="font-size:16px">${stats.openActions}</div><div class="stat-label" style="font-size:10px">Open Tasks</div></div>`
-        : html`<div class="stat" style="padding:8px;cursor:pointer" onClick=${() => setTab('masters')}><div class="stat-num" style="font-size:16px">${stats.dies}</div><div class="stat-label" style="font-size:10px">Dies</div></div>`}
-    </div>
   `;
 }
 
