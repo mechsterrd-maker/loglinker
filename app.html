@@ -10162,7 +10162,7 @@ function Chat({ plant, me, myPerms, user, onUnreadChange, deepLinkGroupId, navAc
               </select>
             </div>
           `}
-          ${attachment.type?.startsWith('image/') && activeGroup?.ai_logistics_enabled && projects.length > 0 && html`
+          ${(attachment.type?.startsWith('image/') || attachment.type === 'application/pdf') && activeGroup?.ai_logistics_enabled && projects.length > 0 && html`
             <div style="padding:8px 12px;background:var(--teal-50);border-top:1px solid var(--teal-100);display:flex;align-items:center;gap:10px;font-size:12px;flex-wrap:wrap">
               <span style="color:var(--teal-800);font-weight:600">📐 Tag this bill to:</span>
               <select value=${attachmentProject} onChange=${e => { setAttachmentProject(e.target.value); setAttachmentStage(''); }}
@@ -20681,7 +20681,7 @@ function ProjectCostingModule({ plant, me, activeUnit }) {
     setLoading(true);
     const [p, d, e, pc] = await Promise.all([
       unitScope(sb.from('mcp_projects').select('id, code, name, customer_name, status, order_value, unit_id').eq('plant_id', plant.id)).order('created_at', { ascending: false }),
-      unitScope(sb.from('mcp_logistics_documents').select('id, project_id, doc_type, doc_number, vendor_name_raw, total_value, doc_date, unit_id, cost_category').eq('plant_id', plant.id).not('project_id', 'is', null)).limit(3000),
+      unitScope(sb.from('mcp_logistics_documents').select('id, project_id, doc_type, doc_number, vendor_name_raw, total_value, doc_date, unit_id, cost_category, items').eq('plant_id', plant.id).in('doc_type', PC_COST_DOC_TYPES)).limit(3000),
       unitScope(sb.from('mcp_expenses').select('id, project_id, amount, category, vendor_name, description, expense_date, unit_id').eq('plant_id', plant.id).not('project_id', 'is', null)).limit(3000),
       unitScope(sb.from('mcp_petty_cash_txns').select('id, project_id, amount, category, vendor_name, description, txn_date, txn_type, unit_id').eq('plant_id', plant.id).eq('txn_type', 'expense').not('project_id', 'is', null)).limit(3000),
     ]);
@@ -20703,9 +20703,22 @@ function ProjectCostingModule({ plant, me, activeUnit }) {
     const by = {};
     for (const p of projects) by[p.id] = { project: p, items: [], billSpend: 0, expSpend: 0, pettySpend: 0 };
     for (const d of docs) {
-      const b = by[d.project_id]; if (!b || !PC_COST_DOC_TYPES.includes(d.doc_type)) continue;
-      const v = Number(d.total_value || 0); b.billSpend += v;
-      b.items.push({ kind: 'bill', catKey: pcBillCat(d), docId: d.id, label: PC_DOC_LABEL[d.doc_type] || d.doc_type, ref: d.doc_number, party: d.vendor_name_raw, amount: v, date: d.doc_date });
+      if (!PC_COST_DOC_TYPES.includes(d.doc_type)) continue;
+      const its = Array.isArray(d.items) ? d.items : [];
+      const itsWithProj = its.filter(it => it.project_id);
+      if (itsWithProj.length) {
+        // Bill's line items each tagged to a project — attribute per item.
+        for (const it of itsWithProj) {
+          const b = by[it.project_id]; if (!b) continue;
+          const v = Number(it.amount || 0); b.billSpend += v;
+          b.items.push({ kind: 'bill', catKey: pcBillCat(d), docId: d.id, label: PC_DOC_LABEL[d.doc_type] || d.doc_type, ref: d.doc_number, party: d.vendor_name_raw, amount: v, date: d.doc_date });
+        }
+      } else if (d.project_id) {
+        // Bill tagged to a project at the document level.
+        const b = by[d.project_id]; if (!b) continue;
+        const v = Number(d.total_value || 0); b.billSpend += v;
+        b.items.push({ kind: 'bill', catKey: pcBillCat(d), docId: d.id, label: PC_DOC_LABEL[d.doc_type] || d.doc_type, ref: d.doc_number, party: d.vendor_name_raw, amount: v, date: d.doc_date });
+      }
     }
     for (const e of expenses) {
       const b = by[e.project_id]; if (!b) continue;
@@ -23971,6 +23984,7 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
   const [compAction, setCompAction] = useState(null); // { mode:'send'|'dispatch', comp }
   const [expenses, setExpenses] = useState({ total: 0, docs: [] }); // accurate per-item expenses for THIS project
   const [expensesOpen, setExpensesOpen] = useState(false);
+  const [linkBillOpen, setLinkBillOpen] = useState(false); // "link an existing bill to this project" picker
   const restricted = isProjectRestricted(myPerms);
 
   const reload = useCallback(async () => {
@@ -24153,7 +24167,8 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
       </div>
       ${expensesOpen && html`
         <div style="border-top:1px solid var(--slate-100)">
-          ${expenses.docs.length === 0 ? html`<div style="padding:14px;font-size:12px;color:var(--slate-400)">No bills assigned to this project yet. Assign bill items to this project in the bill processor.</div>` :
+          ${!restricted && html`<div style="padding:10px 14px;border-bottom:1px solid var(--slate-100)"><button class="btn small" onClick=${() => setLinkBillOpen(true)} style="font-size:12px">🔗 Link a bill to this project</button><span style="font-size:11px;color:var(--slate-400);margin-left:8px">transport, machining or any bill</span></div>`}
+          ${expenses.docs.length === 0 ? html`<div style="padding:14px;font-size:12px;color:var(--slate-400)">No bills assigned to this project yet. Tap <b>🔗 Link a bill</b> above, or assign bill items to this project in the bill processor.</div>` :
             (() => {
               const byCat = {}; expenses.docs.forEach(dd => { const k = dd.catKey || 'other'; byCat[k] = (byCat[k] || 0) + (dd.subtotal || 0); });
               const cats = PC_CATS.filter(k => expenses.docs.some(dd => (dd.catKey || 'other') === k));
@@ -24294,12 +24309,94 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
 
     ${askModal && html`<${StageAskModal} plant=${plant} me=${me} project=${project} stage=${askModal.stage} kind=${askModal.kind} onClose=${()=>setAskModal(null)} onSent=${()=>setAskModal(null)} />`}
     ${receiveOpen && html`<${ReceiveComponentsModal} plant=${plant} me=${me} project=${project} onClose=${() => setReceiveOpen(false)} onSaved=${() => { setReceiveOpen(false); reload(); }} />`}
+    ${linkBillOpen && html`<${ProjectLinkBillModal} plant=${plant} project=${project} onClose=${() => setLinkBillOpen(false)} onLinked=${() => reload()} />`}
     ${compAction && html`<${ComponentMoveModal} plant=${plant} me=${me} action=${compAction} onClose=${() => setCompAction(null)} onSaved=${() => { setCompAction(null); reload(); }} />`}
   `;
 }
 
 // Inward cut/processed components for a project — typed as they arrive, no stock
 // master. Each row upserts into mcp_project_components via pc_receive.
+// Link an existing bill (esp. a service bill like transport / machining that has
+// no stock items) to a project, and set its cost category — a reliable pathway
+// that doesn't depend on the upload-time tagging.
+function ProjectLinkBillModal({ plant, project, onClose, onLinked }) {
+  const [rows, setRows] = useState(null);
+  const [search, setSearch] = useState('');
+  const [busyId, setBusyId] = useState(null);
+  const [onlyUnlinked, setOnlyUnlinked] = useState(true);
+  const [cats, setCats] = useState({}); // docId -> chosen category
+
+  const load = async () => {
+    const { data } = await sb.from('mcp_logistics_documents')
+      .select('id, doc_type, doc_number, vendor_name_raw, total_value, doc_date, project_id, cost_category, items')
+      .eq('plant_id', plant.id).in('doc_type', PC_COST_DOC_TYPES)
+      .order('doc_date', { ascending: false }).limit(150);
+    setRows(data || []);
+  };
+  useEffect(() => { load(); }, []);
+
+  // Link the WHOLE bill to this project: set the doc's project + every line item's
+  // project (line items take precedence in the per-project rollup), plus category.
+  const link = async (d, cat) => {
+    setBusyId(d.id);
+    const newItems = Array.isArray(d.items) ? d.items.map(it => ({ ...it, project_id: project.id })) : d.items;
+    const { error } = await sb.from('mcp_logistics_documents').update({ project_id: project.id, cost_category: cat || d.cost_category || null, items: newItems }).eq('id', d.id);
+    setBusyId(null);
+    if (error) { showToast('Could not link: ' + error.message); return; }
+    showToast('🔗 Bill linked to ' + (project.code || project.name));
+    setRows(rs => rs.map(x => x.id === d.id ? { ...x, project_id: project.id, cost_category: cat || x.cost_category, items: newItems } : x));
+    onLinked && onLinked();
+  };
+  const unlink = async (d) => {
+    if (!confirm('Unlink this bill from ' + (project.code || project.name) + '?')) return;
+    setBusyId(d.id);
+    const newItems = Array.isArray(d.items) ? d.items.map(it => ({ ...it, project_id: null })) : d.items;
+    await sb.from('mcp_logistics_documents').update({ project_id: null, items: newItems }).eq('id', d.id);
+    setBusyId(null);
+    setRows(rs => rs.map(x => x.id === d.id ? { ...x, project_id: null, items: newItems } : x));
+    onLinked && onLinked();
+  };
+
+  const itemProjOf = (d) => Array.isArray(d.items) ? ((d.items.find(it => it.project_id) || {}).project_id || null) : null;
+  let list = rows || [];
+  if (onlyUnlinked) list = list.filter(d => { const ip = itemProjOf(d); return (!d.project_id && !ip) || d.project_id === project.id || ip === project.id; });
+  if (search.trim()) { const s = search.toLowerCase(); list = list.filter(d => (`${d.vendor_name_raw || ''} ${d.doc_number || ''}`).toLowerCase().includes(s)); }
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:560px">
+        <div class="modal-header"><div class="modal-title">🔗 Link a bill</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        <div style="font-size:12px;color:var(--slate-500);margin:-4px 0 10px">Attach a bill to <b>${project.code ? project.code + ' · ' : ''}${project.name}</b> and set its cost type. Works for service bills (transport, machining) that have no stock items.</div>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+          <input type="search" value=${search} onInput=${e => setSearch(e.target.value)} placeholder="Search vendor or bill no…" style="flex:1;min-width:150px;padding:8px 10px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+          <label style="font-size:11px;color:var(--slate-600);display:flex;align-items:center;gap:4px;white-space:nowrap"><input type="checkbox" checked=${onlyUnlinked} onChange=${e => setOnlyUnlinked(e.target.checked)} /> unlinked only</label>
+        </div>
+        ${rows === null ? html`<div class="loader"><div class="spinner"></div></div>`
+          : list.length === 0 ? html`<div class="empty" style="padding:16px"><div style="font-size:13px;color:var(--slate-500)">No bills${onlyUnlinked ? ' waiting to be linked' : ' found'}. Upload a bill first, then link it here.</div></div>`
+          : html`<div style="max-height:52vh;overflow-y:auto;border:1px solid var(--slate-200);border-radius:10px">
+            ${list.map((d, i) => {
+              const ip = itemProjOf(d);
+              const linked = d.project_id === project.id || ip === project.id;
+              const elsewhere = !linked && (d.project_id || ip);
+              const cat = cats[d.id] || d.cost_category || (PC_JW_TYPES.includes(d.doc_type) ? 'machining' : 'purchase');
+              return html`<div key=${d.id} style="display:flex;align-items:center;gap:8px;padding:9px 10px;${i > 0 ? 'border-top:1px solid var(--slate-100);' : ''}${linked ? 'background:var(--teal-50);' : ''}">
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${d.vendor_name_raw || '—'} <span style="color:var(--slate-400);font-weight:400">₹${fmtNum(d.total_value || 0)}</span></div>
+                  <div style="font-size:10.5px;color:var(--slate-500)">${(d.doc_type || '').replace(/_/g, ' ')}${d.doc_number ? ' · ' + d.doc_number : ''}${d.doc_date ? ' · ' + fmtDMY(d.doc_date) : ''}${elsewhere ? ' · ⚠ linked to another project' : ''}</div>
+                </div>
+                <select value=${cat} onChange=${e => setCats(c => ({ ...c, [d.id]: e.target.value }))} style="font-size:11px;padding:3px 6px;border:1px solid var(--slate-200);border-radius:6px;background:#fff;flex-shrink:0">
+                  ${PC_CATS.map(c => html`<option key=${c} value=${c}>${PC_CAT_LABEL[c]}</option>`)}
+                </select>
+                ${linked ? html`<button class="btn small ghost" disabled=${busyId === d.id} onClick=${() => unlink(d)} style="font-size:11px;color:var(--rose-600);flex-shrink:0">Unlink</button>`
+                  : html`<button class="btn small" disabled=${busyId === d.id} onClick=${() => link(d, cat)} style="font-size:11px;flex-shrink:0">${busyId === d.id ? '…' : 'Link'}</button>`}
+              </div>`;
+            })}
+          </div>`}
+      </div>
+    </div>
+  `;
+}
+
 function ReceiveComponentsModal({ plant, me, project, onClose, onSaved }) {
   const [rows, setRows] = useState([{ name: '', qty: '', uom: 'nos' }]);
   const [stage, setStage] = useState('');
