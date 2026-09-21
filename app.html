@@ -5955,7 +5955,9 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
       const catCount = {}; its.forEach(i => { const c = i.category || 'general'; catCount[c] = (catCount[c] || 0) + 1; });
       const withRe = its.filter(i => i.reorder_level != null && i.reorder_level !== '');
       const lowStock = withRe.filter(i => parseFloat(i.current_qty || 0) <= parseFloat(i.reorder_level || 0)).length;
-      const outStock = withRe.filter(i => parseFloat(i.current_qty || 0) <= 0).length;
+      // Out of stock = any item at/below zero (matches the Stocks "out" filter
+      // the tile deep-links to), not only items that have a reorder level set.
+      const outStock = its.filter(i => parseFloat(i.current_qty || 0) <= 0).length;
       const dd = dcDocs.data || [];
       const dcRet = dd.filter(d => d.doc_type === 'dc_out_returnable' && d.status !== 'cancelled').length;
       const dcReg = dd.filter(d => d.doc_type === 'dc_out' && d.status !== 'cancelled').length;
@@ -6020,22 +6022,22 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
       <div class="card" style="padding:14px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
           <div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">📦</span><span style="font-size:14px;font-weight:800">Stock Overview</span></div>
-          <button class="btn small ghost" onClick=${() => navTo('stocks')} style="font-size:11px">View Stock →</button>
+          <button class="btn small ghost" onClick=${() => navTo('stocks', 'items_all')} style="font-size:11px">View Stock →</button>
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
           ${[['Raw Material', '🪨', 'raw_material', 'var(--teal-50)'], ['Consumables', '🧴', 'consumables', '#faf5ff'], ['Tools', '🔧', 'tools', '#fff7ed'], ['General', '🧩', 'general', 'var(--slate-50)']].map(c => html`
-            <div key=${c[2]} onClick=${() => navTo('stocks')} style=${'flex:1;min-width:110px;background:' + c[3] + ';border:1px solid var(--slate-200);border-radius:10px;padding:12px;cursor:pointer'}>
+            <div key=${c[2]} onClick=${() => navTo('stocks', 'cat_' + c[2])} style=${'flex:1;min-width:110px;background:' + c[3] + ';border:1px solid var(--slate-200);border-radius:10px;padding:12px;cursor:pointer'}>
               <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;font-weight:700;color:var(--slate-600)">${c[0]}</span><span style="font-size:16px">${c[1]}</span></div>
               <div style="font-size:22px;font-weight:800;margin-top:4px">${fmtNum(S.catCount[c[2]] || 0)}</div>
               <div style="font-size:10px;color:var(--slate-400)">items</div>
             </div>`)}
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
-          <div onClick=${() => navTo('stocks')} style="flex:1;min-width:150px;background:var(--rose-50);border:1px solid var(--rose-200);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer">
+          <div onClick=${() => navTo('stocks', 'low')} style="flex:1;min-width:150px;background:var(--rose-50);border:1px solid var(--rose-200);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer">
             <span style="width:30px;height:30px;border-radius:50%;background:var(--rose-100);display:flex;align-items:center;justify-content:center;font-size:15px">⚠️</span>
             <div><div style="font-size:11px;color:var(--slate-600);font-weight:600">Low Stock Items</div><div style="font-size:18px;font-weight:800;color:var(--rose-700)">${S.lowStock}</div></div>
           </div>
-          <div onClick=${() => navTo('stocks')} style="flex:1;min-width:150px;background:var(--rose-50);border:1px solid var(--rose-200);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer">
+          <div onClick=${() => navTo('stocks', 'out')} style="flex:1;min-width:150px;background:var(--rose-50);border:1px solid var(--rose-200);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer">
             <span style="width:30px;height:30px;border-radius:50%;background:var(--rose-100);display:flex;align-items:center;justify-content:center;font-size:15px">⛔</span>
             <div><div style="font-size:11px;color:var(--slate-600);font-weight:600">Out of Stock</div><div style="font-size:18px;font-weight:800;color:var(--rose-700)">${S.outStock}</div></div>
           </div>
@@ -38017,6 +38019,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
   const [activeItem, setActiveItem] = useState(null);
   const [priceTarget, setPriceTarget] = useState(null); // item whose price is being entered
   const [needsPriceOnly, setNeedsPriceOnly] = useState(false); // filter: in-stock items with no price
+  const [stockLevel, setStockLevel] = useState('all'); // all | low | out — from dashboard Low/Out shortcuts
   const [unitFilter, setUnitFilter] = useState(activeUnit?.unit_id || 'all'); // 'all' | unit_id — which unit's stock to show
   const [selectedIds, setSelectedIds] = useState(() => new Set()); // multi-select for bulk move-to-unit
   const [splitTarget, setSplitTarget] = useState(null); // item being split across units
@@ -38056,8 +38059,10 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
   useEffect(() => {
     if (!navAction || navAction.tab !== 'stocks' || !navAction.sub) return;
     const s = navAction.sub;
-    if (s === 'items_all') { setView('items'); setCategoryFilter('all'); setSubcategoryFilter('all'); }
-    else if (s.startsWith('cat_')) { setView('items'); setCategoryFilter(s.slice(4)); setSubcategoryFilter('all'); }
+    if (s === 'items_all') { setView('items'); setCategoryFilter('all'); setSubcategoryFilter('all'); setStockLevel('all'); }
+    else if (s.startsWith('cat_')) { setView('items'); setCategoryFilter(s.slice(4)); setSubcategoryFilter('all'); setStockLevel('all'); }
+    else if (s === 'low') { setView('items'); setCategoryFilter('all'); setStockLevel('low'); }
+    else if (s === 'out') { setView('items'); setCategoryFilter('all'); setStockLevel('out'); }
     else if (s === 'in') { setView('transactions'); setTxnTypeFilter('inward'); }
     else if (s === 'issue') { setView('transactions'); setTxnTypeFilter('outward'); }
     else if (s === 'return') { setView('transactions'); setTxnTypeFilter('return'); }
@@ -38122,6 +38127,8 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
     filteredItems = filteredItems.filter(i => (i.code + ' ' + i.name + ' ' + (i.subcategory || '')).toLowerCase().includes(q));
   }
   if (needsPriceOnly) filteredItems = filteredItems.filter(i => parseFloat(i.current_qty || 0) > 0 && !i.unit_cost);
+  if (stockLevel === 'low') filteredItems = filteredItems.filter(i => i.reorder_level && parseFloat(i.current_qty || 0) <= parseFloat(i.reorder_level));
+  else if (stockLevel === 'out') filteredItems = filteredItems.filter(i => parseFloat(i.current_qty || 0) <= 0);
   const needPriceCount = items.filter(i => parseFloat(i.current_qty || 0) > 0 && !i.unit_cost).length;
   // Unit filter (client-side): a specific unit also shows shared (null-unit) items.
   if (multiUnit && unitFilter !== 'all') filteredItems = filteredItems.filter(i => i.unit_id === unitFilter || !i.unit_id);
@@ -38390,11 +38397,15 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
 
       ${(layout === 'list' || layout === 'table') && html`
         <div class="auth-tabs" style="margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
-          <button class=${'auth-tab' + (categoryFilter === 'all' ? ' active' : '')} onClick=${() => { setCategoryFilter('all'); setSubcategoryFilter('all'); }}>All · ${items.length}</button>
+          <button class=${'auth-tab' + (categoryFilter === 'all' ? ' active' : '')} onClick=${() => { setCategoryFilter('all'); setSubcategoryFilter('all'); setStockLevel('all'); }}>All · ${items.length}</button>
           ${Object.keys(categoryLabels).map(c => categoryCounts[c] > 0 && html`
-            <button key=${c} class=${'auth-tab' + (categoryFilter === c ? ' active' : '')} onClick=${() => { setCategoryFilter(c); setSubcategoryFilter('all'); }}>${lbl(c)} · ${categoryCounts[c]}</button>
+            <button key=${c} class=${'auth-tab' + (categoryFilter === c ? ' active' : '')} onClick=${() => { setCategoryFilter(c); setSubcategoryFilter('all'); setStockLevel('all'); }}>${lbl(c)} · ${categoryCounts[c]}</button>
           `)}
         </div>
+        ${stockLevel !== 'all' && html`<div style="margin-bottom:10px"><span style="display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;color:var(--rose-700);background:var(--rose-50);border:1px solid var(--rose-200);border-radius:999px;padding:4px 10px">
+          ${stockLevel === 'low' ? '⚠️ Low stock only' : '⛔ Out of stock only'}
+          <button onClick=${() => setStockLevel('all')} style="border:none;background:none;color:var(--rose-700);cursor:pointer;font-size:13px;line-height:1;padding:0">✕</button>
+        </span></div>`}
         ${categoryFilter !== 'all' && subcatKeys.length > 1 && html`
           <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;gap:6px">
             <button class=${'auth-tab small' + (subcategoryFilter === 'all' ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => setSubcategoryFilter('all')}>All</button>
