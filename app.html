@@ -729,6 +729,30 @@ html[data-hr-dark] .card-title,html[data-hr-dark] .field label{color:var(--hrink
   .stats-4-wide{grid-template-columns:repeat(4,1fr) !important}
 }
 
+/* ================= ANIMATIONS ================= */
+@keyframes llkFadeUp { from { opacity:0; transform:translateY(14px); } to { opacity:1; transform:translateY(0); } }
+@keyframes llkPop { 0% { opacity:0; transform:scale(.85); } 60% { transform:scale(1.04); } 100% { opacity:1; transform:scale(1); } }
+@keyframes llkSpinIn { from { opacity:0; transform:scale(.6) rotate(-25deg); } to { opacity:1; transform:scale(1) rotate(0); } }
+/* Entrance: fade + rise, with a small stagger via the .llk-d* delay classes */
+.llk-in { opacity:0; animation: llkFadeUp .55s cubic-bezier(.22,1,.36,1) both; }
+.llk-pop { opacity:0; animation: llkPop .5s cubic-bezier(.22,1,.36,1) both; }
+.llk-d1{animation-delay:.04s} .llk-d2{animation-delay:.10s} .llk-d3{animation-delay:.16s}
+.llk-d4{animation-delay:.22s} .llk-d5{animation-delay:.28s} .llk-d6{animation-delay:.34s}
+.llk-d7{animation-delay:.40s} .llk-d8{animation-delay:.46s}
+/* Hover lift for tappable cards / tiles (transform + shadow only → GPU-cheap) */
+.llk-lift { transition: transform .18s cubic-bezier(.22,1,.36,1), box-shadow .18s ease; will-change: transform; }
+.llk-lift:hover { transform: translateY(-4px); box-shadow: 0 12px 26px rgba(15,23,42,.12); }
+.llk-lift:active { transform: translateY(-1px) scale(.985); }
+/* Subtle press for the quick-action tiles */
+.llk-press { transition: transform .14s ease, box-shadow .18s ease; }
+.llk-press:hover { transform: translateY(-3px); box-shadow: 0 10px 22px rgba(15,23,42,.10); }
+.llk-press:active { transform: scale(.96); }
+@media (prefers-reduced-motion: reduce) {
+  .llk-in, .llk-pop { animation: none; opacity: 1; transform: none; }
+  .llk-lift, .llk-press { transition: none; }
+  .llk-lift:hover, .llk-press:hover, .llk-lift:active, .llk-press:active { transform: none; box-shadow: none; }
+}
+
 /* ================= FLO ASSISTANT ================= */
 .dfield{position:relative;display:flex;align-items:center;border:1px solid var(--slate-200);border-radius:8px;padding:8px 12px;background:#fff;font-size:13px;min-height:40px;box-sizing:border-box;width:100%}
 .dfield-txt{color:var(--slate-800)}
@@ -5919,6 +5943,32 @@ function TabBtn({ icon, label, active, onClick, badge }) {
   return html`<button class=${'tab' + (active ? ' active' : '')} onClick=${onClick} style="position:relative">${icons[icon]}<span class="tab-label">${label}</span>${badge > 0 ? html`<span style="position:absolute;top:4px;right:calc(50% - 18px);background:var(--rose-500);color:white;font-size:9px;font-weight:700;padding:1px 5px;border-radius:999px;min-width:16px;text-align:center;line-height:1.4">${badge > 99 ? '99+' : badge}</span>` : ''}</button>`;
 }
 
+// Counts up from 0 to `value` on mount / whenever the value changes — a subtle
+// "roll-up" for the dashboard numbers. Honours reduced-motion (shows instantly)
+// and formats with fmtNum. Small counts don't animate (nothing to roll).
+function CountUp({ value, dur = 750 }) {
+  const target = Number(value) || 0;
+  const [n, setN] = useState(target);
+  const raf = useRef(0);
+  useEffect(() => {
+    let reduce = false;
+    try { reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (_) {}
+    if (reduce || target <= 0) { setN(target); return; }
+    const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    const tick = (now) => {
+      const p = Math.min(((now || Date.now()) - t0) / dur, 1);
+      const eased = 1 - Math.pow(1 - p, 3);
+      setN(target * eased);
+      if (p < 1) raf.current = requestAnimationFrame(tick);
+      else setN(target);
+    };
+    cancelAnimationFrame(raf.current);
+    raf.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf.current);
+  }, [target, dur]);
+  return html`${fmtNum(Math.round(n))}`;
+}
+
 // ============= HOME =============
 function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
   // Fallback so Home still works if rendered without `go` (e.g. older callers).
@@ -5985,7 +6035,7 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
 
   return html`
     <${HomeInstallBanner} />
-    <div class="page-header">
+    <div class="page-header llk-in">
       <div>
         <h1>${greetWord}, ${greeting}</h1>
         <div class="sub">Manage your materials, DCs, job works and bills efficiently.</div>
@@ -6001,13 +6051,13 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
         { label: 'Upload Bill', emoji: '🧾', bg: '#fdf2f8', bd: '#fbcfe8', col: '#be185d', on: () => navTo('chat', 'upload_bill'), see: 'chat' },
         { label: 'Create Job Work', emoji: '🔧', bg: 'var(--teal-50)', bd: 'var(--teal-200)', col: 'var(--teal-800)', on: () => navTo('subcontract_plans'), see: 'subcontract_plans' },
       ].filter(a => canSee(a.see));
-      return html`<div class="card" style="padding:14px;margin-bottom:14px">
+      return html`<div class="card llk-in" style="padding:14px;margin-bottom:14px">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
           <span style="font-size:18px">⚡</span>
           <div><div style="font-size:14px;font-weight:800">Quick Actions</div><div style="font-size:11px;color:var(--slate-500)">Start your daily tasks</div></div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:10px">
-          ${QA.map(a => html`<button key=${a.label} onClick=${a.on} style=${'display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:16px 8px;border:1px solid ' + a.bd + ';background:' + a.bg + ';border-radius:12px;cursor:pointer;font-family:inherit'}>
+          ${QA.map((a, i) => html`<button key=${a.label} class="llk-press" onClick=${a.on} style=${'display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:16px 8px;border:1px solid ' + a.bd + ';background:' + a.bg + ';border-radius:12px;cursor:pointer;font-family:inherit'}>
             <span style="font-size:22px">${a.emoji}</span>
             <span style=${'font-size:12px;font-weight:700;text-align:center;color:' + a.col}>${a.label}</span>
           </button>`)}
@@ -6019,41 +6069,41 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px">
 
       <!-- Stock Overview -->
-      <div class="card" style="padding:14px">
+      <div class="card llk-in llk-d2" style="padding:14px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
           <div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">📦</span><span style="font-size:14px;font-weight:800">Stock Overview</span></div>
           <button class="btn small ghost" onClick=${() => navTo('stocks', 'items_all')} style="font-size:11px">View Stock →</button>
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
           ${[['Raw Material', '🪨', 'raw_material', 'var(--teal-50)'], ['Consumables', '🧴', 'consumables', '#faf5ff'], ['Tools', '🔧', 'tools', '#fff7ed'], ['General', '🧩', 'general', 'var(--slate-50)']].map(c => html`
-            <div key=${c[2]} onClick=${() => navTo('stocks', 'cat_' + c[2])} style=${'flex:1;min-width:110px;background:' + c[3] + ';border:1px solid var(--slate-200);border-radius:10px;padding:12px;cursor:pointer'}>
+            <div key=${c[2]} class="llk-lift" onClick=${() => navTo('stocks', 'cat_' + c[2])} style=${'flex:1;min-width:110px;background:' + c[3] + ';border:1px solid var(--slate-200);border-radius:10px;padding:12px;cursor:pointer'}>
               <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;font-weight:700;color:var(--slate-600)">${c[0]}</span><span style="font-size:16px">${c[1]}</span></div>
-              <div style="font-size:22px;font-weight:800;margin-top:4px">${fmtNum(S.catCount[c[2]] || 0)}</div>
+              <div style="font-size:22px;font-weight:800;margin-top:4px"><${CountUp} value=${S.catCount[c[2]] || 0} /></div>
               <div style="font-size:10px;color:var(--slate-400)">items</div>
             </div>`)}
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
-          <div onClick=${() => navTo('stocks', 'low')} style="flex:1;min-width:150px;background:var(--rose-50);border:1px solid var(--rose-200);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer">
+          <div class="llk-lift" onClick=${() => navTo('stocks', 'low')} style="flex:1;min-width:150px;background:var(--rose-50);border:1px solid var(--rose-200);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer">
             <span style="width:30px;height:30px;border-radius:50%;background:var(--rose-100);display:flex;align-items:center;justify-content:center;font-size:15px">⚠️</span>
-            <div><div style="font-size:11px;color:var(--slate-600);font-weight:600">Low Stock Items</div><div style="font-size:18px;font-weight:800;color:var(--rose-700)">${S.lowStock}</div></div>
+            <div><div style="font-size:11px;color:var(--slate-600);font-weight:600">Low Stock Items</div><div style="font-size:18px;font-weight:800;color:var(--rose-700)"><${CountUp} value=${S.lowStock} /></div></div>
           </div>
-          <div onClick=${() => navTo('stocks', 'out')} style="flex:1;min-width:150px;background:var(--rose-50);border:1px solid var(--rose-200);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer">
+          <div class="llk-lift" onClick=${() => navTo('stocks', 'out')} style="flex:1;min-width:150px;background:var(--rose-50);border:1px solid var(--rose-200);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer">
             <span style="width:30px;height:30px;border-radius:50%;background:var(--rose-100);display:flex;align-items:center;justify-content:center;font-size:15px">⛔</span>
-            <div><div style="font-size:11px;color:var(--slate-600);font-weight:600">Out of Stock</div><div style="font-size:18px;font-weight:800;color:var(--rose-700)">${S.outStock}</div></div>
+            <div><div style="font-size:11px;color:var(--slate-600);font-weight:600">Out of Stock</div><div style="font-size:18px;font-weight:800;color:var(--rose-700)"><${CountUp} value=${S.outStock} /></div></div>
           </div>
         </div>
       </div>
 
       <!-- Job Work / Returnable DC status -->
-      <div class="card" style="padding:14px">
+      <div class="card llk-in llk-d3" style="padding:14px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
           <div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">🔧</span><span style="font-size:14px;font-weight:800">Job Work / Returnable DC</span></div>
           <button class="btn small ghost" onClick=${() => navTo('subcontract_plans')} style="font-size:11px">View All →</button>
         </div>
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:4px">
-          ${[['Sent', S.rOpen, '#0284c7'], ['Partial', S.rPartial, '#b45309'], ['Received', S.rReceived, '#059669'], ['Closed', S.rClosed, '#64748b']].map(p => html`
+          ${[['Sent', S.rOpen, '#0284c7'], ['Partial', S.rPartial, '#b45309'], ['Received', S.rReceived, '#059669'], ['Closed', S.rClosed, '#64748b']].map((p, i) => html`
             <div key=${p[0]} style="flex:1;text-align:center">
-              <div style=${'width:44px;height:44px;border-radius:50%;background:' + p[2] + '22;color:' + p[2] + ';display:flex;align-items:center;justify-content:center;font-weight:800;margin:0 auto;font-size:16px'}>${p[1]}</div>
+              <div class=${'llk-pop llk-d' + (i + 2)} style=${'width:44px;height:44px;border-radius:50%;background:' + p[2] + '22;color:' + p[2] + ';display:flex;align-items:center;justify-content:center;font-weight:800;margin:0 auto;font-size:16px'}><${CountUp} value=${p[1]} /></div>
               <div style="font-size:10.5px;color:var(--slate-500);margin-top:5px">${p[0]}</div>
             </div>`)}
         </div>
@@ -6066,7 +6116,7 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
       </div>
 
       <!-- Recent Activity -->
-      <div class="card" style="padding:14px">
+      <div class="card llk-in llk-d4" style="padding:14px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
           <div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">🕘</span><span style="font-size:14px;font-weight:800">Recent Activity</span></div>
         </div>
@@ -6078,7 +6128,7 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
       </div>
 
       <!-- Important Alerts -->
-      <div class="card" style="padding:14px">
+      <div class="card llk-in llk-d5" style="padding:14px">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
           <span style="font-size:18px">🔔</span><span style="font-size:14px;font-weight:800">Important Alerts</span>
         </div>
