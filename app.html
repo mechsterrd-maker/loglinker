@@ -40400,6 +40400,32 @@ function ItemDetail({ plant, me, item: initialItem, onClose, onEdit, onDeleted }
   const [loading, setLoading] = useState(true);
   const [txnModal, setTxnModal] = useState(null); // null | 'in' | 'out'
   const [deleting, setDeleting] = useState(false);
+  const [billDoc, setBillDoc] = useState(null);   // linked bill/invoice opened from a GRN row
+  const [billLoading, setBillLoading] = useState(false);
+  const [vendors, setVendors] = useState([]);
+
+  // A doc-backed GRN row links straight to the bill it came from — open the
+  // full bill view (DocumentDetail) so the source invoice can be seen. Newer
+  // rows carry document_id; older ones only note the reception id, so fall
+  // back to resolving the bill through the reception.
+  const receptionIdOf = (t) => { const m = /reception ([0-9a-f-]{36})/i.exec(t.notes || ''); return m ? m[1] : null; };
+  const txnHasBill = (t) => !!t.document_id || !!receptionIdOf(t);
+  const openBill = async (t) => {
+    let docId = t.document_id;
+    setBillLoading(true);
+    if (!docId) {
+      const rid = receptionIdOf(t);
+      if (rid) { const { data: rec } = await sb.from('mcp_logistics_grn_receptions').select('document_id').eq('id', rid).maybeSingle(); docId = rec?.document_id || null; }
+    }
+    if (!docId) { setBillLoading(false); showToast('This receipt has no linked bill.'); return; }
+    const [d, v] = await Promise.all([
+      sb.from('mcp_logistics_documents').select('*, mcp_logistics_vendors(name, gstin, payment_terms_days)').eq('id', docId).maybeSingle(),
+      sb.from('mcp_logistics_vendors').select('*').eq('plant_id', plant.id).order('name'),
+    ]);
+    setBillLoading(false);
+    if (d.data) { setVendors(v.data || []); setBillDoc(d.data); }
+    else showToast('The linked bill could not be found.');
+  };
 
   const doDelete = async () => {
     if (!confirm('Delete "' + (item.code || item.name) + '"? This removes the item and its stock history. This cannot be undone.')) return;
@@ -40432,6 +40458,8 @@ function ItemDetail({ plant, me, item: initialItem, onClose, onEdit, onDeleted }
     return () => { sb.removeChannel(channel); };
   }, [initialItem.id]);
 
+  if (billDoc) return html`<${DocumentDetail} plant=${plant} me=${me} doc=${billDoc} vendors=${vendors} onClose=${() => { setBillDoc(null); refresh(); }} />`;
+  if (billLoading) return html`<div class="loader"><div class="spinner"></div><div style="text-align:center;font-size:12px;color:var(--slate-500);margin-top:8px">Opening bill…</div></div>`;
   if (loading && txns.length === 0) return html`<div class="loader"><div class="spinner"></div></div>`;
 
   const isLow = item.reorder_level && parseFloat(item.current_qty || 0) <= parseFloat(item.reorder_level || 0);
@@ -40530,8 +40558,9 @@ function ItemDetail({ plant, me, item: initialItem, onClose, onEdit, onDeleted }
       <div style="border:1px solid var(--slate-200);border-radius:10px;background:white;overflow:hidden">
         ${txnsWithRunning.map((t, idx) => {
           const inward = isInwardType(t.txn_type);
+          const hasBill = txnHasBill(t);
           return html`
-            <div key=${t.id} style="display:flex;align-items:center;gap:10px;padding:12px 14px;${idx > 0 ? 'border-top:0.5px solid var(--slate-100);' : ''}">
+            <div key=${t.id} onClick=${hasBill ? () => openBill(t) : undefined} style="display:flex;align-items:center;gap:10px;padding:12px 14px;${idx > 0 ? 'border-top:0.5px solid var(--slate-100);' : ''}${hasBill ? 'cursor:pointer' : ''}">
               <div style="width:28px;height:28px;border-radius:50%;background:${inward ? 'var(--emerald-100)' : 'var(--rose-100)'};color:${inward ? 'var(--emerald-700)' : 'var(--rose-700)'};display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex-shrink:0">${inward ? '+' : '−'}</div>
               <div style="flex:1;min-width:0">
                 <div style="font-size:13px;font-weight:500">
@@ -40545,6 +40574,7 @@ function ItemDetail({ plant, me, item: initialItem, onClose, onEdit, onDeleted }
                   ${t.reference ? ' · ' + t.reference : ''}
                 </div>
                 ${t.notes && html`<div style="font-size:11px;color:var(--slate-500);margin-top:2px;font-style:italic">${t.notes}</div>`}
+                ${hasBill && html`<div style="font-size:11px;color:var(--teal-600);font-weight:600;margin-top:3px">🧾 View bill →</div>`}
               </div>
               <div style="text-align:right;flex-shrink:0">
                 <div style="font-size:11px;color:var(--slate-500)">balance</div>
