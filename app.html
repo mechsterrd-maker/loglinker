@@ -37881,10 +37881,15 @@ function StockImportModal({ plant, me, activeUnit, existingItems, onClose, onSav
     setImporting(true); setError('');
     try {
       let createdCount = 0, updatedCount = 0;
+      // Tag every item created in this import with one batch id so the whole
+      // import can be reviewed, corrected, or undone as a unit later.
+      const batchId = (crypto?.randomUUID?.() || (Date.now() + '-' + Math.random().toString(36).slice(2)));
+      const batchLabel = (fileName || 'Excel import').slice(0, 120);
       if (newRows.length) {
         const items = newRows.map(r => ({
           plant_id: plant.id, code: r.code, name: r.name, category: r.category, subcategory: r.subcategory, uom: r.uom,
           reorder_level: r.reorder_level, unit_cost: r.unit_cost, current_qty: 0, opening_qty: r.opening_qty,
+          import_batch_id: batchId, import_batch_label: batchLabel,
           ...(activeUnit?.unit_id ? { unit_id: activeUnit.unit_id } : {}),
         }));
         const { data: created, error: iErr } = await sb.from('mcp_stocks_items').insert(items).select('id, code');
@@ -37994,6 +37999,179 @@ function StockImportModal({ plant, me, activeUnit, existingItems, onClose, onSav
   `;
 }
 
+// Review / correct / undo Excel stock imports. Each import is tagged with a
+// batch id, so imported items can be seen on their own (not mixed with all
+// stock), have missing fields filled in, or be deleted as a whole if wrong.
+const IMPORT_CATS = [
+  { v: 'raw_material', l: '🪨 Raw material' },
+  { v: 'store_material', l: '🏬 Store material' },
+  { v: 'consumables', l: '🧴 Consumables' },
+  { v: 'tools', l: '🔧 Tools' },
+  { v: 'general', l: '🧩 General' },
+];
+function StockImportsReview({ plant, me, activeUnit, onClose, onChanged }) {
+  const [batches, setBatches] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [activeBatch, setActiveBatch] = useState(null); // batch_id being viewed
+  const [editId, setEditId] = useState(null);           // item being edited inline
+  const [form, setForm] = useState({});
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [onlyGaps, setOnlyGaps] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    let q = sb.from('mcp_stocks_items')
+      .select('id, code, name, category, subcategory, uom, current_qty, reorder_level, unit_cost, unit_weight, import_batch_id, import_batch_label, created_at')
+      .eq('plant_id', plant.id).not('import_batch_id', 'is', null)
+      .order('created_at', { ascending: false }).limit(5000);
+    if (activeUnit?.unit_id) q = q.or(`unit_id.eq.${activeUnit.unit_id},unit_id.is.null`);
+    const { data } = await q;
+    const m = new Map();
+    (data || []).forEach(it => {
+      const b = m.get(it.import_batch_id) || { batch_id: it.import_batch_id, label: it.import_batch_label || 'Excel import', created_at: it.created_at, items: [] };
+      b.items.push(it);
+      if (new Date(it.created_at) < new Date(b.created_at)) b.created_at = it.created_at;
+      m.set(it.import_batch_id, b);
+    });
+    setBatches([...m.values()].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
+    setLoading(false);
+  };
+  useEffect(() => { load(); }, []);
+
+  // Which key fields are still blank on an imported item.
+  const gapsOf = (it) => {
+    const g = [];
+    if (it.unit_cost == null || it.unit_cost === '' || parseFloat(it.unit_cost) <= 0) g.push('price');
+    if (it.reorder_level == null || it.reorder_level === '') g.push('reorder');
+    if (!it.category || it.category === 'general') g.push('category');
+    if (it.category === 'raw_material' && (it.unit_weight == null || parseFloat(it.unit_weight) <= 0)) g.push('weight');
+    return g;
+  };
+
+  const startEdit = (it) => {
+    setEditId(it.id);
+    setForm({
+      unit_cost: it.unit_cost ?? '', reorder_level: it.reorder_level ?? '',
+      unit_weight: it.unit_weight ?? '', category: it.category || 'general',
+      subcategory: it.subcategory || '', uom: it.uom || 'nos',
+    });
+  };
+  const saveEdit = async (it) => {
+    setSaving(true);
+    const patch = {
+      unit_cost: form.unit_cost === '' ? null : parseFloat(form.unit_cost),
+      reorder_level: form.reorder_level === '' ? null : parseFloat(form.reorder_level),
+      unit_weight: form.unit_weight === '' ? null : parseFloat(form.unit_weight),
+      category: form.category, subcategory: form.subcategory.trim() || null, uom: form.uom.trim() || 'nos',
+      updated_at: new Date().toISOString(),
+    };
+    const { error } = await sb.from('mcp_stocks_items').update(patch).eq('id', it.id);
+    setSaving(false);
+    if (error) { showToast('Could not save: ' + error.message); return; }
+    showToast('✓ Saved ' + (it.code || it.name));
+    setEditId(null);
+    onChanged && onChanged();
+    load();
+  };
+
+  const deleteBatch = async (b) => {
+    if (!confirm('Delete this whole import?\n\nAll ' + b.items.length + ' item' + (b.items.length === 1 ? '' : 's') + ' from "' + b.label + '" and their opening stock will be removed. This cannot be undone.')) return;
+    setDeleting(true);
+    let ok = 0, fail = 0;
+    for (const it of b.items) {
+      const { data, error } = await sb.rpc('delete_stock_item', { p_item_id: it.id });
+      if (error || data?.success === false) fail++; else ok++;
+    }
+    setDeleting(false);
+    showToast('🗑 Deleted ' + ok + ' item' + (ok === 1 ? '' : 's') + (fail ? ' · ' + fail + ' kept (already used in stock moves)' : ''));
+    setActiveBatch(null);
+    onChanged && onChanged();
+    load();
+  };
+
+  const batch = (batches || []).find(b => b.batch_id === activeBatch);
+
+  return html`
+    <div class="modal-backdrop active" style="align-items:flex-start;overflow-y:auto;z-index:400" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style="background:#fafaf9;max-width:820px;width:100%;margin:16px auto;border-radius:14px;padding:16px 16px 28px;min-height:60vh">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+          ${activeBatch ? html`<button class="btn ghost small" onClick=${() => { setActiveBatch(null); setEditId(null); }}>← Imports</button>` : ''}
+          <div style="flex:1;min-width:0">
+            <h2 style="font-size:18px;font-weight:700;margin:0">📥 ${activeBatch ? 'Review import' : 'Excel Imports'}</h2>
+            <div style="font-size:12px;color:var(--slate-500)">${activeBatch ? (batch?.label || '') : 'Each import kept on its own — review, fill gaps, or undo'}</div>
+          </div>
+          <button class="btn ghost small" onClick=${onClose}>✕ Close</button>
+        </div>
+
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+          !activeBatch ? html`
+            ${(batches || []).length === 0 ? html`
+              <div class="card"><div class="empty"><div class="icon">📥</div><div style="font-size:13px">No Excel imports yet. Use <strong>📄 Import from Excel</strong> on a stock section, and each import will show here to review or undo.</div></div></div>
+            ` : html`
+              <div style="font-size:12px;color:var(--slate-500);margin-bottom:10px">${batches.length} import${batches.length === 1 ? '' : 's'} · tap one to review its items, fill missing details, or delete it</div>
+              ${batches.map(b => {
+                const gapCount = b.items.filter(it => gapsOf(it).length).length;
+                return html`
+                  <div class="card" key=${b.batch_id} onClick=${() => { setActiveBatch(b.batch_id); setOnlyGaps(false); }} style="margin-bottom:8px;padding:14px;cursor:pointer;display:flex;align-items:center;gap:12px">
+                    <div style="font-size:26px">📄</div>
+                    <div style="flex:1;min-width:0">
+                      <div style="font-size:13px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${b.label}</div>
+                      <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${fmtDate(b.created_at)} · ${b.items.length} item${b.items.length === 1 ? '' : 's'}</div>
+                    </div>
+                    ${gapCount > 0
+                      ? html`<span class="badge amber" style="font-size:10px">${gapCount} need details</span>`
+                      : html`<span class="badge emerald" style="font-size:10px">complete</span>`}
+                    <span style="color:var(--slate-300)">›</span>
+                  </div>`;
+              })}
+            `}
+          ` : !batch ? html`<div class="empty">This import was removed.</div>` : html`
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
+              <button class="btn small danger" disabled=${deleting} onClick=${() => deleteBatch(batch)} style="width:auto">${deleting ? 'Deleting…' : '🗑 Delete this whole import'}</button>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--slate-600);cursor:pointer;margin-left:auto">
+                <input type="checkbox" checked=${onlyGaps} onChange=${e => setOnlyGaps(e.target.checked)} /> Only items missing details
+              </label>
+            </div>
+            <div style="border:1px solid var(--slate-200);border-radius:10px;background:white;overflow:hidden">
+              ${(onlyGaps ? batch.items.filter(it => gapsOf(it).length) : batch.items).map((it, idx) => {
+                const g = gapsOf(it);
+                const isEd = editId === it.id;
+                return html`
+                  <div key=${it.id} style="${idx > 0 ? 'border-top:0.5px solid var(--slate-100);' : ''}padding:12px 14px">
+                    <div style="display:flex;align-items:center;gap:10px">
+                      <div style="flex:1;min-width:0">
+                        <div style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${it.code || it.name}</div>
+                        <div style="font-size:11px;color:var(--slate-500)">${it.name && it.name !== it.code ? it.name + ' · ' : ''}${fmtNum(it.current_qty)} ${it.uom} · ${(IMPORT_CATS.find(c => c.v === it.category)?.l) || it.category || 'general'}</div>
+                        ${g.length ? html`<div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:5px">
+                          ${g.map(k => html`<span key=${k} style="font-size:10px;font-weight:600;color:var(--amber-700);background:var(--amber-50);border:1px solid var(--amber-200);border-radius:999px;padding:1px 7px">no ${k}</span>`)}
+                        </div>` : html`<div style="font-size:10px;color:var(--emerald-600);margin-top:4px">✓ complete</div>`}
+                      </div>
+                      <button class="btn small ${isEd ? 'ghost' : 'secondary'}" style="width:auto;flex-shrink:0" onClick=${() => isEd ? setEditId(null) : startEdit(it)}>${isEd ? 'Cancel' : '✏️ Fill in'}</button>
+                    </div>
+                    ${isEd && html`
+                      <div style="margin-top:10px;background:var(--slate-50);border-radius:10px;padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px">
+                        <div class="field" style="margin:0"><label>Category</label>
+                          <select value=${form.category} onChange=${e => setForm({ ...form, category: e.target.value })}>
+                            ${IMPORT_CATS.map(c => html`<option key=${c.v} value=${c.v}>${c.l}</option>`)}
+                          </select>
+                        </div>
+                        <div class="field" style="margin:0"><label>Unit (uom)</label><input type="text" value=${form.uom} onChange=${e => setForm({ ...form, uom: e.target.value })} placeholder="nos / kg / m" /></div>
+                        <div class="field" style="margin:0"><label>Unit price (₹ / ${form.uom || 'unit'})</label><input type="number" step="any" value=${form.unit_cost} onChange=${e => setForm({ ...form, unit_cost: e.target.value })} placeholder="e.g. 61" /></div>
+                        <div class="field" style="margin:0"><label>Reorder level</label><input type="number" step="any" value=${form.reorder_level} onChange=${e => setForm({ ...form, reorder_level: e.target.value })} placeholder="alert below this" /></div>
+                        <div class="field" style="margin:0"><label>Weight (kg / ${form.uom || 'unit'})</label><input type="number" step="any" value=${form.unit_weight} onChange=${e => setForm({ ...form, unit_weight: e.target.value })} placeholder="optional" /></div>
+                        <div class="field" style="margin:0"><label>Sub-category</label><input type="text" value=${form.subcategory} onChange=${e => setForm({ ...form, subcategory: e.target.value })} placeholder="optional group" /></div>
+                        <div style="grid-column:1 / -1"><button class="btn" disabled=${saving} onClick=${() => saveEdit(it)}>${saving ? 'Saving…' : '💾 Save details'}</button></div>
+                      </div>`}
+                  </div>`;
+              })}
+            </div>
+          `}
+      </div>
+    </div>
+  `;
+}
+
 function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
   const units = (accessibleUnits || []).filter(u => u.unit_id); // real units (not the "all" pseudo)
   const multiUnit = units.length > 1;
@@ -38014,6 +38192,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
   const [txnLoading, setTxnLoading] = useState(false);
   const [scrapOpen, setScrapOpen] = useState(false); // "Move to scrap yard" entry + register
   const [reportsOpen, setReportsOpen] = useState(false); // 📊 Stock Reports (statement / movement / low / scrap)
+  const [importsOpen, setImportsOpen] = useState(false); // 📥 Excel import batches — review / fill gaps / undo
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [activeItem, setActiveItem] = useState(null);
@@ -38315,6 +38494,11 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
               <div style="font-size:24px">📊</div>
               <div style="font-size:13px;font-weight:700;margin-top:4px;color:#3730a3">Stock Reports</div>
               <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Stock statement · movement · low stock · scrap · Print / Excel / WhatsApp</div>
+            </button>
+            <button class="card" style="text-align:left;padding:14px;cursor:pointer;background:var(--amber-50);border-color:var(--amber-300)" onClick=${() => setImportsOpen(true)}>
+              <div style="font-size:24px">📥</div>
+              <div style="font-size:13px;font-weight:700;margin-top:4px;color:var(--amber-700)">Excel Imports</div>
+              <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Review each import on its own · fill missing prices/reorder/weight · undo a bad import</div>
             </button>
           </div>
 
@@ -38673,6 +38857,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
     ${voiceOpen && html`<${VoiceEntryModal} plant=${plant} me=${me} moduleKey="stock_issue" onClose=${() => setVoiceOpen(false)} onSaved=${() => { setVoiceOpen(false); refresh(); }} />`}
     ${scrapOpen && html`<${ScrapEntryModal} plant=${plant} me=${me} activeUnit=${activeUnit} onClose=${() => setScrapOpen(false)} onSaved=${() => refresh()} />`}
     ${reportsOpen && html`<${StockReports} plant=${plant} me=${me} units=${units} multiUnit=${multiUnit} unitNameOf=${unitNameOf} items=${items} onClose=${() => setReportsOpen(false)} />`}
+    ${importsOpen && html`<${StockImportsReview} plant=${plant} me=${me} activeUnit=${activeUnit} onClose=${() => setImportsOpen(false)} onChanged=${() => refresh()} />`}
     ${priceTarget && html`<${QuickPriceModal} item=${priceTarget} onClose=${() => setPriceTarget(null)} onSaved=${() => { setPriceTarget(null); refresh(); }} />`}
     ${splitTarget && html`<${SplitUnitModal} item=${splitTarget} units=${units} unitNameOf=${unitNameOf} onClose=${() => setSplitTarget(null)} onSaved=${() => { setSplitTarget(null); clearSelect(); refresh(); }} />`}
   `;
