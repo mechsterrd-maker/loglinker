@@ -38018,6 +38018,55 @@ function StockImportsReview({ plant, me, activeUnit, onClose, onChanged }) {
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [onlyGaps, setOnlyGaps] = useState(false);
+  const [aiRun, setAiRun] = useState(false);      // AI weight estimation in progress
+  const [aiWeights, setAiWeights] = useState({}); // code -> { unit_weight, material, shape, confidence, note }
+  const [applying, setApplying] = useState(false);
+
+  // Ask the AI to read each item's name (e.g. "MS Plate 100x1630 Thk 22mm"),
+  // parse material + section + sizes, and compute the per-piece weight. Only
+  // items still missing a weight (and not measured in kg) are sent. Nothing is
+  // saved yet — the computed weights are shown for review, then applied on tap.
+  const runAiWeights = async (b) => {
+    const targets = b.items.filter(it => (it.unit_weight == null || it.unit_weight === '' || parseFloat(it.unit_weight) <= 0)
+      && it.uom && !/^(kg|kgs|ltr|litre|liter|set|sets)$/i.test(String(it.uom).trim()));
+    if (!targets.length) { showToast('No items here need a weight (they may be measured in kg).'); return; }
+    setAiRun(true);
+    const map = {};
+    try {
+      const session = (await sb.auth.getSession()).data.session;
+      for (let i = 0; i < targets.length; i += 40) {
+        const chunk = targets.slice(i, i + 40).map(it => ({ code: it.code, name: it.name, uom: it.uom }));
+        const resp = await fetch(SUPABASE_URL + '/functions/v1/estimate-stock-weights', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (session?.access_token || ''), 'apikey': SUPABASE_ANON_KEY },
+          body: JSON.stringify({ items: chunk }),
+        });
+        const data = await resp.json().catch(() => null);
+        if (data?.success) (data.results || []).forEach(r => { if (r.unit_weight != null && r.unit_weight > 0) map[r.code] = r; });
+        else if (data?.error) showToast('AI: ' + data.error);
+      }
+      setAiWeights(map);
+      showToast('🤖 Worked out weight for ' + Object.keys(map).length + ' of ' + targets.length + ' item' + (targets.length === 1 ? '' : 's'));
+    } catch (e) { showToast('AI weight failed: ' + (e.message || e)); }
+    finally { setAiRun(false); }
+  };
+  const applyAiWeights = async (b) => {
+    const toSet = b.items.filter(it => aiWeights[it.code] && aiWeights[it.code].unit_weight > 0);
+    if (!toSet.length) return;
+    setApplying(true);
+    let ok = 0;
+    for (let i = 0; i < toSet.length; i += 25) {
+      const slice = toSet.slice(i, i + 25);
+      const res = await Promise.all(slice.map(it => sb.from('mcp_stocks_items')
+        .update({ unit_weight: aiWeights[it.code].unit_weight, updated_at: new Date().toISOString() }).eq('id', it.id)));
+      ok += res.filter(r => !r.error).length;
+    }
+    setApplying(false);
+    showToast('✓ Weight saved on ' + ok + ' item' + (ok === 1 ? '' : 's'));
+    setAiWeights({});
+    onChanged && onChanged();
+    load();
+  };
 
   const load = async () => {
     setLoading(true);
@@ -38096,7 +38145,7 @@ function StockImportsReview({ plant, me, activeUnit, onClose, onChanged }) {
     <div class="modal-backdrop active" style="align-items:flex-start;overflow-y:auto;z-index:400" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
       <div style="background:#fafaf9;max-width:820px;width:100%;margin:16px auto;border-radius:14px;padding:16px 16px 28px;min-height:60vh">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
-          ${activeBatch ? html`<button class="btn ghost small" onClick=${() => { setActiveBatch(null); setEditId(null); }}>← Imports</button>` : ''}
+          ${activeBatch ? html`<button class="btn ghost small" onClick=${() => { setActiveBatch(null); setEditId(null); setAiWeights({}); }}>← Imports</button>` : ''}
           <div style="flex:1;min-width:0">
             <h2 style="font-size:18px;font-weight:700;margin:0">📥 ${activeBatch ? 'Review import' : 'Excel Imports'}</h2>
             <div style="font-size:12px;color:var(--slate-500)">${activeBatch ? (batch?.label || '') : 'Each import kept on its own — review, fill gaps, or undo'}</div>
@@ -38113,7 +38162,7 @@ function StockImportsReview({ plant, me, activeUnit, onClose, onChanged }) {
               ${batches.map(b => {
                 const gapCount = b.items.filter(it => gapsOf(it).length).length;
                 return html`
-                  <div class="card" key=${b.batch_id} onClick=${() => { setActiveBatch(b.batch_id); setOnlyGaps(false); }} style="margin-bottom:8px;padding:14px;cursor:pointer;display:flex;align-items:center;gap:12px">
+                  <div class="card" key=${b.batch_id} onClick=${() => { setActiveBatch(b.batch_id); setOnlyGaps(false); setAiWeights({}); }} style="margin-bottom:8px;padding:14px;cursor:pointer;display:flex;align-items:center;gap:12px">
                     <div style="font-size:26px">📄</div>
                     <div style="flex:1;min-width:0">
                       <div style="font-size:13px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${b.label}</div>
@@ -38127,6 +38176,20 @@ function StockImportsReview({ plant, me, activeUnit, onClose, onChanged }) {
               })}
             `}
           ` : !batch ? html`<div class="empty">This import was removed.</div>` : html`
+            ${(() => { const noWt = batch.items.filter(it => (it.unit_weight == null || parseFloat(it.unit_weight) <= 0) && it.uom && !/^(kg|kgs|ltr|litre|liter|set|sets)$/i.test(String(it.uom).trim())).length;
+              return noWt > 0 || Object.keys(aiWeights).length ? html`
+              <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);padding:12px 14px;margin-bottom:10px">
+                <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                  <div style="flex:1;min-width:160px">
+                    <div style="font-size:13px;font-weight:700;color:var(--teal-800)">🤖 Auto-fill weights with AI</div>
+                    <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Reads each item's name (material · section · size) and works out the weight per piece. ${noWt} item${noWt === 1 ? '' : 's'} still without a weight.</div>
+                  </div>
+                  ${Object.keys(aiWeights).length
+                    ? html`<button class="btn small" style="width:auto;background:var(--emerald-600)" disabled=${applying} onClick=${() => applyAiWeights(batch)}>${applying ? 'Saving…' : '✓ Apply ' + Object.keys(aiWeights).length + ' weights'}</button>
+                           <button class="btn small ghost" style="width:auto" onClick=${() => setAiWeights({})}>Discard</button>`
+                    : html`<button class="btn small" style="width:auto" disabled=${aiRun || noWt === 0} onClick=${() => runAiWeights(batch)}>${aiRun ? '🤖 Working…' : '🤖 Work out weights'}</button>`}
+                </div>
+              </div>` : ''; })()}
             <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
               <button class="btn small danger" disabled=${deleting} onClick=${() => deleteBatch(batch)} style="width:auto">${deleting ? 'Deleting…' : '🗑 Delete this whole import'}</button>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--slate-600);cursor:pointer;margin-left:auto">
@@ -38146,6 +38209,7 @@ function StockImportsReview({ plant, me, activeUnit, onClose, onChanged }) {
                         ${g.length ? html`<div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:5px">
                           ${g.map(k => html`<span key=${k} style="font-size:10px;font-weight:600;color:var(--amber-700);background:var(--amber-50);border:1px solid var(--amber-200);border-radius:999px;padding:1px 7px">no ${k}</span>`)}
                         </div>` : html`<div style="font-size:10px;color:var(--emerald-600);margin-top:4px">✓ complete</div>`}
+                        ${aiWeights[it.code] && aiWeights[it.code].unit_weight > 0 && html`<div style="font-size:11px;color:var(--teal-700);font-weight:600;margin-top:5px">🤖 will set <b>${fmtNum(aiWeights[it.code].unit_weight)} kg</b>/${it.uom}${aiWeights[it.code].shape ? ' · ' + aiWeights[it.code].shape : ''}${aiWeights[it.code].confidence === 'low' ? ' · check this' : ''}</div>`}
                       </div>
                       <button class="btn small ${isEd ? 'ghost' : 'secondary'}" style="width:auto;flex-shrink:0" onClick=${() => isEd ? setEditId(null) : startEdit(it)}>${isEd ? 'Cancel' : '✏️ Fill in'}</button>
                     </div>
