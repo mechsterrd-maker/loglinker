@@ -1,14 +1,20 @@
-// extract-document/index.ts — v29 (extract PDF bills via document block, not image)
+// extract-document/index.ts — v30
+// v30: removed server-side pixel rotation. Decoding multi-megapixel phone photos
+// with a pure-JS codec (imagescript) to rotate them blew the edge function's
+// CPU/memory budget and the platform silently KILLED the worker mid-run, leaving
+// the queue row stuck in 'processing' with no error. That is why bills from some
+// users (whose phones save photos rotated) never extracted while upright photos
+// worked. Claude reads rotated documents fine, so we keep the cheap rotation
+// DETECTION and pass the angle to the model as a hint instead of rotating pixels.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { Image } from "https://deno.land/x/imagescript@1.2.17/mod.ts";
 import { SYSTEM_PROMPT, buildContext } from "./prompt.ts";
 
 const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const MODEL = "claude-sonnet-4-6";
-const WORKER_VERSION = "v29";
+const WORKER_VERSION = "v30";
 // Claude Sonnet 4.6 pricing (USD per token). Update here if the model/pricing changes.
 const PRICE_IN_PER_TOK  = 3 / 1_000_000;
 const PRICE_OUT_PER_TOK = 15 / 1_000_000;
@@ -56,16 +62,6 @@ async function detectRotationDeg(imgB64: string, mediaType: string): Promise<{ d
     const deg = m ? parseInt(m[1], 10) : 0;
     return { deg: [0,90,180,270].includes(deg) ? deg : 0, inTok: data.usage?.input_tokens ?? 0, outTok: data.usage?.output_tokens ?? 0 };
   } catch { return { deg: 0, inTok: 0, outTok: 0 }; }
-}
-
-async function rotateImageBytes(bytes: Uint8Array, deg: number): Promise<{ bytes: Uint8Array; mediaType: string } | null> {
-  if (deg === 0) return null;
-  try {
-    const img = await Image.decode(bytes);
-    img.rotate(deg);
-    const out = await img.encodeJPEG(95);
-    return { bytes: out, mediaType: "image/jpeg" };
-  } catch { return null; }
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -187,8 +183,8 @@ async function attemptExtraction(url: string, contextText: string): Promise<Atte
   const imgRes = await fetch(url);
   if (!imgRes.ok) throw new Error(`Image fetch ${imgRes.status} on ${url}`);
   const imgBuf = await imgRes.arrayBuffer();
-  let bytes = new Uint8Array(imgBuf);
-  let imgB64 = bytesToBase64(bytes);
+  const bytes = new Uint8Array(imgBuf);
+  const imgB64 = bytesToBase64(bytes);
   let mediaType = imgRes.headers.get("content-type") || "image/jpeg";
   if (mediaType.includes(";")) mediaType = mediaType.split(";")[0].trim();
   // A PDF bill must go to Claude as a document block, NOT an image — mislabeling
@@ -196,21 +192,28 @@ async function attemptExtraction(url: string, contextText: string): Promise<Atte
   const isPdf = mediaType === "application/pdf" || /\.pdf(\?|$)/i.test(url);
   const rotationLog: number[] = [];
   let rotIn = 0, rotOut = 0;
+  let detectedRotationDeg = 0;
+  let orientationNote = "";
   let contentBlock: unknown;
   if (isPdf) {
-    // Rotation detection/correction is image-only; PDFs carry their own page orientation.
+    // PDFs carry their own page orientation; no rotation handling needed.
     contentBlock = { type: "document", source: { type: "base64", media_type: "application/pdf", data: imgB64 } };
   } else {
     if (!["image/jpeg","image/png","image/webp","image/gif"].includes(mediaType)) mediaType = "image/jpeg";
     const rot = await detectRotationDeg(imgB64, mediaType);
-    rotIn = rot.inTok; rotOut = rot.outTok;
+    rotIn = rot.inTok; rotOut = rot.outTok; detectedRotationDeg = rot.deg;
+    // IMPORTANT: do NOT rotate the pixels here. Decoding a multi-megapixel photo
+    // with a pure-JS codec to rotate it exceeded the edge function's CPU/memory
+    // budget and got the worker killed mid-run (rows stuck 'processing', no error),
+    // which is why some users' bills never extracted. Claude handles rotated
+    // documents on its own — we just tell it the detected angle as a hint.
     if (rot.deg !== 0) {
-      const rotated = await rotateImageBytes(bytes, rot.deg);
-      if (rotated) { bytes = rotated.bytes; mediaType = rotated.mediaType; imgB64 = bytesToBase64(bytes); rotationLog.push(rot.deg); }
+      const ccw = (360 - rot.deg) % 360;
+      orientationNote = `\n\nIMPORTANT — IMAGE ORIENTATION: this photo appears rotated about ${rot.deg}° clockwise from upright. Mentally rotate it ${ccw}° clockwise (i.e. ${rot.deg}° counter-clockwise) so the text reads upright, then extract. Orientation never changes which party is the seller/consignor.`;
     }
     contentBlock = { type: "image", source: { type: "base64", media_type: mediaType, data: imgB64 } };
   }
-  const totalRotationDeg = rotationLog.reduce((s, d) => s + d, 0) % 360;
+  const totalRotationDeg = detectedRotationDeg;
   // Static rules ride in the cacheable system prompt; only the image/PDF + per-plant context vary.
   const visionRes = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -219,7 +222,7 @@ async function attemptExtraction(url: string, contextText: string): Promise<Atte
       system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
       messages: [{ role: "user", content: [
         contentBlock,
-        { type: "text", text: contextText },
+        { type: "text", text: contextText + orientationNote },
       ] }] }),
   });
   if (!visionRes.ok) throw new Error(`Vision API ${visionRes.status}: ${(await visionRes.text()).slice(0, 500)}`);
@@ -434,7 +437,7 @@ async function processQueueRow(supabase: ReturnType<typeof createClient>, row: Q
     await supabase.from("mcp_logistics_extraction_queue").update({
       status: "completed", result_doc_id: doc.id, classification: "document", processed_at: new Date().toISOString(), extraction_ms: Date.now() - startedAt, error_message: null,
       raw_response: keepRawForDebug ? lastRawResponse?.slice(0, 8192) ?? null : null,
-      debug_payload: { worker_version: WORKER_VERSION, model: MODEL, confidence: parsed.confidence ?? null, flags: flagsList, direction: parsed.direction ?? null, resolved_doc_type: docType, vendor_match_id: resolvedVendorId, auto_rotated_deg: totalRotationDeg, auto_rotated_iterations: rotationLog.length, auto_rotated_log: rotationLog, escalated_to_hires: escalated, image_source: escalated ? "hires" : "compressed", image_url_used: attempt.imageUrl, direction_override: directionCheck.overridden, direction_reason: directionCheck.reason, server_seller_is_us: directionCheck.computed_seller_is_us, server_buyer_is_us: directionCheck.computed_buyer_is_us, server_arithmetic_issues: issues, scale_correction: scaleNote },
+      debug_payload: { worker_version: WORKER_VERSION, model: MODEL, confidence: parsed.confidence ?? null, flags: flagsList, direction: parsed.direction ?? null, resolved_doc_type: docType, vendor_match_id: resolvedVendorId, auto_rotated_deg: totalRotationDeg, auto_rotated_iterations: rotationLog.length, auto_rotated_log: rotationLog, rotation_applied: false, escalated_to_hires: escalated, image_source: escalated ? "hires" : "compressed", image_url_used: attempt.imageUrl, direction_override: directionCheck.overridden, direction_reason: directionCheck.reason, server_seller_is_us: directionCheck.computed_seller_is_us, server_buyer_is_us: directionCheck.computed_buyer_is_us, server_arithmetic_issues: issues, scale_correction: scaleNote },
     }).eq("id", row.id);
     return { ok: true, queue_id: row.id, doc_id: doc.id, doc_type: docType, direction: parsed.direction, confidence: parsed.confidence, flags: flagsList, auto_rotated_deg: totalRotationDeg, auto_rotated_log: rotationLog, escalated_to_hires: escalated };
   } catch (err) {
@@ -473,6 +476,11 @@ Deno.serve(async (req: Request) => {
       rows = (data ?? []) as QueueRow[];
     } else {
       const limit = Math.min(body.batch_size ?? 5, 10);
+      // Drain fresh 'pending' rows AND rows stuck in 'processing' whose worker died
+      // mid-run (client disconnected, or the old rotate step killed the isolate) and
+      // that a reclaim has already reset — both surface here as 'pending'. A pg_cron
+      // job invokes this every minute so extraction no longer depends on the
+      // uploader's device staying connected.
       const { data, error } = await supabase.from("mcp_logistics_extraction_queue").select("id, plant_id, unit_id, message_id, group_id, image_url, attempts").eq("status", "pending").order("created_at", { ascending: true }).limit(limit);
       if (error) throw error;
       rows = (data ?? []) as QueueRow[];

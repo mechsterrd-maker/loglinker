@@ -1,7 +1,7 @@
 // sw.js — Loglinkr Service Worker
 // Handles: PWA install, offline shell, Web Push notifications, click routing
 
-const CACHE_NAME = 'loglinkr-v17';
+const CACHE_NAME = 'loglinkr-v18';
 const SHARE_CACHE = 'loglinkr-share';
 const APP_SHELL = ['/app', '/assets/kiosk-face-1.jpg', '/assets/kiosk-face-2.jpg'];
 // CDN hosts whose assets (Preact/htm, jsPDF, face-api script + face models) must
@@ -18,7 +18,7 @@ self.addEventListener('install', (event) => {
 // Activate: clean old caches
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k))))
+    caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE_NAME && k !== SHARE_CACHE).map(k => caches.delete(k))))
   );
   self.clients.claim();
 });
@@ -63,7 +63,10 @@ self.addEventListener('fetch', (event) => {
   if (CDN_HOSTS.some(h => url.hostname.endsWith(h))) {
     event.respondWith(
       caches.match(event.request).then(cached => cached || fetch(event.request).then(res => {
-        if (res && res.ok) { const clone = res.clone(); caches.open(CACHE_NAME).then(c => c.put(event.request, clone)).catch(() => {}); }
+        // Cache ONLY a complete, first-party/CORS 200. A redirect, error page, or
+        // opaque/partial response cached here would be served forever (cache-first)
+        // and silently brick the app boot — the "blank screen on one phone" bug.
+        if (res && res.status === 200 && (res.type === 'basic' || res.type === 'cors')) { const clone = res.clone(); caches.open(CACHE_NAME).then(c => c.put(event.request, clone)).catch(() => {}); }
         return res;
       }).catch(() => cached))
     );
