@@ -53,6 +53,13 @@
     window.__bipEvent = null;
     try { window.dispatchEvent(new Event('loglinkr-installed')); } catch (_) {}
   });
+  // Apply the saved per-device text size as early as possible (before first paint,
+  // so there is no flash). The profile "Text size" control writes 'llk_zoom'; the
+  // phone-width CSS reads --app-zoom (default 1.18). Range 1.0–1.6.
+  try {
+    var _z = parseFloat(localStorage.getItem('llk_zoom'));
+    if (_z >= 1.0 && _z <= 1.6) document.documentElement.style.setProperty('--app-zoom', String(_z));
+  } catch (_) {}
   // ── Blank-screen auto-heal watchdog ─────────────────────────────────────────
   // The app's runtime (Preact/htm) loads from a version-pinned CDN and is cached
   // by the service worker. If one of those files was cached half-downloaded on a
@@ -144,7 +151,7 @@ body{
    widths so the desktop sidebar layout is untouched. Pinch-to-zoom is also re-enabled
    (viewport meta) so anyone who needs it bigger still can zoom further. */
 @media (max-width: 767.98px) {
-  body { zoom: 1.18; }
+  body { zoom: var(--app-zoom, 1.18); }
 }
 
 /* ================= AUTH ================= */
@@ -3020,6 +3027,17 @@ function ProfileModal({ me, user, plant, activeUnit, logout, onClose, onSaved })
   const [pw1, setPw1] = useState('');
   const [pw2, setPw2] = useState('');
   const [pwBusy, setPwBusy] = useState(false);
+  // Text-size (zoom) preference — saved per device in localStorage, applied live.
+  const [zoom, setZoom] = useState(() => {
+    try { const v = parseFloat(localStorage.getItem('llk_zoom')); if (v >= 1.0 && v <= 1.6) return v; } catch (_) {}
+    return 1.18;
+  });
+  const applyZoom = (v) => {
+    const val = Math.min(1.6, Math.max(1.0, Math.round(v * 100) / 100));
+    setZoom(val);
+    try { document.documentElement.style.setProperty('--app-zoom', String(val)); } catch (_) {}
+    try { localStorage.setItem('llk_zoom', String(val)); } catch (_) {}
+  };
 
   const pickPhoto = async (e) => {
     const f = e.target.files?.[0];
@@ -3128,6 +3146,24 @@ function ProfileModal({ me, user, plant, activeUnit, logout, onClose, onSaved })
         <div class="field"><label>Emergency phone</label><input type="tel" value=${ecPhone} onInput=${e => setEcPhone(e.target.value)} placeholder="+91…" /></div>
 
         <button class="btn" onClick=${save} disabled=${busy || uploading} style="width:100%;margin-top:6px">${busy ? 'Saving…' : '✓ Save profile'}</button>
+
+        ${lbl('Text size')}
+        <div style="background:var(--slate-50);border:1px solid var(--slate-200);border-radius:8px;padding:12px 12px 10px">
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <span style="font-size:12px;color:var(--slate-600)">Make the app text bigger or smaller</span>
+            <b style="font-size:13px;color:var(--teal-700)">${Math.round(zoom * 100)}%</b>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+            <span style="font-size:13px;font-weight:800;color:var(--slate-500)">A</span>
+            <input type="range" min="100" max="160" step="2" value=${Math.round(zoom * 100)} onInput=${e => applyZoom(parseInt(e.target.value, 10) / 100)} style="flex:1;accent-color:var(--teal-600)" />
+            <span style="font-size:23px;font-weight:800;color:var(--slate-700)">A</span>
+          </div>
+          <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">
+            <button type="button" class="btn small ghost" onClick=${() => applyZoom(1.0)}>Normal</button>
+            <button type="button" class="btn small ghost" onClick=${() => applyZoom(1.18)}>Recommended</button>
+          </div>
+          <div style="font-size:11px;color:var(--slate-500);margin-top:9px">Saved on this device · applies everywhere in the app, instantly. Best seen on a phone.</div>
+        </div>
 
         ${lbl('Security')}
         ${!pwOpen
