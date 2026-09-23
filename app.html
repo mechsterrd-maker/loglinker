@@ -5969,6 +5969,42 @@ function CountUp({ value, dur = 750 }) {
   return html`${fmtNum(Math.round(n))}`;
 }
 
+// Lightweight animated donut (inline SVG, no chart library). Segments sweep in
+// on mount via a stroke-dasharray transition, staggered per slice; honours
+// reduced-motion. `data` = [{ label, value, color }]. Shows a big number +
+// caption in the middle.
+function DonutChart({ data, size = 132, thickness = 15, centerNum, centerCap }) {
+  const items = (data || []).filter(d => (d.value || 0) > 0);
+  const total = items.reduce((s, d) => s + d.value, 0) || 1;
+  const r = (size - thickness) / 2;
+  const c = 2 * Math.PI * r;
+  const cx = size / 2, cy = size / 2;
+  const [on, setOn] = useState(false);
+  useEffect(() => {
+    let reduce = false;
+    try { reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (_) {}
+    if (reduce) { setOn(true); return; }
+    const t = setTimeout(() => setOn(true), 60);
+    return () => clearTimeout(t);
+  }, [total]);
+  let acc = 0;
+  const segs = items.map(d => { const frac = d.value / total; const off = acc; acc += frac; return { ...d, len: frac * c, off: off * c }; });
+  return html`<div style=${'position:relative;width:' + size + 'px;height:' + size + 'px;flex-shrink:0'}>
+    <svg width=${size} height=${size} viewBox=${'0 0 ' + size + ' ' + size} style="transform:rotate(-90deg)">
+      <circle cx=${cx} cy=${cy} r=${r} fill="none" stroke="var(--slate-100)" stroke-width=${thickness} />
+      ${segs.map((s, i) => html`<circle key=${i} cx=${cx} cy=${cy} r=${r} fill="none" stroke=${s.color}
+        stroke-width=${thickness} stroke-linecap="round"
+        stroke-dasharray=${(on ? s.len : 0) + ' ' + (c - (on ? s.len : 0))}
+        stroke-dashoffset=${-s.off}
+        style=${'transition:stroke-dasharray .9s cubic-bezier(.22,1,.36,1) ' + (i * 0.12) + 's'} />`)}
+    </svg>
+    <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center">
+      <div style="font-size:26px;font-weight:800;line-height:1;color:var(--slate-900)"><${CountUp} value=${centerNum != null ? centerNum : total} /></div>
+      ${centerCap ? html`<div style="font-size:10px;color:var(--slate-500);margin-top:2px">${centerCap}</div>` : ''}
+    </div>
+  </div>`;
+}
+
 // ============= HOME =============
 function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
   // Fallback so Home still works if rendered without `go` (e.g. older callers).
@@ -6004,7 +6040,7 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
       const its = items.data || [];
       const catCount = {}; its.forEach(i => { const c = i.category || 'general'; catCount[c] = (catCount[c] || 0) + 1; });
       const withRe = its.filter(i => i.reorder_level != null && i.reorder_level !== '');
-      const lowStock = withRe.filter(i => parseFloat(i.current_qty || 0) <= parseFloat(i.reorder_level || 0)).length;
+      const lowStock = withRe.filter(i => { const q = parseFloat(i.current_qty || 0); return q > 0 && q <= parseFloat(i.reorder_level || 0); }).length;
       // Out of stock = any item at/below zero (matches the Stocks "out" filter
       // the tile deep-links to), not only items that have a reorder level set.
       const outStock = its.filter(i => parseFloat(i.current_qty || 0) <= 0).length;
@@ -6074,13 +6110,22 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
           <div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">📦</span><span style="font-size:14px;font-weight:800">Stock Overview</span></div>
           <button class="btn small ghost" onClick=${() => navTo('stocks', 'items_all')} style="font-size:11px">View Stock →</button>
         </div>
-        <div style="display:flex;gap:10px;flex-wrap:wrap">
-          ${[['Raw Material', '🪨', 'raw_material', 'var(--teal-50)'], ['Consumables', '🧴', 'consumables', '#faf5ff'], ['Tools', '🔧', 'tools', '#fff7ed'], ['General', '🧩', 'general', 'var(--slate-50)']].map(c => html`
-            <div key=${c[2]} class="llk-lift" onClick=${() => navTo('stocks', 'cat_' + c[2])} style=${'flex:1;min-width:110px;background:' + c[3] + ';border:1px solid var(--slate-200);border-radius:10px;padding:12px;cursor:pointer'}>
-              <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;font-weight:700;color:var(--slate-600)">${c[0]}</span><span style="font-size:16px">${c[1]}</span></div>
-              <div style="font-size:22px;font-weight:800;margin-top:4px"><${CountUp} value=${S.catCount[c[2]] || 0} /></div>
-              <div style="font-size:10px;color:var(--slate-400)">items</div>
-            </div>`)}
+        <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;justify-content:center">
+          <${DonutChart} centerCap="items" data=${[
+            { label: 'Raw Material', value: S.catCount['raw_material'] || 0, color: '#0d9488' },
+            { label: 'Consumables', value: S.catCount['consumables'] || 0, color: '#a855f7' },
+            { label: 'Tools', value: S.catCount['tools'] || 0, color: '#f59e0b' },
+            { label: 'General', value: S.catCount['general'] || 0, color: '#94a3b8' },
+          ]} />
+          <div style="flex:1;min-width:160px;display:flex;flex-direction:column;gap:6px">
+            ${[['Raw Material', 'raw_material', '#0d9488', '🪨'], ['Consumables', 'consumables', '#a855f7', '🧴'], ['Tools', 'tools', '#f59e0b', '🔧'], ['General', 'general', '#94a3b8', '🧩']].map(l => html`
+              <div key=${l[1]} class="llk-lift" onClick=${() => navTo('stocks', 'cat_' + l[1])} style="display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:9px;background:var(--slate-50);border:1px solid var(--slate-200);cursor:pointer">
+                <span style=${'width:11px;height:11px;border-radius:3px;flex-shrink:0;background:' + l[2]}></span>
+                <span style="font-size:14px">${l[3]}</span>
+                <span style="flex:1;font-size:12.5px;font-weight:600;color:var(--slate-700)">${l[0]}</span>
+                <b style="font-size:15px;color:var(--slate-900)"><${CountUp} value=${S.catCount[l[1]] || 0} /></b>
+              </div>`)}
+          </div>
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
           <div class="llk-lift" onClick=${() => navTo('stocks', 'low')} style="flex:1;min-width:150px;background:var(--rose-50);border:1px solid var(--rose-200);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer">
