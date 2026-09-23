@@ -6123,8 +6123,8 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
       const QA = [
         { label: 'Create DC', emoji: '📄', bg: 'var(--teal-50)', bd: 'var(--teal-200)', col: 'var(--teal-800)', on: () => navTo('sales_docs', 'new_dc'), see: 'sales_docs' },
         { label: 'Stock Entry', emoji: '📦', bg: 'var(--emerald-50)', bd: 'var(--emerald-200)', col: 'var(--emerald-800)', on: () => navTo('stocks', 'new_item'), see: 'stocks' },
-        { label: 'Issue Material', emoji: '📤', bg: '#fff7ed', bd: '#fed7aa', col: '#b45309', on: () => navTo('stocks'), see: 'stocks' },
-        { label: 'Stock Return', emoji: '↩️', bg: '#eef2ff', bd: '#c7d2fe', col: '#4338ca', on: () => navTo('stocks'), see: 'stocks' },
+        { label: 'Issue Material', emoji: '📤', bg: '#fff7ed', bd: '#fed7aa', col: '#b45309', on: () => navTo('stocks', 'issue_pick'), see: 'stocks' },
+        { label: 'Stock Return', emoji: '↩️', bg: '#eef2ff', bd: '#c7d2fe', col: '#4338ca', on: () => navTo('stocks', 'return_pick'), see: 'stocks' },
         { label: 'Upload Bill', emoji: '🧾', bg: '#fdf2f8', bd: '#fbcfe8', col: '#be185d', on: () => navTo('chat', 'upload_bill'), see: 'chat' },
         { label: 'Create Job Work', emoji: '🔧', bg: 'var(--teal-50)', bd: 'var(--teal-200)', col: 'var(--teal-800)', on: () => navTo('subcontract_plans'), see: 'subcontract_plans' },
       ].filter(a => canSee(a.see));
@@ -38394,6 +38394,8 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
   const [layout, setLayout] = useState('table'); // table reads clearest after a bulk import (name · category · qty · value)
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [subcategoryFilter, setSubcategoryFilter] = useState('all');
+  const [gradeFilter, setGradeFilter] = useState('all'); // 'all' | MS | SS | Aluminium | … — material grade (raw material only)
+  const [pickHint, setPickHint] = useState(null); // 'issue' | 'return' | null — banner when landed from a dashboard "pick an item" shortcut
   const [search, setSearch] = useState('');
   const [txnSearch, setTxnSearch] = useState('');
   const [txnTypeFilter, setTxnTypeFilter] = useState('all');
@@ -38452,14 +38454,21 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
     // Dashboard "Stock Entry" → open the create-stock form (New Item + Opening)
     // directly, instead of only landing on the stock list.
     if (s === 'new_item') { setEditTarget(null); setModal('item'); }
-    else if (s === 'items_all') { setView('items'); setCategoryFilter('all'); setSubcategoryFilter('all'); setStockLevel('all'); }
-    else if (s.startsWith('cat_')) { setView('items'); setCategoryFilter(s.slice(4)); setSubcategoryFilter('all'); setStockLevel('all'); }
-    else if (s === 'low') { setView('items'); setCategoryFilter('all'); setStockLevel('low'); }
-    else if (s === 'out') { setView('items'); setCategoryFilter('all'); setStockLevel('out'); }
+    // "Issue Material" / "Stock Return" → land on the item list, ready to pick the
+    // item to act on (a banner names the intent; tap an item to issue/return it).
+    else if (s === 'issue_pick') { setView('items'); setCategoryFilter('all'); setSubcategoryFilter('all'); setGradeFilter('all'); setStockLevel('all'); setPickHint('issue'); }
+    else if (s === 'return_pick') { setView('items'); setCategoryFilter('all'); setSubcategoryFilter('all'); setGradeFilter('all'); setStockLevel('all'); setPickHint('return'); }
+    else if (s === 'items_all') { setView('items'); setCategoryFilter('all'); setSubcategoryFilter('all'); setGradeFilter('all'); setStockLevel('all'); setPickHint(null); }
+    else if (s.startsWith('cat_')) { setView('items'); setCategoryFilter(s.slice(4)); setSubcategoryFilter('all'); setGradeFilter('all'); setStockLevel('all'); setPickHint(null); }
+    else if (s === 'low') { setView('items'); setCategoryFilter('all'); setStockLevel('low'); setPickHint(null); }
+    else if (s === 'out') { setView('items'); setCategoryFilter('all'); setStockLevel('out'); setPickHint(null); }
     else if (s === 'in') { setView('transactions'); setTxnTypeFilter('inward'); }
     else if (s === 'issue') { setView('transactions'); setTxnTypeFilter('outward'); }
     else if (s === 'return') { setView('transactions'); setTxnTypeFilter('return'); }
   }, [navAction?.ts]);
+
+  // Clear the "pick an item" banner once the user opens an item (they've picked).
+  useEffect(() => { if (activeItem) setPickHint(null); }, [activeItem]);
 
   // Whole-history ledger: the default load is only the latest 500 txns, so a
   // day-wise search of older history wouldn't reach them. When the user sets a
@@ -38509,9 +38518,27 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
     return parts.join(' · ');
   };
 
-  // Filter by category (+ sub-category) + search
+  // Material grade of an item (MS / SS / Aluminium / …). Prefer the explicit
+  // `material` field; fall back to reading it from the name + code (e.g. "Alu
+  // Plate" → Aluminium, "MS-ANG-…" → MS) so items saved without the field still
+  // group. Returns null when it can't be told (shown as "Other").
+  const normGrade = (raw) => {
+    const s = (raw || '').toLowerCase();
+    if (!s) return null;
+    if (/\bss\b|stainless/.test(s)) return 'SS';
+    if (/\bms\b|mild\s*steel/.test(s)) return 'MS';
+    if (/\balu\w*\b|aluminium|aluminum/.test(s)) return 'Aluminium';
+    if (/\bbrass\b/.test(s)) return 'Brass';
+    if (/\bcopper\b/.test(s)) return 'Copper';
+    if (/cast\s*iron|\bc\.?i\.?\b/.test(s)) return 'Cast Iron';
+    return null;
+  };
+  const gradeOf = (i) => normGrade(i.material) || normGrade((i.name || '') + ' ' + (i.code || ''));
+
+  // Filter by category (+ material grade + sub-category) + search
   let filteredItems = items;
   if (categoryFilter !== 'all') filteredItems = filteredItems.filter(i => (i.category || 'general') === categoryFilter);
+  if (gradeFilter !== 'all') filteredItems = filteredItems.filter(i => (gradeOf(i) || '—') === gradeFilter);
   if (categoryFilter !== 'all' && subcategoryFilter !== 'all') {
     filteredItems = filteredItems.filter(i => (subcategoryFilter === '—' ? !i.subcategory : i.subcategory === subcategoryFilter));
   }
@@ -38534,10 +38561,28 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
     ? items.filter(i => i.unit_id === unitFilter || !i.unit_id)
     : items;
 
-  // Sub-categories available within the currently selected category (with counts)
+  // Material-grade chips (raw material only — grade is a metals concept). Counts
+  // are unit-scoped and reflect the whole raw-material set, so the row is stable
+  // as you drill in.
+  const gradeCounts = {};
+  if (categoryFilter === 'raw_material') {
+    for (const i of unitScopedItems.filter(i => (i.category || 'general') === 'raw_material')) {
+      const g = gradeOf(i) || '—';
+      gradeCounts[g] = (gradeCounts[g] || 0) + 1;
+    }
+  }
+  const GRADE_ORDER = ['MS', 'SS', 'Aluminium', 'Brass', 'Copper', 'Cast Iron'];
+  const gradeKeys = Object.keys(gradeCounts).sort((a, b) => {
+    if ((a === '—') !== (b === '—')) return (a === '—') ? 1 : -1; // "Other" last
+    const ia = GRADE_ORDER.indexOf(a), ib = GRADE_ORDER.indexOf(b);
+    if (ia !== ib) return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    return a.localeCompare(b);
+  });
+
+  // Sub-categories available within the selected category AND grade (with counts)
   const subcatCounts = {};
   if (categoryFilter !== 'all') {
-    for (const i of unitScopedItems.filter(i => (i.category || 'general') === categoryFilter)) {
+    for (const i of unitScopedItems.filter(i => (i.category || 'general') === categoryFilter && (gradeFilter === 'all' || (gradeOf(i) || '—') === gradeFilter))) {
       const s = (i.subcategory || '').trim() || '—';
       subcatCounts[s] = (subcatCounts[s] || 0) + 1;
     }
@@ -38803,11 +38848,20 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
 
       ${(layout === 'list' || layout === 'table') && html`
         <div class="auth-tabs" style="margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
-          <button class=${'auth-tab' + (categoryFilter === 'all' ? ' active' : '')} onClick=${() => { setCategoryFilter('all'); setSubcategoryFilter('all'); setStockLevel('all'); }}>All · ${unitScopedItems.length}</button>
+          <button class=${'auth-tab' + (categoryFilter === 'all' ? ' active' : '')} onClick=${() => { setCategoryFilter('all'); setSubcategoryFilter('all'); setGradeFilter('all'); setStockLevel('all'); }}>All · ${unitScopedItems.length}</button>
           ${Object.keys(categoryLabels).map(c => categoryCounts[c] > 0 && html`
-            <button key=${c} class=${'auth-tab' + (categoryFilter === c ? ' active' : '')} onClick=${() => { setCategoryFilter(c); setSubcategoryFilter('all'); setStockLevel('all'); }}>${lbl(c)} · ${categoryCounts[c]}</button>
+            <button key=${c} class=${'auth-tab' + (categoryFilter === c ? ' active' : '')} onClick=${() => { setCategoryFilter(c); setSubcategoryFilter('all'); setGradeFilter('all'); setStockLevel('all'); }}>${lbl(c)} · ${categoryCounts[c]}</button>
           `)}
         </div>
+        ${categoryFilter === 'raw_material' && gradeKeys.length > 1 && html`
+          <div class="auth-tabs" style="margin-bottom:10px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;gap:6px;align-items:center">
+            <span style="font-size:11px;font-weight:700;color:var(--slate-500);padding:0 2px;white-space:nowrap">Grade</span>
+            <button class=${'auth-tab small' + (gradeFilter === 'all' ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => { setGradeFilter('all'); setSubcategoryFilter('all'); }}>All</button>
+            ${gradeKeys.map(g => html`
+              <button key=${g} class=${'auth-tab small' + (gradeFilter === g ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => { setGradeFilter(g); setSubcategoryFilter('all'); }}>${g === '—' ? 'Other' : g} · ${gradeCounts[g]}</button>
+            `)}
+          </div>
+        `}
         ${stockLevel !== 'all' && html`<div style="margin-bottom:10px"><span style="display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;color:var(--rose-700);background:var(--rose-50);border:1px solid var(--rose-200);border-radius:999px;padding:4px 10px">
           ${stockLevel === 'low' ? '⚠️ Low stock only' : '⛔ Out of stock only'}
           <button onClick=${() => setStockLevel('all')} style="border:none;background:none;color:var(--rose-700);cursor:pointer;font-size:13px;line-height:1;padding:0">✕</button>
@@ -38822,6 +38876,13 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
         `}
       `}
 
+      ${pickHint && html`
+        <div style=${'display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:10px 12px;border-radius:10px;font-size:12.5px;font-weight:600;' + (pickHint === 'issue' ? 'background:#fff7ed;border:1px solid #fed7aa;color:#b45309' : 'background:#eef2ff;border:1px solid #c7d2fe;color:#4338ca')}>
+          <span style="font-size:16px">${pickHint === 'issue' ? '📤' : '↩️'}</span>
+          <span style="flex:1">Pick an item below to ${pickHint === 'issue' ? 'issue material' : 'return material'} — tap it, then choose ${pickHint === 'issue' ? '“− Issue stock”' : '“↩ Return / + Add stock”'}.</span>
+          <button onClick=${() => setPickHint(null)} style="border:none;background:none;color:inherit;cursor:pointer;font-size:15px;line-height:1;padding:0">✕</button>
+        </div>
+      `}
       <div class="section-h">Items · ${filteredItems.length}<span style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn small" style="background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white" onClick=${() => setVoiceOpen(true)} title="Voice issue — Tamil / Hindi / English">🎙️ Voice Issue</button>
         <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('item'); }}>+ Add</button>
