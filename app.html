@@ -38121,7 +38121,7 @@ function StockImportsReview({ plant, me, activeUnit, onClose, onChanged }) {
   const load = async () => {
     setLoading(true);
     let q = sb.from('mcp_stocks_items')
-      .select('id, code, name, category, subcategory, uom, current_qty, reorder_level, unit_cost, unit_weight, import_batch_id, import_batch_label, created_at')
+      .select('id, code, name, category, subcategory, uom, current_qty, reorder_level, unit_cost, rate_per_kg, unit_weight, import_batch_id, import_batch_label, created_at')
       .eq('plant_id', plant.id).not('import_batch_id', 'is', null)
       .order('created_at', { ascending: false }).limit(5000);
     if (activeUnit?.unit_id) q = q.or(`unit_id.eq.${activeUnit.unit_id},unit_id.is.null`);
@@ -38151,17 +38151,28 @@ function StockImportsReview({ plant, me, activeUnit, onClose, onChanged }) {
   const startEdit = (it) => {
     setEditId(it.id);
     setForm({
-      unit_cost: it.unit_cost ?? '', reorder_level: it.reorder_level ?? '',
+      // When the item is priced by weight the price field holds the ₹/kg rate.
+      price: (it.rate_per_kg != null ? it.rate_per_kg : (it.unit_cost ?? '')),
+      reorder_level: it.reorder_level ?? '',
       unit_weight: it.unit_weight ?? '', category: it.category || 'general',
       subcategory: it.subcategory || '', uom: it.uom || 'nos',
     });
   };
   const saveEdit = async (it) => {
     setSaving(true);
+    const wt = form.unit_weight === '' ? null : parseFloat(form.unit_weight);
+    const price = form.price === '' || form.price == null ? null : parseFloat(form.price);
+    // If the item has a weight, the entered price is ₹/kg → store rate_per_kg and
+    // derive unit_cost = ₹/kg × weight, so Value = qty × unit_cost is correct.
+    let rate_per_kg = null, unit_cost = null;
+    if (price != null && !isNaN(price)) {
+      if (wt && wt > 0) { rate_per_kg = price; unit_cost = Math.round(price * wt * 100) / 100; }
+      else { unit_cost = price; }
+    }
     const patch = {
-      unit_cost: form.unit_cost === '' ? null : parseFloat(form.unit_cost),
+      unit_cost, rate_per_kg,
       reorder_level: form.reorder_level === '' ? null : parseFloat(form.reorder_level),
-      unit_weight: form.unit_weight === '' ? null : parseFloat(form.unit_weight),
+      unit_weight: wt,
       category: form.category, subcategory: form.subcategory.trim() || null, uom: form.uom.trim() || 'nos',
       updated_at: new Date().toISOString(),
     };
@@ -38271,7 +38282,7 @@ function StockImportsReview({ plant, me, activeUnit, onClose, onChanged }) {
                           </select>
                         </div>
                         <div class="field" style="margin:0"><label>Unit (uom)</label><input type="text" value=${form.uom} onChange=${e => setForm({ ...form, uom: e.target.value })} placeholder="nos / kg / m" /></div>
-                        <div class="field" style="margin:0"><label>Unit price (₹ / ${form.uom || 'unit'})</label><input type="number" step="any" value=${form.unit_cost} onChange=${e => setForm({ ...form, unit_cost: e.target.value })} placeholder="e.g. 61" /></div>
+                        <div class="field" style="margin:0"><label>${form.unit_weight && parseFloat(form.unit_weight) > 0 ? 'Rate (₹ / kg)' : 'Unit price (₹ / ' + (form.uom || 'unit') + ')'}</label><input type="number" step="any" value=${form.price} onChange=${e => setForm({ ...form, price: e.target.value })} placeholder=${form.unit_weight && parseFloat(form.unit_weight) > 0 ? 'e.g. 70 per kg' : 'e.g. 61'} /></div>
                         <div class="field" style="margin:0"><label>Reorder level</label><input type="number" step="any" value=${form.reorder_level} onChange=${e => setForm({ ...form, reorder_level: e.target.value })} placeholder="alert below this" /></div>
                         <div class="field" style="margin:0"><label>Weight (kg / ${form.uom || 'unit'})</label><input type="number" step="any" value=${form.unit_weight} onChange=${e => setForm({ ...form, unit_weight: e.target.value })} placeholder="optional" /></div>
                         <div class="field" style="margin:0"><label>Sub-category</label><input type="text" value=${form.subcategory} onChange=${e => setForm({ ...form, subcategory: e.target.value })} placeholder="optional group" /></div>
