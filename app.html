@@ -53,6 +53,47 @@
     window.__bipEvent = null;
     try { window.dispatchEvent(new Event('loglinkr-installed')); } catch (_) {}
   });
+  // ── Blank-screen auto-heal watchdog ─────────────────────────────────────────
+  // The app's runtime (Preact/htm) loads from a version-pinned CDN and is cached
+  // by the service worker. If one of those files was cached half-downloaded on a
+  // weak connection (or the CDN served a transient bad response), the phone keeps
+  // serving the broken copy and the main module never runs — a blank screen that
+  // only clears by wiping the saved copy. This lives in a plain (non-module) head
+  // script so it STILL runs when the module is dead. The app sets window.__llkBooted
+  // once it renders (or hits its own render-error screen); if that flag is still
+  // unset ~14s after load, we drop the service worker + all caches and reload once
+  // to fetch clean files. A counter caps heal attempts so a genuinely offline
+  // device (which also never boots) can't loop forever.
+  (function () {
+    try {
+      var HEAL_KEY = 'llk_heal_n';
+      window.addEventListener('load', function () {
+        setTimeout(function () {
+          if (window.__llkBooted) { try { sessionStorage.removeItem(HEAL_KEY); } catch (_) {} return; }
+          var n = 0; try { n = +(sessionStorage.getItem(HEAL_KEY) || 0); } catch (_) {}
+          if (n >= 2) return;  // already healed twice with no boot — stop (likely offline / real outage)
+          try { sessionStorage.setItem(HEAL_KEY, n + 1); } catch (_) {}
+          var reloaded = false;
+          var reload = function () { if (reloaded) return; reloaded = true; try { location.reload(); } catch (_) {} };
+          var jobs = [];
+          try {
+            if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations)
+              jobs.push(navigator.serviceWorker.getRegistrations().then(function (rs) {
+                return Promise.all(rs.map(function (r) { return r.unregister(); }));
+              }).catch(function () {}));
+          } catch (_) {}
+          try {
+            if (window.caches && caches.keys)
+              jobs.push(caches.keys().then(function (ks) {
+                return Promise.all(ks.map(function (k) { return caches.delete(k); }));
+              }).catch(function () {}));
+          } catch (_) {}
+          Promise.all(jobs).then(reload).catch(reload);
+          setTimeout(reload, 2000);  // reload even if the clears hang
+        }, 14000);
+      });
+    } catch (_) {}
+  })();
 </script>
 <link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192">
 <link rel="apple-touch-icon" href="/icon-192.png">
@@ -53326,7 +53367,13 @@ function SimpleTab({ title, sub, comingSoon, block }) {
 try {
   const root = createRoot(document.getElementById('root'));
   root.render(h(App));
+  // Tell the blank-screen watchdog the app runtime loaded and rendered — a real
+  // boot, so it must NOT wipe caches and reload.
+  window.__llkBooted = true;
 } catch (err) {
+  // The module ran but render threw: this shows a visible error screen, not a
+  // blank one, so also mark booted — a cache wipe wouldn't fix a code bug.
+  window.__llkBooted = true;
   document.getElementById('root').innerHTML = '<div style="padding:40px;font-family:monospace;color:#be123c;background:#fff1f2;margin:20px;border-radius:12px;border:1px solid #fecdd3;"><h2 style="margin-bottom:12px;font-family:sans-serif;">Loglinkr crashed during render</h2><pre style="white-space:pre-wrap;font-size:12px;">' + (err.stack || err.message || err) + '</pre></div>';
   console.error('Loglinkr render error:', err);
 }
