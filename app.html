@@ -28432,10 +28432,20 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   // When a length stock item is picked, note whether it has a rod breakdown so we
   // can offer "Pick rods" on that line.
   const fetchRods = async (idx, id) => {
-    if (!id) { setForm(f => ({ ...f, items: f.items.map((x, i) => i === idx ? { ...x, _hasRods: false } : x) })); return; }
-    const { data } = await sb.from('mcp_stocks_items').select('pieces').eq('id', id).single();
+    if (!id) { setForm(f => ({ ...f, items: f.items.map((x, i) => i === idx ? { ...x, _hasRods: false, _lastPrice: null } : x) })); return; }
+    const [{ data }, priceRes] = await Promise.all([
+      sb.from('mcp_stocks_items').select('pieces').eq('id', id).single(),
+      sb.rpc('last_purchase_rate', { p_item_id: id }),
+    ]);
     const has = Array.isArray(data?.pieces) && data.pieces.length > 0;
-    setForm(f => ({ ...f, items: f.items.map((x, i) => i === idx ? { ...x, _hasRods: has } : x) }));
+    const price = Number(priceRes.data || 0);
+    // Auto-fill the challan's Approx Value from the item's last bought price × qty.
+    setForm(f => ({ ...f, items: f.items.map((x, i) => {
+      if (i !== idx) return x;
+      const q = parseFloat(x.qty) || 0;
+      const auto = (Math.round(q * price * 100) / 100).toString();
+      return { ...x, _hasRods: has, _lastPrice: price, approx_value: price > 0 ? auto : x.approx_value, _approxAuto: price > 0 };
+    }) }));
   };
   const [projects, setProjects] = useState([]);
   const [planId, setPlanId] = useState('');       // set when this RDC came from a subcontract plan
@@ -28466,7 +28476,13 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
     const it = form.items[i];
     const qty = parseFloat(it.qty) || 0;
     const rate = parseFloat(it.rate) || 0;
-    setItem(i, { amount: (qty * rate).toFixed(2) });
+    const patch = { amount: (qty * rate).toFixed(2) };
+    // Keep the DC's Approx Value in step with qty × last bought price (until the
+    // user types their own value).
+    if (it.kind === 'stock' && it._approxAuto && Number(it._lastPrice) > 0) {
+      patch.approx_value = (Math.round(qty * Number(it._lastPrice) * 100) / 100).toString();
+    }
+    setItem(i, patch);
   };
 
   // Totals
@@ -28739,7 +28755,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
                     </select>`}
                 ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.rate} onChange=${e => setItem(idx, { rate: e.target.value })} onBlur=${() => recalcAmount(idx)} placeholder="Rate ₹" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />`}
                 ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.amount} onChange=${e => setItem(idx, { amount: e.target.value })} placeholder="Amount ₹" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;font-weight:600" />`}
-                ${!isInvoice && html`<input type="number" step="any" min=${0} value=${it.approx_value} onChange=${e => setItem(idx, { approx_value: e.target.value })} placeholder="Approx value ₹" title="Approx value (shown on the DC)" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />`}
+                ${!isInvoice && html`<input type="number" step="any" min=${0} value=${it.approx_value} onChange=${e => setItem(idx, { approx_value: e.target.value, _approxAuto: false })} placeholder="Approx value ₹" title="Auto = qty × last bought price · edit to override" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />`}
               </div>
               ${it.kind === 'stock' && it.stock_item_id && ['mtr', 'ft'].includes((it.uom || '').toLowerCase()) && it._hasRods && html`
                 <div style="margin-top:6px">
