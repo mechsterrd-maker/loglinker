@@ -24478,7 +24478,7 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
   const restricted = isProjectRestricted(myPerms);
 
   const reload = useCallback(async () => {
-    const [m, d, c, e1, e2] = await Promise.all([
+    const [m, d, c, e1, e2, u] = await Promise.all([
       sb.from('mcp_project_milestones').select('*').eq('project_id', project.id).order('seq'),
       sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, total_value, stage_id, created_at').eq('project_id', project.id).eq('hide_from_project', false).order('created_at',{ascending:false}).limit(40),
       sb.from('mcp_project_components').select('*').eq('project_id', project.id).order('created_at'),
@@ -24486,6 +24486,8 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
       sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, items, project_id, cost_category').eq('plant_id', plant.id).contains('items', [{ project_id: project.id }]).limit(300),
       // …plus bills tagged to this project at the document level.
       sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, items, project_id, cost_category').eq('project_id', project.id).limit(300),
+      // Real material used (issued − returned) — the consumption-based material cost.
+      sb.from('mcp_project_material_usage').select('amount').eq('project_id', project.id).is('reversed_at', null),
     ]);
     const all = m.data || [];
     const tops = all.filter(x => !x.parent_id);
@@ -24514,7 +24516,14 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
       exDocs.push({ id: dd.id, doc_type: dd.doc_type, doc_number: dd.doc_number, doc_date: dd.doc_date, vendor: dd.vendor_name_raw, items: rel, subtotal: sub, cost_category: dd.cost_category, catKey });
     });
     exDocs.sort((a, b) => new Date(b.doc_date || 0) - new Date(a.doc_date || 0));
-    setExpenses({ total: exTotal, docs: exDocs });
+    // Consumption-based project expense: material actually USED (issued − returned,
+    // at last-bought price) replaces raw-material PURCHASE bills, which only over-
+    // stated things when material was bought in excess. Non-material bills (job-work,
+    // transport, other services) still count as real project cost.
+    const matConsumed = (u.data || []).reduce((s, r) => s + Number(r.amount || 0), 0);
+    const purchaseTotal = exDocs.filter(dd => (dd.catKey || 'other') === 'purchase').reduce((s, dd) => s + (dd.subtotal || 0), 0);
+    const servicesTotal = exTotal - purchaseTotal;   // non-material bills
+    setExpenses({ total: exTotal, docs: exDocs, matConsumed, purchaseTotal, servicesTotal, realTotal: matConsumed + servicesTotal });
   }, [project.id, plant.id]);
   useEffect(()=>{ reload(); }, [reload]);
   useEffect(()=>{ setProgressDraft(project.progress_pct||0); setWeightDraft(project.actual_weight_kg||''); }, [project.id]);
@@ -24523,7 +24532,8 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
   const setBillCat = async (docId, cat) => {
     setExpenses(x => ({ ...x, docs: x.docs.map(d => d.id === docId ? { ...d, cost_category: cat, catKey: cat } : d) }));
     const { error } = await sb.from('mcp_logistics_documents').update({ cost_category: cat }).eq('id', docId);
-    if (error) { showToast('Could not save category'); reload(); }
+    if (error) showToast('Could not save category');
+    reload();   // recompute the consumption-based total (purchase vs counted)
   };
 
   const saveField = async (field, value) => {
@@ -24651,25 +24661,37 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
         <div style="font-size:22px">💰</div>
         <div style="flex:1;min-width:0">
           <div style="font-size:12px;font-weight:700;color:var(--slate-600)">Project expenses</div>
-          <div style="font-family:'Bricolage Grotesque',sans-serif;font-size:20px;font-weight:700;color:var(--slate-900);line-height:1.1;margin-top:2px">₹${fmtNum(expenses.total)}</div>
-          <div style="font-size:11px;color:var(--slate-500);margin-top:2px">${expenses.docs.length} bill${expenses.docs.length === 1 ? '' : 's'} · only this project's items counted</div>
+          <div style="font-family:'Bricolage Grotesque',sans-serif;font-size:20px;font-weight:700;color:var(--slate-900);line-height:1.1;margin-top:2px">₹${fmtNum(expenses.realTotal || 0)}</div>
+          <div style="font-size:11px;color:var(--slate-500);margin-top:2px">🔧 ₹${fmtNum(expenses.matConsumed || 0)} material used + 🧾 ₹${fmtNum(expenses.servicesTotal || 0)} services & other${(expenses.purchaseTotal || 0) > 0 ? ' · raw-material purchases counted when issued' : ''}</div>
         </div>
         <div style="font-size:16px;color:var(--slate-400);transform:${expensesOpen ? 'rotate(90deg)' : 'none'};transition:transform .12s">▸</div>
       </div>
       ${expensesOpen && html`
         <div style="border-top:1px solid var(--slate-100)">
           ${!restricted && html`<div style="padding:10px 14px;border-bottom:1px solid var(--slate-100)"><button class="btn small" onClick=${() => setLinkBillOpen(true)} style="font-size:12px">🔗 Link a bill to this project</button><span style="font-size:11px;color:var(--slate-400);margin-left:8px">transport, machining or any bill</span></div>`}
-          ${expenses.docs.length === 0 ? html`<div style="padding:14px;font-size:12px;color:var(--slate-400)">No bills assigned to this project yet. Tap <b>🔗 Link a bill</b> above, or assign bill items to this project in the bill processor.</div>` :
+          ${(expenses.docs.length === 0 && (expenses.matConsumed || 0) === 0) ? html`<div style="padding:14px;font-size:12px;color:var(--slate-400)">Nothing assigned to this project yet. Issue material below, tap <b>🔗 Link a bill</b> above, or assign bill items to this project in the bill processor.</div>` :
             (() => {
               const byCat = {}; expenses.docs.forEach(dd => { const k = dd.catKey || 'other'; byCat[k] = (byCat[k] || 0) + (dd.subtotal || 0); });
-              const cats = PC_CATS.filter(k => expenses.docs.some(dd => (dd.catKey || 'other') === k));
+              // Raw-material purchases are NOT counted here — the material counts when
+              // it is issued (consumption). Everything else (services) counts.
+              const cats = PC_CATS.filter(k => k !== 'purchase' && expenses.docs.some(dd => (dd.catKey || 'other') === k));
               return html`
-                ${PC_CATS.some(k => (byCat[k] || 0) > 0) && html`<div style="display:flex;gap:6px;flex-wrap:wrap;padding:10px 14px;border-bottom:1px solid var(--slate-100);background:var(--slate-50)">
-                  ${PC_CATS.filter(k => (byCat[k] || 0) > 0).map(k => html`<div key=${k} style="border:1px solid var(--slate-200);border-left:3px solid ${PC_CAT_COLOR[k]};border-radius:8px;padding:5px 10px;background:#fff">
+                <div style="display:flex;gap:6px;flex-wrap:wrap;padding:10px 14px;border-bottom:1px solid var(--slate-100);background:var(--slate-50)">
+                  <div style="border:1px solid var(--emerald-200);border-left:3px solid var(--emerald-600);border-radius:8px;padding:5px 10px;background:#fff">
+                    <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.3px;color:var(--emerald-700)">Material used</div>
+                    <div style="font-size:13px;font-weight:700">₹${fmtNum(expenses.matConsumed || 0)}</div>
+                  </div>
+                  ${PC_CATS.filter(k => k !== 'purchase' && (byCat[k] || 0) > 0).map(k => html`<div key=${k} style="border:1px solid var(--slate-200);border-left:3px solid ${PC_CAT_COLOR[k]};border-radius:8px;padding:5px 10px;background:#fff">
                     <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.3px;color:${PC_CAT_COLOR[k]}">${PC_CAT_LABEL[k]}</div>
                     <div style="font-size:13px;font-weight:700">₹${fmtNum(byCat[k])}</div>
                   </div>`)}
-                </div>`}
+                </div>
+                <div style="padding:9px 14px;border-bottom:1px solid var(--slate-100);font-size:11px;color:var(--slate-500);display:flex;align-items:center;gap:8px">
+                  <span>🔧 Material used (real cost)</span>
+                  <span style="flex:1;border-bottom:1px dotted var(--slate-200)"></span>
+                  <b style="color:var(--emerald-700)">₹${fmtNum(expenses.matConsumed || 0)}</b>
+                </div>
+                ${(expenses.purchaseTotal || 0) > 0 && html`<div style="padding:9px 14px;border-bottom:1px solid var(--slate-100);font-size:11px;color:var(--slate-400)">🛒 Raw-material purchases tagged: ₹${fmtNum(expenses.purchaseTotal)} — <b>not added here</b>; the material is counted when you issue it (see “Materials used” below).</div>`}
                 ${cats.map(catKey => {
                   const docs = expenses.docs.filter(dd => (dd.catKey || 'other') === catKey);
                   const csub = docs.reduce((s, dd) => s + (dd.subtotal || 0), 0);
@@ -24700,6 +24722,23 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
                     `)}
                   </div>`;
                 })}
+                ${(() => {
+                  const pur = expenses.docs.filter(dd => (dd.catKey || 'other') === 'purchase');
+                  if (!pur.length) return '';
+                  return html`<div style="opacity:0.75">
+                    <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 14px;background:var(--slate-50);border-top:1px solid var(--slate-100)">
+                      <span style="font-size:11px;font-weight:700;color:var(--slate-500)">🛒 Raw-material purchases · ${pur.length} · not counted here</span>
+                      <span style="font-size:12px;font-weight:700;color:var(--slate-400)">₹${fmtNum(expenses.purchaseTotal || 0)}</span>
+                    </div>
+                    ${pur.map(dd => html`<div key=${dd.id} style="padding:9px 14px;border-top:1px solid var(--slate-100);display:flex;justify-content:space-between;align-items:center;gap:8px">
+                      <div style="font-size:11.5px;color:var(--slate-500);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">🧾 ${dd.vendor || '—'} · ${dd.doc_number || 'no #'} · ₹${fmtNum(dd.subtotal)}</div>
+                      ${!restricted && html`<select value=${dd.catKey} onChange=${e => setBillCat(dd.id, e.target.value)} title="Not a material purchase? Change the category to count it" style="font-size:11px;padding:3px 6px;border:1px solid var(--slate-200);border-radius:6px;background:#fff;flex-shrink:0">
+                        ${PC_CATS.map(c => html`<option key=${c} value=${c}>${PC_CAT_LABEL[c]}</option>`)}
+                      </select>`}
+                    </div>`)}
+                    <div style="padding:6px 14px;font-size:10px;color:var(--slate-400)">Bought for this project — it becomes project cost when the material is <b>issued</b> (so it's not double-counted). If a line here isn't raw material, change its category to count it.</div>
+                  </div>`;
+                })()}
               `;
             })()}
         </div>
