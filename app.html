@@ -21017,6 +21017,127 @@ function ToolingAppsModal({ plant, me, item, parts, onClose, onSaved }) {
   `;
 }
 
+// ── Project material consumption ─────────────────────────────────────────────
+// The REAL project material cost = what was actually pulled for the project,
+// valued at the item's LAST BOUGHT price. Buying excess (for stock / future
+// projects) no longer inflates a project — only issued material is charged.
+function IssueMaterialModal({ plant, project, onClose, onSaved }) {
+  const [item, setItem] = useState(null);        // full stock item row
+  const [qty, setQty] = useState('');
+  const [price, setPrice] = useState('');        // last bought price, editable
+  const [priceKnown, setPriceKnown] = useState(true);
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const onPick = async (id, p) => {
+    if (!id) { setItem(null); setPrice(''); return; }
+    setErr('');
+    const [full, rate] = await Promise.all([
+      sb.from('mcp_stocks_items').select('id, code, name, uom, unit_weight, size_spec, current_qty').eq('id', id).single(),
+      sb.rpc('last_purchase_rate', { p_item_id: id }),
+    ]);
+    setItem(full.data || p || { id });
+    const r = Number(rate.data || 0);
+    setPriceKnown(r > 0);
+    setPrice(r > 0 ? String(r) : '');
+  };
+
+  const qN = parseFloat(qty) || 0;
+  const pN = parseFloat(price) || 0;
+  const uw = item && item.unit_weight != null ? Number(item.unit_weight) : null;
+  const totWt = uw != null ? Math.round(uw * qN * 1000) / 1000 : null;
+  const amount = Math.round(qN * pN * 100) / 100;
+  const avail = item ? Number(item.current_qty || 0) : 0;
+
+  const save = async () => {
+    if (!item) { setErr('Pick a material first.'); return; }
+    if (!(qN > 0)) { setErr('Enter the quantity used.'); return; }
+    setBusy(true); setErr('');
+    const { data, error } = await sb.rpc('issue_material_to_project', {
+      p_project_id: project.id, p_item_id: item.id, p_qty: qN, p_note: note.trim() || null, p_price: pN > 0 ? pN : null,
+    });
+    setBusy(false);
+    if (error || data?.success === false) { setErr(error?.message || data?.error || 'Could not issue.'); return; }
+    showToast('✓ Issued to project · stock reduced');
+    onSaved();
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:460px">
+        <div class="modal-header"><div class="modal-title">🔧 Issue material to project</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        <div style="font-size:12px;color:var(--slate-600);margin-bottom:10px">${project.code ? project.code + ' · ' : ''}${project.name} — records the real material used and reduces stock.</div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        <div class="field"><label>Material *</label><${StockItemPicker} plant=${plant} value=${item?.id || ''} onChange=${onPick} placeholder="— Pick from stock —" /></div>
+        ${item && html`
+          <div style="display:flex;gap:8px;flex-wrap:wrap;font-size:11px;color:var(--slate-500);margin:-4px 2px 8px">
+            <span>In stock: <b style=${'color:' + (avail > 0 ? 'var(--teal-700)' : 'var(--rose-600)')}>${fmtNum(avail)} ${item.uom || ''}</b></span>
+            ${item.size_spec ? html`<span>· Size: ${item.size_spec}</span>` : ''}
+            ${uw != null && uw > 0 ? html`<span>· ${fmtNum(uw)} kg/${item.uom || 'unit'}</span>` : ''}
+          </div>`}
+        <div class="field-row" style="display:flex;gap:10px">
+          <div class="field" style="flex:1"><label>Qty used (${item?.uom || 'qty'}) *</label><input type="number" step="any" value=${qty} onInput=${e => setQty(e.target.value)} placeholder="0" /></div>
+          <div class="field" style="flex:1"><label>Price / ${item?.uom || 'unit'}${priceKnown ? ' · last bought' : ''}</label><input type="number" step="any" value=${price} onInput=${e => setPrice(e.target.value)} placeholder="0" /></div>
+        </div>
+        ${item && !priceKnown && html`<div style="font-size:11px;color:var(--amber-700);background:var(--amber-50);border:1px solid var(--amber-200);border-radius:6px;padding:6px 8px;margin-bottom:8px">No purchase price on record for this item — type the price so the cost is captured.</div>`}
+        <div class="field"><label>Note (optional)</label><input type="text" value=${note} onInput=${e => setNote(e.target.value)} placeholder="e.g. cut for 20-leaf wagon" /></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:8px;padding:10px 12px;margin-bottom:10px">
+          <div style="font-size:11px;color:var(--slate-500)">${totWt != null ? fmtNum(totWt) + ' kg total' : ''}</div>
+          <div style="font-size:12px;color:var(--slate-600)">Cost to project: <b style="font-size:15px;color:var(--slate-900)">${pcINR(amount)}</b></div>
+        </div>
+        ${item && qN > avail ? html`<div style="font-size:11px;color:var(--rose-600);margin-bottom:8px">⚠ Using more than what's in stock — stock will go negative.</div>` : ''}
+        <button class="btn" onClick=${save} disabled=${busy} style="width:100%">${busy ? 'Issuing…' : '✓ Issue & record cost'}</button>
+      </div>
+    </div>`;
+}
+
+function ProjectMaterialsSection({ plant, project }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [modal, setModal] = useState(false);
+  const load = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from('mcp_project_material_usage')
+      .select('*').eq('project_id', project.id).is('reversed_at', null)
+      .order('created_at', { ascending: false });
+    setRows(data || []); setLoading(false);
+  }, [project.id]);
+  useEffect(() => { load(); }, [load]);
+  const total = rows.reduce((s, r) => s + Number(r.amount || 0), 0);
+  const totalKg = rows.reduce((s, r) => s + Number(r.total_weight || 0), 0);
+  const undo = async (id) => {
+    if (!confirm('Undo this line and return the material to stock?')) return;
+    const { data, error } = await sb.rpc('reverse_project_material_usage', { p_usage_id: id });
+    if (error || data?.success === false) { showToast('Could not undo'); return; }
+    showToast('↩ Returned to stock'); load();
+  };
+  return html`
+    <div style="display:flex;justify-content:space-between;align-items:center;margin:16px 0 6px">
+      <div class="section-h" style="margin:0">🔧 Materials used · real cost</div>
+      <button class="btn small" onClick=${() => setModal(true)} style="background:var(--teal-600)">+ Issue material</button>
+    </div>
+    <div style="background:#ecfdf5;border:1px solid var(--emerald-200);border-radius:10px;padding:10px 12px;margin-bottom:10px">
+      <div style="font-size:10px;font-weight:700;text-transform:uppercase;color:var(--emerald-700)">Consumed · at last-bought price</div>
+      <div style="font-size:19px;font-weight:800;color:var(--emerald-700)">${pcINR(total)}</div>
+      <div style="font-size:11px;color:var(--slate-500)">${rows.length} line${rows.length === 1 ? '' : 's'}${totalKg > 0 ? ' · ' + fmtNum(Math.round(totalKg)) + ' kg' : ''} — the real material this project used</div>
+    </div>
+    ${loading ? html`<div style="padding:10px;color:var(--slate-400);font-size:12px">Loading…</div>` :
+      rows.length === 0 ? html`<div class="card"><div class="empty" style="padding:16px"><div style="font-size:12px;color:var(--slate-500)">No material pulled for this project yet. Tap <b>+ Issue material</b> to record what was actually used — that's the real cost, valued at the last price you bought it for.</div></div></div>` :
+      html`<div style="border:1px solid var(--slate-200);border-radius:8px;overflow:hidden">
+        ${rows.map((r, i) => html`<div key=${r.id} style="display:flex;align-items:center;gap:8px;padding:8px 10px;${i > 0 ? 'border-top:1px solid var(--slate-100);' : ''}">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${r.item_name || 'Item'}</div>
+            <div style="font-size:10.5px;color:var(--slate-500)">${fmtNum(r.qty)} ${r.uom || ''}${r.total_weight ? ' · ' + fmtNum(r.total_weight) + ' kg' : ''} × ${pcINR(r.unit_price || 0)}${r.price_source === 'manual' ? ' (typed)' : ''}${r.created_at ? ' · ' + fmtDMY(r.created_at) : ''}</div>
+          </div>
+          <div style="font-size:13px;font-weight:700;white-space:nowrap">${pcINR(r.amount || 0)}</div>
+          <button onClick=${() => undo(r.id)} title="Undo — return to stock" style="border:none;background:none;color:var(--rose-500);cursor:pointer;font-size:14px;padding:2px 4px">↩</button>
+        </div>`)}
+      </div>`}
+    ${modal && html`<${IssueMaterialModal} plant=${plant} project=${project} onClose=${() => setModal(false)} onSaved=${() => { setModal(false); load(); }} />`}
+  `;
+}
+
 function ProjectCostingModule({ plant, me, activeUnit }) {
   const [projects, setProjects] = useState([]);
   const [docs, setDocs] = useState([]);
@@ -21130,6 +21251,8 @@ function ProjectCostingModule({ plant, me, activeUnit }) {
         <${PerfKpi} num=${pcINR(drillRow.billSpend)} label="Bills / invoices" tone="slate" />
         <${PerfKpi} num=${pcINR(drillRow.expSpend + drillRow.pettySpend)} label="Expenses + petty" tone="slate" />
       </div>
+
+      <${ProjectMaterialsSection} plant=${plant} project=${p} />
 
       <div class="section-h" style="margin-bottom:6px">Spend by category</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
