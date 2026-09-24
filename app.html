@@ -4307,6 +4307,7 @@ function ReceiveReturnModal({ plant, me, lines, prefillParts, linkDoc, onClose, 
   const [sameQty, setSameQty] = useState('');
   const [retMat, setRetMat] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [history, setHistory] = useState([]);   // past receiving events for this RDC
   const pendingLine = linePending(line);
 
   // Ad-hoc receive (no formal plan) — the common laser-cut case.
@@ -4359,6 +4360,7 @@ function ReceiveReturnModal({ plant, me, lines, prefillParts, linkDoc, onClose, 
 
   const saveAdhoc = async () => {
     setBusy(true);
+    const ledger = [];   // one entry per thing received, for the history ledger
     try {
       // 0. Inputs that came back as-is → mark each ticked input received.
       for (const l of allLines) {
@@ -4366,6 +4368,7 @@ function ReceiveReturnModal({ plant, me, lines, prefillParts, linkDoc, onClose, 
         if (r && r.on && parseFloat(r.qty) > 0) {
           const { data, error } = await sb.rpc('receive_rdc_line', { p_line_id: l.id, p_qty: parseFloat(r.qty) });
           if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Receive failed');
+          ledger.push({ kind: 'return', item_name: l.item_name || 'Material', qty: parseFloat(r.qty), uom: l.uom || '' });
         }
       }
       // 1. Parts → project components (each assigned to a project)
@@ -4378,12 +4381,14 @@ function ReceiveReturnModal({ plant, me, lines, prefillParts, linkDoc, onClose, 
             p_uom: p.uom || 'nos', p_stage: 'laser cut', p_location: (line.party_name || 'Vendor') + (refNo ? ' · ' + refNo : ''),
           });
           if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Part save failed');
+          ledger.push({ kind: 'part_project', item_name: p.name.trim(), qty: parseFloat(p.qty), uom: p.uom || 'nos', project_id: p.project_id, project_name: (projects.find(x => x.id === p.project_id) || {}).name || '' });
         } else {
           // No project → general stock.
           const { data, error } = await sb.rpc('rdc_receive_part_stock', {
             p_line_id: line.id, p_name: p.name.trim(), p_qty: parseFloat(p.qty), p_uom: p.uom || 'nos',
           });
           if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Part save failed');
+          ledger.push({ kind: 'part_stock', item_name: p.name.trim(), qty: parseFloat(p.qty), uom: p.uom || 'nos' });
         }
       }
       // 2. Wastage / leftover → stock (offcut sheet or by weight); scrap adds nothing.
@@ -4399,6 +4404,7 @@ function ReceiveReturnModal({ plant, me, lines, prefillParts, linkDoc, onClose, 
           p_category: 'raw_material', p_ref_note: parseFloat(wOffKg) > 0 ? 'weighed ' + fmtNum(parseFloat(wOffKg)) + ' kg' : null,
         });
         if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Offcut save failed');
+        ledger.push({ kind: 'offcut', item_name: wBuilt.name, qty: parseFloat(wQty), uom: wBuilt.uom || 'nos', size_spec: wBuilt.size_spec || '', note: parseFloat(wOffKg) > 0 ? 'weighed ' + fmtNum(parseFloat(wOffKg)) + ' kg' : '' });
       }
       // Reusable material by weight → stock.
       if (wWtOn && parseFloat(wKg) > 0) {
@@ -4408,6 +4414,7 @@ function ReceiveReturnModal({ plant, me, lines, prefillParts, linkDoc, onClose, 
           p_uom: 'kg', p_unit_weight: 1, p_rate_per_kg: null, p_qty: parseFloat(wKg), p_category: 'raw_material', p_ref_note: null,
         });
         if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Weight save failed');
+        ledger.push({ kind: 'weight', item_name: (mat?.short || wMat) + ' offcut', qty: parseFloat(wKg), uom: 'kg' });
       }
       // Scrap by weight → scrap bucket (kept out of usable stock).
       if (wScrapOn && parseFloat(wScrapKg) > 0) {
@@ -4417,6 +4424,11 @@ function ReceiveReturnModal({ plant, me, lines, prefillParts, linkDoc, onClose, 
           p_uom: 'kg', p_unit_weight: 1, p_rate_per_kg: null, p_qty: parseFloat(wScrapKg), p_category: 'general', p_ref_note: 'scrap',
         });
         if (error) throw error; if (data?.success === false) throw new Error(data.error || 'Scrap save failed');
+        ledger.push({ kind: 'scrap', item_name: (mat?.short || wMat) + ' scrap', qty: parseFloat(wScrapKg), uom: 'kg' });
+      }
+      // 3. Record this receiving as one ledger event for the RDC history.
+      if (ledger.length && line.doc_id) {
+        await sb.rpc('log_rdc_receipt', { p_doc_id: line.doc_id, p_received_on: rcvDate || null, p_ref_no: refNo || null, p_note: null, p_lines: ledger });
       }
       // Linked to an uploaded return bill: mark its lines inwarded + flag it so
       // the bill screen won't also inward them (one route, no double entry).
@@ -4427,6 +4439,7 @@ function ReceiveReturnModal({ plant, me, lines, prefillParts, linkDoc, onClose, 
           raw_extraction: { ...(linkDoc.raw_extraction || {}), rdc_received: true, rdc_doc_id: line.doc_id },
         }).eq('id', linkDoc.id);
       }
+      loadHistory();
       await askCompleteAndClose();
       showToast('✓ Received' + (validParts.length ? ' · ' + validParts.length + ' part' + (validParts.length === 1 ? '' : 's') : ''));
       onSaved && onSaved();
@@ -4446,6 +4459,15 @@ function ReceiveReturnModal({ plant, me, lines, prefillParts, linkDoc, onClose, 
     }
   }, [line.doc_id, plant.id]);
   useEffect(() => { reload(); }, [reload]);
+
+  // Receiving history ledger — every "Save receipt" against this RDC (returned
+  // material, cut parts, offcuts, scrap), newest first.
+  const loadHistory = useCallback(async () => {
+    if (!line.doc_id) { setHistory([]); return; }
+    const { data } = await sb.from('mcp_rdc_receipts').select('*').eq('doc_id', line.doc_id).order('created_at', { ascending: false });
+    setHistory(data || []);
+  }, [line.doc_id]);
+  useEffect(() => { loadHistory(); }, [loadHistory]);
 
   const receiveProduct = async (pr) => {
     const pend = Number(pr.qty_planned || 0) - Number(pr.qty_received || 0);
@@ -4572,6 +4594,36 @@ function ReceiveReturnModal({ plant, me, lines, prefillParts, linkDoc, onClose, 
 
             <button class="btn" disabled=${busy} style="width:100%;margin-top:8px" onClick=${saveAdhoc}>${busy ? 'Saving…' : '💾 Save receipt'}</button>
         `}
+
+        ${history.length > 0 && (() => {
+          const KIND = {
+            return:       { lbl: '📥 Returned',      bg: '#eff6ff', fg: '#1d4ed8' },
+            part_project: { lbl: '🔧 Part → project', bg: '#ecfdf5', fg: '#047857' },
+            part_stock:   { lbl: '🔧 Part → stock',   bg: '#ecfdf5', fg: '#047857' },
+            offcut:       { lbl: '📐 Offcut',         bg: '#fffbeb', fg: '#b45309' },
+            weight:       { lbl: '⚖ Reusable kg',    bg: '#fffbeb', fg: '#b45309' },
+            scrap:        { lbl: '🗑 Scrap',          bg: '#f1f5f9', fg: '#64748b' },
+          };
+          return html`
+            <div class="section-h" style="margin-top:18px">🧾 Receiving history <span style="font-weight:400;color:var(--slate-400);font-size:11px">· ${history.length} receipt${history.length === 1 ? '' : 's'}</span></div>
+            ${history.map(rc => { const lns = Array.isArray(rc.lines) ? rc.lines : []; return html`
+              <div key=${rc.id} class="card" style="padding:8px 10px;margin-bottom:6px">
+                <div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--slate-500);margin-bottom:6px">
+                  <span style="font-weight:600;color:var(--slate-600)">${fmtDMY(rc.received_on || rc.created_at)}${rc.ref_no ? ' · ' + rc.ref_no : ''}</span>
+                  <span>${lns.length} item${lns.length === 1 ? '' : 's'}${rc.note ? ' · ' + rc.note : ''}</span>
+                </div>
+                ${lns.length === 0 ? html`<div style="font-size:12px;color:var(--slate-400)">No detail recorded.</div>` :
+                  lns.map((ln, i) => { const k = KIND[ln.kind] || { lbl: ln.kind || 'Item', bg: '#f1f5f9', fg: '#64748b' }; return html`
+                    <div key=${i} style="display:flex;justify-content:space-between;gap:8px;align-items:baseline;padding:3px 0;border-top:${i ? '1px solid var(--slate-100)' : 'none'}">
+                      <span style="min-width:0;font-size:12px">
+                        <span style=${'display:inline-block;font-size:10px;font-weight:600;padding:1px 6px;border-radius:10px;margin-right:6px;white-space:nowrap;background:' + k.bg + ';color:' + k.fg}>${k.lbl}</span>
+                        <span style="font-weight:500">${ln.item_name || 'Item'}</span>${ln.project_name ? html`<span style="color:var(--slate-500)"> · ${ln.project_name}</span>` : ''}${ln.size_spec ? html`<span style="color:var(--slate-400)"> · ${ln.size_spec}</span>` : ''}${ln.note ? html`<span style="color:var(--slate-400)"> · ${ln.note}</span>` : ''}
+                      </span>
+                      <span style="white-space:nowrap;font-size:12px;font-weight:600;color:var(--slate-700)">${fmtNum(ln.qty)} ${ln.uom || ''}</span>
+                    </div>`; })}
+              </div>`; })}
+          `;
+        })()}
 
         <button class="btn ghost" style="width:100%;margin-top:16px" onClick=${onClose}>Done</button>
       </div>
