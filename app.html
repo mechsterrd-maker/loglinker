@@ -28815,7 +28815,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
       const stkMeta = {};
       const wStockIds = [...new Set(validItems.filter(it => it.kind === 'stock' && it.stock_item_id).map(it => it.stock_item_id))];
       if (wStockIds.length) {
-        const { data: sm } = await sb.from('mcp_stocks_items').select('id, unit_weight, size_spec').in('id', wStockIds);
+        const { data: sm } = await sb.from('mcp_stocks_items').select('id, unit_weight, size_spec, hsn').in('id', wStockIds);
         (sm || []).forEach(s => { stkMeta[s.id] = s; });
       }
       const items = validItems.map(it => {
@@ -28885,8 +28885,18 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
         created_by: me.id,
       }).select('*').single();
       if (error) throw error;
-      // Rod-picked lines: the DB trigger deducted stock by qty (metres); now keep
-      // each item's rod breakdown in step (remove issued rods, return offcuts).
+      // Teach each stock item its HSN from the DC line, so the master fills up and
+      // future DCs auto-fill it. Only set where the item has no HSN yet — never
+      // overwrite an existing one.
+      try {
+        const learn = [...new Map(validItems
+          .filter(it => it.kind === 'stock' && it.stock_item_id && (it.hsn || '').trim()
+            && !((stkMeta[it.stock_item_id]?.hsn || '').trim()))
+          .map(it => [it.stock_item_id, it.hsn.trim()])).entries()];
+        for (const [sid, hsn] of learn) { await sb.from('mcp_stocks_items').update({ hsn }).eq('id', sid); }
+      } catch (_) { /* best-effort — HSN learning never blocks the DC */ }
+      // Rod-picked lines: keep each item's rod breakdown in step (remove issued
+      // rods, return offcuts) — the DB trigger already deducted stock by metres.
       const rodLines = validItems.filter(it => it.kind === 'stock' && it.stock_item_id && Array.isArray(it._rodRows) && it._rodRows.length);
       if (rodLines.length) {
         const byItem = {};
@@ -28991,7 +29001,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
                     ? html`<${PartPicker} plant=${plant} value=${it.part_id} onChange=${(id, p) => setItem(idx, { part_id: id, name: p ? (p.name || p.part_number || '') : it.name })} placeholder="🔍 Search & pick part…" />`
                     : it.kind === 'machine'
                     ? html`<${MachinePicker} plant=${plant} value=${it.machine_id} onChange=${(id, p) => setItem(idx, { machine_id: id, name: p ? (p.display_name || [p.make, p.model].filter(Boolean).join(' ') || p.code || '') : it.name })} placeholder="🔍 Search & pick machine…" />`
-                    : html`<${StockItemPicker} plant=${plant} value=${it.stock_item_id} category=${(DC_PICK_CATS.find(x => x.key === it.pickcat) || {}).cat || null} onChange=${(id, p) => { setItem(idx, { stock_item_id: id, name: p ? (p.name || p.code || '') : it.name, uom: p?.uom || it.uom, _rodRows: null, _hasRods: false }); fetchRods(idx, id); }} placeholder="🔍 Search & pick item…" />`}
+                    : html`<${StockItemPicker} plant=${plant} value=${it.stock_item_id} category=${(DC_PICK_CATS.find(x => x.key === it.pickcat) || {}).cat || null} onChange=${(id, p) => { setItem(idx, { stock_item_id: id, name: p ? (p.name || p.code || '') : it.name, uom: p?.uom || it.uom, hsn: (p && p.hsn) ? p.hsn : it.hsn, _rodRows: null, _hasRods: false }); fetchRods(idx, id); }} placeholder="🔍 Search & pick item…" />`}
                 </div>
                 ${form.items.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => removeItem(idx)} style="padding:2px 8px;font-size:11px">×</button>`}
               </div>
@@ -31828,7 +31838,7 @@ function StockItemPicker({ plant, value, onChange, placeholder, allowClear = tru
 
   useEffect(() => {
     setLoading(true);
-    let q = sb.from('mcp_stocks_items').select('id, code, name, uom, current_qty')
+    let q = sb.from('mcp_stocks_items').select('id, code, name, uom, current_qty, hsn')
       .eq('plant_id', plant.id);
     if (category) q = q.eq('category', category);
     q.order('code').then(({ data }) => { setItems(data || []); setLoading(false); });
@@ -39885,6 +39895,7 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
         category: form.category || 'general',
         subcategory: (form.subcategory || '').trim() || null,
         uom: form.uom,
+        hsn: (form.hsn || '').trim() || null,
         reorder_level: form.reorder_level ? parseFloat(form.reorder_level) : null,
         unit_cost: form.unit_cost ? parseFloat(form.unit_cost) : null,
       };
@@ -40072,6 +40083,7 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
               : html`<div class="field"><label>Current qty</label><input type="number" disabled value=${editTarget.current_qty} style="background:var(--slate-100);color:var(--slate-700);font-weight:600" /></div>`}
             <div class="field"><label>Reorder level</label><input type="number" step="0.001" value=${form.reorder_level || ''} onChange=${e => setForm({...form, reorder_level: e.target.value})} /></div>
           </div>
+          <div class="field"><label>HSN code <span style="font-weight:400;color:var(--slate-400);font-size:11px">· used to auto-fill DCs & invoices</span></label><input type="text" value=${form.hsn || ''} onChange=${e => setForm({...form, hsn: e.target.value})} placeholder="e.g. 72163100" /></div>
           ${isRaw && uw > 0 && !isEdit && effectiveOpening > 0 && html`
             <div style="font-size:12px;color:var(--teal-700);font-weight:600;margin:-4px 0 10px">⚖️ Total weight of opening: ${fmtNum(Math.round(effectiveOpening * uw * 100) / 100)} kg  <span style="color:var(--slate-400);font-weight:400">(${fmtNum(effectiveOpening)} ${form.uom} × ${fmtNum(uw)} kg/${form.uom})</span></div>
           `}
