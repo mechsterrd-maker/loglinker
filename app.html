@@ -38876,6 +38876,116 @@ function StockImportsReview({ plant, me, activeUnit, onClose, onChanged }) {
   `;
 }
 
+// AI HSN filler: suggest the GST HSN for stock items that have none. AI proposes,
+// the user reviews & applies (HSN affects GST — never blind-write).
+function HsnFillerModal({ plant, me, onClose, onChanged }) {
+  const [items, setItems] = useState(null);   // items missing an HSN
+  const [sugg, setSugg] = useState({});        // id -> { hsn, confidence, note }
+  const [sel, setSel] = useState({});          // id -> checked
+  const [edit, setEdit] = useState({});        // id -> edited hsn
+  const [running, setRunning] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [ran, setRan] = useState(false);
+
+  useEffect(() => {
+    sb.from('mcp_stocks_items').select('id, code, name, uom, material, section_type, category, hsn')
+      .eq('plant_id', plant.id).order('name').limit(2000)
+      .then(({ data }) => setItems((data || []).filter(it => !((it.hsn || '').trim()))));
+  }, [plant.id]);
+
+  const editVal = (id) => (edit[id] !== undefined ? edit[id] : ((sugg[id] && sugg[id].hsn) || ''));
+  const confColor = (c) => c === 'high' ? 'emerald' : c === 'med' ? 'amber' : 'slate';
+
+  const run = async () => {
+    if (!items || !items.length) return;
+    setRunning(true); setProgress(0); setRan(true);
+    const map = {};
+    try {
+      const session = (await sb.auth.getSession()).data.session;
+      for (let i = 0; i < items.length; i += 40) {
+        const chunk = items.slice(i, i + 40).map(it => ({ id: it.id, code: it.code, name: it.name, uom: it.uom, material: it.material, section: it.section_type, category: it.category }));
+        const resp = await fetch(SUPABASE_URL + '/functions/v1/suggest-stock-hsn', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (session?.access_token || ''), 'apikey': SUPABASE_ANON_KEY },
+          body: JSON.stringify({ items: chunk }),
+        });
+        const data = await resp.json().catch(() => null);
+        if (data?.success) (data.results || []).forEach(r => { if (r.id && r.hsn) map[r.id] = r; });
+        else if (data?.error) showToast('AI: ' + data.error);
+        setProgress(Math.min(items.length, i + 40));
+        setSugg({ ...map });
+      }
+      const s = {};
+      Object.entries(map).forEach(([id, r]) => { if (r.confidence === 'high' || r.confidence === 'med') s[id] = true; });
+      setSel(s);
+      showToast('🤖 Suggested HSN for ' + Object.keys(map).length + ' of ' + items.length + ' item' + (items.length === 1 ? '' : 's'));
+    } catch (e) { showToast('AI HSN failed: ' + (e.message || e)); }
+    finally { setRunning(false); }
+  };
+
+  const apply = async () => {
+    const toSet = (items || []).filter(it => sel[it.id] && (editVal(it.id) || '').trim()).map(it => ({ id: it.id, hsn: editVal(it.id).replace(/\D/g, '').slice(0, 8) })).filter(x => x.hsn.length >= 4);
+    if (!toSet.length) { showToast('Tick at least one row with an HSN'); return; }
+    setApplying(true);
+    let ok = 0;
+    for (let i = 0; i < toSet.length; i += 25) {
+      const slice = toSet.slice(i, i + 25);
+      const res = await Promise.all(slice.map(x => sb.from('mcp_stocks_items').update({ hsn: x.hsn, updated_at: new Date().toISOString() }).eq('id', x.id)));
+      ok += res.filter(r => !r.error).length;
+    }
+    setApplying(false);
+    showToast('✓ HSN saved on ' + ok + ' item' + (ok === 1 ? '' : 's'));
+    onChanged && onChanged();
+    const doneIds = new Set(toSet.map(x => x.id));
+    setItems(prev => (prev || []).filter(it => !doneIds.has(it.id)));
+  };
+
+  const withSugg = (items || []).filter(it => sugg[it.id]);
+  const selCount = Object.keys(sel).filter(id => sel[id]).length;
+
+  return html`
+    <div class="modal-backdrop active" style="align-items:flex-start;overflow-y:auto" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:760px;width:100%;margin:16px auto;max-height:92vh;overflow-y:auto">
+        <div class="modal-header">
+          <div class="modal-title">🏷 Fill HSN with AI</div>
+          <button class="close-btn" onClick=${onClose}>×</button>
+        </div>
+        ${items == null ? html`<div class="loader"><div class="spinner"></div></div>` :
+          items.length === 0 ? html`<div class="empty" style="padding:24px"><div style="font-size:28px">✅</div><div style="font-size:13px;margin-top:8px;color:var(--slate-600)">Every stock item already has an HSN.</div></div>` : html`
+          <div style="font-size:12.5px;color:var(--slate-600);margin-bottom:10px">${items.length} item${items.length === 1 ? '' : 's'} have no HSN. AI reads each item's name (material / shape) and suggests the Indian GST HSN. <b>Review and correct</b> before applying — HSN affects GST.</div>
+          ${!ran ? html`
+            <button class="btn" style="width:100%" disabled=${running} onClick=${run}>✨ Suggest HSN with AI</button>
+          ` : html`
+            ${running ? html`<div style="font-size:12px;color:var(--teal-700);margin-bottom:8px">🤖 Working… ${progress} / ${items.length}</div>` : ''}
+            ${withSugg.length === 0 && !running ? html`<div style="font-size:12px;color:var(--slate-500);margin-bottom:8px">No confident suggestions. You can still set HSN on items individually in the item form.</div>` : html`
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+                <button class="btn small ghost" onClick=${() => { const s = {}; withSugg.forEach(it => s[it.id] = true); setSel(s); }}>Select all</button>
+                <button class="btn small ghost" onClick=${() => setSel({})}>Clear</button>
+                <span style="font-size:11px;color:var(--slate-500);margin-left:auto">${selCount} selected</span>
+              </div>
+              <div style="border:1px solid var(--slate-200);border-radius:8px;overflow:hidden">
+                ${withSugg.map((it, k) => { const r = sugg[it.id]; return html`
+                  <div key=${it.id} style=${'display:flex;align-items:center;gap:8px;padding:7px 10px;' + (k > 0 ? 'border-top:1px solid var(--slate-100);' : '') + (sel[it.id] ? 'background:var(--teal-50);' : '')}>
+                    <input type="checkbox" checked=${!!sel[it.id]} onChange=${e => setSel(s => ({ ...s, [it.id]: e.target.checked }))} />
+                    <div style="flex:1;min-width:0">
+                      <div style="font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${it.name}</div>
+                      <div style="font-size:10.5px;color:var(--slate-400)">${it.code}${r.note ? ' · ' + r.note : ''}</div>
+                    </div>
+                    <span class=${'badge ' + confColor(r.confidence)} style="font-size:10px">${r.confidence || '?'}</span>
+                    <input type="text" value=${editVal(it.id)} onInput=${e => setEdit(m => ({ ...m, [it.id]: e.target.value }))} placeholder="HSN" style="width:96px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-300);border-radius:5px;font-family:monospace;text-align:center" />
+                  </div>`; })}
+              </div>
+              <button class="btn" style="width:100%;margin-top:12px" disabled=${applying || selCount === 0} onClick=${apply}>${applying ? 'Saving…' : '✓ Apply HSN to ' + selCount + ' selected item' + (selCount === 1 ? '' : 's')}</button>
+              <div style="font-size:10.5px;color:var(--slate-400);margin-top:6px;text-align:center">Low-confidence rows are left unticked on purpose — check those before applying.</div>
+            `}
+          `}
+        `}
+        <button class="btn ghost" style="width:100%;margin-top:14px" onClick=${onClose}>Done</button>
+      </div>
+    </div>`;
+}
+
 function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
   const units = (accessibleUnits || []).filter(u => u.unit_id); // real units (not the "all" pseudo)
   const multiUnit = units.length > 1;
@@ -38899,6 +39009,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
   const [scrapOpen, setScrapOpen] = useState(false); // "Move to scrap yard" entry + register
   const [reportsOpen, setReportsOpen] = useState(false); // 📊 Stock Reports (statement / movement / low / scrap)
   const [importsOpen, setImportsOpen] = useState(false); // 📥 Excel import batches — review / fill gaps / undo
+  const [hsnOpen, setHsnOpen] = useState(false); // 🏷 AI HSN filler for items with no HSN
   const [modal, setModal] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [activeItem, setActiveItem] = useState(null);
@@ -39255,6 +39366,11 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
               <div style="font-size:24px">📥</div>
               <div style="font-size:13px;font-weight:700;margin-top:4px;color:var(--amber-700)">Excel Imports</div>
               <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Review each import on its own · fill missing prices/reorder/weight · undo a bad import</div>
+            </button>
+            <button class="card" style="text-align:left;padding:14px;cursor:pointer;background:var(--indigo-50,#eef2ff);border-color:var(--indigo-200,#c7d2fe)" onClick=${() => setHsnOpen(true)}>
+              <div style="font-size:24px">🏷</div>
+              <div style="font-size:13px;font-weight:700;margin-top:4px;color:#3730a3">Fill HSN (AI)</div>
+              <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Suggest the GST HSN for items that have none · review &amp; apply</div>
             </button>
           </div>
 
@@ -39638,6 +39754,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
     ${scrapOpen && html`<${ScrapEntryModal} plant=${plant} me=${me} activeUnit=${activeUnit} onClose=${() => setScrapOpen(false)} onSaved=${() => refresh()} />`}
     ${reportsOpen && html`<${StockReports} plant=${plant} me=${me} units=${units} multiUnit=${multiUnit} unitNameOf=${unitNameOf} items=${items} onClose=${() => setReportsOpen(false)} />`}
     ${importsOpen && html`<${StockImportsReview} plant=${plant} me=${me} activeUnit=${activeUnit} onClose=${() => setImportsOpen(false)} onChanged=${() => refresh()} />`}
+    ${hsnOpen && html`<${HsnFillerModal} plant=${plant} me=${me} onClose=${() => setHsnOpen(false)} onChanged=${() => refresh()} />`}
     ${priceTarget && html`<${QuickPriceModal} item=${priceTarget} onClose=${() => setPriceTarget(null)} onSaved=${() => { setPriceTarget(null); refresh(); }} />`}
     ${splitTarget && html`<${SplitUnitModal} item=${splitTarget} units=${units} unitNameOf=${unitNameOf} onClose=${() => setSplitTarget(null)} onSaved=${() => { setSplitTarget(null); clearSelect(); refresh(); }} />`}
   `;
