@@ -43262,6 +43262,8 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
   const [isPlanner, setIsPlanner] = useState(false); // has this user authored a subcontract plan
   const [stockItems, setStockItems] = useState([]);  // existing stock items, to match received lines
   const [itemDest, setItemDest] = useState({});      // per-line: { dest, project_id, project_later, qty }
+  const [lineForm, setLineForm] = useState({});      // per-line receive builder: { kind, category, material, section, qty, unit_weight, project_id, cost_type }
+  const [savingLine, setSavingLine] = useState({});  // per-line save-in-progress
   const [processing, setProcessing] = useState(false);
   const [planTally, setPlanTally] = useState([]);    // subcontract-plan products to receive against (RM sent → parts back)
   const [planRq, setPlanRq] = useState({});          // per-product received qty typed
@@ -43305,6 +43307,50 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     const { error } = await sb.from('mcp_logistics_documents').update({ cost_category: cat }).eq('id', doc.id);
     if (error) { showToast('Could not save category'); return; }
     setDoc(d => ({ ...d, cost_category: cat }));
+  };
+
+  // ── Per-line receive builder (stock / charge / skip), one Save per line ──────
+  const guessMatLocal = (nm) => { const s = (nm || '').toUpperCase(); if (/STAINLESS|\bSS\b/.test(s)) return 'SS'; if (/ALUM|\bALU?\b/.test(s)) return 'Aluminium'; if (/BRASS/.test(s)) return 'Brass'; if (/COPPER|\bCU\b/.test(s)) return 'Copper'; if (/CAST\s*IRON|\bCI\b/.test(s)) return 'Cast Iron'; return 'MS'; };
+  const guessSecLocal = (nm) => { const s = (nm || '').toLowerCase(); if (/\brhs\b|rect.*tube/.test(s)) return 'rhs'; if (/\bshs\b|square.*tube/.test(s)) return 'shs'; if (/pipe|\bod\b/.test(s)) return 'pipe'; if (/angle/.test(s)) return 'angle'; if (/flat/.test(s)) return 'flat'; if (/round|\bdia\b/.test(s)) return 'round_bar'; if (/square\s*bar|\bsqr\b/.test(s)) return 'square_bar'; if (/sheet|coil/.test(s)) return 'sheet'; if (/plate/.test(s)) return 'plate'; if (/bar|block|segment/.test(s)) return 'block'; return 'plate'; };
+  const lf = (i) => lineForm[i] || {};
+  const lfVal = (i, k, dflt) => { const v = lf(i)[k]; return v !== undefined && v !== '' ? v : dflt; };
+  const setLF = (i, patch) => setLineForm(m => ({ ...m, [i]: { ...(m[i] || {}), ...patch } }));
+  const CATEGORIES = [{ v: 'raw_material', label: '🪨 Raw material' }, { v: 'tools', label: '🔧 Tools' }, { v: 'general', label: '🧩 Parts / General' }, { v: 'consumable', label: '🧴 Consumables' }];
+
+  const saveLine = async (i, it) => {
+    const f = lineForm[i] || {};
+    const kind = f.kind || 'stock';
+    const payload = { kind };
+    if (kind === 'stock') {
+      const cat = f.category || 'raw_material';
+      payload.name = (it.name || it.item_name || '').trim() || 'Item';
+      payload.category = cat;
+      payload.material = cat === 'raw_material' ? (f.material || guessMatLocal(it.name || it.item_name)) : null;
+      payload.section = cat === 'raw_material' ? (f.section || guessSecLocal(it.name || it.item_name)) : null;
+      payload.uom = it.uom || 'nos';
+      payload.qty = parseFloat(f.qty != null && f.qty !== '' ? f.qty : (it.qty || 0));
+      payload.unit_weight = f.unit_weight ? parseFloat(f.unit_weight) : null;
+      payload.rate = parseFloat(it.rate || 0);
+      payload.project_id = f.project_id || null;
+      payload.cost_type = f.cost_type || 'purchase';
+      if (!(payload.qty > 0)) { showToast('Enter a quantity for this line'); return; }
+    } else if (kind === 'charge') {
+      payload.cost_type = f.cost_type || 'transport';
+      payload.project_id = f.project_id || null;
+    }
+    setSavingLine(m => ({ ...m, [i]: true }));
+    const { data, error } = await sb.rpc('receive_bill_line', { p_doc_id: doc.id, p_idx: i, p_line: payload });
+    setSavingLine(m => ({ ...m, [i]: false }));
+    if (error || data?.success === false) { showToast('Failed: ' + (error?.message || data?.error || '')); return; }
+    showToast(kind === 'stock' ? '✓ Added to stock' : kind === 'charge' ? '✓ Saved as charge' : '✓ Line skipped');
+    refresh();
+  };
+  const undoLine = async (i) => {
+    setSavingLine(m => ({ ...m, [i]: true }));
+    const { data, error } = await sb.rpc('undo_bill_line', { p_doc_id: doc.id, p_idx: i });
+    setSavingLine(m => ({ ...m, [i]: false }));
+    if (error || data?.success === false) { showToast('Failed: ' + (error?.message || data?.error || '')); return; }
+    showToast('↺ Undone — edit and save again'); refresh();
   };
 
   // Seed per-line destinations from any project already assigned to the items.
@@ -43654,7 +43700,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
             ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
           </select>
         </div>
-        ${PC_COST_DOC_TYPES.includes(doc.doc_type) && html`<div class="field"><label>Cost category</label>
+        ${(PC_COST_DOC_TYPES.includes(doc.doc_type) || isInward) && html`<div class="field"><label>Cost category</label>
           <select value=${doc.cost_category || (PC_JW_TYPES.includes(doc.doc_type) ? 'machining' : 'purchase')} onChange=${e => setDocCat(e.target.value)}>
             ${PC_CATS.map(c => html`<option key=${c} value=${c}>${PC_CAT_LABEL[c]}</option>`)}
           </select>
@@ -43694,7 +43740,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       ` : items.length > 0 ? (canProcess ? html`
         <div class="card" style="background:var(--teal-50);border-color:var(--teal-200)">
           <div style="font-weight:700;color:var(--teal-700);margin-bottom:4px">📦 Receive & file this bill</div>
-          <div style="font-size:12px;color:var(--slate-700)">Set each line's <b>project</b> (or “assign later”) and <b>stock destination</b> (or “not accountable”) below, then hit <b>Save</b> — it adds them to stock and to their projects in one go.</div>
+          <div style="font-size:12px;color:var(--slate-700)">For each line below, pick <b>Add to stock</b> (set material / section / category, pieces &amp; weight), <b>Charge</b> (transport / loading — no stock), or <b>Skip</b>, then hit its own <b>Save</b>. Saved lines turn green.</div>
         </div>
       ` : html`
         <div class="card" style="background:var(--teal-50);border-color:var(--teal-200)">
@@ -43790,24 +43836,66 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
             <div class="list-item-main">
               <div class="list-item-title">${it.name || it.item_name || '?'} ${(it.customer_part_number || it.part_no) && html`<span class="badge slate" style="margin-left:6px;font-family:monospace;font-size:10px">#${it.customer_part_number || it.part_no}</span>`}</div>
               <div class="list-item-sub">${it.qty || 0} ${it.uom || 'nos'} × ₹${fmtNum(it.rate || 0)} ${it.hsn ? '· HSN ' + it.hsn : ''} ${it.process ? '· ' + it.process : ''}</div>
-              ${canProcess && isInward ? html`
-                <div style="display:flex;align-items:center;gap:6px;margin-top:6px;flex-wrap:wrap">
-                  <select value=${itemDest[i]?.project_later ? '__later__' : (itemDest[i]?.project_id || '')}
-                    onChange=${e => { const v = e.target.value; if (v === '__later__') setDest(i, { project_later: true, project_id: '' }); else setDest(i, { project_later: false, project_id: v }); }}
-                    style=${'flex:1;min-width:140px;max-width:230px;font-size:12px;padding:5px 6px;border:1px solid ' + ((itemDest[i]?.project_id || itemDest[i]?.project_later) ? 'var(--teal-300)' : 'var(--amber-300)') + ';border-radius:5px;background:white'}>
-                    <option value="">🏗 — project —</option>
-                    <option value="__later__">⏳ Assign later</option>
-                    ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
-                  </select>
-                  <select value=${itemDest[i]?.dest || ''} onChange=${e => setDest(i, { dest: e.target.value })}
-                    style=${'flex:1;min-width:130px;max-width:200px;font-size:12px;padding:5px 6px;border:1px solid ' + (itemDest[i]?.dest ? 'var(--teal-300)' : 'var(--amber-300)') + ';border-radius:5px;background:white'}>
-                    <option value="">📦 — stock? —</option>
-                    ${STOCK_DESTS.map(d => html`<option key=${d.v} value=${d.v}>${d.label}</option>`)}
-                  </select>
-                  ${itemDest[i]?.dest && itemDest[i].dest !== 'not_accountable' && html`<input type="number" step="any" min="0" value=${itemDest[i]?.qty != null ? itemDest[i].qty : (it.qty || '')} onInput=${e => setDest(i, { qty: e.target.value })} title="Received qty" style="width:62px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px" />`}
-                  ${it.inwarded_component && html`<span class="badge emerald" style="font-size:10px">✓ in project</span>`}
+              ${canProcess && isInward ? ((it._rcv || grnDone) ? html`
+                <div style="display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap">
+                  <span class="badge emerald" style="font-size:11px">${it._rcv === 'charge' ? '✓ Saved as charge' + (it.cost_type ? ' · ' + (PC_CAT_LABEL[it.cost_type] || it.cost_type) : '') : it._rcv === 'skip' ? '⏭ Skipped' : '✓ Added to stock' + (it.received_qty ? ' · ' + fmtNum(it.received_qty) + ' ' + (it.uom || '') : '')}</span>
+                  ${it.project_id && html`<span style="font-size:10px;color:var(--teal-700)">🏗 ${(projects.find(p => p.id === it.project_id) || {}).name || 'project'}</span>`}
+                  ${it._rcv && html`<button class="btn small ghost" disabled=${savingLine[i]} onClick=${() => undoLine(i)} style="font-size:11px;padding:2px 8px">↺ Undo</button>`}
                 </div>
-              ` : canProcess ? html`
+              ` : (() => {
+                const kind = lfVal(i, 'kind', 'stock');
+                const cat = lfVal(i, 'category', 'raw_material');
+                return html`
+                <div style="margin-top:8px;border-top:1px dashed var(--slate-200);padding-top:8px">
+                  <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">
+                    ${[['stock', '📦 Add to stock'], ['charge', '🧾 Charge'], ['skip', '🚫 Skip']].map(([k, lbl]) => html`
+                      <button key=${k} type="button" onClick=${() => setLF(i, { kind: k })} style=${'padding:5px 10px;border-radius:16px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid ' + (kind === k ? 'var(--teal-600)' : 'var(--slate-200)') + ';background:' + (kind === k ? 'var(--teal-600)' : 'white') + ';color:' + (kind === k ? 'white' : 'var(--slate-600)')}>${lbl}</button>`)}
+                  </div>
+                  ${kind === 'stock' ? html`
+                    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                      <select value=${cat} onChange=${e => setLF(i, { category: e.target.value })} style="font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px;background:white">
+                        ${CATEGORIES.map(c => html`<option key=${c.v} value=${c.v}>${c.label}</option>`)}
+                      </select>
+                      ${cat === 'raw_material' && html`
+                        <select value=${lfVal(i, 'material', guessMatLocal(it.name || it.item_name))} onChange=${e => setLF(i, { material: e.target.value })} style="font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px;background:white">
+                          ${RM_MATERIALS.map(m => html`<option key=${m.key} value=${m.key}>${m.label}</option>`)}
+                        </select>
+                        <select value=${lfVal(i, 'section', guessSecLocal(it.name || it.item_name))} onChange=${e => setLF(i, { section: e.target.value })} style="font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px;background:white">
+                          ${RM_SECTIONS.map(s => html`<option key=${s.key} value=${s.key}>${s.label}</option>`)}
+                        </select>`}
+                      <input type="number" step="any" min="0" value=${lfVal(i, 'qty', it.qty || '')} onInput=${e => setLF(i, { qty: e.target.value })} placeholder="pieces" title="Quantity received" style="width:70px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px" />
+                      <input type="number" step="any" min="0" value=${lfVal(i, 'unit_weight', '')} onInput=${e => setLF(i, { unit_weight: e.target.value })} placeholder="kg/pc" title="Weight per piece (optional)" style="width:66px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px" />
+                    </div>
+                    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px">
+                      <select value=${lfVal(i, 'project_id', '')} onChange=${e => setLF(i, { project_id: e.target.value })} style="flex:1;min-width:130px;max-width:220px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px;background:white">
+                        <option value="">🏗 — project (optional) —</option>
+                        ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+                      </select>
+                      <select value=${lfVal(i, 'cost_type', 'purchase')} onChange=${e => setLF(i, { cost_type: e.target.value })} style="font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px;background:white" title="Cost type">
+                        ${PC_CATS.map(c => html`<option key=${c} value=${c}>${PC_CAT_LABEL[c]}</option>`)}
+                      </select>
+                      <button class="btn small" disabled=${savingLine[i]} onClick=${() => saveLine(i, it)} style="font-size:12px">${savingLine[i] ? '…' : '✓ Save to stock'}</button>
+                    </div>
+                  ` : kind === 'charge' ? html`
+                    <div style="font-size:11px;color:var(--slate-500);margin-bottom:6px">Not stock — a charge (transport, loading, freight…). Files under the project's cost, not the item list.</div>
+                    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                      <select value=${lfVal(i, 'cost_type', 'transport')} onChange=${e => setLF(i, { cost_type: e.target.value })} style="font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px;background:white" title="Charge type">
+                        ${PC_CATS.filter(c => c !== 'purchase').map(c => html`<option key=${c} value=${c}>${PC_CAT_LABEL[c]}</option>`)}
+                      </select>
+                      <select value=${lfVal(i, 'project_id', '')} onChange=${e => setLF(i, { project_id: e.target.value })} style="flex:1;min-width:130px;max-width:220px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px;background:white">
+                        <option value="">🏗 — project (optional) —</option>
+                        ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+                      </select>
+                      <button class="btn small" disabled=${savingLine[i]} onClick=${() => saveLine(i, it)} style="font-size:12px">${savingLine[i] ? '…' : '✓ Save charge'}</button>
+                    </div>
+                  ` : html`
+                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                      <span style="font-size:11px;color:var(--slate-500)">This line won't be added to stock or costed.</span>
+                      <button class="btn small ghost" disabled=${savingLine[i]} onClick=${() => saveLine(i, it)} style="font-size:12px">✓ Skip line</button>
+                    </div>
+                  `}
+                </div>`;
+              })()) : canProcess ? html`
                 <div style="display:flex;align-items:center;gap:6px;margin-top:6px;flex-wrap:wrap">
                   <span style="font-size:11px;color:${it.project_id ? 'var(--teal-700)' : 'var(--slate-400)'}">🏗 ${it.project_id ? 'Project' : 'Assign project'}</span>
                   <select value=${it.project_id || ''} disabled=${savingItem === i} onChange=${e => assignItemProject(i, e.target.value)} style="flex:1;min-width:150px;max-width:280px;font-size:12px;padding:5px 6px;border:1px solid ${it.project_id ? 'var(--teal-300)' : 'var(--slate-200)'};border-radius:5px;background:white">
@@ -43826,17 +43914,18 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
           </div>
         </div>
       `)}
-      ${canProcess && isInward && items.length > 0 && (grnDone ? html`
-        <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);margin-top:10px;text-align:center">
-          <div style="font-weight:700;color:var(--emerald-700)">✅ Saved — added to stock &amp; assigned</div>
-          <div style="font-size:11px;color:var(--slate-600);margin-top:2px">This bill is received. No need to save again.</div>
-        </div>
-      ` : html`
-        <button class="btn" style="width:100%;margin-top:10px" disabled=${processing} onClick=${processAndSave}>
-          ${processing ? 'Saving…' : '✅ Save — add to stock & assign projects'}
-        </button>
-        <div style="font-size:11px;color:var(--slate-500);margin-top:5px;text-align:center">Every line needs a project (or “assign later”) and a stock destination (or “not accountable”).</div>
-      `)}
+      ${canProcess && isInward && items.length > 0 && (() => {
+        const handled = items.filter(x => x._rcv).length;
+        if (grnDone || handled === items.length) return html`
+          <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);margin-top:10px;text-align:center">
+            <div style="font-weight:700;color:var(--emerald-700)">✅ All ${items.length} line${items.length === 1 ? '' : 's'} done</div>
+            <div style="font-size:11px;color:var(--slate-600);margin-top:2px">Stock lines are received; charges are filed. Undo any line above to change it.</div>
+          </div>`;
+        return html`
+          <div style="font-size:11.5px;color:var(--slate-500);margin-top:10px;text-align:center">
+            ${handled} of ${items.length} lines saved · pick a type and hit <b>Save</b> on each remaining line.
+          </div>`;
+      })()}
     `}
 
     ${['invoice_in','bill','invoice_out'].includes(doc.doc_type) && html`
