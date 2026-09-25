@@ -40933,8 +40933,13 @@ function rptDownload(name, text, mime) {
   } catch (e) { alert('Could not download: ' + e.message); }
 }
 // A report model → CSV (blocks, group labels, subtotals and totals all flattened).
+// Numeric cells (N/MON set a numeric `.n`) are written as bare numbers — the ₹
+// sign and the Indian grouping commas are display-only and would turn the column
+// into un-summable text and, worse, the ₹ mis-decodes to "â¹…" in spreadsheets.
+// A leading UTF-8 BOM keeps ₹ and non-ASCII item names correct in Sheets/Excel.
 function rptToCsv(report) {
   const esc = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  const cell = c => (c && typeof c.n === 'number' && c.t !== '') ? c.t.replace(/[₹,]/g, '') : (c ? c.t : '');
   const lines = [];
   lines.push([report.title]); if (report.subtitle) lines.push([report.subtitle]); lines.push([]);
   report.blocks.forEach(b => {
@@ -40943,13 +40948,13 @@ function rptToCsv(report) {
     if (!b.sections.length || b.sections.every(s => !s.rows.length)) lines.push([b.empty || 'Nothing to show.']);
     b.sections.forEach(sec => {
       if (sec.label) lines.push([sec.label]);
-      sec.rows.forEach(r => lines.push(r.map(c => c.t)));
-      if (sec.subtotal) lines.push(sec.subtotal.map(c => c.t));
+      sec.rows.forEach(r => lines.push(r.map(cell)));
+      if (sec.subtotal) lines.push(sec.subtotal.map(cell));
     });
-    if (b.totals) lines.push(b.totals.map(c => c.t));
+    if (b.totals) lines.push(b.totals.map(cell));
     lines.push([]);
   });
-  return lines.map(r => r.map(esc).join(',')).join('\r\n');
+  return '﻿' + lines.map(r => r.map(esc).join(',')).join('\r\n');
 }
 // A report model → printable standalone HTML (its own Print / Save-PDF button).
 function rptToHtml(report, plant) {
