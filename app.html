@@ -39204,12 +39204,6 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
           })()}
 
           <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:14px">
-            <button class="card" style="text-align:left;padding:14px;cursor:pointer;background:var(--teal-50);border-color:var(--teal-300);position:relative" onClick=${() => setModal('receive_picker')}>
-              <div style="font-size:24px">📥</div>
-              <div style="font-size:13px;font-weight:700;margin-top:4px;color:var(--teal-800)">Receive from Doc</div>
-              <div style="font-size:11px;color:var(--slate-600);margin-top:2px">From approved vendor bill, DC, job-work return</div>
-              ${pendingReceptions.length > 0 && html`<span style="position:absolute;top:8px;right:8px;background:var(--amber-600);color:white;font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px">${pendingReceptions.length}</span>`}
-            </button>
             <button class="card" style="text-align:left;padding:14px;cursor:pointer;background:var(--slate-50);border-color:var(--slate-300)" onClick=${() => { setEditTarget(null); setModal('item'); }}>
               <div style="font-size:24px">➕</div>
               <div style="font-size:13px;font-weight:700;margin-top:4px;color:var(--slate-800)">New Item + Opening</div>
@@ -39624,7 +39618,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
 
     ${modal === 'item' && html`<${ItemModal} plant=${plant} me=${me} activeUnit=${activeUnit} editTarget=${editTarget} allItems=${items} defaultCategory="raw_material" onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
     ${modal === 'txn' && html`<${TxnModal} plant=${plant} me=${me} item=${editTarget} isAdmin=${isAdmin} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
-    ${modal === 'receive_picker' && html`<${ReceiveFromDocPicker} plant=${plant} me=${me} pendingReceptions=${pendingReceptions} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
+    ${/* 'receive_picker' retired — receiving to stock now lives on the document itself (Documents → open bill → Receive into stock). */ ''}
     ${modal === 'stock_import' && html`<${StockImportModal} plant=${plant} me=${me} activeUnit=${activeUnit} existingItems=${items} onClose=${() => setModal(null)} onSaved=${() => { setModal(null); refresh(); }} />`}
     ${modal === 'pick_part_for_stock' && html`<${PickPartForStockModal} plant=${plant} stockItems=${items} onPick=${(p) => { setEditTarget(p); setModal('track_stock'); }} onClose=${() => setModal(null)} />`}
     ${modal === 'track_stock' && editTarget && html`<${TrackStockForPartModal} plant=${plant} me=${me} part=${editTarget} onClose=${() => { setModal(null); setEditTarget(null); }} onSaved=${() => { setModal(null); setEditTarget(null); refresh(); }} />`}
@@ -40086,7 +40080,7 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
             <div class="card" style="background:var(--amber-50);border-color:var(--amber-200);padding:8px 10px;margin-bottom:10px">
               <div style="font-size:11px;color:var(--amber-800);line-height:1.5">
                 <strong>📌 Opening balance is one-time only.</strong> Once saved, this item can only receive stock through a document
-                (vendor bill, DC, job-work return) or an admin adjustment. Use <strong>📥 Receive from Doc</strong> for every subsequent inward.
+                (vendor bill, DC, job-work return) or an admin adjustment. Open the bill/DC in <strong>Documents</strong> and hit <strong>Receive into stock</strong> for every subsequent inward.
               </div>
             </div>
           `}
@@ -42674,6 +42668,7 @@ function Documents({ plant, me, activeUnit, navAction }) {
   const [loading, setLoading] = useState(true);
   const [ocrUsage, setOcrUsage] = useState(null); // { cap, used, period } — null cap = unlimited
   const [ingestingBill, setIngestingBill] = useState(false); // "Upload Bill" → OCR in progress, then auto-open the processor
+  const [pendingRcvIds, setPendingRcvIds] = useState(() => new Set()); // doc ids with an inward reception not yet received to stock
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -42683,13 +42678,14 @@ function Documents({ plant, me, activeUnit, navAction }) {
       .order('doc_date', { ascending: false, nullsFirst: false })
       .limit(500);
     if (u) docsQ = docsQ.or(`unit_id.eq.${u},unit_id.is.null`);
-    const [d, v, jw, r, iu, o] = await Promise.all([
+    const [d, v, jw, r, iu, o, pr] = await Promise.all([
       docsQ,
       sb.from('mcp_logistics_vendors').select('*').eq('plant_id', plant.id).order('name'),
       unitScope(sb.from('v_vendor_jobwork_stock').select('*').eq('plant_id', plant.id).order('vendor_name')),
       unitScope(sb.from('v_returnables_open').select('*').eq('plant_id', plant.id).limit(500)),
       sb.from('interunit_transfers').select('*, from_unit:from_unit_id(name), to_unit:to_unit_id(name), out_doc:out_doc_id(doc_number, doc_date), in_doc:in_doc_id(doc_number, doc_date)').eq('plant_id', plant.id).order('created_at', { ascending: false }).limit(200),
       sb.rpc('ocr_usage_state', { p_plant_id: plant.id }),
+      sb.from('mcp_logistics_grn_receptions').select('document_id').eq('plant_id', plant.id).eq('status', 'pending_verification').limit(1000),
     ]);
     setDocs(d.data || []);
     setVendors(v.data || []);
@@ -42697,6 +42693,7 @@ function Documents({ plant, me, activeUnit, navAction }) {
     setReturnables(r.data || []);
     setInterunits(iu.data || []);
     setOcrUsage(o.data || null);
+    setPendingRcvIds(new Set((pr.data || []).map(x => x.document_id).filter(Boolean)));
     setLoading(false);
   }, [activeUnit?.unit_id]);
 
@@ -42772,6 +42769,7 @@ function Documents({ plant, me, activeUnit, navAction }) {
   if (statusFilter === 'open') filteredDocs = filteredDocs.filter(d => ['pending','approved','partial'].includes(d.status));
   else if (statusFilter === 'overdue') filteredDocs = filteredDocs.filter(d => ['pending','approved','partial'].includes(d.status) && d.due_date && new Date(d.due_date) < new Date());
   else if (statusFilter === 'paid') filteredDocs = filteredDocs.filter(d => d.status === 'paid');
+  else if (statusFilter === 'to_receive') filteredDocs = filteredDocs.filter(d => pendingRcvIds.has(d.id));
   if (search.trim()) {
     const q = search.toLowerCase();
     filteredDocs = filteredDocs.filter(d =>
@@ -42857,12 +42855,14 @@ function Documents({ plant, me, activeUnit, navAction }) {
         <button onClick=${() => setBillsOnly(false)} style="border:none;background:none;color:var(--teal-700);cursor:pointer;font-size:13px;line-height:1;padding:0">✕</button>
       </span></div>`}
 
+      ${(() => { const rcvN = docs.filter(d => pendingRcvIds.has(d.id)).length; return html`
       <div class="auth-tabs" style="margin-bottom:14px">
+        ${rcvN > 0 && html`<button class=${'auth-tab' + (statusFilter === 'to_receive' ? ' active' : '')} onClick=${() => setStatusFilter('to_receive')} style=${statusFilter === 'to_receive' ? '' : 'color:var(--amber-700)'}>📥 To receive · ${rcvN}</button>`}
         <button class=${'auth-tab' + (statusFilter === 'open' ? ' active' : '')} onClick=${() => setStatusFilter('open')}>Open</button>
         <button class=${'auth-tab' + (statusFilter === 'overdue' ? ' active' : '')} onClick=${() => setStatusFilter('overdue')}>Overdue</button>
         <button class=${'auth-tab' + (statusFilter === 'paid' ? ' active' : '')} onClick=${() => setStatusFilter('paid')}>Paid</button>
         <button class=${'auth-tab' + (statusFilter === 'all' ? ' active' : '')} onClick=${() => setStatusFilter('all')}>All</button>
-      </div>
+      </div>`; })()}
 
       <div class="section-h">${filteredDocs.length} document${filteredDocs.length !== 1 ? 's' : ''}<button class="btn small ghost" onClick=${() => setActiveDoc({ _new: true })}>+ Add manually</button></div>
 
@@ -42885,6 +42885,7 @@ function Documents({ plant, me, activeUnit, navAction }) {
                 </div>
                 <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
                   ${d.total_value && html`<span style="font-size:13px;font-weight:600">₹${fmtNum(d.total_value)}</span>`}
+                  ${pendingRcvIds.has(d.id) && html`<span class="badge amber" style="font-size:10px">📥 to receive</span>`}
                   <span class=${'badge ' + (d.status === 'paid' ? 'emerald' : d.status === 'partial' ? 'amber' : overdue ? 'rose' : '')}>${d.status}</span>
                   ${d.status === 'partial' && balance > 0 && html`<span style="font-size:10px;color:var(--rose-500)">₹${fmtNum(balance)} bal</span>`}
                 </div>
@@ -43320,6 +43321,11 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
   const canProcess = isAuthority || isPoster || isPlanner;
   // The receive → stock + project flow only applies to INWARD documents.
   const isInward = ['job_work_dc_in', 'dc_in', 'bill', 'invoice_in', 'interunit_dc_in'].includes(doc?.doc_type);
+  // A reception counts as DONE only once its stock is actually posted (status
+  // 'received'). A 'pending_verification' row (auto-created on approval) means
+  // "still to receive" — show the receive flow, don't claim it's done. This is
+  // what makes Documents the single place to receive to stock.
+  const grnDone = !!grnReception && (grnReception.status === 'received' || grnReception.status === 'completed');
 
   const refresh = useCallback(async () => {
     if (isNew || !doc?.id) return;
@@ -43397,7 +43403,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
           rejected_qty: 0, rate: parseFloat(its[i].rate || 0), uom: its[i].uom || si.uom || 'nos', reject_reason: null, notes: null,
         });
       }
-      if (grnLines.length && !grnReception) {
+      if (grnLines.length && !grnDone) {
         const { data, error } = await sb.rpc('accept_grn_reception', { p_doc_id: doc.id, p_lines: grnLines, p_notes: 'Received via bill processor' });
         if (error) throw error;
         if (!data?.success) throw new Error(data?.error || 'Add-to-stock failed');
@@ -43417,7 +43423,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       setStockItems(local);
       // Mark it received right away so the button turns into a confirmation and a
       // second click can't re-post (accept_grn_reception is also guarded server-side).
-      setGrnReception({ received_at: new Date().toISOString(), users: { full_name: me?.full_name || 'you' }, shortage_detected: false });
+      setGrnReception({ status: 'received', received_at: new Date().toISOString(), users: { full_name: me?.full_name || 'you' }, shortage_detected: false });
       const naCount = its.filter((_, i) => itemDest[i]?.dest === 'not_accountable').length;
       showToast('✅ Saved · ' + grnLines.length + ' to stock' + (naCount ? ' · ' + naCount + ' not accountable' : ''));
       refresh();
@@ -43672,7 +43678,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
 
     ${['invoice_in','dc_in','job_work_dc_in','bill'].includes(doc.doc_type) && html`
       <div class="section-h">Inward / Stock</div>
-      ${grnReception ? html`
+      ${grnDone ? html`
         <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200)">
           <div style="font-weight:700;color:var(--emerald-700);margin-bottom:8px">✅ Stock received</div>
           <div class="card-row" style="border:none;padding:4px 0"><span class="label">Received by</span><span class="value">${grnReception.users?.full_name || '?'}</span></div>
@@ -43818,7 +43824,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
           </div>
         </div>
       `)}
-      ${canProcess && isInward && items.length > 0 && (grnReception ? html`
+      ${canProcess && isInward && items.length > 0 && (grnDone ? html`
         <div class="card" style="background:var(--emerald-50);border-color:var(--emerald-200);margin-top:10px;text-align:center">
           <div style="font-weight:700;color:var(--emerald-700)">✅ Saved — added to stock &amp; assigned</div>
           <div style="font-size:11px;color:var(--slate-600);margin-top:2px">This bill is received. No need to save again.</div>
