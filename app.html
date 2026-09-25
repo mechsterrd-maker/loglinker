@@ -43316,6 +43316,11 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
   const lfVal = (i, k, dflt) => { const v = lf(i)[k]; return v !== undefined && v !== '' ? v : dflt; };
   const setLF = (i, patch) => setLineForm(m => ({ ...m, [i]: { ...(m[i] || {}), ...patch } }));
   const CATEGORIES = [{ v: 'raw_material', label: '🪨 Raw material' }, { v: 'tools', label: '🔧 Tools' }, { v: 'general', label: '🧩 Parts / General' }, { v: 'consumable', label: '🧴 Consumables' }];
+  const UOM_OPTS = [{ v: 'kg', label: 'kg · weight' }, { v: 'nos', label: 'nos · pieces' }, { v: 'mtr', label: 'mtr · length' }, { v: 'mtn', label: 'MT · tonne' }];
+  const round3 = (n) => Math.round((parseFloat(n) || 0) * 1000) / 1000;
+  const normUom = (u) => { const s = (u || '').toLowerCase().trim(); if (/^(kg|kgs|kilogram)/.test(s)) return 'kg'; if (/^(mtn|tonne|ton|te)\b/.test(s) || /^mt$/.test(s) || /tonne|metric ton/.test(s)) return 'mtn'; if (/^(mtr|mtrs|mts|rmt|meter|metre)/.test(s) || /^m$/.test(s)) return 'mtr'; if (/^(no|nos|pcs?|pce|ea|unit|nb)/.test(s)) return 'nos'; return ''; };
+  const billKgOf = (it) => { const q = parseFloat(it.qty) || 0; const u = normUom(it.uom); if (u === 'mtn') return q * 1000; if (u === 'kg') return q; return null; };
+  const billAmtOf = (it) => (parseFloat(it.amount) || (parseFloat(it.qty || 0) * parseFloat(it.rate || 0)) || 0);
 
   const saveLine = async (i, it) => {
     const f = lineForm[i] || {};
@@ -43323,17 +43328,23 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     const payload = { kind };
     if (kind === 'stock') {
       const cat = f.category || 'raw_material';
+      const uom = f.uom || (billKgOf(it) != null ? 'kg' : (normUom(it.uom) || 'nos'));
+      const qty = parseFloat(f.qty != null && f.qty !== '' ? f.qty : (uom === 'kg' ? billKgOf(it) : it.qty) || 0);
+      const totalKg = (parseFloat(f.weight_kg) || 0) || (uom === 'kg' ? qty : uom === 'mtn' ? qty * 1000 : (billKgOf(it) || 0));
+      const amount = billAmtOf(it);
       payload.name = (it.name || it.item_name || '').trim() || 'Item';
       payload.category = cat;
       payload.material = cat === 'raw_material' ? (f.material || guessMatLocal(it.name || it.item_name)) : null;
       payload.section = cat === 'raw_material' ? (f.section || guessSecLocal(it.name || it.item_name)) : null;
-      payload.uom = it.uom || 'nos';
-      payload.qty = parseFloat(f.qty != null && f.qty !== '' ? f.qty : (it.qty || 0));
-      payload.unit_weight = f.unit_weight ? parseFloat(f.unit_weight) : null;
-      payload.rate = parseFloat(it.rate || 0);
+      payload.uom = uom;
+      payload.qty = qty;
+      payload.rate_per_kg = totalKg > 0 ? round3(amount / totalKg) : null;
+      payload.unit_weight = (totalKg > 0 && qty > 0) ? round3(totalKg / qty) : null;
+      payload.unit_cost = qty > 0 ? Math.round((amount / qty) * 100) / 100 : (parseFloat(it.rate) || null);
+      payload.pieces = f.pieces ? parseFloat(f.pieces) : null;
       payload.project_id = f.project_id || null;
       payload.cost_type = f.cost_type || 'purchase';
-      if (!(payload.qty > 0)) { showToast('Enter a quantity for this line'); return; }
+      if (!(qty > 0)) { showToast('Enter a quantity for this line'); return; }
     } else if (kind === 'charge') {
       payload.cost_type = f.cost_type || 'transport';
       payload.project_id = f.project_id || null;
@@ -43362,8 +43373,29 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       return next;
     });
   }, [doc?.id, Array.isArray(doc?.items) ? doc.items.length : 0]);
-  // Only the planner, the person who posted the bill, and plant admin/head may
-  // process it (assign items to projects, receive/close returnable DCs).
+  // Seed the per-line receive builder: default to weight (kg) as the universal
+  // unit for raw material bought by tonne/kg, prefilled from the bill.
+  useEffect(() => {
+    const its = Array.isArray(doc?.items) ? doc.items : [];
+    setLineForm(prev => {
+      const next = { ...prev };
+      its.forEach((it, i) => {
+        if (it._rcv || next[i]) return;
+        const bkg = billKgOf(it);
+        const nu = normUom(it.uom);
+        const uom = bkg != null ? 'kg' : (nu || 'nos');
+        const qty = uom === 'kg' ? (bkg != null ? String(round3(bkg)) : '')
+          : uom === 'mtn' ? (bkg != null ? String(round3(bkg / 1000)) : String(it.qty || ''))
+          : (nu === 'nos' || nu === 'mtr') ? String(it.qty || '') : '';
+        next[i] = {
+          kind: 'stock', category: 'raw_material',
+          material: guessMatLocal(it.name || it.item_name), section: guessSecLocal(it.name || it.item_name),
+          uom, qty, weight_kg: bkg != null ? String(round3(bkg)) : '', pieces: '', cost_type: 'purchase',
+        };
+      });
+      return next;
+    });
+  }, [doc?.id, Array.isArray(doc?.items) ? doc.items.length : 0]);
   const isPoster = !!doc?.created_by && doc.created_by === me?.id;
   const isAuthority = me?.role === 'admin' || me?.role === 'plant_head';
   const canProcess = isAuthority || isPoster || isPlanner;
@@ -43838,13 +43870,18 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
               <div class="list-item-sub">${it.qty || 0} ${it.uom || 'nos'} × ₹${fmtNum(it.rate || 0)} ${it.hsn ? '· HSN ' + it.hsn : ''} ${it.process ? '· ' + it.process : ''}</div>
               ${canProcess && isInward ? ((it._rcv || grnDone) ? html`
                 <div style="display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap">
-                  <span class="badge emerald" style="font-size:11px">${it._rcv === 'charge' ? '✓ Saved as charge' + (it.cost_type ? ' · ' + (PC_CAT_LABEL[it.cost_type] || it.cost_type) : '') : it._rcv === 'skip' ? '⏭ Skipped' : '✓ Added to stock' + (it.received_qty ? ' · ' + fmtNum(it.received_qty) + ' ' + (it.uom || '') : '')}</span>
+                  <span class="badge emerald" style="font-size:11px">${it._rcv === 'charge' ? '✓ Saved as charge' + (it.cost_type ? ' · ' + (PC_CAT_LABEL[it.cost_type] || it.cost_type) : '') : it._rcv === 'skip' ? '⏭ Skipped' : '✓ Added to stock' + (it.received_qty ? ' · ' + fmtNum(it.received_qty) + ' ' + (it.received_uom || it.uom || '') : '') + (it.pieces ? ' · ' + fmtNum(it.pieces) + ' pcs' : '')}</span>
                   ${it.project_id && html`<span style="font-size:10px;color:var(--teal-700)">🏗 ${(projects.find(p => p.id === it.project_id) || {}).name || 'project'}</span>`}
                   ${it._rcv && html`<button class="btn small ghost" disabled=${savingLine[i]} onClick=${() => undoLine(i)} style="font-size:11px;padding:2px 8px">↺ Undo</button>`}
                 </div>
               ` : (() => {
                 const kind = lfVal(i, 'kind', 'stock');
                 const cat = lfVal(i, 'category', 'raw_material');
+                const uom = lfVal(i, 'uom', billKgOf(it) != null ? 'kg' : (normUom(it.uom) || 'nos'));
+                const amount = billAmtOf(it);
+                const qtyN = parseFloat(lfVal(i, 'qty', 0)) || 0;
+                const wkgN = parseFloat(lfVal(i, 'weight_kg', billKgOf(it) || 0)) || 0;
+                const rpk = wkgN > 0 ? amount / wkgN : null;
                 return html`
                 <div style="margin-top:8px;border-top:1px dashed var(--slate-200);padding-top:8px">
                   <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">
@@ -43863,9 +43900,18 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
                         <select value=${lfVal(i, 'section', guessSecLocal(it.name || it.item_name))} onChange=${e => setLF(i, { section: e.target.value })} style="font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px;background:white">
                           ${RM_SECTIONS.map(s => html`<option key=${s.key} value=${s.key}>${s.label}</option>`)}
                         </select>`}
-                      <input type="number" step="any" min="0" value=${lfVal(i, 'qty', it.qty || '')} onInput=${e => setLF(i, { qty: e.target.value })} placeholder="pieces" title="Quantity received" style="width:70px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px" />
-                      <input type="number" step="any" min="0" value=${lfVal(i, 'unit_weight', '')} onInput=${e => setLF(i, { unit_weight: e.target.value })} placeholder="kg/pc" title="Weight per piece (optional)" style="width:66px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px" />
                     </div>
+                    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px">
+                      <label style="font-size:10px;color:var(--slate-500)">Track by</label>
+                      <select value=${uom} onChange=${e => { const nu = e.target.value; const w = parseFloat(lfVal(i, 'weight_kg', billKgOf(it) || 0)) || 0; const patch = { uom: nu }; if (nu === 'kg' && w > 0) patch.qty = String(round3(w)); else if (nu === 'mtn' && w > 0) patch.qty = String(round3(w / 1000)); setLF(i, patch); }} style="font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px;background:white" title="Stock unit">
+                        ${UOM_OPTS.map(u => html`<option key=${u.v} value=${u.v}>${u.label}</option>`)}
+                      </select>
+                      <input type="number" step="any" min="0" value=${lfVal(i, 'qty', '')} onInput=${e => setLF(i, { qty: e.target.value })} placeholder="qty" title=${'Quantity in ' + uom} style="width:72px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px" />
+                      <span style="font-size:11px;color:var(--slate-400)">${uom}</span>
+                      <input type="number" step="any" min="0" value=${lfVal(i, 'weight_kg', '')} onInput=${e => setLF(i, { weight_kg: e.target.value })} placeholder="total kg" title="Total weight (kg) — the universal unit for valuation" style="width:82px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px" />
+                      <input type="number" step="any" min="0" value=${lfVal(i, 'pieces', '')} onInput=${e => setLF(i, { pieces: e.target.value })} placeholder="pcs/sheets" title="How many pieces / sheets (extra info)" style="width:84px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px" />
+                    </div>
+                    ${rpk ? html`<div style="font-size:10.5px;color:var(--teal-700);margin-top:4px">≈ ₹${fmtNum(round3(rpk))}/kg · ${fmtNum(wkgN)} kg total → value ₹${fmtNum(Math.round(amount))}${qtyN > 0 ? ' · ₹' + fmtNum(Math.round(amount / qtyN)) + '/' + uom : ''}</div>` : ''}
                     <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px">
                       <select value=${lfVal(i, 'project_id', '')} onChange=${e => setLF(i, { project_id: e.target.value })} style="flex:1;min-width:130px;max-width:220px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px;background:white">
                         <option value="">🏗 — project (optional) —</option>
