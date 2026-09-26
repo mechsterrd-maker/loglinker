@@ -43118,17 +43118,25 @@ function Documents({ plant, me, activeUnit, navAction }) {
   let filteredDocs = docs;
   if (billsOnly) filteredDocs = filteredDocs.filter(d => ['invoice_in','bill'].includes(d.doc_type));
   if (typeFilter !== 'all') filteredDocs = filteredDocs.filter(d => d.doc_type === typeFilter);
-  if (statusFilter === 'open') filteredDocs = filteredDocs.filter(d => ['pending','approved','partial'].includes(d.status));
-  else if (statusFilter === 'overdue') filteredDocs = filteredDocs.filter(d => ['pending','approved','partial'].includes(d.status) && d.due_date && new Date(d.due_date) < new Date());
-  else if (statusFilter === 'paid') filteredDocs = filteredDocs.filter(d => d.status === 'paid');
-  else if (statusFilter === 'to_receive') filteredDocs = filteredDocs.filter(d => pendingRcvIds.has(d.id));
-  if (search.trim()) {
-    const q = search.toLowerCase();
-    filteredDocs = filteredDocs.filter(d =>
-      (d.vendor_name_raw || '').toLowerCase().includes(q) ||
-      (d.doc_number || '').toLowerCase().includes(q) ||
-      (d.mcp_logistics_vendors?.name || '').toLowerCase().includes(q)
-    );
+  const qActive = search.trim().toLowerCase();
+  // The Open / Overdue / Paid / To-receive tab is a browsing view; when the user
+  // is searching, look across ALL statuses so a text match is never hidden by it.
+  if (!qActive) {
+    if (statusFilter === 'open') filteredDocs = filteredDocs.filter(d => ['pending','approved','partial'].includes(d.status));
+    else if (statusFilter === 'overdue') filteredDocs = filteredDocs.filter(d => ['pending','approved','partial'].includes(d.status) && d.due_date && new Date(d.due_date) < new Date());
+    else if (statusFilter === 'paid') filteredDocs = filteredDocs.filter(d => d.status === 'paid');
+    else if (statusFilter === 'to_receive') filteredDocs = filteredDocs.filter(d => pendingRcvIds.has(d.id));
+  }
+  if (qActive) {
+    // Match vendor, doc number, notes, and any line item's name / HSN — with
+    // spaces & punctuation stripped, so "coil", "1.22x230", an HSN etc. all match.
+    const norm = qActive.replace(/[^a-z0-9]/g, '');
+    filteredDocs = filteredDocs.filter(d => {
+      let hay = (d.vendor_name_raw || '') + ' ' + (d.doc_number || '') + ' ' + (d.mcp_logistics_vendors?.name || '') + ' ' + (d.notes || '');
+      if (Array.isArray(d.items)) for (const it of d.items) hay += ' ' + (it.name || '') + ' ' + (it.hsn || '');
+      const low = hay.toLowerCase();
+      return low.includes(qActive) || (!!norm && low.replace(/[^a-z0-9]/g, '').includes(norm));
+    });
   }
 
   // Stats
@@ -43193,7 +43201,7 @@ function Documents({ plant, me, activeUnit, navAction }) {
       </div>
 
       <div style="margin-bottom:10px">
-        <input type="search" value=${search} onInput=${e => setSearch(e.target.value)} placeholder="Search vendor, invoice number…" style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+        <input type="search" value=${search} onInput=${e => setSearch(e.target.value)} placeholder="Search vendor, number, item, HSN…" style="width:100%;padding:10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
       </div>
 
       <div class="auth-tabs" style="margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
