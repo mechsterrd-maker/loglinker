@@ -28680,6 +28680,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   const [err, setErr] = useState('');
   const [showOverride, setShowOverride] = useState(false); // shown after a stock shortfall
   const [rodPickFor, setRodPickFor] = useState(null); // { idx, stock_item_id } — rod picker open for a line
+  const [coilPickFor, setCoilPickFor] = useState(null); // { idx, stock_item_id } — coil picker open for a line
   // When a length stock item is picked, note whether it has a rod breakdown so we
   // can offer "Pick rods" on that line.
   const fetchRods = async (idx, id) => {
@@ -28908,6 +28909,19 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
           } catch (_) { /* best-effort — the item page flags any rod-list drift */ }
         }
       }
+      // Coil-picked lines: keep each coil item's weight list in step (remove issued
+      // coils, return partial-cut leftovers) — the DB trigger already deducted the kg.
+      const coilLines = validItems.filter(it => it.kind === 'stock' && it.stock_item_id && Array.isArray(it._coilRows) && it._coilRows.length);
+      if (coilLines.length) {
+        const byItem = {};
+        coilLines.forEach(it => { (byItem[it.stock_item_id] = byItem[it.stock_item_id] || []).push(...it._coilRows); });
+        for (const sid in byItem) {
+          try {
+            const { data: cur } = await sb.from('mcp_stocks_items').select('pieces').eq('id', sid).single();
+            await sb.from('mcp_stocks_items').update({ pieces: coilsApplyIssue(cur?.pieces, byItem[sid]) }).eq('id', sid);
+          } catch (_) { /* best-effort — the item page flags any coil-list drift */ }
+        }
+      }
       showToast((isInvoice ? '🧾 Invoice ' : (isReturnable ? '🔁 RDC ' : '📦 DC ')) + docNo + ' created');
       onSaved(doc);
     } catch (e) { setErr(e.message); } finally { setBusy(false); }
@@ -29001,14 +29015,14 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
                     ? html`<${PartPicker} plant=${plant} value=${it.part_id} onChange=${(id, p) => setItem(idx, { part_id: id, name: p ? (p.name || p.part_number || '') : it.name })} placeholder="🔍 Search & pick part…" />`
                     : it.kind === 'machine'
                     ? html`<${MachinePicker} plant=${plant} value=${it.machine_id} onChange=${(id, p) => setItem(idx, { machine_id: id, name: p ? (p.display_name || [p.make, p.model].filter(Boolean).join(' ') || p.code || '') : it.name })} placeholder="🔍 Search & pick machine…" />`
-                    : html`<${StockItemPicker} plant=${plant} value=${it.stock_item_id} category=${(DC_PICK_CATS.find(x => x.key === it.pickcat) || {}).cat || null} onChange=${(id, p) => { setItem(idx, { stock_item_id: id, name: p ? (p.name || p.code || '') : it.name, uom: p?.uom || it.uom, hsn: (p && p.hsn) ? p.hsn : it.hsn, _rodRows: null, _hasRods: false }); fetchRods(idx, id); }} placeholder="🔍 Search & pick item…" />`}
+                    : html`<${StockItemPicker} plant=${plant} value=${it.stock_item_id} category=${(DC_PICK_CATS.find(x => x.key === it.pickcat) || {}).cat || null} onChange=${(id, p) => { setItem(idx, { stock_item_id: id, name: p ? (p.name || p.code || '') : it.name, uom: p?.uom || it.uom, hsn: (p && p.hsn) ? p.hsn : it.hsn, _rodRows: null, _hasRods: false, _coilRows: null }); fetchRods(idx, id); }} placeholder="🔍 Search & pick item…" />`}
                 </div>
                 ${form.items.length > 1 && html`<button type="button" class="btn small danger" onClick=${() => removeItem(idx)} style="padding:2px 8px;font-size:11px">×</button>`}
               </div>
               <input type="text" value=${it.name} onChange=${e => setItem(idx, { name: e.target.value })} placeholder="Item description" style="width:100%;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;box-sizing:border-box;margin-bottom:6px" />
               <div style=${'display:grid;grid-template-columns:'+(isInvoice?'0.7fr 0.6fr 0.5fr 0.8fr 0.8fr':'1fr 0.7fr 0.6fr')+';gap:6px'}>
                 <input type="text" value=${it.hsn} onChange=${e => setItem(idx, { hsn: e.target.value })} placeholder="HSN" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
-                <input type="number" step="any" min=${0} value=${it.qty} onChange=${e => { setItem(idx, { qty: e.target.value, _rodRows: null }); }} onBlur=${() => recalcAmount(idx)} placeholder="Qty *" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                <input type="number" step="any" min=${0} value=${it.qty} onChange=${e => { setItem(idx, { qty: e.target.value, _rodRows: null, _coilRows: null }); }} onBlur=${() => recalcAmount(idx)} placeholder="Qty *" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
                 ${it.kind === 'stock' && it.stock_item_id
                   ? html`<div title="Issued in the item's own stock unit — enter the quantity in ${it.uom || 'this unit'}" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:var(--slate-50);color:var(--slate-600);display:flex;align-items:center;justify-content:center;font-weight:600">${it.uom || '—'}</div>`
                   : html`<select value=${it.uom} onChange=${e => setItem(idx, { uom: e.target.value })} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;background:white" title="Unit">
@@ -29022,6 +29036,12 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
                 <div style="margin-top:6px">
                   <button type="button" class="btn small" onClick=${() => setRodPickFor({ idx, stock_item_id: it.stock_item_id })} style="background:var(--teal-50);color:var(--teal-700);border:1px solid var(--teal-200);font-size:12px">🪵 ${Array.isArray(it._rodRows) && it._rodRows.length ? 'Rods picked · ' + fmtNum(parseFloat(it.qty) || 0) + ' ' + it.uom + ' — change' : 'Pick rods (whole / cut)'}</button>
                   ${Array.isArray(it._rodRows) && it._rodRows.length ? html`<span style="font-size:11px;color:var(--slate-500);margin-left:8px">${it._rodRows.map(r => (r.cut ? fmtNum(r.count) + '×cut ' + fmtNum(r.cut) : fmtNum(r.count) + '×' + fmtNum(r.len)) + ' ' + it.uom).join(', ')}</span>` : ''}
+                </div>
+              `}
+              ${it.kind === 'stock' && it.stock_item_id && (it.uom || '').toLowerCase() === 'kg' && it._hasRods && html`
+                <div style="margin-top:6px">
+                  <button type="button" class="btn small" onClick=${() => setCoilPickFor({ idx, stock_item_id: it.stock_item_id })} style="background:var(--teal-50);color:var(--teal-700);border:1px solid var(--teal-200);font-size:12px">🧵 ${Array.isArray(it._coilRows) && it._coilRows.length ? 'Coils picked · ' + fmtNum(parseFloat(it.qty) || 0) + ' kg — change' : 'Pick coils (whole / partial)'}</button>
+                  ${Array.isArray(it._coilRows) && it._coilRows.length ? html`<span style="font-size:11px;color:var(--slate-500);margin-left:8px">${it._coilRows.map(r => (r.cut ? fmtNum(r.count) + '×' + fmtNum(r.cut) + 'kg cut' : fmtNum(r.count) + '×' + fmtNum(r.w) + 'kg')).join(', ')}</span>` : ''}
                 </div>
               `}
               ${projects.length > 0 && html`
@@ -29042,6 +29062,9 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
       ${rodPickFor && html`<${RodPickModal} plant=${plant} itemId=${rodPickFor.stock_item_id}
         onClose=${() => setRodPickFor(null)}
         onApply=${({ metres, rows }) => { setItem(rodPickFor.idx, { qty: String(metres), _rodRows: rows }); setRodPickFor(null); }} />`}
+      ${coilPickFor && html`<${CoilPickModal} plant=${plant} itemId=${coilPickFor.stock_item_id}
+        onClose=${() => setCoilPickFor(null)}
+        onApply=${({ kg, rows }) => { setItem(coilPickFor.idx, { qty: String(kg), _coilRows: rows }); setCoilPickFor(null); }} />`}
 
       ${isInvoice && html`
         <div class="card" style="background:var(--slate-50);border-color:var(--slate-200);margin-top:14px">
@@ -39903,6 +39926,7 @@ const RM_SECTIONS = [
   { key:'pipe',       label:'Pipe (OD × ID)',   abbr:'PIPE', unit:'mtr', dims:['OD (mm)','ID (mm)'],           calc:(d,r)=> (Math.PI/4*(d.a*d.a-d.b*d.b))/1e6*r },
   { key:'plate',      label:'Plate (per piece)',abbr:'PLT',  unit:'nos', dims:['Thk (mm)','Width (mm)','Length (mm)'], calc:(d,r)=> (d.a*(d.b||0)*(d.c||0))/1e9*r },
   { key:'sheet',      label:'Sheet (per piece)',abbr:'SHT',  unit:'nos', dims:['Thk (mm)','Width (mm)','Length (mm)'], calc:(d,r)=> (d.a*(d.b||0)*(d.c||0))/1e9*r },
+  { key:'coil',       label:'Coil (by weight)', abbr:'COIL', unit:'kg',  dims:['Thk (mm)','Width (mm)'], calc:null },
   { key:'channel',    label:'Channel (ISMC)',   abbr:'CHN',  unit:'mtr', dims:[], spec:'Designation (e.g. ISMC 100)', calc:null },
   { key:'beam',       label:'Beam (ISMB)',      abbr:'BEAM', unit:'mtr', dims:[], spec:'Designation (e.g. ISMB 150)', calc:null },
   { key:'fastener',   label:'Fastener',         abbr:'FAS',  unit:'nos', dims:[], spec:'e.g. M10 × 40 HT Bolt',       calc:null },
@@ -39912,7 +39936,7 @@ const RM_SECTIONS = [
 // Group a raw-material item into a simple shop type (Coil, Sheet, Angle, Pipe…).
 // Uses the section type when set, else reads the item name so imported/legacy
 // items (mostly section_type 'other'/null) still land in the right bucket.
-const RM_SEC_SIMPLE = { angle:'Angle', flat:'Flat', round_bar:'Round bar', square_bar:'Square bar', block:'Block', rhs:'RHS (rect tube)', shs:'SHS (square tube)', pipe:'Pipe / Tube', plate:'Plate', sheet:'Sheet', channel:'Channel', beam:'Beam' };
+const RM_SEC_SIMPLE = { angle:'Angle', flat:'Flat', round_bar:'Round bar', square_bar:'Square bar', block:'Block', rhs:'RHS (rect tube)', shs:'SHS (square tube)', pipe:'Pipe / Tube', plate:'Plate', sheet:'Sheet', coil:'Coil', channel:'Channel', beam:'Beam' };
 const RM_TYPE_ORDER = ['Coil','Sheet','Plate','Angle','Channel','Beam','Flat','Pipe / Tube','RHS (rect tube)','SHS (square tube)','Round bar','Square bar','Block','Rod / Bar','Profile','Other'];
 function rmTypeLabel(item) {
   const st = item.section_type;
@@ -39978,20 +40002,28 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
   const [error, setError] = useState('');
   const isRaw = form.category === 'raw_material';
   const rmSec = RM_SECTIONS.find(s => s.key === form.section_type) || null;
+  // Coil: tracked in kg (weight), priced ₹/kg, with a breakdown of each physical
+  // coil and its own weight — e.g. 4 coils × 1000 kg + 1 × 250 kg = 4250 kg.
+  const isCoil = isRaw && form.section_type === 'coil';
   // Length-based steel (bars/rods/pipes measured in metre/feet) can be recorded
   // as a breakdown of rods: e.g. 5 rods × 6 m + 3 rods × 2 m. Total length feeds
   // the opening qty; weight = total length × kg-per-unit.
   const isLengthItem = ['mtr', 'ft'].includes((form.uom || '').toLowerCase());
-  const [pieceMode, setPieceMode] = useState(() => Array.isArray(editTarget?.pieces) && editTarget.pieces.length > 0);
+  const [pieceMode, setPieceMode] = useState(() => Array.isArray(editTarget?.pieces) && editTarget.pieces.length > 0 && editTarget?.section_type !== 'coil');
+  const [coilMode, setCoilMode] = useState(() => editTarget ? (Array.isArray(editTarget?.pieces) && editTarget.pieces.length > 0 && editTarget?.section_type === 'coil') : true);
   const pcs = Array.isArray(form.pieces) ? form.pieces : [];
   const pcTotalLen = pcs.reduce((s, p) => s + (parseFloat(p.count) || 0) * (parseFloat(p.len) || 0), 0);
   const pcTotalRods = pcs.reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
+  const pcTotalCoilKg = pcs.reduce((s, p) => s + (parseFloat(p.count) || 0) * (parseFloat(p.w) || 0), 0);
+  const pcTotalCoils = pcs.reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
   const uw = parseFloat(form.unit_weight) || 0;
   const setPc = (i, patch) => setForm(f => ({ ...f, pieces: (f.pieces || []).map((x, idx) => idx === i ? { ...x, ...patch } : x) }));
   const addPc = () => setForm(f => ({ ...f, pieces: [...(f.pieces || []), { count: '', len: '' }] }));
+  const addCoilPc = () => setForm(f => ({ ...f, pieces: [...(f.pieces || []), { count: '', w: '' }] }));
   const rmPc = (i) => setForm(f => ({ ...f, pieces: (f.pieces || []).filter((_, idx) => idx !== i) }));
-  // Effective opening qty (metres) — from the rod breakdown when that mode is on.
-  const effectiveOpening = (isLengthItem && pieceMode) ? pcTotalLen : (parseFloat(form.opening_qty) || 0);
+  // Effective opening qty — from the rod breakdown (metres) or coil breakdown (kg)
+  // when that mode is on, else the typed opening qty.
+  const effectiveOpening = (isLengthItem && pieceMode) ? pcTotalLen : (isCoil && coilMode) ? pcTotalCoilKg : (parseFloat(form.opening_qty) || 0);
 
   // RM: auto-build code / name / stock-unit / weight from the picked material +
   // section + sizes. Runs only in RM mode and only when a section is chosen.
@@ -40024,6 +40056,8 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
         payload.size_spec = form.size_spec || null;
         payload.unit_weight = num(form.unit_weight);
         payload.rate_per_kg = num(form.rate_per_kg);
+        // Coil is tracked in kg; its weight-per-unit is 1 so stock value = qty(kg) × ₹/kg.
+        if (form.section_type === 'coil') { payload.uom = 'kg'; payload.unit_weight = 1; }
         // Keep unit_cost (₹ per stock unit) consistent with ₹/kg × unit-weight.
         if (payload.rate_per_kg != null && payload.unit_weight != null) payload.unit_cost = Math.round(payload.rate_per_kg * payload.unit_weight * 100) / 100;
         // Rod breakdown (only when the item is measured by length and the user
@@ -40032,6 +40066,12 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
           const clean = (form.pieces || [])
             .map(p => ({ len: parseFloat(p.len) || 0, count: parseFloat(p.count) || 0 }))
             .filter(p => p.len > 0 && p.count > 0);
+          payload.pieces = clean.length ? clean : null;
+        } else if (form.section_type === 'coil' && coilMode) {
+          // Coil breakdown — each physical coil with its own weight: {w:kg, count}.
+          const clean = (form.pieces || [])
+            .map(p => ({ w: parseFloat(p.w) || 0, count: Math.round(parseFloat(p.count) || 0) }))
+            .filter(p => p.w > 0 && p.count > 0);
           payload.pieces = clean.length ? clean : null;
         }
       }
@@ -40105,7 +40145,7 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
                 </select>
               </div>
               <div class="field"><label>Section type *</label>
-                <select required value=${form.section_type} onChange=${e => setForm({...form, section_type: e.target.value, dim1:'', dim2:'', dim3:'', spec:''})}>
+                <select required value=${form.section_type} onChange=${e => setForm({...form, section_type: e.target.value, dim1:'', dim2:'', dim3:'', spec:'', pieces:[]})}>
                   <option value="">— Pick —</option>
                   ${RM_SECTIONS.map(s => html`<option key=${s.key} value=${s.key}>${s.label}</option>`)}
                 </select>
@@ -40137,9 +40177,11 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
                     <option value="ft">Feet</option><option value="set">Set</option>
                   </select>
                 </div>
-                <div class="field"><label>Weight (kg / ${form.uom || 'unit'})</label>
+                ${isCoil
+                  ? html`<div class="field"><label>Priced by</label><input type="text" disabled value="₹ / kg · by weight" style="background:var(--slate-100);color:var(--slate-600)" /></div>`
+                  : html`<div class="field"><label>Weight (kg / ${form.uom || 'unit'})</label>
                   <input type="number" step="any" min=${0} value=${form.unit_weight} onChange=${e => setForm({ ...form, unit_weight: e.target.value })} placeholder=${rmSec && rmSec.calc ? 'auto' : 'enter'} />
-                </div>
+                </div>`}
               </div>
               <div style="font-size:11px;color:var(--slate-500);margin:-4px 0 10px">${form.unit_weight ? '≈ ' + fmtNum(form.unit_weight) + ' kg per ' + (form.uom || 'unit') + (form.rate_per_kg ? '  ·  ₹' + fmtNum(Math.round(form.unit_weight * form.rate_per_kg)) + ' / ' + (form.uom || 'unit') : '') : (rmSec && rmSec.calc ? 'Enter the sizes above — weight auto-fills.' : 'Enter kg per ' + (form.uom || 'unit') + ' — used for stock value.')}</div>
             `}
@@ -40192,10 +40234,42 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
               `}
             </div>
           `}
+          ${isRaw && isCoil && html`
+            <div class="card" style="background:var(--slate-50);border-color:var(--slate-200);padding:10px 12px;margin-bottom:10px">
+              <label style="display:flex;align-items:center;gap:7px;font-size:12px;font-weight:600;color:var(--slate-700);cursor:pointer;margin-bottom:${coilMode ? '8px' : '0'}">
+                <input type="checkbox" checked=${coilMode} onChange=${e => setCoilMode(e.target.checked)} />
+                List each coil &amp; its weight (kg)
+              </label>
+              ${coilMode && html`
+                <div style="display:flex;flex-direction:column;gap:6px">
+                  <div style="display:flex;gap:6px;font-size:10px;color:var(--slate-500);font-weight:600;padding:0 2px">
+                    <span style="flex:1">No. of coils</span><span style="width:14px"></span><span style="flex:1">Weight each (kg)</span><span style="flex:1;text-align:right">Subtotal</span><span style="width:22px"></span>
+                  </div>
+                  ${pcs.length === 0 ? html`<div style="font-size:11px;color:var(--slate-400);padding:2px">No coils yet — tap “+ add coil”.</div>` : ''}
+                  ${pcs.map((p, i) => html`
+                    <div key=${i} style="display:flex;gap:6px;align-items:center">
+                      <input type="number" min=${0} step=${1} value=${p.count} onInput=${e => setPc(i, { count: e.target.value })} placeholder="4" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                      <span style="width:14px;text-align:center;color:var(--slate-400)">×</span>
+                      <input type="number" min=${0} step="any" value=${p.w} onInput=${e => setPc(i, { w: e.target.value })} placeholder="1000" style="flex:1;min-width:0;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                      <span style="flex:1;text-align:right;font-size:11px;color:var(--slate-500)">${fmtNum(Math.round((parseFloat(p.count) || 0) * (parseFloat(p.w) || 0) * 100) / 100)} kg</span>
+                      <button type="button" onClick=${() => rmPc(i)} title="Remove" style="width:22px;background:none;border:none;color:var(--rose-500);cursor:pointer;font-size:16px">×</button>
+                    </div>
+                  `)}
+                  <button type="button" class="btn small ghost" onClick=${addCoilPc} style="align-self:flex-start;font-size:12px">+ add coil</button>
+                  <div style="display:flex;justify-content:space-between;font-size:12px;font-weight:700;color:var(--teal-700);border-top:1px solid var(--slate-200);padding-top:6px;margin-top:2px">
+                    <span>${fmtNum(pcTotalCoils)} coil${pcTotalCoils === 1 ? '' : 's'}</span>
+                    <span>${fmtNum(Math.round(pcTotalCoilKg * 100) / 100)} kg total</span>
+                  </div>
+                </div>
+              `}
+            </div>
+          `}
           <div class="field-row">
             ${!isEdit
               ? ((isLengthItem && pieceMode)
                   ? html`<div class="field"><label>Opening qty <span style="font-weight:400;color:var(--teal-700);font-size:11px">· auto from rods</span></label><input type="number" disabled value=${Math.round(pcTotalLen * 1000) / 1000} style="background:var(--slate-100);color:var(--slate-700);font-weight:600" /></div>`
+                  : (isCoil && coilMode)
+                  ? html`<div class="field"><label>Opening qty <span style="font-weight:400;color:var(--teal-700);font-size:11px">· auto from coils (kg)</span></label><input type="number" disabled value=${Math.round(pcTotalCoilKg * 1000) / 1000} style="background:var(--slate-100);color:var(--slate-700);font-weight:600" /></div>`
                   : html`<div class="field"><label>Opening qty * <span style="font-weight:400;color:var(--amber-700);font-size:11px">· one-time</span></label><input type="number" required min=${0} step="0.001" value=${form.opening_qty} onChange=${e => setForm({...form, opening_qty: e.target.value})} placeholder="0" /></div>`)
               : html`<div class="field"><label>Current qty</label><input type="number" disabled value=${editTarget.current_qty} style="background:var(--slate-100);color:var(--slate-700);font-weight:600" /></div>`}
             <div class="field"><label>Reorder level</label><input type="number" step="0.001" value=${form.reorder_level || ''} onChange=${e => setForm({...form, reorder_level: e.target.value})} /></div>
@@ -40415,6 +40489,46 @@ function rodsRowsMetres(rows) {
     const c = parseFloat(r.count) || 0, l = parseFloat(r.len) || 0, cut = parseFloat(r.cut) || 0;
     return s + c * ((r.mode === 'cut' || cut > 0) ? cut : l);
   }, 0);
+}
+
+// ---- Coil breakdown helpers ------------------------------------------------
+// A coil item's `pieces` is [{count, w}] where w = the weight (kg) of each coil.
+// Total stock (kg) = Σ count×w. Issuing takes whole coils, or a partial weight
+// cut from one coil (the lighter leftover coil stays in stock).
+function coilsExpand(pieces) {
+  const out = [];
+  for (const p of (pieces || [])) {
+    const c = Math.round(parseFloat(p.count) || 0);
+    const w = Math.round((parseFloat(p.w != null ? p.w : p.weight) || 0) * 1000) / 1000;
+    if (c > 0 && w > 0) for (let k = 0; k < c; k++) out.push(w);
+  }
+  return out;
+}
+function coilsCollapse(weights) {
+  const by = {};
+  (weights || []).forEach(w => { const k = Math.round((parseFloat(w) || 0) * 1000) / 1000; if (k > 0) by[k] = (by[k] || 0) + 1; });
+  return Object.keys(by).map(Number).sort((a, b) => b - a).map(w => ({ count: by[w], w }));
+}
+// Kg implied by a coil selection (cut pieces consume only the cut weight).
+function coilsRowsKg(rows) {
+  return (rows || []).reduce((s, r) => {
+    const c = parseFloat(r.count) || 0, w = parseFloat(r.w) || 0, cut = parseFloat(r.cut) || 0;
+    return s + c * ((r.mode === 'cut' || cut > 0) ? cut : w);
+  }, 0);
+}
+// Apply an issue to the coil list: remove each picked coil; for a partial cut,
+// the leftover (w − cut) coil returns to stock. Returns the new collapsed list.
+function coilsApplyIssue(pieces, rows) {
+  const weights = coilsExpand(pieces);
+  const leftover = [];
+  for (const r of (rows || [])) {
+    const c = Math.round(parseFloat(r.count) || 0);
+    const w = Math.round((parseFloat(r.w) || 0) * 1000) / 1000;
+    const cut = parseFloat(r.cut) || 0;
+    if (c <= 0 || w <= 0) continue;
+    for (let k = 0; k < c; k++) { const idx = weights.findIndex(x => Math.abs(x - w) < 0.0005); if (idx >= 0) weights.splice(idx, 1); if (cut > 0 && (w - cut) > 0.0005) leftover.push(Math.round((w - cut) * 1000) / 1000); }
+  }
+  return coilsCollapse([...weights, ...leftover]);
 }
 
 // Consume `metres` longest-first; cut the longest rod when the remaining need is
@@ -40910,6 +41024,96 @@ function RodPickModal({ plant, itemId, onClose, onApply }) {
               <button type="button" class="btn small ghost" onClick=${addRod} style="align-self:flex-start;font-size:12px">+ add another</button>
               <div style="font-size:13px;font-weight:700;color:var(--teal-700);border-top:1px solid var(--slate-200);padding-top:6px">Total: ${fmtNum(totM)} ${uom}${uw ? ' · ≈ ' + fmtNum(Math.round(totM * uw * 100) / 100) + ' kg' : ''}</div>
               <button type="button" class="btn" onClick=${apply} disabled=${!(totM > 0)} style="margin-top:4px">Use ${fmtNum(totM)} ${uom}</button>
+            </div>
+          `}
+      </div>
+    </div>
+  `;
+}
+
+// Reusable coil picker — pick whole coils or a partial weight (kg) cut from one
+// coil of a coil item's weight list. Returns { kg, rows } so the DC issue form
+// can set the line qty (kg) and update the item's coil breakdown after issuing.
+function CoilPickModal({ plant, itemId, onClose, onApply }) {
+  const [item, setItem] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([{ w: '', count: '', cut: '', mode: 'whole' }]);
+  const [err, setErr] = useState('');
+
+  useEffect(() => { (async () => {
+    const { data } = await sb.from('mcp_stocks_items').select('id, code, name, uom, current_qty, pieces').eq('id', itemId).single();
+    setItem(data || null); setLoading(false);
+  })(); }, [itemId]);
+
+  const availByW = {};
+  (item?.pieces || []).forEach(p => { const w = Math.round((parseFloat(p.w != null ? p.w : p.weight) || 0) * 1000) / 1000; if (w > 0) availByW[w] = (availByW[w] || 0) + Math.round(parseFloat(p.count) || 0); });
+  const availWs = Object.keys(availByW).map(Number).sort((a, b) => b - a);
+  const totKg = Math.round(coilsRowsKg(rows) * 1000) / 1000;
+
+  const setC = (i, patch) => setRows(rs => rs.map((x, idx) => idx === i ? { ...x, ...patch } : x));
+  const setCMode = (i, m) => setRows(rs => rs.map((x, idx) => idx === i ? { ...x, mode: m, cut: m === 'whole' ? '' : x.cut, count: (x.count && parseInt(x.count) > 0) ? x.count : '1' } : x));
+  const addC = () => setRows(rs => [...rs, { w: '', count: '', cut: '', mode: 'whole' }]);
+  const rmC = (i) => setRows(rs => rs.length <= 1 ? rs : rs.filter((_, idx) => idx !== i));
+
+  const apply = () => {
+    setErr('');
+    const reqByW = {};
+    rows.forEach(r => { const c = Math.round(parseFloat(r.count) || 0), w = Math.round((parseFloat(r.w) || 0) * 1000) / 1000; if (c > 0 && w > 0) reqByW[w] = (reqByW[w] || 0) + c; });
+    for (const w in reqByW) { if (reqByW[w] > (availByW[w] || 0)) { setErr('Only ' + (availByW[w] || 0) + ' coil(s) of ' + fmtNum(w) + ' kg in stock'); return; } }
+    for (const r of rows) { const cut = parseFloat(r.cut) || 0, w = parseFloat(r.w) || 0; if (cut > 0 && cut > w + 0.0005) { setErr('Cut weight can’t exceed the coil weight'); return; } }
+    if (!(totKg > 0)) { setErr('Pick at least one coil'); return; }
+    onApply({ kg: totKg, rows: rows.filter(r => (parseFloat(r.count) || 0) > 0 && (parseFloat(r.w) || 0) > 0).map(r => ({ w: r.w, count: r.count, cut: r.mode === 'cut' ? r.cut : '' })) });
+  };
+
+  return html`
+    <div class="modal-backdrop active" onClick=${e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div class="modal" style="max-width:440px">
+        <div class="modal-header"><div class="modal-title">🧵 Pick coils${item ? ' · ' + item.name : ''}</div><button class="close-btn" onClick=${onClose}>×</button></div>
+        ${err && html`<div class="alert error">${err}</div>`}
+        ${loading ? html`<div class="loader"><div class="spinner"></div></div>`
+          : !item ? html`<div style="font-size:13px;color:var(--slate-500)">Item not found.</div>`
+          : availWs.length === 0 ? html`<div style="font-size:13px;color:var(--amber-700)">No coil breakdown recorded for this item yet. Type the kg directly in the Qty box, or edit the item to list its coils.</div>`
+          : html`
+            <div style="font-size:11px;color:var(--slate-600);margin-bottom:8px">In stock: ${availWs.map(w => html`<span style="display:inline-block;background:var(--slate-100);border-radius:10px;padding:1px 8px;margin:0 4px 4px 0">${fmtNum(availByW[w])} × ${fmtNum(w)} kg</span>`)}</div>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              ${rows.map((r, i) => {
+                const rw = parseFloat(r.w) || 0, cnt = parseFloat(r.count) || 0, cutW = parseFloat(r.cut) || 0;
+                const rowKg = r.mode === 'cut' ? cnt * cutW : cnt * rw;
+                return html`
+                <div key=${i} style="border:1px solid var(--slate-200);border-radius:8px;padding:8px;background:var(--slate-50)">
+                  <div style="display:flex;gap:5px;align-items:center;margin-bottom:6px">
+                    <select value=${r.w} onChange=${e => setC(i, { w: e.target.value })} style="flex:1;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px;background:#fff">
+                      <option value="">Pick a coil…</option>
+                      ${availWs.map(w => html`<option key=${w} value=${w}>${fmtNum(w)} kg · ${fmtNum(availByW[w])} in stock</option>`)}
+                    </select>
+                    ${rows.length > 1 && html`<button type="button" onClick=${() => rmC(i)} title="Remove" style="background:none;border:none;color:var(--rose-500);cursor:pointer;font-size:18px;padding:0 4px">×</button>`}
+                  </div>
+                  <div style="display:flex;gap:6px;margin-bottom:6px">
+                    <button type="button" onClick=${() => setCMode(i, 'whole')} style=${'flex:1;padding:6px;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid ' + (r.mode !== 'cut' ? 'var(--teal-600);background:var(--teal-600);color:#fff' : 'var(--slate-200);background:#fff;color:var(--slate-600)')}>Whole coil(s)</button>
+                    <button type="button" onClick=${() => setCMode(i, 'cut')} style=${'flex:1;padding:6px;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid ' + (r.mode === 'cut' ? 'var(--teal-600);background:var(--teal-600);color:#fff' : 'var(--slate-200);background:#fff;color:var(--slate-600)')}>Partial (kg)</button>
+                  </div>
+                  ${r.mode === 'cut' ? html`
+                    <div style="display:flex;gap:5px;align-items:center;font-size:13px;color:var(--slate-600)">
+                      <span>Take</span>
+                      <input type="number" min=${0} step="any" value=${r.cut} onInput=${e => setC(i, { cut: e.target.value })} placeholder="400" style="width:80px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                      <span>kg ×</span>
+                      <input type="text" inputmode="numeric" value=${r.count} onInput=${e => setC(i, { count: e.target.value.replace(/[^0-9]/g, '') })} placeholder="1" style="width:52px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                      <span>coil</span>
+                    </div>
+                    ${rw > 0 && cutW > 0 && cutW < rw && html`<div style="font-size:11px;color:var(--slate-500);margin-top:4px">↩ leftover ${fmtNum(Math.round((rw - cutW) * 1000) / 1000)} kg × ${fmtNum(cnt || 1)} returns to stock</div>`}
+                  ` : html`
+                    <div style="display:flex;gap:5px;align-items:center;font-size:13px;color:var(--slate-600)">
+                      <span>Issue</span>
+                      <input type="text" inputmode="numeric" value=${r.count} onInput=${e => setC(i, { count: e.target.value.replace(/[^0-9]/g, '') })} placeholder="1" style="width:60px;padding:7px;border:1px solid var(--slate-200);border-radius:5px;font-size:13px" />
+                      <span>whole coil${cnt === 1 ? '' : 's'}${rw ? ' of ' + fmtNum(rw) + ' kg' : ''}</span>
+                    </div>
+                  `}
+                  ${rowKg > 0 && html`<div style="font-size:11px;font-weight:600;color:var(--teal-700);margin-top:4px">= ${fmtNum(Math.round(rowKg * 1000) / 1000)} kg</div>`}
+                </div>`;
+              })}
+              <button type="button" class="btn small ghost" onClick=${addC} style="align-self:flex-start;font-size:12px">+ add another</button>
+              <div style="font-size:13px;font-weight:700;color:var(--teal-700);border-top:1px solid var(--slate-200);padding-top:6px">Total: ${fmtNum(totKg)} kg</div>
+              <button type="button" class="btn" onClick=${apply} disabled=${!(totKg > 0)} style="margin-top:4px">Use ${fmtNum(totKg)} kg</button>
             </div>
           `}
       </div>
