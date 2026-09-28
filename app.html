@@ -4197,6 +4197,7 @@ function RdcReturns({ plant, me, activeUnit }) {
   const [recv, setRecv] = useState({});     // line id -> qty string
   const [rcvModal, setRcvModal] = useState(null); // DC group being received in the full dialog
   const [expanded, setExpanded] = useState(() => new Set()); // expanded DC groups
+  const [search, setSearch] = useState('');
   const toggleExp = (k) => setExpanded(prev => { const n = new Set(prev); n.has(k) ? n.delete(k) : n.add(k); return n; });
   const u = activeUnit?.unit_id;
   const scope = (q) => u ? q.or(`unit_id.eq.${u},unit_id.is.null`) : q;
@@ -4215,7 +4216,14 @@ function RdcReturns({ plant, me, activeUnit }) {
   const pending = (l) => Math.max(Number(l.qty_sent || 0) - Number(l.qty_received || 0), 0);
   const isOpen = (l) => l.status === 'open' || l.status === 'partial';
 
-  const shown = lines.filter(l => tab === 'all' ? true : tab === 'open' ? isOpen(l) : !isOpen(l));
+  const _q = search.trim().toLowerCase();
+  const _qn = _q.replace(/[^a-z0-9]/g, '');
+  const matchSearch = (l) => {
+    if (!_q) return true;
+    const hay = ((l.doc?.doc_number || '') + ' ' + (l.party_name || '') + ' ' + (l.item_name || '')).toLowerCase();
+    return hay.includes(_q) || (!!_qn && hay.replace(/[^a-z0-9]/g, '').includes(_qn));
+  };
+  const shown = lines.filter(l => (tab === 'all' ? true : tab === 'open' ? isOpen(l) : !isOpen(l)) && matchSearch(l));
   // Group the visible lines by their DC so one returnable DC = one card (its
   // items expand underneath), instead of a separate card per item.
   const groups = (() => {
@@ -4256,13 +4264,17 @@ function RdcReturns({ plant, me, activeUnit }) {
         <div class="stat ${openCount ? 'amber' : 'teal'}"><div class="stat-num">${openCount}</div><div class="stat-label">Open</div></div>
         <div class="stat ${overdueCount ? 'rose' : 'teal'}"><div class="stat-num">${overdueCount}</div><div class="stat-label">Overdue</div></div>
       </div>
+      <div style="position:relative;margin-bottom:12px">
+        <input type="search" value=${search} onInput=${e => setSearch(e.target.value)} placeholder="🔍 Search DC number, vendor / supplier, item…" style="width:100%;box-sizing:border-box;padding:10px 34px 10px 14px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
+        ${search && html`<button type="button" onClick=${() => setSearch('')} title="Clear" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--slate-400);cursor:pointer;font-size:16px;line-height:1;padding:2px 4px">×</button>`}
+      </div>
       <div class="auth-tabs" style="margin-bottom:14px">
         <button class=${'auth-tab' + (tab === 'open' ? ' active' : '')} onClick=${() => setTab('open')}>Open · ${openCount}</button>
         <button class=${'auth-tab' + (tab === 'done' ? ' active' : '')} onClick=${() => setTab('done')}>Received / Closed</button>
         <button class=${'auth-tab' + (tab === 'all' ? ' active' : '')} onClick=${() => setTab('all')}>All</button>
       </div>
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
-        groups.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🔁</div><div style="font-size:13px">No returnable-DC items ${tab === 'open' ? 'open' : 'here'}. Create a Returnable DC (RDC) in Make Documents and its items appear here for tracking.</div></div></div>` :
+        groups.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">🔁</div><div style="font-size:13px">${_q ? 'No returnable DCs match your search.' : 'No returnable-DC items ' + (tab === 'open' ? 'open' : 'here') + '. Create a Returnable DC (RDC) in Make Documents and its items appear here for tracking.'}</div></div></div>` :
         groups.map(g => {
           const openLines = g.lines.filter(isOpen);
           const anyOpen = openLines.length > 0;
