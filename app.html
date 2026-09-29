@@ -41448,11 +41448,36 @@ function rptToHtml(report, plant) {
     + '<button class="noprint" onclick="window.print()" style="padding:8px 16px;font-size:13px;cursor:pointer">Print / Save as PDF</button>'
     + '</body></html>';
 }
+// Return a copy of the report with the given column labels removed (headers +
+// every row / subtotal / total, all index-aligned). Also drops money summary
+// tiles and the WhatsApp "Total value" line when Value is hidden — for handing
+// a report to the shop floor without prices.
+function rptPickCols(report, hidden) {
+  if (!hidden || !hidden.size) return report;
+  const blocks = report.blocks.map(b => {
+    const keep = b.headers.map((h, i) => (hidden.has(h.label) ? -1 : i)).filter(i => i >= 0);
+    const pick = (arr) => keep.map(i => arr[i]);
+    return {
+      ...b,
+      headers: pick(b.headers),
+      sections: b.sections.map(s => ({ ...s, rows: s.rows.map(pick), subtotal: s.subtotal ? pick(s.subtotal) : s.subtotal })),
+      totals: b.totals ? pick(b.totals) : b.totals,
+    };
+  });
+  let summary = report.summary, waText = report.waText;
+  if (hidden.has('Value') || hidden.has('Rate')) {
+    summary = (summary || []).filter(s => !/value/i.test(s.label));
+    waText = (waText || '').split('\n').filter(l => !/total value/i.test(l)).join('\n');
+  }
+  return { ...report, blocks, summary, waText };
+}
 
 function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose }) {
   const today = new Date().toISOString().slice(0, 10);
   const monthStart = today.slice(0, 8) + '01';
   const [rpt, setRpt] = useState('current'); // current | movement | low | scrap
+  const [hiddenCols, setHiddenCols] = useState(() => new Set()); // column labels to hide from the report (e.g. Rate/Value for shop floor)
+  const toggleCol = (label) => setHiddenCols(prev => { const n = new Set(prev); n.has(label) ? n.delete(label) : n.add(label); return n; });
   const [unitId, setUnitId] = useState('all');
   const [catFilter, setCatFilter] = useState('all'); // all | raw_material | consumables | …
   const [fromD, setFromD] = useState(monthStart);
@@ -41594,7 +41619,11 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
   };
 
   const loading = (rpt === 'movement' && (mvLoading || mvTx == null)) || (rpt === 'scrap' && (scrapLoading || scrapPile == null));
-  const report = rpt === 'current' ? buildCurrent() : rpt === 'movement' ? buildMovement() : rpt === 'low' ? buildLow() : buildScrap();
+  const fullReport = rpt === 'current' ? buildCurrent() : rpt === 'movement' ? buildMovement() : rpt === 'low' ? buildLow() : buildScrap();
+  // Columns available to show/hide (union across blocks), and the report with the
+  // hidden ones removed — used everywhere (screen, Print/PDF, Excel, WhatsApp).
+  const allCols = [...new Set((fullReport.blocks || []).flatMap(b => b.headers.map(h => h.label)))];
+  const report = rptPickCols(fullReport, hiddenCols);
 
   const doPrint = () => { ppapOpenDoc(rptToHtml(report, plant)); };
   const doCsv = () => { rptDownload(report.title.replace(/\s+/g, '_') + '_' + today + '.csv', rptToCsv(report), 'text/csv;charset=utf-8'); };
@@ -41643,6 +41672,12 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
 
         <div style="font-size:13px;font-weight:700;margin-bottom:1px">${report.title}</div>
         ${report.subtitle && html`<div style="font-size:11px;color:var(--slate-500);margin-bottom:8px">${report.subtitle}</div>`}
+
+        ${!loading && allCols.length > 0 && html`<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px;padding:8px 10px;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:10px">
+          <span style="font-size:11px;font-weight:700;color:var(--slate-500);margin-right:2px">🖨 Columns to print</span>
+          ${allCols.map(c => { const shown = !hiddenCols.has(c); return html`<button key=${c} type="button" onClick=${() => toggleCol(c)} title=${shown ? 'Hide ' + c : 'Show ' + c} style=${'font-size:11px;font-weight:600;padding:3px 9px;border-radius:999px;cursor:pointer;border:1px solid ' + (shown ? 'var(--teal-400);background:var(--teal-50);color:var(--teal-800)' : 'var(--slate-200);background:#fff;color:var(--slate-400);text-decoration:line-through')}>${shown ? '✓ ' : ''}${c}</button>`; })}
+          ${(allCols.includes('Value') || allCols.includes('Rate')) && html`<button type="button" onClick=${() => setHiddenCols(prev => { const n = new Set(prev); const on = n.has('Rate') || n.has('Value'); ['Rate','Value'].forEach(k => on ? n.delete(k) : n.add(k)); return n; })} style="font-size:11px;font-weight:700;padding:3px 10px;border-radius:999px;cursor:pointer;border:1px solid var(--slate-300);background:#fff;color:var(--slate-700);margin-left:auto">${(hiddenCols.has('Rate') || hiddenCols.has('Value')) ? '💰 Show prices' : '🔒 Hide prices (shop floor)'}</button>`}
+        </div>`}
 
         ${!loading && report.summary && report.summary.length > 0 && html`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
           ${report.summary.map((s, si) => html`<div key=${si} style="flex:1;min-width:96px;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:10px;padding:8px 12px">
