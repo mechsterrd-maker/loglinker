@@ -39056,6 +39056,8 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
   const [layout, setLayout] = useState('table'); // table reads clearest after a bulk import (name · category · qty · value)
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [subcategoryFilter, setSubcategoryFilter] = useState('all');
+  const [typeFilter, setTypeFilter] = useState('all');   // raw-material shop type: Angle / Plate / Sheet / Flat / …
+  const [thickFilter, setThickFilter] = useState('all'); // thickness (mm) within the selected type
   const [gradeFilter, setGradeFilter] = useState('all'); // 'all' | MS | SS | Aluminium | … — material grade (raw material only)
   const [pickHint, setPickHint] = useState(null); // 'issue' | 'return' | null — banner when landed from a dashboard "pick an item" shortcut
   const [search, setSearch] = useState('');
@@ -39119,10 +39121,10 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
     if (s === 'new_item') { setEditTarget(null); setModal('item'); }
     // "Issue Material" / "Stock Return" → land on the item list, ready to pick the
     // item to act on (a banner names the intent; tap an item to issue/return it).
-    else if (s === 'issue_pick') { setView('items'); setCategoryFilter('all'); setSubcategoryFilter('all'); setGradeFilter('all'); setStockLevel('all'); setPickHint('issue'); }
-    else if (s === 'return_pick') { setView('items'); setCategoryFilter('all'); setSubcategoryFilter('all'); setGradeFilter('all'); setStockLevel('all'); setPickHint('return'); }
-    else if (s === 'items_all') { setView('items'); setCategoryFilter('all'); setSubcategoryFilter('all'); setGradeFilter('all'); setStockLevel('all'); setPickHint(null); }
-    else if (s.startsWith('cat_')) { setView('items'); setCategoryFilter(s.slice(4)); setSubcategoryFilter('all'); setGradeFilter('all'); setStockLevel('all'); setPickHint(null); }
+    else if (s === 'issue_pick') { setView('items'); setCategoryFilter('all'); setSubcategoryFilter('all'); setTypeFilter('all'); setThickFilter('all'); setGradeFilter('all'); setStockLevel('all'); setPickHint('issue'); }
+    else if (s === 'return_pick') { setView('items'); setCategoryFilter('all'); setSubcategoryFilter('all'); setTypeFilter('all'); setThickFilter('all'); setGradeFilter('all'); setStockLevel('all'); setPickHint('return'); }
+    else if (s === 'items_all') { setView('items'); setCategoryFilter('all'); setSubcategoryFilter('all'); setTypeFilter('all'); setThickFilter('all'); setGradeFilter('all'); setStockLevel('all'); setPickHint(null); }
+    else if (s.startsWith('cat_')) { setView('items'); setCategoryFilter(s.slice(4)); setSubcategoryFilter('all'); setTypeFilter('all'); setThickFilter('all'); setGradeFilter('all'); setStockLevel('all'); setPickHint(null); }
     else if (s === 'low') { setView('items'); setCategoryFilter('all'); setStockLevel('low'); setPickHint(null); }
     else if (s === 'out') { setView('items'); setCategoryFilter('all'); setStockLevel('out'); setPickHint(null); }
     else if (s === 'in') { setView('transactions'); setTxnTypeFilter('inward'); }
@@ -39199,12 +39201,38 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
     return null;
   };
   const gradeOf = (i) => normGrade(i.material) || normGrade((i.name || '') + ' ' + (i.code || ''));
+  // Thickness (mm) of a steel item — the key differentiating size. Uses the
+  // section's "Thk" dimension when known, else the last number in the size (the
+  // first for plate/sheet, where thickness is written first).
+  const thicknessOf = (i) => {
+    const sec = RM_SECTIONS.find(s => s.key === i.section_type);
+    if (sec) {
+      // Known section: use its "Thk" dimension only (return null if it has none
+      // or the value wasn't recorded — never guess a leg size as thickness).
+      const ti = sec.dims.findIndex(d => /thk|thick/i.test(d));
+      if (ti < 0) return null;
+      const v = i['dim' + (ti + 1)];
+      return (v != null && v !== '' && isFinite(v)) ? String(+parseFloat(v)) : null;
+    }
+    // Unknown / legacy section (imported) — read from the size text (thickness is
+    // last for angle/flat/tube, first for plate/sheet).
+    const nums = String(i.size_spec || '').match(/[0-9]+(?:\.[0-9]+)?/g);
+    if (nums && nums.length) {
+      const t = rmTypeLabel(i);
+      return String(+parseFloat((t === 'Plate' || t === 'Sheet') ? nums[0] : nums[nums.length - 1]));
+    }
+    return null;
+  };
+  const isRawCat = categoryFilter === 'raw_material';
 
-  // Filter by category (+ material grade + sub-category) + search
+  // Filter by category (+ grade + shop type / thickness for raw material, else
+  // sub-category) + search
   let filteredItems = items;
   if (categoryFilter !== 'all') filteredItems = filteredItems.filter(i => (i.category || 'general') === categoryFilter);
   if (gradeFilter !== 'all') filteredItems = filteredItems.filter(i => (gradeOf(i) || '—') === gradeFilter);
-  if (categoryFilter !== 'all' && subcategoryFilter !== 'all') {
+  if (isRawCat && typeFilter !== 'all') filteredItems = filteredItems.filter(i => rmTypeLabel(i) === typeFilter);
+  if (isRawCat && thickFilter !== 'all') filteredItems = filteredItems.filter(i => (thicknessOf(i) || '') === thickFilter);
+  if (!isRawCat && categoryFilter !== 'all' && subcategoryFilter !== 'all') {
     filteredItems = filteredItems.filter(i => (subcategoryFilter === '—' ? !i.subcategory : i.subcategory === subcategoryFilter));
   }
   if (search.trim()) {
@@ -39262,6 +39290,32 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
     }
   }
   const subcatKeys = Object.keys(subcatCounts).sort((a,b) => (a === '—') - (b === '—') || a.localeCompare(b));
+
+  // Raw-material shop-type groups (Angle / Plate / Sheet / Flat / …) via
+  // rmTypeLabel, so items group by their real type even when no subcategory was
+  // set. Counts are within the current category + grade.
+  const typeCounts = {};
+  if (isRawCat) {
+    for (const i of unitScopedItems.filter(i => (i.category || 'general') === 'raw_material' && (gradeFilter === 'all' || (gradeOf(i) || '—') === gradeFilter))) {
+      const t = rmTypeLabel(i) || 'Other';
+      typeCounts[t] = (typeCounts[t] || 0) + 1;
+    }
+  }
+  const typeTotal = Object.values(typeCounts).reduce((a, b) => a + b, 0);
+  const typeKeys = Object.keys(typeCounts).sort((a, b) => {
+    const ia = RM_TYPE_ORDER.indexOf(a), ib = RM_TYPE_ORDER.indexOf(b);
+    if (ia !== ib) return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    return a.localeCompare(b);
+  });
+  // Thickness options within the selected type.
+  const thickCounts = {};
+  if (isRawCat && typeFilter !== 'all') {
+    for (const i of unitScopedItems.filter(i => (i.category || 'general') === 'raw_material' && (gradeFilter === 'all' || (gradeOf(i) || '—') === gradeFilter) && rmTypeLabel(i) === typeFilter)) {
+      const t = thicknessOf(i);
+      if (t) thickCounts[t] = (thickCounts[t] || 0) + 1;
+    }
+  }
+  const thickKeys = Object.keys(thickCounts).sort((a, b) => parseFloat(a) - parseFloat(b));
 
   // Group by category for category view
   const byCategory = {};
@@ -39521,17 +39575,17 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
 
       ${(layout === 'list' || layout === 'table') && html`
         <div class="auth-tabs" style="margin-bottom:8px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch">
-          <button class=${'auth-tab' + (categoryFilter === 'all' ? ' active' : '')} onClick=${() => { setCategoryFilter('all'); setSubcategoryFilter('all'); setGradeFilter('all'); setStockLevel('all'); }}>All · ${unitScopedItems.length}</button>
+          <button class=${'auth-tab' + (categoryFilter === 'all' ? ' active' : '')} onClick=${() => { setCategoryFilter('all'); setSubcategoryFilter('all'); setTypeFilter('all'); setThickFilter('all'); setGradeFilter('all'); setStockLevel('all'); }}>All · ${unitScopedItems.length}</button>
           ${Object.keys(categoryLabels).map(c => categoryCounts[c] > 0 && html`
-            <button key=${c} class=${'auth-tab' + (categoryFilter === c ? ' active' : '')} onClick=${() => { setCategoryFilter(c); setSubcategoryFilter('all'); setGradeFilter('all'); setStockLevel('all'); }}>${lbl(c)} · ${categoryCounts[c]}</button>
+            <button key=${c} class=${'auth-tab' + (categoryFilter === c ? ' active' : '')} onClick=${() => { setCategoryFilter(c); setSubcategoryFilter('all'); setTypeFilter('all'); setThickFilter('all'); setGradeFilter('all'); setStockLevel('all'); }}>${lbl(c)} · ${categoryCounts[c]}</button>
           `)}
         </div>
         ${categoryFilter === 'raw_material' && gradeKeys.length > 1 && html`
           <div class="auth-tabs" style="margin-bottom:10px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;gap:6px;align-items:center">
             <span style="font-size:11px;font-weight:700;color:var(--slate-500);padding:0 2px;white-space:nowrap">Grade</span>
-            <button class=${'auth-tab small' + (gradeFilter === 'all' ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => { setGradeFilter('all'); setSubcategoryFilter('all'); }}>All</button>
+            <button class=${'auth-tab small' + (gradeFilter === 'all' ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => { setGradeFilter('all'); setSubcategoryFilter('all'); setTypeFilter('all'); setThickFilter('all'); }}>All</button>
             ${gradeKeys.map(g => html`
-              <button key=${g} class=${'auth-tab small' + (gradeFilter === g ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => { setGradeFilter(g); setSubcategoryFilter('all'); }}>${g === '—' ? 'Other' : g} · ${gradeCounts[g]}</button>
+              <button key=${g} class=${'auth-tab small' + (gradeFilter === g ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => { setGradeFilter(g); setSubcategoryFilter('all'); setTypeFilter('all'); setThickFilter('all'); }}>${g === '—' ? 'Other' : g} · ${gradeCounts[g]}</button>
             `)}
           </div>
         `}
@@ -39539,7 +39593,27 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
           ${stockLevel === 'low' ? '⚠️ Low stock only' : '⛔ Out of stock only'}
           <button onClick=${() => setStockLevel('all')} style="border:none;background:none;color:var(--rose-700);cursor:pointer;font-size:13px;line-height:1;padding:0">✕</button>
         </span></div>`}
-        ${categoryFilter !== 'all' && subcatKeys.length > 1 && html`
+        ${isRawCat && typeKeys.length > 0 && html`
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center">
+            <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--slate-600)">
+              <span style="font-weight:700;color:var(--slate-500)">Type</span>
+              <select value=${typeFilter} onChange=${e => { setTypeFilter(e.target.value); setThickFilter('all'); }} style="padding:6px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:#fff;font-family:inherit">
+                <option value="all">All types · ${typeTotal}</option>
+                ${typeKeys.map(t => html`<option key=${t} value=${t}>${t} · ${typeCounts[t]}</option>`)}
+              </select>
+            </label>
+            ${typeFilter !== 'all' && thickKeys.length > 0 && html`
+              <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--slate-600)">
+                <span style="font-weight:700;color:var(--slate-500)">Thickness</span>
+                <select value=${thickFilter} onChange=${e => setThickFilter(e.target.value)} style="padding:6px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:#fff;font-family:inherit">
+                  <option value="all">All</option>
+                  ${thickKeys.map(t => html`<option key=${t} value=${t}>${t} mm · ${thickCounts[t]}</option>`)}
+                </select>
+              </label>
+            `}
+          </div>
+        `}
+        ${!isRawCat && categoryFilter !== 'all' && subcatKeys.length > 1 && html`
           <div class="auth-tabs" style="margin-bottom:14px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;gap:6px">
             <button class=${'auth-tab small' + (subcategoryFilter === 'all' ? ' active' : '')} style="font-size:11px;padding:3px 10px" onClick=${() => setSubcategoryFilter('all')}>All</button>
             ${subcatKeys.map(s => html`
