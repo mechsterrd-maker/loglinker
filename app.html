@@ -39053,7 +39053,9 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
   const [transactions, setTransactions] = useState([]);
   const [pendingReceptions, setPendingReceptions] = useState([]); // doc-backed GRNs awaiting verification
   const [view, setView] = useState('home'); // home | items | transactions
-  const [layout, setLayout] = useState('table'); // table reads clearest after a bulk import (name · category · qty · value)
+  const [layout, setLayout] = useState('table'); // table | list | by_category | grouped
+  const [collapsedThk, setCollapsedThk] = useState(() => new Set()); // collapsed thickness groups in the Grouped view
+  const toggleThk = (k) => setCollapsedThk(prev => { const n = new Set(prev); n.has(k) ? n.delete(k) : n.add(k); return n; });
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [subcategoryFilter, setSubcategoryFilter] = useState('all');
   const [typeFilter, setTypeFilter] = useState('all');   // raw-material shop type: Angle / Plate / Sheet / Flat / …
@@ -39544,6 +39546,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
         <button class="btn small ${layout === 'table' ? '' : 'ghost'}" onClick=${() => setLayout('table')}>Table</button>
         <button class="btn small ${layout === 'list' ? '' : 'ghost'}" onClick=${() => setLayout('list')}>List</button>
         <button class="btn small ${layout === 'by_category' ? '' : 'ghost'}" onClick=${() => setLayout('by_category')}>By Category</button>
+        <button class="btn small ${layout === 'grouped' ? '' : 'ghost'}" onClick=${() => { setLayout('grouped'); setCategoryFilter('raw_material'); setGradeFilter(g => g === 'all' ? 'MS' : g); setTypeFilter(t => t === 'all' ? 'Angle' : t); }}>Grouped</button>
       </div>
       ${needPriceCount > 0 && html`
         <div style="margin-bottom:10px">
@@ -39630,12 +39633,135 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
           <button onClick=${() => setPickHint(null)} style="border:none;background:none;color:inherit;cursor:pointer;font-size:15px;line-height:1;padding:0">✕</button>
         </div>
       `}
-      <div class="section-h">Items · ${filteredItems.length}<span style="display:flex;gap:6px;flex-wrap:wrap">
+      ${layout !== 'grouped' && html`<div class="section-h">Items · ${filteredItems.length}<span style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn small" style="background:linear-gradient(135deg,var(--teal-600),var(--teal-500));color:white" onClick=${() => setVoiceOpen(true)} title="Voice issue — Tamil / Hindi / English">🎙️ Voice Issue</button>
         <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('item'); }}>+ Add</button>
-      </span></div>
+      </span></div>`}
 
       ${loading ? html`<div class="loader"><div class="spinner"></div></div>` :
+        layout === 'grouped' ? (() => {
+          const BLUE = '#2563eb', GRN = '#10b981';
+          const uwOf = (i) => parseFloat(i.unit_weight) || 0;
+          const pcsOf = (i) => {
+            const pcs = Array.isArray(i.pieces) ? i.pieces : [];
+            const n = pcs.reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
+            if (n > 0) return n;
+            if (['nos', 'no', 'no.', 'nos.', 'pcs', 'pc', 'pcs.', 'pieces', 'ea', 'each'].includes((i.uom || '').toLowerCase())) return parseFloat(i.current_qty) || 0;
+            return null;
+          };
+          const rmAll = unitScopedItems.filter(i => (i.category || 'general') === 'raw_material');
+          const byGrade = {};
+          for (const i of rmAll) { const g = gradeOf(i) || 'Other'; (byGrade[g] = byGrade[g] || []).push(i); }
+          const GMETA = { MS: 'Mild Steel', SS: 'Stainless Steel', Aluminium: 'Aluminium', Brass: 'Brass', Copper: 'Copper', 'Cast Iron': 'Cast Iron', Other: 'Other' };
+          const baseG = ['MS', 'SS', 'Aluminium'];
+          const gradeList = [...baseG, ...Object.keys(byGrade).filter(g => !baseG.includes(g)).sort()];
+          const grade = gradeFilter === 'all' ? 'MS' : gradeFilter;
+          const gItems = byGrade[grade] || [];
+          const typesIn = {}; for (const i of gItems) { const t = rmTypeLabel(i); typesIn[t] = (typesIn[t] || 0) + 1; }
+          const TILES = [['Angle', 'Angle'], ['Flat', 'Flat'], ['Channel', 'Channel'], ['Plate', 'Plate'], ['Sheet', 'Sheet'], ['Pipe / Tube', 'Pipe'], ['Beam', 'Beam'], ['RHS (rect tube)', 'Rectangle Tube'], ['SHS (square tube)', 'Square Tube']];
+          const tileKeys = TILES.map(t => t[0]);
+          const tiles = [...TILES, ...Object.keys(typesIn).filter(t => !tileKeys.includes(t)).sort().map(t => [t, t])];
+          const curType = typeFilter === 'all' ? 'Angle' : typeFilter;
+          const curLabel = (tiles.find(t => t[0] === curType) || [null, curType])[1];
+          const panelItems = gItems.filter(i => rmTypeLabel(i) === curType);
+          const byThk = {}; for (const i of panelItems) { const t = thicknessOf(i); const k = (t == null ? '—' : t); (byThk[k] = byThk[k] || []).push(i); }
+          const thkKeys = Object.keys(byThk).sort((a, b) => (a === '—') - (b === '—') || parseFloat(a) - parseFloat(b));
+          const totKg = panelItems.reduce((s, i) => s + (uwOf(i) > 0 ? parseFloat(i.current_qty || 0) * uwOf(i) : 0), 0);
+          const SW = (paths) => html`<svg width="28" height="28" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round">${paths}</svg>`;
+          const P = {
+            'Angle': html`<path d="M9 5 v18 h18"/><path d="M9 5 h4 v14 h14" opacity="0.35"/>`,
+            'Flat': html`<path d="M4 18 L21 12 L28 14 L11 20 Z" fill="currentColor" fill-opacity="0.14"/>`,
+            'Channel': html`<path d="M21 6 h-9 v20 h9"/><path d="M21 10 h-5 v12 h5" opacity="0.35"/>`,
+            'Plate': html`<path d="M4 13 L17 8 L28 12 L15 17 Z" fill="currentColor" fill-opacity="0.14"/><path d="M4 13 v5 l11 4 v-5 M15 17 v5 l13 -5 v-5"/>`,
+            'Sheet': html`<path d="M4 18 L18 11 L29 14 L15 21 Z" fill="currentColor" fill-opacity="0.1"/>`,
+            'Pipe': html`<ellipse cx="10" cy="16" rx="3.4" ry="7" fill="currentColor" fill-opacity="0.12"/><path d="M10 9 h13 M10 23 h13"/><path d="M23 9 a3.4 7 0 0 1 0 14"/>`,
+            'Beam': html`<path d="M8 7 h16 M8 25 h16 M16 7 v18"/>`,
+            'Rectangle Tube': html`<path d="M5 12 L19 8 L27 11 L13 15 Z" fill="currentColor" fill-opacity="0.12"/><path d="M5 12 v8 l8 3 v-8 M13 15 v8 l14 -4 v-9"/>`,
+            'Square Tube': html`<path d="M8 12 L18 8 L26 11 L16 15 Z" fill="currentColor" fill-opacity="0.12"/><path d="M8 12 v9 l8 3 v-9 M16 15 v9 l10 -4 v-9"/>`,
+            '_': html`<rect x="7" y="9" width="18" height="14" rx="2" fill="currentColor" fill-opacity="0.1"/>`,
+          };
+          const ic = (k) => SW(P[({ 'Pipe / Tube': 'Pipe', 'RHS (rect tube)': 'Rectangle Tube', 'SHS (square tube)': 'Square Tube', Coil: '_', 'Round bar': 'Pipe', 'Square bar': 'Beam' })[k] || k] || P._);
+          const gradeIc = (g) => ic(g === 'MS' ? 'Beam' : g === 'SS' ? 'Pipe / Tube' : g === 'Aluminium' ? 'Sheet' : '_');
+          return html`
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-bottom:14px">
+              ${gradeList.map(g => {
+                const active = grade === g;
+                const nTypes = new Set((byGrade[g] || []).map(i => rmTypeLabel(i))).size;
+                return html`<div key=${g} onClick=${() => { setGradeFilter(g); setTypeFilter('Angle'); }} style=${'cursor:pointer;border:2px solid ' + (active ? BLUE : 'var(--slate-200)') + ';background:' + (active ? '#eff6ff' : '#fff') + ';border-radius:14px;padding:13px 15px;display:flex;align-items:center;gap:12px'}>
+                  <div style=${'width:44px;height:44px;border-radius:10px;flex-shrink:0;display:flex;align-items:center;justify-content:center;background:' + (active ? BLUE : 'var(--slate-100)') + ';color:' + (active ? '#fff' : 'var(--slate-500)')}>${gradeIc(g)}</div>
+                  <div style="flex:1;min-width:0">
+                    <div style="font-weight:800;font-size:15px;color:var(--slate-900)">${g}${(GMETA[g] && GMETA[g] !== g) ? html` <span style="font-weight:600">– ${GMETA[g]}</span>` : ''}</div>
+                    <div style="font-size:12px;color:var(--slate-500)">${nTypes} Subcategor${nTypes === 1 ? 'y' : 'ies'}</div>
+                  </div>
+                  <span style="color:var(--slate-300);font-size:18px">›</span>
+                </div>`;
+              })}
+            </div>
+            <div style="display:flex;gap:10px;overflow-x:auto;padding-bottom:4px;margin-bottom:16px;-webkit-overflow-scrolling:touch">
+              ${tiles.map(([k, label]) => {
+                const active = curType === k;
+                const n = typesIn[k] || 0;
+                return html`<button key=${k} onClick=${() => setTypeFilter(k)} style=${'flex:0 0 auto;width:104px;border:2px solid ' + (active ? BLUE : 'var(--slate-200)') + ';background:' + (active ? '#eff6ff' : '#fff') + ';border-radius:12px;padding:12px 8px;display:flex;flex-direction:column;align-items:center;gap:7px;cursor:pointer;opacity:' + (n ? '1' : '0.45')}>
+                  <span style=${'color:' + (active ? BLUE : 'var(--slate-400)')}>${ic(k)}</span>
+                  <span style=${'font-size:12px;font-weight:600;text-align:center;line-height:1.2;color:' + (active ? BLUE : 'var(--slate-600)')}>${label}</span>
+                </button>`;
+              })}
+            </div>
+            <div class="card" style="padding:0;overflow:hidden">
+              <div style="display:flex;align-items:center;gap:10px;padding:15px 18px;border-bottom:1px solid var(--slate-100);flex-wrap:wrap">
+                <span style="color:${BLUE};display:flex">${ic(curType)}</span>
+                <div style="font-size:17px;font-weight:800;color:var(--slate-900);flex:1;min-width:120px">${grade} ${curLabel}</div>
+                <span style="font-size:11px;font-weight:700;color:#047857;background:#ecfdf5;border:1px solid #6ee7b7;border-radius:999px;padding:3px 10px">${grade} Category</span>
+                <button class="btn small ghost" onClick=${() => { setEditTarget(null); setModal('item'); }} style="font-size:12px">+ Add</button>
+              </div>
+              ${panelItems.length === 0 ? html`<div class="empty" style="padding:26px"><div style="font-size:13px;color:var(--slate-500)">No ${grade} ${curLabel} items in stock yet.</div></div>` :
+                thkKeys.map(tk => {
+                  const rows = byThk[tk].slice().sort((a, b) => String(a.size_spec || a.name || '').localeCompare(String(b.size_spec || b.name || '')));
+                  const key = grade + '|' + curType + '|' + tk;
+                  const open = !collapsedThk.has(key);
+                  return html`<div key=${tk} style="border-bottom:1px solid var(--slate-100)">
+                    <div onClick=${() => toggleThk(key)} style="display:flex;align-items:center;gap:10px;padding:11px 18px;cursor:pointer;background:var(--slate-50)">
+                      <span style="color:var(--slate-400);font-size:12px;width:12px">${open ? '▾' : '▸'}</span>
+                      <span style=${'font-size:12px;font-weight:700;color:#fff;background:' + GRN + ';border-radius:999px;padding:3px 12px'}>${tk === '—' ? 'No thickness set' : tk + ' mm Thickness'}</span>
+                      <span style="font-size:11px;color:var(--slate-400);margin-left:auto">${rows.length} size${rows.length === 1 ? '' : 's'}</span>
+                    </div>
+                    ${open && html`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">
+                      <thead><tr style="color:var(--slate-500);font-size:10.5px;text-transform:uppercase;letter-spacing:.03em">
+                        <th style="text-align:left;padding:8px 18px;font-weight:600">S.No</th>
+                        <th style="text-align:left;padding:8px 12px;font-weight:600">Size</th>
+                        <th style="text-align:left;padding:8px 12px;font-weight:600">Thickness</th>
+                        <th style="text-align:right;padding:8px 12px;font-weight:600">Qty/Nos</th>
+                        <th style="text-align:right;padding:8px 12px;font-weight:600">Mtr</th>
+                        <th style="text-align:right;padding:8px 18px;font-weight:600">Stock/Weight</th>
+                      </tr></thead>
+                      <tbody>
+                        ${rows.map((i, ri) => {
+                          const isLen = ['mtr', 'ft'].includes((i.uom || '').toLowerCase());
+                          const q = parseFloat(i.current_qty || 0);
+                          const nos = isLen ? pcsOf(i) : q;
+                          const mtr = isLen ? q : null;
+                          const kg = uwOf(i) > 0 ? q * uwOf(i) : null;
+                          const thk = thicknessOf(i);
+                          return html`<tr key=${i.id} onClick=${() => setActiveItem(i)} style="border-top:1px solid var(--slate-100);cursor:pointer">
+                            <td style="padding:10px 18px;color:var(--slate-500)">${ri + 1}</td>
+                            <td style="padding:10px 12px;font-weight:600;color:var(--slate-800)">${i.size_spec || i.name}</td>
+                            <td style="padding:10px 12px;color:var(--slate-600)">${thk != null ? thk + ' mm' : '—'}</td>
+                            <td style="padding:10px 12px;text-align:right;color:var(--slate-700)">${(nos != null && nos !== '' && !isNaN(nos)) ? fmtNum(nos) : '—'}</td>
+                            <td style="padding:10px 12px;text-align:right;color:var(--slate-700)">${mtr != null ? fmtNum(Math.round(mtr * 1000) / 1000) : '—'}</td>
+                            <td style="padding:10px 18px;text-align:right;font-weight:700;color:var(--slate-800)">${kg != null ? fmtNum(Math.round(kg * 100) / 100) + ' kg' : '—'}</td>
+                          </tr>`;
+                        })}
+                      </tbody>
+                    </table></div>`}
+                  </div>`;
+                })}
+              <div style="display:flex;gap:20px;align-items:center;padding:13px 18px;background:var(--slate-50);font-size:13px;color:var(--slate-600);flex-wrap:wrap">
+                <span>🗄️ Total Items : <b style="color:var(--slate-800)">${panelItems.length}</b></span>
+                <span>Total Weight : <b style="color:var(--slate-800)">${fmtNum(Math.round(totKg * 100) / 100)} kg</b></span>
+              </div>
+            </div>
+          `;
+        })() :
         filteredItems.length === 0 ? html`<div class="card"><div class="empty"><div class="icon">📦</div>${items.length === 0 ? 'No items yet' : 'No items match this filter'}</div></div>` :
         layout === 'table' ? (() => {
           const totVal = filteredItems.reduce((s, i) => s + (parseFloat(i.current_qty || 0) * parseFloat(i.unit_cost || 0)), 0);
