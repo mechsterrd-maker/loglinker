@@ -28642,7 +28642,11 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   useEffect(() => {
     if (!plant?.id) { setUnitPreview(''); return; }
     let cancelled = false;
-    sb.rpc('peek_next_logistics_doc_number', { p_plant_id: plant.id, p_doc_kind: kind, p_unit_id: unitId || null })
+    // Manual-numbering plants keep their own running series (…/RDC/26-27/595), so
+    // suggest the TRUE next number (max existing + 1) rather than the auto counter,
+    // which can drift and cause "duplicate number" errors on fast, back-to-back DCs.
+    const fn = plant?.manual_doc_numbering ? 'next_doc_number_smart' : 'peek_next_logistics_doc_number';
+    sb.rpc(fn, { p_plant_id: plant.id, p_doc_kind: kind, p_unit_id: unitId || null })
       .then(({ data }) => { if (!cancelled) setUnitPreview(data || ''); });
     return () => { cancelled = true; };
   }, [plant?.id, kind, unitId]);
@@ -28859,7 +28863,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
         };
       });
 
-      const { data: doc, error } = await sb.from('mcp_logistics_documents').insert({
+      const docPayload = {
         plant_id: plant.id,
         unit_id: unitId || null,
         doc_type: isInvoice ? 'invoice_out' : (isReturnable ? 'dc_out_returnable' : 'dc_out'),
@@ -28896,7 +28900,24 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
         extracted_by_ai: false,
         extraction_status: 'completed',
         created_by: me.id,
-      }).select('*').single();
+      };
+      // Insert with auto-retry on a doc-number collision (idx_docs_unique). Fast,
+      // back-to-back DC creation can reuse a number that's a moment old; grab the
+      // next free number and retry instead of erroring / appearing to hang.
+      let doc = null, error = null;
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const res = await sb.from('mcp_logistics_documents').insert(docPayload).select('*').single();
+        doc = res.data; error = res.error;
+        const isDup = error && (error.code === '23505' || /idx_docs_unique|duplicate key/i.test(error.message || ''));
+        if (!isDup) break;
+        const nextRes = manualNum
+          ? await sb.rpc('next_doc_number_smart', { p_plant_id: plant.id, p_doc_kind: kind, p_date: form.doc_date, p_unit_id: unitId || null })
+          : await sb.rpc('get_next_logistics_doc_number', { p_plant_id: plant.id, p_doc_kind: kind, p_date: form.doc_date, p_unit_id: unitId || null });
+        const nextNo = nextRes && nextRes.data;
+        if (!nextNo || nextNo === docPayload.doc_number) break;
+        docPayload.doc_number = nextNo; docNo = nextNo;
+        setForm(f => ({ ...f, doc_number: nextNo }));
+      }
       if (error) throw error;
       // Teach each stock item its HSN from the DC line, so the master fills up and
       // future DCs auto-fill it. Only set where the item has no HSN yet — never
