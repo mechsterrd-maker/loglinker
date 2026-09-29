@@ -39209,19 +39209,25 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
   const thicknessOf = (i) => {
     const sec = RM_SECTIONS.find(s => s.key === i.section_type);
     if (sec) {
-      // Known section: use its "Thk" dimension only (return null if it has none
-      // or the value wasn't recorded — never guess a leg size as thickness).
+      // Known section: prefer its structured "Thk" dimension.
       const ti = sec.dims.findIndex(d => /thk|thick/i.test(d));
-      if (ti < 0) return null;
-      const v = i['dim' + (ti + 1)];
-      return (v != null && v !== '' && isFinite(v)) ? String(+parseFloat(v)) : null;
+      if (ti >= 0) { const v = i['dim' + (ti + 1)]; if (v != null && v !== '' && isFinite(v)) return String(+parseFloat(v)); }
     }
-    // Unknown / legacy section (imported) — read from the size text (thickness is
-    // last for angle/flat/tube, first for plate/sheet).
-    const nums = String(i.size_spec || '').match(/[0-9]+(?:\.[0-9]+)?/g);
-    if (nums && nums.length) {
-      const t = rmTypeLabel(i);
-      return String(+parseFloat((t === 'Plate' || t === 'Sheet') ? nums[0] : nums[nums.length - 1]));
+    // Thickness written into the name / size text — e.g. "Thk 22mm", "6.6 THK"
+    // (Excel imports often carry it here rather than as a structured dim).
+    const txt = (i.name || '') + ' ' + (i.size_spec || '');
+    const m = txt.match(/(?:thk|thick(?:ness)?)\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mm)?/i)
+           || txt.match(/([0-9]+(?:\.[0-9]+)?)\s*(?:mm)?\s*(?:thk|thick(?:ness)?)/i);
+    if (m) return String(+parseFloat(m[1]));
+    // Legacy / unknown-shape section — infer from the size text (thickness is
+    // first for plate/sheet, last otherwise). Not used for known structured
+    // shapes, so a leg size (e.g. 35×35) is never mistaken for thickness.
+    if (!sec || i.section_type === 'other') {
+      const nums = String(i.size_spec || '').match(/[0-9]+(?:\.[0-9]+)?/g);
+      if (nums && nums.length) {
+        const t = rmTypeLabel(i);
+        return String(+parseFloat((t === 'Plate' || t === 'Sheet') ? nums[0] : nums[nums.length - 1]));
+      }
     }
     return null;
   };
