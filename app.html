@@ -2753,6 +2753,17 @@ const MORE_GROUPS = [
 ];
 const MORE_FLAT_KEYS = MORE_GROUPS.flatMap(g => g.items.map(i => i.key));
 
+// Per-plant dashboard module hiding. Marvel (MMPL) doesn't use Quality, Transport,
+// Schedules, Sub-Contracting, Performance Dashboards or Trace — hide those launcher
+// tiles (and the whole Quality & IATF group) from its dashboard.
+const MMPL_HIDDEN_MOD_KEYS = new Set([
+  'quality', 'movements', 'schedules', 'jobwork', 'performance', 'trace',
+  ...(((MORE_GROUPS.find(g => g.key === 'quality') || {}).items) || []).map(i => i.key),
+]);
+function dashHiddenKeys(plant) {
+  return /marvel/i.test(plant?.name || '') ? MMPL_HIDDEN_MOD_KEYS : null;
+}
+
 // Opt-in modules. Unlike core modules, these are NOT auto-surfaced to legacy
 // plants (enabled_tabs = NULL). They appear ONLY when a plant explicitly lists
 // them in enabled_tabs — e.g. Starter Pack plants. This stops a newly added
@@ -6124,7 +6135,8 @@ function ModuleLauncher({ plant, me, myPerms, go, setTab, inline, onPicked }) {
   const [subFor, setSubFor] = useState(null);
   const fab = isFab(plant);
   const _hg = moduleAccessGuard(myPerms);
-  const canSee = (k) => !_hg.enforce || !RBAC_MODULE_KEYS.has(k) || _hg.canView(k);
+  const _hidden = dashHiddenKeys(plant);
+  const canSee = (k) => (!_hidden || !_hidden.has(k)) && (!_hg.enforce || !RBAC_MODULE_KEYS.has(k) || _hg.canView(k));
   const nav = (tab, sub) => {
     if (go) go(tab, sub); else setTab && setTab(tab);
     setSubFor(null); onPicked && onPicked();
@@ -6149,7 +6161,7 @@ function ModuleLauncher({ plant, me, myPerms, go, setTab, inline, onPicked }) {
 
   const surfaced = new Set(freq.map(f => f.key));
   const moreGroups = visibleMoreGroups(plant, myPerms)
-    .map(g => ({ ...g, items: g.items.filter(it => !surfaced.has(it.key)) }))
+    .map(g => ({ ...g, items: g.items.filter(it => !surfaced.has(it.key) && (!_hidden || !_hidden.has(it.key))) }))
     .filter(g => g.items.length > 0);
 
   const sections = [
