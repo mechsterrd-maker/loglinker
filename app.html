@@ -39128,6 +39128,8 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
   const [search, setSearch] = useState('');
   const [txnSearch, setTxnSearch] = useState('');
   const [txnTypeFilter, setTxnTypeFilter] = useState('all');
+  const [txnCat, setTxnCat] = useState('all');     // category filter on the movements list
+  const [txnItem, setTxnItem] = useState('');       // specific master item to isolate ('' = all)
   const [txnDateFrom, setTxnDateFrom] = useState('');
   const [txnDateTo, setTxnDateTo] = useState('');
   const [txnRows, setTxnRows] = useState(null);   // server-fetched rows when a date range is set (whole history)
@@ -39196,7 +39198,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
     else if (s === 'issue') { setView('transactions'); setTxnTypeFilter('outward'); }
     // "Issued Material" quick action → the issued-material log (Issue movements),
     // with a clean filter set so it opens on the full recent list.
-    else if (s === 'issue_log') { setView('transactions'); setTxnTypeFilter('issue'); setTxnSearch(''); setTxnDateFrom(''); setTxnDateTo(''); }
+    else if (s === 'issue_log') { setView('transactions'); setTxnTypeFilter('issue'); setTxnSearch(''); setTxnDateFrom(''); setTxnDateTo(''); setTxnCat('all'); setTxnItem(''); }
     else if (s === 'return') { setView('transactions'); setTxnTypeFilter('return'); }
     // Dashboard "Scrap Yard" quick action → open the scrap yard register directly.
     else if (s === 'scrap') { setScrapOpen(true); }
@@ -39992,6 +39994,10 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
         else if (txnTypeFilter === 'outward') filtered = filtered.filter(t => OUTWARD_TYPES.includes(t.txn_type));
         else if (txnTypeFilter !== 'all') filtered = filtered.filter(t => t.txn_type === txnTypeFilter);
 
+        // Category filter + master-item sub-filter (replaces the inward/outward dropdown).
+        if (txnCat !== 'all') filtered = filtered.filter(t => (t.mcp_stocks_items?.category || 'general') === txnCat);
+        if (txnItem) filtered = filtered.filter(t => t.item_id === txnItem);
+
         if (txnDateFrom) filtered = filtered.filter(t => t.created_at >= txnDateFrom);
         if (txnDateTo) filtered = filtered.filter(t => t.created_at <= (txnDateTo + 'T23:59:59'));
 
@@ -40046,27 +40052,21 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
           <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px">
             <input type="search" value=${txnSearch} onInput=${e => setTxnSearch(e.target.value)} placeholder="Search by item, code, reference, person, notes…" style="width:100%;padding:9px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
             <div style="display:flex;gap:6px;flex-wrap:wrap">
-              <select value=${txnTypeFilter} onChange=${e => setTxnTypeFilter(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
-                <option value="all">All types</option>
-                <optgroup label="Inward">
-                  <option value="inward">All inward</option>
-                  <option value="grn">GRN only</option>
-                  <option value="return">Return only</option>
-                  <option value="opening">Opening only</option>
-                  <option value="adjustment_in">Adj+ only</option>
-                </optgroup>
-                <optgroup label="Outward">
-                  <option value="outward">All outward</option>
-                  <option value="issue">Issue only</option>
-                  <option value="consumption">Consumption only</option>
-                  <option value="scrap">Scrap only</option>
-                  <option value="adjustment_out">Adj− only</option>
-                </optgroup>
+              <select value=${txnCat} onChange=${e => { setTxnCat(e.target.value); setTxnItem(''); }} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white">
+                <option value="all">All categories</option>
+                <option value="raw_material">Raw Material</option>
+                <option value="consumables">Consumables</option>
+                <option value="tools">Tools</option>
+                <option value="general">General</option>
+              </select>
+              <select value=${txnItem} onChange=${e => setTxnItem(e.target.value)} style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:white;max-width:58%">
+                <option value="">${txnCat === 'all' ? 'All items' : 'All ' + ({ raw_material: 'Raw Material', consumables: 'Consumables', tools: 'Tools', general: 'General' }[txnCat] || '') + ' items'}</option>
+                ${items.filter(i => txnCat === 'all' || (i.category || 'general') === txnCat).slice().sort((a, b) => (a.name || a.code || '').localeCompare(b.name || b.code || '', undefined, { numeric: true })).map(i => html`<option key=${i.id} value=${i.id}>${(i.code ? i.code + ' · ' : '') + (i.name || '')}</option>`)}
               </select>
               <${DateField} value=${txnDateFrom} onChange=${e => setTxnDateFrom(e.target.value)} placeholder="From" style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px" />
               <${DateField} value=${txnDateTo} onChange=${e => setTxnDateTo(e.target.value)} placeholder="To" style="padding:7px 10px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px" />
-              ${(txnSearch || txnTypeFilter !== 'all' || txnDateFrom || txnDateTo) && html`
-                <button class="btn small ghost" onClick=${() => { setTxnSearch(''); setTxnTypeFilter('all'); setTxnDateFrom(''); setTxnDateTo(''); }} style="padding:7px 12px;font-size:12px">Clear</button>
+              ${(txnSearch || txnCat !== 'all' || txnItem || txnDateFrom || txnDateTo) && html`
+                <button class="btn small ghost" onClick=${() => { setTxnSearch(''); setTxnCat('all'); setTxnItem(''); setTxnDateFrom(''); setTxnDateTo(''); }} style="padding:7px 12px;font-size:12px">Clear</button>
               `}
               <button class="btn small" onClick=${exportCsv} disabled=${!filtered.length} title="Download the shown movements as a CSV report" style="padding:7px 12px;font-size:12px;margin-left:auto">⬇ Export CSV</button>
             </div>
