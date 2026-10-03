@@ -6331,13 +6331,13 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
     const todayStr = new Date().toISOString().slice(0, 10);
     const uid = activeUnit?.unit_id || null;
     const byUnit = (q) => uid ? q.eq('unit_id', uid) : q;
-    const EMPTY = { catCount: {}, lowStock: 0, outStock: 0, machines: 0, totalItems: 0, dcRet: 0, dcReg: 0, dcJw: 0, billsPending: 0, rOpen: 0, rPartial: 0, rReceived: 0, rClosed: 0, rOverdue: 0, recent: [] };
+    const EMPTY = { catCount: {}, lowStock: 0, outStock: 0, machines: 0, totalItems: 0, dcRet: 0, dcReg: 0, dcJw: 0, billsPending: 0, rOpen: 0, rPartial: 0, rReceived: 0, rClosed: 0, rOverdue: 0, rdcTotal: 0, rdcClosed: 0, rdcPending: 0, recent: [] };
     try {
       const [items, mCount, dcDocs, rdc, recentDocs, recentTxns] = await Promise.all([
         byUnit(sb.from('mcp_stocks_items').select('category, current_qty, reorder_level')).limit(5000),
         byUnit(sb.from('machines').select('id', { count: 'exact', head: true })),
         byUnit(sb.from('mcp_logistics_documents').select('doc_type, status, extraction_status').in('doc_type', ['dc_out', 'dc_out_returnable', 'job_work_dc_in', 'invoice_in', 'bill'])).limit(5000),
-        sb.from('mcp_rdc_lines').select('status, expected_return_date').eq('plant_id', plant.id).limit(5000),
+        byUnit(sb.from('mcp_rdc_lines').select('status, expected_return_date, doc_id').eq('plant_id', plant.id)).limit(5000),
         byUnit(sb.from('mcp_logistics_documents').select('doc_type, doc_number, vendor_name_raw, created_at')).order('created_at', { ascending: false }).limit(6),
         byUnit(sb.from('mcp_stocks_transactions').select('txn_type, qty, created_at, reference')).order('created_at', { ascending: false }).limit(6),
       ]);
@@ -6359,10 +6359,20 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
       const rReceived = rd.filter(r => r.status === 'received').length;
       const rClosed = rd.filter(r => r.status === 'closed').length;
       const rOverdue = rd.filter(r => (r.status === 'open' || r.status === 'partial') && r.expected_return_date && r.expected_return_date < todayStr).length;
+      // Per-DC roll-up (document level): group the return lines by their DC so we
+      // can show "out of N returnable DCs, X fully back vs Y still pending" — a
+      // DC is pending if ANY of its items are still open/partial. This is the
+      // document-level comparison, distinct from the item-level counts above.
+      const rdcByDoc = {};
+      rd.forEach(r => { if (!r.doc_id) return; if (!(r.doc_id in rdcByDoc)) rdcByDoc[r.doc_id] = 0; if (r.status === 'open' || r.status === 'partial') rdcByDoc[r.doc_id]++; });
+      const rdcDocVals = Object.values(rdcByDoc);
+      const rdcTotal = rdcDocVals.length;
+      const rdcPending = rdcDocVals.filter(n => n > 0).length;
+      const rdcClosed = rdcTotal - rdcPending;
       const evDocs = (recentDocs.data || []).map(d => ({ t: d.created_at, icon: '🧾', text: (d.doc_type || 'doc').replace(/_/g, ' ') + (d.vendor_name_raw ? ' · ' + d.vendor_name_raw : ''), ref: d.doc_number || '' }));
       const evTxns = (recentTxns.data || []).map(t => ({ t: t.created_at, icon: ['grn', 'return', 'opening', 'adjustment_in', 'jobwork_in'].includes(t.txn_type) ? '📥' : '📤', text: (t.txn_type || '').replace(/_/g, ' ') + ' ' + fmtNum(Math.abs(t.qty || 0)), ref: t.reference || '' }));
       const recent = [...evDocs, ...evTxns].sort((a, b) => new Date(b.t) - new Date(a.t)).slice(0, 7);
-      setStats({ catCount, lowStock, outStock, machines: mCount.count || 0, totalItems: its.length, dcRet, dcReg, dcJw, billsPending, rOpen, rPartial, rReceived, rClosed, rOverdue, recent });
+      setStats({ catCount, lowStock, outStock, machines: mCount.count || 0, totalItems: its.length, dcRet, dcReg, dcJw, billsPending, rOpen, rPartial, rReceived, rClosed, rOverdue, rdcTotal, rdcClosed, rdcPending, recent });
     } catch (e) { setStats(EMPTY); }
     setLoading(false);
   };
@@ -6370,7 +6380,7 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
   const hour = new Date().getHours();
   const greetWord = hour < 12 ? 'Good Morning' : hour < 17 ? 'Good Afternoon' : 'Good Evening';
   const greeting = (me.full_name || me.email || 'there').split(' ')[0];
-  const S = stats || { catCount: {}, lowStock: 0, outStock: 0, machines: 0, totalItems: 0, dcRet: 0, dcReg: 0, dcJw: 0, billsPending: 0, rOpen: 0, rPartial: 0, rReceived: 0, rClosed: 0, rOverdue: 0, recent: [] };
+  const S = stats || { catCount: {}, lowStock: 0, outStock: 0, machines: 0, totalItems: 0, dcRet: 0, dcReg: 0, dcJw: 0, billsPending: 0, rOpen: 0, rPartial: 0, rReceived: 0, rClosed: 0, rOverdue: 0, rdcTotal: 0, rdcClosed: 0, rdcPending: 0, recent: [] };
   const alertsN = S.lowStock + S.rOpen + S.rOverdue + S.billsPending;
 
   return html`
@@ -6424,18 +6434,27 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
           <div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">🔧</span><span style="font-size:14px;font-weight:800">Job Work / Returnable DC</span></div>
           <button class="btn small ghost" onClick=${() => navTo('subcontract_plans')} style="font-size:11px">View All →</button>
         </div>
-        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:4px">
+        <div style="font-size:10px;color:var(--slate-400);font-weight:700;text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px">Items on returnable DC</div>
+        <div onClick=${() => navTo('rdc_returns')} style="display:flex;align-items:flex-start;justify-content:space-between;gap:4px;cursor:pointer">
           ${[['Sent', S.rOpen, '#0284c7'], ['Partial', S.rPartial, '#b45309'], ['Received', S.rReceived, '#059669'], ['Closed', S.rClosed, '#64748b']].map((p, i) => html`
             <div key=${p[0]} style="flex:1;text-align:center">
               <div class=${'llk-pop llk-d' + (i + 2)} style=${'width:44px;height:44px;border-radius:50%;background:' + p[2] + '22;color:' + p[2] + ';display:flex;align-items:center;justify-content:center;font-weight:800;margin:0 auto;font-size:16px'}><${CountUp} value=${p[1]} /></div>
               <div style="font-size:10.5px;color:var(--slate-500);margin-top:5px">${p[0]}</div>
             </div>`)}
         </div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:14px">
-          <span style="font-size:11px;background:var(--slate-100);border-radius:10px;padding:3px 9px">Returnable DCs: <b>${S.dcRet}</b></span>
-          <span style="font-size:11px;background:var(--slate-100);border-radius:10px;padding:3px 9px">Regular DCs: <b>${S.dcReg}</b></span>
-          <span style="font-size:11px;background:var(--slate-100);border-radius:10px;padding:3px 9px">Job-work in: <b>${S.dcJw}</b></span>
-          ${S.rOverdue > 0 && html`<span style="font-size:11px;background:var(--rose-50);color:var(--rose-700);border-radius:10px;padding:3px 9px">Overdue return: <b>${S.rOverdue}</b></span>`}
+        ${S.rdcTotal > 0 && html`<div onClick=${() => navTo('rdc_returns')} class="llk-lift" style="margin-top:14px;cursor:pointer;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:10px;padding:9px 11px">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;font-size:11.5px;margin-bottom:6px">
+            <span style="color:var(--slate-700);font-weight:700">Out of ${S.rdcTotal} returnable DC${S.rdcTotal === 1 ? '' : 's'}</span>
+            <span style="color:var(--slate-500)"><b style="color:var(--emerald-600)">${S.rdcClosed}</b> closed · <b style="color:var(--amber-700)">${S.rdcPending}</b> pending</span>
+          </div>
+          <div style="height:7px;border-radius:4px;background:var(--amber-100);overflow:hidden" title=${S.rdcClosed + ' of ' + S.rdcTotal + ' fully returned'}>
+            <div style=${'height:100%;width:' + (S.rdcTotal ? Math.round(S.rdcClosed / S.rdcTotal * 100) : 0) + '%;background:var(--emerald-500);transition:width .9s cubic-bezier(.22,1,.36,1)'}></div>
+          </div>
+        </div>`}
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px">
+          ${[['Returnable DCs', S.dcRet, () => navTo('rdc_returns')], ['Regular DCs', S.dcReg, () => navTo('documents', 'type_dc_out')], ['Job-work in', S.dcJw, () => navTo('documents', 'type_job_work_dc_in')]].map(c => html`
+            <button key=${c[0]} type="button" onClick=${c[2]} class="llk-lift" style="font-size:11px;background:var(--slate-100);border:1px solid var(--slate-200);border-radius:10px;padding:4px 10px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;font-family:inherit;color:var(--slate-700)">${c[0]}: <b>${c[1]}</b><span style="color:var(--slate-400)">›</span></button>`)}
+          ${S.rOverdue > 0 && html`<button type="button" onClick=${() => navTo('rdc_returns')} class="llk-lift" style="font-size:11px;background:var(--rose-50);color:var(--rose-700);border:1px solid var(--rose-200);border-radius:10px;padding:4px 10px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;font-family:inherit">Overdue return: <b>${S.rOverdue}</b><span style="opacity:.6">›</span></button>`}
         </div>
       </div>
     </div>
@@ -43377,6 +43396,8 @@ function Documents({ plant, me, activeUnit, navAction }) {
     const s = navAction.sub;
     if (s === 'bills_pending') { setView('dashboard'); setBillsOnly(true); setTypeFilter('all'); setStatusFilter('open'); }
     else if (s === 'bills_closed') { setView('dashboard'); setBillsOnly(true); setTypeFilter('all'); setStatusFilter('paid'); }
+    // Dashboard "Job Work / Returnable DC" chips deep-link to a doc-type here.
+    else if (s && s.startsWith('type_')) { setView('dashboard'); setBillsOnly(false); setTypeFilter(s.slice(5)); setStatusFilter('all'); }
   }, [navAction?.ts]);
 
   // "Upload Bill" handoff: a queue id was stashed → poll it, then open the
