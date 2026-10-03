@@ -6452,7 +6452,7 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
         </div>
         <div style="font-size:10px;color:var(--slate-400);font-weight:700;text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px">Returnable DCs by status</div>
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:4px">
-          ${[['Sent', S.rdcTotal, '#0284c7', 'all'], ['Open', S.rdcSent, '#b45309', 'open'], ['Partial', S.rdcPartialD, '#7c3aed', 'open'], ['Received', S.rdcClosed, '#059669', 'done']].map((p, i) => html`
+          ${[['Sent', S.rdcTotal, '#0284c7', 'all'], ['Open', S.rdcSent, '#b45309', 'open'], ['Partial', S.rdcPartialD, '#db2777', 'open'], ['Received', S.rdcClosed, '#059669', 'done']].map((p, i) => html`
             <div key=${p[0]} onClick=${() => navTo('rdc_returns', p[3])} class="llk-lift" style="flex:1;text-align:center;cursor:pointer">
               <div class=${'llk-pop llk-d' + (i + 2)} style=${'width:44px;height:44px;border-radius:50%;background:' + p[2] + '22;color:' + p[2] + ';display:flex;align-items:center;justify-content:center;font-weight:800;margin:0 auto;font-size:16px'}><${CountUp} value=${p[1]} /></div>
               <div style="font-size:10.5px;color:var(--slate-500);margin-top:5px">${p[0]}</div>
@@ -6471,6 +6471,7 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
         { label: 'Create DC', emoji: '📄', bg: 'var(--teal-50)', bd: 'var(--teal-200)', col: 'var(--teal-800)', on: () => navTo('sales_docs', 'new_dc'), see: 'sales_docs' },
         { label: 'Stock Entry', emoji: '📦', bg: 'var(--emerald-50)', bd: 'var(--emerald-200)', col: 'var(--emerald-800)', on: () => navTo('stocks', 'new_item'), see: 'stocks' },
         { label: 'Issue Material', emoji: '📤', bg: '#fff7ed', bd: '#fed7aa', col: '#b45309', on: () => navTo('stocks', 'issue_pick'), see: 'stocks' },
+        { label: 'Issued Material', emoji: '📋', bg: '#eff6ff', bd: '#bfdbfe', col: '#1d4ed8', on: () => navTo('stocks', 'issue_log'), see: 'stocks' },
         { label: 'Upload Bill', emoji: '🧾', bg: '#fdf2f8', bd: '#fbcfe8', col: '#be185d', on: () => navTo('chat', 'upload_bill'), see: 'chat' },
         { label: 'Create Job Work', emoji: '🔧', bg: 'var(--teal-50)', bd: 'var(--teal-200)', col: 'var(--teal-800)', on: () => navTo('subcontract_plans'), see: 'subcontract_plans' },
         { label: 'Scrap Yard', emoji: '🗑️', bg: 'var(--rose-50)', bd: 'var(--rose-200)', col: 'var(--rose-700)', on: () => navTo('stocks', 'scrap'), see: 'stocks' },
@@ -39193,6 +39194,9 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
     else if (s === 'out') { setView('items'); setCategoryFilter('all'); setStockLevel('out'); setPickHint(null); }
     else if (s === 'in') { setView('transactions'); setTxnTypeFilter('inward'); }
     else if (s === 'issue') { setView('transactions'); setTxnTypeFilter('outward'); }
+    // "Issued Material" quick action → the issued-material log (Issue movements),
+    // with a clean filter set so it opens on the full recent list.
+    else if (s === 'issue_log') { setView('transactions'); setTxnTypeFilter('issue'); setTxnSearch(''); setTxnDateFrom(''); setTxnDateTo(''); }
     else if (s === 'return') { setView('transactions'); setTxnTypeFilter('return'); }
     // Dashboard "Scrap Yard" quick action → open the scrap yard register directly.
     else if (s === 'scrap') { setScrapOpen(true); }
@@ -40006,6 +40010,38 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
         const totalIn = filtered.filter(t => INWARD_TYPES.includes(t.txn_type)).reduce((s, t) => s + parseFloat(t.qty || 0), 0);
         const totalOut = filtered.filter(t => OUTWARD_TYPES.includes(t.txn_type)).reduce((s, t) => s + parseFloat(t.qty || 0), 0);
 
+        // Report generation: download the currently filtered movements as CSV
+        // (UTF-8 BOM so ₹ / regional names open cleanly in Excel). Numbers stay
+        // bare so spreadsheets treat them as numbers.
+        const exportCsv = () => {
+          const esc = v => { const s = (v == null ? '' : String(v)); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+          const header = ['Date', 'Time', 'Type', 'Item code', 'Item', 'Qty', 'UOM', 'Balance after', 'Reference', 'Person', 'Notes'];
+          const rows = filtered.map(t => {
+            const inward = INWARD_TYPES.includes(t.txn_type);
+            return [
+              (t.created_at || '').slice(0, 10),
+              new Date(t.created_at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
+              TYPE_LABEL[t.txn_type] || t.txn_type,
+              t.mcp_stocks_items?.code || '',
+              t.mcp_stocks_items?.name || '',
+              (inward ? '' : '-') + (t.qty == null ? '' : t.qty),
+              t.mcp_stocks_items?.uom || '',
+              t.qty_after == null ? '' : t.qty_after,
+              t.reference || '',
+              t.users?.full_name || '',
+              t.notes || '',
+            ].map(esc).join(',');
+          });
+          const csv = '﻿' + [header.join(','), ...rows].join('\n');
+          const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'stock-movements-' + new Date().toISOString().slice(0, 10) + '.csv';
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        };
+
         return html`
           <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px">
             <input type="search" value=${txnSearch} onInput=${e => setTxnSearch(e.target.value)} placeholder="Search by item, code, reference, person, notes…" style="width:100%;padding:9px 12px;border:1px solid var(--slate-200);border-radius:8px;font-size:13px" />
@@ -40032,6 +40068,7 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
               ${(txnSearch || txnTypeFilter !== 'all' || txnDateFrom || txnDateTo) && html`
                 <button class="btn small ghost" onClick=${() => { setTxnSearch(''); setTxnTypeFilter('all'); setTxnDateFrom(''); setTxnDateTo(''); }} style="padding:7px 12px;font-size:12px">Clear</button>
               `}
+              <button class="btn small" onClick=${exportCsv} disabled=${!filtered.length} title="Download the shown movements as a CSV report" style="padding:7px 12px;font-size:12px;margin-left:auto">⬇ Export CSV</button>
             </div>
           </div>
 
