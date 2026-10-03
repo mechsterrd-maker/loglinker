@@ -24823,6 +24823,22 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
     showToast('Saved');
     onChanged && onChanged();
   };
+  // Delete the whole project. Milestones/components/members cascade away; linked
+  // bills, expenses & payments are kept but their project tag is cleared. Only
+  // admins / plant heads can delete (DB policy enforces this too).
+  const canDelete = me?.role === 'admin' || me?.role === 'plant_head';
+  const [deleting, setDeleting] = useState(false);
+  const deleteProject = async () => {
+    const label = (project.code ? project.code + ' · ' : '') + (project.name || 'this project');
+    if (!confirm('Delete "' + label + '"?\n\nThis removes the project with its milestones & components. Any bills or expenses linked to it are kept, but no longer tagged to this project.\n\nThis cannot be undone.')) return;
+    setDeleting(true);
+    const { error } = await sb.from('mcp_projects').delete().eq('id', project.id);
+    setDeleting(false);
+    if (error) { alert('Could not delete: ' + error.message); return; }
+    showToast('Project deleted');
+    onChanged && onChanged();
+    onBack && onBack();
+  };
   const cycleStage = async (m) => {
     const next = m.status==='pending'?'in_progress':m.status==='in_progress'?'done':'pending';
     const { error } = await sb.from('mcp_project_milestones').update({ status:next, done_date: next==='done'?new Date().toISOString().slice(0,10):null }).eq('id',m.id);
@@ -24872,6 +24888,7 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
       </div>
       ${!restricted && onDuplicate && html`<button class="btn small ghost" onClick=${onDuplicate} title="Duplicate this project (repeat order)" style="padding:6px 10px">⧉ Duplicate</button>`}
       ${!restricted && html`<button class="btn small ghost" onClick=${onEdit} title="Edit project details" style="padding:6px 10px">✏️ Edit</button>`}
+      ${!restricted && canDelete && html`<button class="btn small ghost" onClick=${deleteProject} disabled=${deleting} title="Delete this project" style="padding:6px 10px;color:var(--rose-600)">${deleting ? 'Deleting…' : '🗑️ Delete'}</button>`}
     </div>
 
     ${!leanProject && html`<div class="card" style="padding:14px;margin-bottom:10px">
