@@ -24782,7 +24782,7 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
   };
 
   const reload = useCallback(async () => {
-    const [m, d, c, e1, e2, u] = await Promise.all([
+    const [m, d, c, e1, e2, u, dm] = await Promise.all([
       sb.from('mcp_project_milestones').select('*').eq('project_id', project.id).order('seq'),
       sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, total_value, stage_id, created_at').eq('project_id', project.id).eq('hide_from_project', false).order('created_at',{ascending:false}).limit(40),
       sb.from('mcp_project_components').select('*').eq('project_id', project.id).order('created_at'),
@@ -24792,6 +24792,8 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
       sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, items, project_id, cost_category').eq('project_id', project.id).limit(300),
       // Real material used (issued − returned) — the consumption-based material cost.
       sb.from('mcp_project_material_usage').select('amount').eq('project_id', project.id).is('reversed_at', null),
+      // Bills also linked to this project as a secondary (multi-project link).
+      sb.from('mcp_logistics_documents').select('id, doc_type, doc_number, doc_date, vendor_name_raw, total_value, stage_id, created_at').contains('project_ids', [project.id]).eq('hide_from_project', false).order('created_at',{ascending:false}).limit(40),
     ]);
     const all = m.data || [];
     const tops = all.filter(x => !x.parent_id);
@@ -24801,7 +24803,9 @@ function ProjectDetail({ plant, me, myPerms, project, users, go, onBack, onEdit,
     }
     setStages(tops);
     setSubs(childMap);
-    setBills(d.data || []);
+    // Bills tagged to this project directly + bills multi-linked to it (dedup).
+    const seenBill = new Set();
+    setBills([...(d.data || []), ...(dm.data || [])].filter(b => { if (seenBill.has(b.id)) return false; seenBill.add(b.id); return true; }));
     setComponents(c.data || []);
     // Compute this project's expenses from per-item amounts (item's own project,
     // falling back to the document's project) — the same rule as the chat slices.
@@ -44053,6 +44057,19 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     if (error) { showToast('Could not save category'); return; }
     setDoc(d => ({ ...d, cost_category: cat }));
   };
+  // Link this bill to one OR MORE projects. The first stays the "primary" project
+  // (project_id) so existing cost / per-line rollups keep working; project_ids
+  // holds every linked project so the bill also shows under each of them.
+  const setDocProjects = async (arr) => {
+    const primary = arr[0] || null;
+    const its = Array.isArray(doc?.items) ? doc.items : [];
+    const anyLineProj = its.some(it => it.project_id);
+    const newItems = (!anyLineProj && its.length && primary) ? its.map(it => ({ ...it, project_id: primary })) : its;
+    const { error } = await sb.from('mcp_logistics_documents').update({ project_id: primary, project_ids: arr, items: newItems }).eq('id', doc.id);
+    if (error) { showToast('Could not update projects'); return; }
+    setDoc(d => ({ ...d, project_id: primary, project_ids: arr, items: newItems }));
+    showToast(arr.length ? ('📐 Linked to ' + arr.length + ' project' + (arr.length === 1 ? '' : 's')) : 'Project links cleared');
+  };
 
   // ── Per-line receive builder (stock / charge / skip), one Save per line ──────
   const guessMatLocal = (nm) => { const s = (nm || '').toUpperCase(); if (/STAINLESS|\bSS\b/.test(s)) return 'SS'; if (/ALUM|\bALU?\b/.test(s)) return 'Aluminium'; if (/BRASS/.test(s)) return 'Brass'; if (/COPPER|\bCU\b/.test(s)) return 'Copper'; if (/CAST\s*IRON|\bCI\b/.test(s)) return 'Cast Iron'; return 'MS'; };
@@ -44509,18 +44526,29 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     ${canProcess && html`
       <div class="card" style="margin-top:14px;background:var(--teal-50);border-color:var(--teal-200)">
         <div class="card-title" style="color:var(--teal-800)">📐 Link to project & cost type</div>
-        <div class="field"><label>Project</label>
-          <select value=${doc.project_id || ''} onChange=${e => linkDocProject(e.target.value)}>
-            <option value="">— No project —</option>
-            ${projects.map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
-          </select>
-        </div>
+        ${(() => {
+          const linkedProjects = (Array.isArray(doc.project_ids) && doc.project_ids.length) ? doc.project_ids : (doc.project_id ? [doc.project_id] : []);
+          return html`<div class="field"><label>Project${linkedProjects.length > 1 ? 's · ' + linkedProjects.length : ''}</label>
+            ${linkedProjects.length > 0 && html`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
+              ${linkedProjects.map((pid, i) => { const p = projects.find(x => x.id === pid); return html`
+                <span key=${pid} style="display:inline-flex;align-items:center;gap:7px;font-size:12px;background:#fff;border:1px solid var(--teal-200);border-radius:999px;padding:3px 5px 3px 11px">
+                  ${i === 0 ? html`<span style="font-size:9px;font-weight:700;color:var(--teal-700)" title="Primary — carries the cost">★</span>` : ''}
+                  ${p ? ((p.code ? p.code + ' · ' : '') + p.name) : 'Project'}
+                  <button type="button" onClick=${() => setDocProjects(linkedProjects.filter(x => x !== pid))} title="Remove this project" style="border:none;background:var(--slate-100);border-radius:50%;width:18px;height:18px;line-height:1;cursor:pointer;color:var(--slate-500);flex-shrink:0">×</button>
+                </span>`; })}
+            </div>`}
+            <select value="" onChange=${e => { if (e.target.value) setDocProjects([...linkedProjects, e.target.value]); }}>
+              <option value="">${linkedProjects.length ? '+ Add another project…' : '— Link a project —'}</option>
+              ${projects.filter(p => !linkedProjects.includes(p.id)).map(p => html`<option key=${p.id} value=${p.id}>${p.code ? p.code + ' · ' : ''}${p.name}</option>`)}
+            </select>
+          </div>`;
+        })()}
         ${(PC_COST_DOC_TYPES.includes(doc.doc_type) || isInward) && html`<div class="field"><label>Cost category</label>
           <select value=${doc.cost_category || (PC_JW_TYPES.includes(doc.doc_type) ? 'machining' : 'purchase')} onChange=${e => setDocCat(e.target.value)}>
             ${PC_CATS.map(c => html`<option key=${c} value=${c}>${PC_CAT_LABEL[c]}</option>`)}
           </select>
         </div>`}
-        <div style="font-size:11px;color:var(--slate-500)">Links the whole bill to one project — ideal for transport / machining / service bills. For a material bill split across jobs, set each line's project below instead.</div>
+        <div style="font-size:11px;color:var(--slate-500)">Link the bill to one or more projects. The first (★) is the primary and carries the cost; the others also list this bill under their project. For a material bill split by line, set each line's project below instead.</div>
       </div>
     `}
 
