@@ -4251,8 +4251,12 @@ function RdcReturns({ plant, me, activeUnit, navAction }) {
     }
     return [...m.values()];
   })();
-  const openCount = lines.filter(isOpen).length;
-  const overdueCount = lines.filter(l => isOpen(l) && overdueDays(l)).length;
+  // Count DISTINCT returnable DCs (not individual items), matching the cards
+  // shown below (one card per DC). A DC is "open" if any of its items are still
+  // out; "overdue" if any still-out item is past its expected return date.
+  const dcCount = (ls) => new Set(ls.map(l => l.doc_id || l.id)).size;
+  const openCount = dcCount(lines.filter(isOpen));
+  const overdueCount = dcCount(lines.filter(l => isOpen(l) && overdueDays(l)));
 
   const call = async (id, fn) => {
     setBusy(b => ({ ...b, [id]: true }));
@@ -6363,7 +6367,8 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
       const rPartial = rd.filter(r => r.status === 'partial').length;
       const rReceived = rd.filter(r => r.status === 'received').length;
       const rClosed = rd.filter(r => r.status === 'closed').length;
-      const rOverdue = rd.filter(r => (r.status === 'open' || r.status === 'partial') && r.expected_return_date && r.expected_return_date < todayStr).length;
+      // Overdue = distinct returnable DCs (not items) with any still-out item past due.
+      const rOverdue = new Set(rd.filter(r => (r.status === 'open' || r.status === 'partial') && r.expected_return_date && r.expected_return_date < todayStr && r.doc_id).map(r => r.doc_id)).size;
       // Per-DC roll-up (document level): group the return lines by their DC and
       // classify each whole returnable DC into one bucket, so the circles count
       // DCs (not items). A DC is Sent = nothing back yet, Partial = some back /
@@ -6443,7 +6448,7 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
       <div class="card llk-in llk-d3" style="padding:14px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
           <div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">🔧</span><span style="font-size:14px;font-weight:800">Job Work / Returnable DC</span></div>
-          <button class="btn small ghost" onClick=${() => navTo('subcontract_plans')} style="font-size:11px">View All →</button>
+          <button class="btn small ghost" onClick=${() => navTo('rdc_returns', 'all')} style="font-size:11px">View All →</button>
         </div>
         <div style="font-size:10px;color:var(--slate-400);font-weight:700;text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px">Returnable DCs by status</div>
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:4px">
@@ -6453,16 +6458,7 @@ function Home({ plant, me, activeUnit, setTab, go, reload, myPerms }) {
               <div style="font-size:10.5px;color:var(--slate-500);margin-top:5px">${p[0]}</div>
             </div>`)}
         </div>
-        ${S.rdcTotal > 0 && html`<div onClick=${() => navTo('rdc_returns', 'all')} class="llk-lift" style="margin-top:14px;cursor:pointer;background:var(--slate-50);border:1px solid var(--slate-200);border-radius:10px;padding:9px 11px">
-          <div style="display:flex;justify-content:space-between;align-items:baseline;font-size:11.5px;margin-bottom:6px">
-            <span style="color:var(--slate-700);font-weight:700">Out of ${S.rdcTotal} returnable DC${S.rdcTotal === 1 ? '' : 's'}</span>
-            <span style="color:var(--slate-500)"><b style="color:var(--emerald-600)">${S.rdcClosed}</b> back · <b style="color:var(--amber-700)">${S.rdcPending}</b> pending</span>
-          </div>
-          <div style="height:7px;border-radius:4px;background:var(--amber-100);overflow:hidden" title=${S.rdcClosed + ' of ' + S.rdcTotal + ' fully returned'}>
-            <div style=${'height:100%;width:' + (S.rdcTotal ? Math.round(S.rdcClosed / S.rdcTotal * 100) : 0) + '%;background:var(--emerald-500);transition:width .9s cubic-bezier(.22,1,.36,1)'}></div>
-          </div>
-        </div>`}
-        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px">
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:14px">
           ${[['Returnable DCs', S.dcRet, () => navTo('rdc_returns', 'all')], ['Regular DCs', S.dcReg, () => navTo('documents', 'type_dc_out')], ['Job-work in', S.dcJw, () => navTo('documents', 'type_job_work_dc_in')]].map(c => html`
             <button key=${c[0]} type="button" onClick=${c[2]} class="llk-lift" style="font-size:11px;background:var(--slate-100);border:1px solid var(--slate-200);border-radius:10px;padding:4px 10px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;font-family:inherit;color:var(--slate-700)">${c[0]}: <b>${c[1]}</b><span style="color:var(--slate-400)">›</span></button>`)}
           ${S.rOverdue > 0 && html`<button type="button" onClick=${() => navTo('rdc_returns', 'open')} class="llk-lift" style="font-size:11px;background:var(--rose-50);color:var(--rose-700);border:1px solid var(--rose-200);border-radius:10px;padding:4px 10px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;font-family:inherit">Overdue return: <b>${S.rOverdue}</b><span style="opacity:.6">›</span></button>`}
