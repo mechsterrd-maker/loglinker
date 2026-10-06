@@ -41633,7 +41633,7 @@ function rptToHtml(report, plant) {
   return '<!doctype html><html><head><meta charset="utf-8"><title>' + esc(report.title) + '</title><style>'
     + 'body{font-family:Arial,Helvetica,sans-serif;color:#111;margin:20px;font-size:12px}'
     + 'h1{font-size:18px;margin:0 0 2px}h2{font-size:14px;margin:16px 0 4px}.sub{color:#555;font-size:11px;margin:0 0 12px}'
-    + 'table{width:100%;border-collapse:collapse;margin:0 0 12px}th,td{border:1px solid #999;padding:4px 6px;text-align:left;vertical-align:top}'
+    + 'table{width:100%;border-collapse:collapse;margin:0 0 12px}th,td{border:1px solid #999;padding:4px 6px;text-align:left;vertical-align:top;white-space:pre-line}'
     + 'th{background:#e5e7eb}.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}'
     + 'tr.grp td{background:#f3f4f6;font-weight:bold}tr.sub td{background:#fafafa;font-weight:600}tr.tot td{font-weight:bold;background:#f1f5f9;border-top:2px solid #333}'
     + '@media print{.noprint{display:none}}'
@@ -41739,25 +41739,28 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
 
   // rod / piece count from the pieces breakdown (rods [{len,count}] or sheets [{w,l,count}])
   const rodsOf = (i) => (Array.isArray(i.pieces) ? i.pieces : []).reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
-  // Rod / coil breakdown as text: "27×0.7" (count×length) or "4×1000kg + 1×250kg".
-  // Separator is " + " (no commas) so it stays a single CSV cell.
+  // Rod / coil breakdown, one size per line for readability, longest first:
+  //   "85 × 0.815 m\n51 × 1.135 m\n…"  (rods)  ·  "4 × 1000 kg\n1 × 250 kg" (coils).
+  // Each cell is quoted in the CSV, so the line breaks survive in Excel too.
   const rodBreakdownOf = (i) => {
     const pc = Array.isArray(i.pieces) ? i.pieces : [];
     if (!pc.length) return '';
     if (pc.some(p => p.len != null)) {
       return pc.filter(p => (parseFloat(p.count) || 0) > 0 && (parseFloat(p.len) || 0) > 0)
-        .map(p => fmtNum(parseFloat(p.count)) + '×' + fmtNum(parseFloat(p.len))).join(' + ');
+        .slice().sort((a, b) => (parseFloat(b.len) || 0) - (parseFloat(a.len) || 0))
+        .map(p => fmtNum(parseFloat(p.count)) + ' × ' + fmtNum(parseFloat(p.len)) + ' m').join('\n');
     }
     if (pc.some(p => p.w != null)) {
       return pc.filter(p => (parseFloat(p.count) || 0) > 0 && (parseFloat(p.w) || 0) > 0)
-        .map(p => fmtNum(parseFloat(p.count)) + '×' + fmtNum(parseFloat(p.w)) + 'kg').join(' + ');
+        .slice().sort((a, b) => (parseFloat(b.w) || 0) - (parseFloat(a.w) || 0))
+        .map(p => fmtNum(parseFloat(p.count)) + ' × ' + fmtNum(parseFloat(p.w)) + ' kg').join('\n');
     }
     return '';
   };
   const buildCurrent = () => {
     const arr = scopeItems.filter(i => Math.abs(parseFloat(i.current_qty) || 0) > 0);
     const groups = {}; arr.forEach(i => { const k = rptGroupKey(i); (groups[k] = groups[k] || []).push(i); });
-    const headers = [{ label: 'Code' }, { label: 'Item' }].concat(showUnit ? [{ label: 'Unit' }] : []).concat([{ label: 'Qty', isNum: true }, { label: 'UOM' }, { label: 'Rods/Pcs', isNum: true }, { label: 'Rod sizes' }, { label: 'Weight kg', isNum: true }, { label: 'Rate', isNum: true }, { label: 'Value', isNum: true }]);
+    const headers = [{ label: 'Code' }, { label: 'Item' }].concat(showUnit ? [{ label: 'Unit' }] : []).concat([{ label: 'Qty', isNum: true }, { label: 'UOM' }, { label: 'Rods/Pcs', isNum: true }, { label: 'Breakdown' }, { label: 'Weight kg', isNum: true }, { label: 'Rate', isNum: true }, { label: 'Value', isNum: true }]);
     let gW = 0, gV = 0, gN = 0, gR = 0;
     // Raw-material grade sections first (grouped together), then other categories.
     const orderedKeys = Object.keys(groups).sort((a, b) => {
@@ -41869,7 +41872,7 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
     if (!b.sections.length || b.sections.every(s => !s.rows.length)) { out.push(html`<tr key="empty"><td colspan=${b.headers.length} style="padding:12px;color:var(--slate-400);font-size:12px">${b.empty || 'Nothing to show.'}</td></tr>`); return out; }
     b.sections.forEach((sec, si) => {
       if (sec.label) out.push(html`<tr key=${'g' + si} style="background:var(--slate-100)"><td colspan=${b.headers.length} style="padding:5px 8px;font-weight:700;font-size:11px;color:var(--slate-600)">${sec.label}</td></tr>`);
-      sec.rows.forEach((r, ri) => out.push(html`<tr key=${si + '-' + ri} style="border-bottom:1px solid var(--slate-100)">${r.map((c, ci) => html`<td key=${ci} style=${'padding:5px 8px;font-size:12px;' + (c.align === 'right' ? 'text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap' : '')}>${c.t}</td>`)}</tr>`));
+      sec.rows.forEach((r, ri) => out.push(html`<tr key=${si + '-' + ri} style="border-bottom:1px solid var(--slate-100)">${r.map((c, ci) => html`<td key=${ci} style=${'padding:5px 8px;font-size:12px;vertical-align:top;' + (c.align === 'right' ? 'text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap' : 'white-space:pre-line')}>${c.t}</td>`)}</tr>`));
       if (sec.subtotal) out.push(html`<tr key=${'s' + si} style="background:var(--slate-50)">${sec.subtotal.map((c, ci) => html`<td key=${ci} style=${'padding:5px 8px;font-size:11px;font-weight:600;' + (c.align === 'right' ? 'text-align:right;font-variant-numeric:tabular-nums' : '')}>${c.t}</td>`)}</tr>`);
     });
     if (b.totals) out.push(html`<tr key="tot" style="background:var(--slate-100);border-top:2px solid var(--slate-400)">${b.totals.map((c, ci) => html`<td key=${ci} style=${'padding:6px 8px;font-size:12px;font-weight:700;' + (c.align === 'right' ? 'text-align:right;font-variant-numeric:tabular-nums' : '')}>${c.t}</td>`)}</tr>`);
