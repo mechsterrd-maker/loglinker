@@ -40391,6 +40391,32 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
     showToast('✓ Stock adjusted · logged to ledger');
     onSaved();
   };
+  // Guard against the recurring "mm typed as metre" error: for a length item with a
+  // rod breakdown, the stock should match the rod metre-total. Legitimate drift only
+  // makes stock SMALLER than the rod total, so a stock ~1000× (mm) or ~100× (cm) the
+  // rod total is unambiguously a scale typo — flag it with a one-tap fix.
+  const savedRods = Array.isArray(editTarget?.pieces) ? editTarget.pieces : [];
+  const rodTotalSaved = Math.round(savedRods.reduce((s, p) => s + (parseFloat(p.len) || 0) * (parseFloat(p.count) || 0), 0) * 1000) / 1000;
+  const curQtySaved = parseFloat(editTarget?.current_qty) || 0;
+  const scaleRatio = rodTotalSaved > 0 ? curQtySaved / rodTotalSaved : 0;
+  const scaleMismatch = isEdit && rodTotalSaved > 0 && curQtySaved > rodTotalSaved + 0.01
+    && ((scaleRatio >= 900 && scaleRatio <= 1100) || (scaleRatio >= 90 && scaleRatio <= 110));
+  const fixScaleError = async () => {
+    const delta = Math.round((rodTotalSaved - curQtySaved) * 1000) / 1000; // negative
+    if (delta >= 0) return;
+    if (!isAdmin) { setError('This correction reduces the number, so it needs an admin / plant head.'); return; }
+    setAdjBusy(true); setError('');
+    const { error: tErr } = await sb.from('mcp_stocks_transactions').insert({
+      plant_id: plant.id, item_id: editTarget.id, txn_type: 'adjustment_out',
+      qty: Math.abs(delta), reference: 'Stock adjusted',
+      notes: 'Quantity was entered in mm; corrected to rod total ' + rodTotalSaved + ' mtr',
+      performed_by: me?.id || null,
+    });
+    setAdjBusy(false);
+    if (tErr) { setError(tErr.message || 'Could not fix the quantity'); return; }
+    showToast('✓ Fixed to ' + rodTotalSaved + ' mtr · logged to ledger');
+    onSaved();
+  };
   const isRaw = form.category === 'raw_material';
   const rmSec = RM_SECTIONS.find(s => s.key === form.section_type) || null;
   // Coil: tracked in kg (weight), priced ₹/kg, with a breakdown of each physical
@@ -40672,6 +40698,13 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
               : html`<div class="field"><label style="display:flex;justify-content:space-between;align-items:center">Current qty${alreadyOpened ? html`<button type="button" onClick=${() => { setAdjOpen(o => !o); setAdjQty(String(editTarget.current_qty ?? '')); setAdjNote(''); setError(''); }} style="font-size:11px;font-weight:600;color:var(--teal-700);background:none;border:none;cursor:pointer;padding:0">${adjOpen ? 'Cancel' : '✏️ Adjust'}</button>` : ''}</label><input type="number" disabled value=${editTarget.current_qty} style="background:var(--slate-100);color:var(--slate-700);font-weight:600" /></div>`}
             <div class="field"><label>Reorder level</label><input type="number" step="0.001" value=${form.reorder_level || ''} onChange=${e => setForm({...form, reorder_level: e.target.value})} /></div>
           </div>
+          ${scaleMismatch && html`
+            <div class="card" style="background:var(--rose-50);border-color:var(--rose-200);padding:10px;margin-bottom:10px">
+              <div style="font-size:12px;color:var(--rose-700);line-height:1.5">⚠️ <b>This looks entered in mm, not metre.</b> Stock shows <b>${fmtNum(curQtySaved)}</b> but the rods total <b>${fmtNum(rodTotalSaved)} mtr</b>. They should match.</div>
+              <button type="button" class="btn small" style="margin-top:8px;background:var(--rose-600);color:#fff" disabled=${adjBusy} onClick=${fixScaleError}>📏 Fix → set stock to ${fmtNum(rodTotalSaved)} mtr</button>
+              ${!isAdmin ? html`<div style="font-size:10.5px;color:var(--slate-500);margin-top:6px">Needs an admin / plant head to apply.</div>` : ''}
+            </div>
+          `}
           ${isEdit && alreadyOpened && adjOpen && html`
             <div class="card" style="background:var(--amber-50);border-color:var(--amber-200);padding:10px;margin-bottom:10px">
               <div style="font-size:12px;font-weight:700;color:var(--amber-800);margin-bottom:8px">✏️ Adjust stock quantity</div>
