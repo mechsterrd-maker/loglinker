@@ -41689,6 +41689,23 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
   const catLabel = (i) => CATL[i.category] || (i.category || 'General');
   const matLabel = (k) => (RM_MATERIALS.find(m => m.key === k) || {}).label || k || 'Other';
   const secLabel = (k) => (RM_SECTIONS.find(s => s.key === k) || {}).label || 'Other';
+  // Material grade (MS / SS / Aluminium …) — prefer the explicit `material` field,
+  // else read it from the name/code. Used to split raw material into its own table
+  // per grade in the stock statement.
+  const rptNormGrade = (raw) => {
+    const s = (raw || '').toLowerCase();
+    if (!s) return null;
+    if (/\bss\b|stainless/.test(s)) return 'SS';
+    if (/\bms\b|mild\s*steel/.test(s)) return 'MS';
+    if (/\balu\w*\b|aluminium|aluminum/.test(s)) return 'Aluminium';
+    if (/\bbrass\b/.test(s)) return 'Brass';
+    if (/\bcopper\b/.test(s)) return 'Copper';
+    if (/cast\s*iron|\bc\.?i\.?\b/.test(s)) return 'Cast Iron';
+    return null;
+  };
+  const rptGradeOf = (i) => rptNormGrade(i.material) || rptNormGrade((i.name || '') + ' ' + (i.code || '')) || 'Other';
+  // Section key: raw material splits by grade; other categories group by category.
+  const rptGroupKey = (i) => (i.category || 'general') === 'raw_material' ? ('Raw Material · ' + rptGradeOf(i)) : catLabel(i);
   const showUnit = multiUnit && unitId === 'all';
   const catOf = (i) => i.category || 'general';
   const catOptions = [...new Set(items.map(catOf))].sort((a, b) => (CATL[a] || a).localeCompare(CATL[b] || b));
@@ -41724,10 +41741,16 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
   const rodsOf = (i) => (Array.isArray(i.pieces) ? i.pieces : []).reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
   const buildCurrent = () => {
     const arr = scopeItems.filter(i => Math.abs(parseFloat(i.current_qty) || 0) > 0);
-    const groups = {}; arr.forEach(i => { const k = catLabel(i); (groups[k] = groups[k] || []).push(i); });
+    const groups = {}; arr.forEach(i => { const k = rptGroupKey(i); (groups[k] = groups[k] || []).push(i); });
     const headers = [{ label: 'Code' }, { label: 'Item' }].concat(showUnit ? [{ label: 'Unit' }] : []).concat([{ label: 'Qty', isNum: true }, { label: 'UOM' }, { label: 'Rods/Pcs', isNum: true }, { label: 'Weight kg', isNum: true }, { label: 'Rate', isNum: true }, { label: 'Value', isNum: true }]);
     let gW = 0, gV = 0, gN = 0, gR = 0;
-    const sections = Object.keys(groups).sort().map(k => {
+    // Raw-material grade sections first (grouped together), then other categories.
+    const orderedKeys = Object.keys(groups).sort((a, b) => {
+      const ra = a.startsWith('Raw Material · '), rb = b.startsWith('Raw Material · ');
+      if (ra !== rb) return ra ? -1 : 1;
+      return a.localeCompare(b);
+    });
+    const sections = orderedKeys.map(k => {
       const list = groups[k].slice().sort((a, b) => String(a.code || a.name || '').localeCompare(String(b.code || b.name || '')));
       let sW = 0, sV = 0, sR = 0;
       const rows = list.map(i => {
