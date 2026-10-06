@@ -41739,10 +41739,25 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
 
   // rod / piece count from the pieces breakdown (rods [{len,count}] or sheets [{w,l,count}])
   const rodsOf = (i) => (Array.isArray(i.pieces) ? i.pieces : []).reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
+  // Rod / coil breakdown as text: "27×0.7" (count×length) or "4×1000kg + 1×250kg".
+  // Separator is " + " (no commas) so it stays a single CSV cell.
+  const rodBreakdownOf = (i) => {
+    const pc = Array.isArray(i.pieces) ? i.pieces : [];
+    if (!pc.length) return '';
+    if (pc.some(p => p.len != null)) {
+      return pc.filter(p => (parseFloat(p.count) || 0) > 0 && (parseFloat(p.len) || 0) > 0)
+        .map(p => fmtNum(parseFloat(p.count)) + '×' + fmtNum(parseFloat(p.len))).join(' + ');
+    }
+    if (pc.some(p => p.w != null)) {
+      return pc.filter(p => (parseFloat(p.count) || 0) > 0 && (parseFloat(p.w) || 0) > 0)
+        .map(p => fmtNum(parseFloat(p.count)) + '×' + fmtNum(parseFloat(p.w)) + 'kg').join(' + ');
+    }
+    return '';
+  };
   const buildCurrent = () => {
     const arr = scopeItems.filter(i => Math.abs(parseFloat(i.current_qty) || 0) > 0);
     const groups = {}; arr.forEach(i => { const k = rptGroupKey(i); (groups[k] = groups[k] || []).push(i); });
-    const headers = [{ label: 'Code' }, { label: 'Item' }].concat(showUnit ? [{ label: 'Unit' }] : []).concat([{ label: 'Qty', isNum: true }, { label: 'UOM' }, { label: 'Rods/Pcs', isNum: true }, { label: 'Weight kg', isNum: true }, { label: 'Rate', isNum: true }, { label: 'Value', isNum: true }]);
+    const headers = [{ label: 'Code' }, { label: 'Item' }].concat(showUnit ? [{ label: 'Unit' }] : []).concat([{ label: 'Qty', isNum: true }, { label: 'UOM' }, { label: 'Rods/Pcs', isNum: true }, { label: 'Rod sizes' }, { label: 'Weight kg', isNum: true }, { label: 'Rate', isNum: true }, { label: 'Value', isNum: true }]);
     let gW = 0, gV = 0, gN = 0, gR = 0;
     // Raw-material grade sections first (grouped together), then other categories.
     const orderedKeys = Object.keys(groups).sort((a, b) => {
@@ -41758,18 +41773,18 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
         sW += w; sV += val; sR += rods;
         const cells = [C(i.code || ''), C(i.name || i.code || '')];
         if (showUnit) cells.push(C(unitNameOf(i.unit_id)));
-        cells.push(N(q, 3), C(i.uom || ''), rods ? N(rods, 0) : C(''), w ? N(w, 2) : C(''), rate ? N(rate, 2) : C(''), val ? MON(val) : C(''));
+        cells.push(N(q, 3), C(i.uom || ''), rods ? N(rods, 0) : C(''), C(rodBreakdownOf(i)), w ? N(w, 2) : C(''), rate ? N(rate, 2) : C(''), val ? MON(val) : C(''));
         return cells;
       });
       gW += sW; gV += sV; gN += list.length; gR += sR;
       const sub = [C(''), C('Subtotal · ' + list.length)];
       if (showUnit) sub.push(C(''));
-      sub.push(C(''), C(''), sR ? N(sR, 0) : C(''), N(sW, 2), C(''), MON(sV));
+      sub.push(C(''), C(''), sR ? N(sR, 0) : C(''), C(''), N(sW, 2), C(''), MON(sV));
       return { label: k + ' · ' + list.length + ' item' + (list.length === 1 ? '' : 's'), rows, subtotal: sub };
     });
     const totals = [C(''), C('GRAND TOTAL · ' + gN)];
     if (showUnit) totals.push(C(''));
-    totals.push(C(''), C(''), gR ? N(gR, 0) : C(''), N(gW, 2), C(''), MON(gV));
+    totals.push(C(''), C(''), gR ? N(gR, 0) : C(''), C(''), N(gW, 2), C(''), MON(gV));
     const summary = [{ label: 'Items', val: fmtNum(gN) }];
     if (gR > 0) summary.push({ label: 'Rods / pcs', val: fmtNum(gR) });
     summary.push({ label: 'Total weight', val: fmtNum(Math.round(gW)) + ' kg' }, { label: 'Total value', val: '₹' + Math.round(gV).toLocaleString('en-IN') });
