@@ -41677,6 +41677,7 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
   const toggleCol = (label) => setHiddenCols(prev => { const n = new Set(prev); n.has(label) ? n.delete(label) : n.add(label); return n; });
   const [unitId, setUnitId] = useState('all');
   const [catFilter, setCatFilter] = useState('all'); // all | raw_material | consumables | …
+  const [gradeFilter, setGradeFilter] = useState('all'); // all | MS | SS | Aluminium | … (raw material)
   const [fromD, setFromD] = useState(monthStart);
   const [toD, setToD] = useState(today);
   const [mvTx, setMvTx] = useState(null);
@@ -41709,7 +41710,13 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
   const showUnit = multiUnit && unitId === 'all';
   const catOf = (i) => i.category || 'general';
   const catOptions = [...new Set(items.map(catOf))].sort((a, b) => (CATL[a] || a).localeCompare(CATL[b] || b));
-  const scopeItems = items.filter(i => (unitId === 'all' || i.unit_id === unitId) && (catFilter === 'all' || catOf(i) === catFilter));
+  // Raw-material grades available in the master (within the current unit scope),
+  // so the report can be printed for one grade (MS / SS / Aluminium …) alone.
+  const gradeOptions = [...new Set(items.filter(i => catOf(i) === 'raw_material' && (unitId === 'all' || i.unit_id === unitId)).map(rptGradeOf))].sort();
+  const gradeActive = gradeFilter !== 'all' && (catFilter === 'all' || catFilter === 'raw_material');
+  const scopeItems = items.filter(i => (unitId === 'all' || i.unit_id === unitId)
+    && (catFilter === 'all' || catOf(i) === catFilter)
+    && (!gradeActive || (catOf(i) === 'raw_material' && rptGradeOf(i) === gradeFilter)));
   const INWARD = ['grn', 'return', 'opening', 'adjustment_in', 'jobwork_in'];
   const dmy = (d) => d ? String(d).slice(0, 10).split('-').reverse().join('/') : '';
 
@@ -41792,9 +41799,9 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
     if (gR > 0) summary.push({ label: 'Rods / pcs', val: fmtNum(gR) });
     summary.push({ label: 'Total weight', val: fmtNum(Math.round(gW)) + ' kg' }, { label: 'Total value', val: '₹' + Math.round(gV).toLocaleString('en-IN') });
     return {
-      title: 'Stock Statement', subtitle: [unitTag, catFilter !== 'all' ? (CATL[catFilter] || catFilter) : '', 'as on ' + dmy(today)].filter(Boolean).join(' · '),
+      title: 'Stock Statement', subtitle: [unitTag, catFilter !== 'all' ? (CATL[catFilter] || catFilter) : '', gradeActive ? gradeFilter : '', 'as on ' + dmy(today)].filter(Boolean).join(' · '),
       summary,
-      waText: '*' + (plant.name || '') + ' — Stock Statement*\n' + [unitTag, catFilter !== 'all' ? (CATL[catFilter] || catFilter) : ''].filter(Boolean).join(' · ') + (unitTag || catFilter !== 'all' ? '\n' : '') + 'As on ' + dmy(today) + '\nItems: ' + gN + (gR ? '\nRods/pcs: ' + fmtNum(gR) : '') + '\nTotal weight: ' + fmtNum(Math.round(gW)) + ' kg\nTotal value: ₹' + Math.round(gV).toLocaleString('en-IN'),
+      waText: '*' + (plant.name || '') + ' — Stock Statement*\n' + [unitTag, catFilter !== 'all' ? (CATL[catFilter] || catFilter) : '', gradeActive ? gradeFilter : ''].filter(Boolean).join(' · ') + (unitTag || catFilter !== 'all' || gradeActive ? '\n' : '') + 'As on ' + dmy(today) + '\nItems: ' + gN + (gR ? '\nRods/pcs: ' + fmtNum(gR) : '') + '\nTotal weight: ' + fmtNum(Math.round(gW)) + ' kg\nTotal value: ₹' + Math.round(gV).toLocaleString('en-IN'),
       blocks: [{ headers, sections, totals, empty: 'No items in stock.' }],
     };
   };
@@ -41817,7 +41824,7 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
       return { label: k + ' · ' + list.length, rows, subtotal: null };
     });
     return {
-      title: 'Stock Movement', subtitle: [unitTag, catFilter !== 'all' ? (CATL[catFilter] || catFilter) : '', dmy(fromD) + ' → ' + dmy(toD)].filter(Boolean).join(' · '),
+      title: 'Stock Movement', subtitle: [unitTag, catFilter !== 'all' ? (CATL[catFilter] || catFilter) : '', gradeActive ? gradeFilter : '', dmy(fromD) + ' → ' + dmy(toD)].filter(Boolean).join(' · '),
       summary: [{ label: 'Items moved', val: fmtNum(rowsData.length) }],
       waText: '*' + (plant.name || '') + ' — Stock Movement*\n' + (unitTag ? unitTag + '\n' : '') + dmy(fromD) + ' → ' + dmy(toD) + '\nItems moved: ' + rowsData.length,
       blocks: [{ headers, sections, totals: null, empty: 'No stock moved in this period.' }],
@@ -41831,7 +41838,7 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
     const headers = [{ label: 'Code' }, { label: 'Item' }].concat(showUnit ? [{ label: 'Unit' }] : []).concat([{ label: 'Current', isNum: true }, { label: 'Reorder at', isNum: true }, { label: 'Short by', isNum: true }, { label: 'UOM' }]);
     const rows = list.map(r => { const cells = [C(r.i.code || ''), C(r.i.name || r.i.code || '')]; if (showUnit) cells.push(C(unitNameOf(r.i.unit_id))); const short = Math.max(0, r.ro - r.cur); cells.push(N(r.cur, 3), N(r.ro, 3), N(short, 3), C(r.i.uom || '')); return cells; });
     return {
-      title: 'Low Stock', subtitle: [unitTag, catFilter !== 'all' ? (CATL[catFilter] || catFilter) : '', list.length + ' item' + (list.length === 1 ? '' : 's') + ' at/below reorder'].filter(Boolean).join(' · '),
+      title: 'Low Stock', subtitle: [unitTag, catFilter !== 'all' ? (CATL[catFilter] || catFilter) : '', gradeActive ? gradeFilter : '', list.length + ' item' + (list.length === 1 ? '' : 's') + ' at/below reorder'].filter(Boolean).join(' · '),
       summary: [{ label: 'Low items', val: fmtNum(list.length) }],
       waText: '*' + (plant.name || '') + ' — Low Stock*\n' + (unitTag ? unitTag + '\n' : '') + (list.length ? list.slice(0, 25).map(r => '• ' + (r.i.name || r.i.code) + ': ' + fmtNum(r.cur) + '/' + fmtNum(r.ro) + ' ' + (r.i.uom || '')).join('\n') + (list.length > 25 ? ('\n…+' + (list.length - 25) + ' more') : '') : 'Nothing is low. 👍'),
       blocks: [{ headers, sections: [{ label: null, rows, subtotal: null }], totals: null, empty: 'Nothing is low — every item is above its reorder level. 👍' }],
@@ -41899,6 +41906,10 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
           ${rpt !== 'scrap' && html`<select value=${catFilter} onChange=${e => setCatFilter(e.target.value)} style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:#fff">
             <option value="all">All categories</option>
             ${catOptions.map(c => html`<option key=${c} value=${c}>${CATL[c] || c}</option>`)}
+          </select>`}
+          ${rpt !== 'scrap' && (catFilter === 'all' || catFilter === 'raw_material') && gradeOptions.length > 0 && html`<select value=${gradeFilter} onChange=${e => setGradeFilter(e.target.value)} title="Material grade (raw material)" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:6px;font-size:12px;background:#fff">
+            <option value="all">All grades</option>
+            ${gradeOptions.map(g => html`<option key=${g} value=${g}>${g}</option>`)}
           </select>`}
           ${rpt === 'movement' && html`<div style="display:flex;gap:4px;align-items:center"><${DateField} value=${fromD} onChange=${e => setFromD(e.target.value)} /><span style="color:var(--slate-400)">→</span><${DateField} value=${toD} onChange=${e => setToD(e.target.value)} /></div>`}
           <div style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">
