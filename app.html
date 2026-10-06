@@ -40428,6 +40428,10 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
   const isLengthItem = ['mtr', 'ft'].includes((form.uom || '').toLowerCase());
   const [pieceMode, setPieceMode] = useState(() => Array.isArray(editTarget?.pieces) && editTarget.pieces.length > 0 && editTarget?.section_type !== 'coil');
   const [coilMode, setCoilMode] = useState(() => editTarget ? (Array.isArray(editTarget?.pieces) && editTarget.pieces.length > 0 && editTarget?.section_type === 'coil') : true);
+  // New length (rod) items take their quantity ONLY from the rod breakdown, so force
+  // it on — there is then no free "type a total" box to put mm into by mistake.
+  const rodsRequired = !isEdit && isRaw && isLengthItem;
+  useEffect(() => { if (rodsRequired && !pieceMode) setPieceMode(true); }, [rodsRequired]);
   const pcs = Array.isArray(form.pieces) ? form.pieces : [];
   const pcTotalLen = pcs.reduce((s, p) => s + (parseFloat(p.count) || 0) * (parseFloat(p.len) || 0), 0);
   const pcTotalRods = pcs.reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
@@ -40454,6 +40458,11 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
   const submit = async (e) => {
     e.preventDefault();
     setError(''); setLoading(true);
+    // New length (rod) items must carry a rod breakdown — that is their quantity.
+    if (rodsRequired) {
+      const validRods = (form.pieces || []).filter(p => (parseFloat(p.len) || 0) > 0 && (parseFloat(p.count) || 0) > 0);
+      if (!validRods.length) { setError('Add at least one rod size (count × length). A length item takes its stock quantity from the rod breakdown.'); setLoading(false); return; }
+    }
     try {
       const payload = {
         plant_id: plant.id,
@@ -40629,10 +40638,11 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
           `}
           ${isRaw && isLengthItem && html`
             <div class="card" style="background:var(--slate-50);border-color:var(--slate-200);padding:10px 12px;margin-bottom:10px">
-              <label style="display:flex;align-items:center;gap:7px;font-size:12px;font-weight:600;color:var(--slate-700);cursor:pointer;margin-bottom:${pieceMode ? '8px' : '0'}">
-                <input type="checkbox" checked=${pieceMode} onChange=${e => setPieceMode(e.target.checked)} />
-                Break into rods (count × length)${isEdit ? '' : ' — recommended for bars/pipes'}
+              <label style="display:flex;align-items:center;gap:7px;font-size:12px;font-weight:600;color:var(--slate-700);cursor:${rodsRequired ? 'default' : 'pointer'};margin-bottom:${pieceMode ? '8px' : '0'}">
+                <input type="checkbox" checked=${pieceMode} disabled=${rodsRequired} onChange=${e => setPieceMode(e.target.checked)} />
+                ${rodsRequired ? 'Rods (count × length) — stock is taken from here' : 'Break into rods (count × length)' + (isEdit ? '' : ' — recommended for bars/pipes')}
               </label>
+              ${rodsRequired ? html`<div style="font-size:10.5px;color:var(--slate-500);margin:-2px 0 8px 24px">Enter lengths in <b>${form.uom}</b> — the opening stock is the total of all rods.</div>` : ''}
               ${pieceMode && html`
                 <div style="display:flex;flex-direction:column;gap:6px">
                   <div style="display:flex;gap:6px;font-size:10px;color:var(--slate-500);font-weight:600;padding:0 2px">
