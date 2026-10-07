@@ -44259,10 +44259,12 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     const f = lineForm[i] || {};
     const kind = f.kind || 'stock';
     const payload = { kind };
+    // Name the user may have corrected (AI sometimes extracts a wrong name).
+    const editedName = (f.name != null && String(f.name).trim() !== '') ? String(f.name).trim() : '';
     if (kind === 'stock') {
       const cat = f.category || 'raw_material';
       const amount = billAmtOf(it);
-      payload.name = (it.name || it.item_name || '').trim() || 'Item';
+      payload.name = (editedName || it.name || it.item_name || '').trim() || 'Item';
       payload.category = cat;
       payload.cost_type = f.cost_type || 'purchase';
       payload.project_id = f.project_id || null;
@@ -44270,8 +44272,8 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
         // Tracked in kg. Weight is the value anchor; pieces is optional info.
         const totalKg = parseFloat(f.weight_kg) || 0;
         const pcs = f.pieces ? parseFloat(f.pieces) : null;
-        payload.material = f.material || guessMatLocal(it.name || it.item_name);
-        payload.section = f.section || guessSecLocal(it.name || it.item_name);
+        payload.material = f.material || guessMatLocal(editedName || it.name || it.item_name);
+        payload.section = f.section || guessSecLocal(editedName || it.name || it.item_name);
         payload.uom = 'kg';
         payload.qty = totalKg;
         payload.unit_weight = 1;
@@ -44292,6 +44294,12 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       payload.project_id = f.project_id || null;
     }
     setSavingLine(m => ({ ...m, [i]: true }));
+    // Persist a corrected name onto the bill line too, so the document matches the
+    // stock item (the receive RPC reads items fresh, so this is kept).
+    if (kind !== 'skip' && editedName && editedName !== (it.name || it.item_name || '')) {
+      const newItems = (Array.isArray(doc.items) ? doc.items : []).map((x, idx) => idx === i ? { ...x, name: editedName } : x);
+      await sb.from('mcp_logistics_documents').update({ items: newItems }).eq('id', doc.id);
+    }
     const { data, error } = await sb.rpc('receive_bill_line', { p_doc_id: doc.id, p_idx: i, p_line: payload });
     setSavingLine(m => ({ ...m, [i]: false }));
     if (error || data?.success === false) { showToast('Failed: ' + (error?.message || data?.error || '')); return; }
@@ -44815,6 +44823,9 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
                       <button key=${k} type="button" onClick=${() => setLF(i, { kind: k })} style=${'padding:5px 10px;border-radius:16px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid ' + (kind === k ? 'var(--teal-600)' : 'var(--slate-200)') + ';background:' + (kind === k ? 'var(--teal-600)' : 'white') + ';color:' + (kind === k ? 'white' : 'var(--slate-600)')}>${lbl}</button>`)}
                     <span style="font-size:10px;color:var(--slate-400)">✨ auto-filled — check &amp; fix</span>
                   </div>
+                  ${kind !== 'skip' && html`<div key="nm" style="margin-bottom:8px">
+                    <input type="text" value=${lfVal(i, 'name', it.name || it.item_name || '')} onInput=${e => setLF(i, { name: e.target.value })} placeholder="Item name" title="Correct the item name if the AI pulled it wrong — this is the name saved to stock" style="width:100%;box-sizing:border-box;font-size:12.5px;font-weight:600;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px" />
+                  </div>`}
                   ${kind === 'stock' ? html`<div key="body">
                     <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
                       <select value=${cat} onChange=${e => setLF(i, { category: e.target.value })} style="font-size:12px;padding:5px 6px;border:1px solid var(--slate-200);border-radius:5px;background:white">
