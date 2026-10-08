@@ -41675,7 +41675,7 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
   const today = new Date().toISOString().slice(0, 10);
   const monthStart = today.slice(0, 8) + '01';
   const [rpt, setRpt] = useState('current'); // current | movement | low | scrap
-  const [hiddenCols, setHiddenCols] = useState(() => new Set()); // column labels to hide from the report (e.g. Rate/Value for shop floor)
+  const [hiddenCols, setHiddenCols] = useState(() => new Set(['Code'])); // column labels to hide from the report (Code duplicates Item; re-enable in the picker)
   const toggleCol = (label) => setHiddenCols(prev => { const n = new Set(prev); n.has(label) ? n.delete(label) : n.add(label); return n; });
   const [unitId, setUnitId] = useState('all');
   const [catFilter, setCatFilter] = useState('all'); // all | raw_material | consumables | …
@@ -41748,21 +41748,22 @@ function StockReports({ plant, me, units, multiUnit, unitNameOf, items, onClose 
 
   // rod / piece count from the pieces breakdown (rods [{len,count}] or sheets [{w,l,count}])
   const rodsOf = (i) => (Array.isArray(i.pieces) ? i.pieces : []).reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
-  // Rod / coil breakdown, one size per line for readability, longest first:
-  //   "85 × 0.815 m\n51 × 1.135 m\n…"  (rods)  ·  "4 × 1000 kg\n1 × 250 kg" (coils).
-  // Each cell is quoted in the CSV, so the line breaks survive in Excel too.
+  // Rod / coil breakdown as a compact, wrapping list, longest first:
+  //   "5×1.15m · 14×1.14m · 51×1.135m · …"  (rods)  ·  "4×1000kg · 1×250kg" (coils).
+  // Flows across the column width (wraps) instead of one tall line per size, and
+  // stays a single clean cell in the CSV.
   const rodBreakdownOf = (i) => {
     const pc = Array.isArray(i.pieces) ? i.pieces : [];
     if (!pc.length) return '';
     if (pc.some(p => p.len != null)) {
       return pc.filter(p => (parseFloat(p.count) || 0) > 0 && (parseFloat(p.len) || 0) > 0)
         .slice().sort((a, b) => (parseFloat(b.len) || 0) - (parseFloat(a.len) || 0))
-        .map(p => fmtNum(parseFloat(p.count)) + ' × ' + fmtNum(parseFloat(p.len)) + ' m').join('\n');
+        .map(p => fmtNum(parseFloat(p.count)) + '×' + fmtNum(parseFloat(p.len)) + 'm').join(' · ');
     }
     if (pc.some(p => p.w != null)) {
       return pc.filter(p => (parseFloat(p.count) || 0) > 0 && (parseFloat(p.w) || 0) > 0)
         .slice().sort((a, b) => (parseFloat(b.w) || 0) - (parseFloat(a.w) || 0))
-        .map(p => fmtNum(parseFloat(p.count)) + ' × ' + fmtNum(parseFloat(p.w)) + ' kg').join('\n');
+        .map(p => fmtNum(parseFloat(p.count)) + '×' + fmtNum(parseFloat(p.w)) + 'kg').join(' · ');
     }
     return '';
   };
