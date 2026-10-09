@@ -44275,6 +44275,13 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
         const pcs = f.pieces ? parseFloat(f.pieces) : null;
         payload.material = f.material || guessMatLocal(editedName || it.name || it.item_name);
         payload.section = f.section || guessSecLocal(editedName || it.name || it.item_name);
+        // Marvel: a standard uniform name built from material + section + sizes
+        // replaces the supplier's free-text name (once the sizes are entered), so
+        // the same material from any supplier lands on one standard stock item.
+        if (/marvel/i.test(plant?.name || '') && f.section) {
+          const built = rmBuild(f.material || 'MS', f.section, f.d1, f.d2, f.d3, f.spec);
+          if ((built.size_spec || '').trim()) { payload.name = built.name.trim(); payload.material = f.material || 'MS'; payload.section = f.section; }
+        }
         payload.uom = 'kg';
         payload.qty = totalKg;
         payload.unit_weight = 1;
@@ -44295,10 +44302,11 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       payload.project_id = f.project_id || null;
     }
     setSavingLine(m => ({ ...m, [i]: true }));
-    // Persist a corrected name onto the bill line too, so the document matches the
-    // stock item (the receive RPC reads items fresh, so this is kept).
-    if (kind !== 'skip' && editedName && editedName !== (it.name || it.item_name || '')) {
-      const newItems = (Array.isArray(doc.items) ? doc.items : []).map((x, idx) => idx === i ? { ...x, name: editedName } : x);
+    // Persist the final name (corrected or built-standard) onto the bill line too,
+    // so the document matches the stock item (the receive RPC reads items fresh).
+    const finalName = (kind === 'stock' && payload.name) ? payload.name : editedName;
+    if (kind !== 'skip' && finalName && finalName !== (it.name || it.item_name || '')) {
+      const newItems = (Array.isArray(doc.items) ? doc.items : []).map((x, idx) => idx === i ? { ...x, name: finalName } : x);
       await sb.from('mcp_logistics_documents').update({ items: newItems }).eq('id', doc.id);
     }
     const { data, error } = await sb.rpc('receive_bill_line', { p_doc_id: doc.id, p_idx: i, p_line: payload });
@@ -44840,6 +44848,22 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
                           ${RM_SECTIONS.map(s => html`<option key=${s.key} value=${s.key}>${s.label}</option>`)}
                         </select>`}
                     </div>
+                    ${isRaw && /marvel/i.test(plant?.name || '') && (() => {
+                      const secKey = lfVal(i, 'section', 'plate');
+                      const S = RM_SECTIONS.find(s => s.key === secKey);
+                      if (!S) return '';
+                      const built = rmBuild(lfVal(i, 'material', 'MS'), secKey, lfVal(i, 'd1', ''), lfVal(i, 'd2', ''), lfVal(i, 'd3', ''), lfVal(i, 'spec', ''));
+                      const hasSize = (built.size_spec || '').trim() !== '';
+                      return html`<div style="margin-top:6px;background:var(--teal-50);border:1px solid var(--teal-200);border-radius:6px;padding:7px 9px">
+                        <div style="font-size:10px;font-weight:700;color:var(--teal-800);text-transform:uppercase;letter-spacing:.3px;margin-bottom:5px">📐 Standard name — enter the sizes</div>
+                        <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center">
+                          ${S.dims.length > 0
+                            ? S.dims.map((dl, di) => html`<input key=${di} type="number" step="any" value=${lfVal(i, 'd' + (di + 1), '')} onInput=${e => setLF(i, { ['d' + (di + 1)]: e.target.value })} placeholder=${dl} title=${dl} style="width:92px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-300);border-radius:5px" />`)
+                            : html`<input type="text" value=${lfVal(i, 'spec', '')} onInput=${e => setLF(i, { spec: e.target.value })} placeholder=${S.spec || 'Describe'} style="flex:1;min-width:140px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-300);border-radius:5px" />`}
+                        </div>
+                        ${hasSize ? html`<div style="font-size:11.5px;color:var(--teal-800);margin-top:5px">→ saved as <b>${built.name}</b></div>` : html`<div style="font-size:10.5px;color:var(--slate-500);margin-top:5px">Fill the sizes to name it uniformly — otherwise the bill's name is kept.</div>`}
+                      </div>`;
+                    })()}
                     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px">
                       ${isRaw ? html`
                         <label style="font-size:11px;color:var(--slate-700);display:flex;align-items:center;gap:5px;font-weight:600">Weight <input type="number" step="any" min="0" value=${lfVal(i, 'weight_kg', '')} onInput=${e => setLF(i, { weight_kg: e.target.value })} placeholder="0" title="Total weight in kg" style="width:88px;font-size:12px;padding:5px 6px;border:1px solid var(--slate-300);border-radius:5px" /> kg</label>
