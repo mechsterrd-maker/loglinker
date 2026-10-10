@@ -44270,6 +44270,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     const f = lineForm[i] || {};
     const kind = f.kind || 'stock';
     const payload = { kind };
+    let rmStruct = null; // Marvel: sizes to write onto the stock item after receive (RPC doesn't store dims)
     // Name the user may have corrected (AI sometimes extracts a wrong name).
     const editedName = (f.name != null && String(f.name).trim() !== '') ? String(f.name).trim() : '';
     if (kind === 'stock') {
@@ -44290,7 +44291,11 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
         // the same material from any supplier lands on one standard stock item.
         if (/marvel/i.test(plant?.name || '') && f.section) {
           const built = rmBuild(f.material || 'MS', f.section, f.d1, f.d2, f.d3, f.spec, true);
-          if ((built.size_spec || '').trim()) { payload.name = built.name.trim(); payload.material = f.material || 'MS'; payload.section = f.section; }
+          if ((built.size_spec || '').trim()) {
+            payload.name = built.name.trim(); payload.material = f.material || 'MS'; payload.section = f.section;
+            const nn = (v) => (v !== '' && v != null ? parseFloat(v) : null);
+            rmStruct = { dim1: nn(f.d1), dim2: nn(f.d2), dim3: nn(f.d3), size_spec: built.size_spec };
+          }
         }
         payload.uom = 'kg';
         payload.qty = totalKg;
@@ -44320,6 +44325,11 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       await sb.from('mcp_logistics_documents').update({ items: newItems }).eq('id', doc.id);
     }
     const { data, error } = await sb.rpc('receive_bill_line', { p_doc_id: doc.id, p_idx: i, p_line: payload });
+    // Store the structured sizes on the stock item so a bill-received item is as
+    // complete as one made in the item editor (the receive RPC doesn't take dims).
+    if (!error && data?.success !== false && rmStruct && data?.stock_item) {
+      await sb.from('mcp_stocks_items').update(rmStruct).eq('id', data.stock_item);
+    }
     setSavingLine(m => ({ ...m, [i]: false }));
     if (error || data?.success === false) { showToast('Failed: ' + (error?.message || data?.error || '')); return; }
     showToast(kind === 'stock' ? '✓ Added to stock' : kind === 'charge' ? '✓ Saved as charge' : '✓ Line skipped');
