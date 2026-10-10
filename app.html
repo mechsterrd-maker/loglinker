@@ -3864,7 +3864,7 @@ function ReturnOffcutModal({ plant, material, onClose, onSaved }) {
   }, [material.stock_item_id]);
 
   const sec = RM_SECTIONS.find(s => s.key === section) || null;
-  const built = rmBuild(mat, section, d1, d2, d3, spec);
+  const built = rmBuild(mat, section, d1, d2, d3, spec, /marvel/i.test(plant?.name || ''));
 
   const submit = async (e) => {
     e.preventDefault(); setErr(''); setBusy(true);
@@ -4401,7 +4401,7 @@ function ReceiveReturnModal({ plant, me, lines, prefillParts, linkDoc, onClose, 
   // Build the offcut item (code/name/weight/uom) from the chosen shape — works
   // for bar / plate / angle / pipe / RHS, not just sheets.
   const wSec = RM_SECTIONS.find(s => s.key === wSection) || null;
-  const wBuilt = rmBuild(wMat, wSection, wd1, wd2, wd3, wSpec);
+  const wBuilt = rmBuild(wMat, wSection, wd1, wd2, wd3, wSpec, /marvel/i.test(plant?.name || ''));
   const wUnitWeight = wBuilt.unit_weight;
 
   const askCompleteAndClose = async () => {
@@ -40279,6 +40279,7 @@ const RM_MATERIALS = [
   { key:'Cast Iron', label:'Cast Iron',       short:'CI',  abbr:'CI',  rho:7200 },
   { key:'Brass',     label:'Brass',           short:'Brass', abbr:'BR', rho:8500 },
   { key:'Copper',    label:'Copper',          short:'Cu',  abbr:'CU',  rho:8960 },
+  { key:'GI',        label:'GI (galvanized)', short:'GI',  abbr:'GI',  rho:7850 },
   { key:'Other',     label:'Other',           short:'',    abbr:'MAT', rho:7850 },
 ];
 const RM_SECTIONS = [
@@ -40289,12 +40290,13 @@ const RM_SECTIONS = [
   { key:'block',      label:'Rect. block / bar',abbr:'BLK',  unit:'mtr', dims:['A (mm)','B (mm)'],             calc:(d,r)=> (d.a*d.b)/1e6*r },
   { key:'rhs',        label:'RHS (rect tube)',  abbr:'RHS',  unit:'mtr', dims:['A (mm)','B (mm)','Thk (mm)'],  calc:(d,r)=> ((d.a*d.b)-Math.max(0,d.a-2*d.c)*Math.max(0,d.b-2*d.c))/1e6*r },
   { key:'shs',        label:'SHS (square tube)',abbr:'SHS',  unit:'mtr', dims:['Side (mm)','Thk (mm)'],        calc:(d,r)=> ((d.a*d.a)-Math.max(0,d.a-2*d.b)*Math.max(0,d.a-2*d.b))/1e6*r },
-  { key:'pipe',       label:'Pipe (OD × ID)',   abbr:'PIPE', unit:'mtr', dims:['OD (mm)','ID (mm)'],           calc:(d,r)=> (Math.PI/4*(d.a*d.a-d.b*d.b))/1e6*r },
+  { key:'pipe',       label:'Pipe (OD × thk)',  abbr:'PIPE', unit:'mtr', dims:['OD (mm)','Thk (mm)'],          calc:(d,r)=> (Math.PI/4*(d.a*d.a-Math.max(0,d.a-2*d.b)*Math.max(0,d.a-2*d.b)))/1e6*r },
   { key:'plate',      label:'Plate (per piece)',abbr:'PLT',  unit:'nos', dims:['Thk (mm)','Width (mm)','Length (mm)'], calc:(d,r)=> (d.a*(d.b||0)*(d.c||0))/1e9*r },
   { key:'sheet',      label:'Sheet (per piece)',abbr:'SHT',  unit:'nos', dims:['Thk (mm)','Width (mm)','Length (mm)'], calc:(d,r)=> (d.a*(d.b||0)*(d.c||0))/1e9*r },
+  { key:'chequered',  label:'Chequered plate',  abbr:'CHQP', unit:'nos', dims:['Thk (mm)','Width (mm)','Length (mm)'], calc:(d,r)=> (d.a*(d.b||0)*(d.c||0))/1e9*r },
   { key:'coil',       label:'Coil (by weight)', abbr:'COIL', unit:'kg',  dims:['Thk (mm)','Width (mm)'], calc:null },
-  { key:'channel',    label:'Channel (ISMC)',   abbr:'CHN',  unit:'mtr', dims:[], spec:'Designation (e.g. ISMC 100)', calc:null },
-  { key:'beam',       label:'Beam (ISMB)',      abbr:'BEAM', unit:'mtr', dims:[], spec:'Designation (e.g. ISMB 150)', calc:null },
+  { key:'channel',    label:'Channel / ISMC',   abbr:'CHN',  unit:'mtr', dims:['Depth (mm)','Flange (mm)','Thk (mm)'], calc:null },
+  { key:'beam',       label:'Beam / ISMB',      abbr:'BEAM', unit:'mtr', dims:['Depth (mm)','Flange (mm)','Thk (mm)'], calc:null },
   { key:'fastener',   label:'Fastener',         abbr:'FAS',  unit:'nos', dims:[], spec:'e.g. M10 × 40 HT Bolt',       calc:null },
   { key:'consumable', label:'Consumable',       abbr:'CON',  unit:'nos', dims:[], spec:'e.g. 3.15mm Welding rod',     calc:null },
   { key:'other',      label:'Other',            abbr:'OTH',  unit:'nos', dims:[], spec:'Describe the material',       calc:null },
@@ -40302,7 +40304,7 @@ const RM_SECTIONS = [
 // Group a raw-material item into a simple shop type (Coil, Sheet, Angle, Pipe…).
 // Uses the section type when set, else reads the item name so imported/legacy
 // items (mostly section_type 'other'/null) still land in the right bucket.
-const RM_SEC_SIMPLE = { angle:'Angle', flat:'Flat', round_bar:'Round bar', square_bar:'Square bar', block:'Block', rhs:'RHS (rect tube)', shs:'SHS (square tube)', pipe:'Pipe / Tube', plate:'Plate', sheet:'Sheet', coil:'Coil', channel:'Channel', beam:'Beam' };
+const RM_SEC_SIMPLE = { angle:'Angle', flat:'Flat', round_bar:'Round bar', square_bar:'Square bar', block:'Block', rhs:'RHS (rect tube)', shs:'SHS (square tube)', pipe:'Pipe / Tube', plate:'Plate', chequered:'Plate', sheet:'Sheet', coil:'Coil', channel:'Channel', beam:'Beam' };
 const RM_TYPE_ORDER = ['Coil','Sheet','Plate','Angle','Channel','Beam','Flat','Pipe / Tube','RHS (rect tube)','SHS (square tube)','Round bar','Square bar','Block','Rod / Bar','Profile','Other'];
 function rmTypeLabel(item) {
   const st = item.section_type;
@@ -40322,16 +40324,22 @@ function rmTypeLabel(item) {
   if (/\bSHS\b/.test(n)) return 'SHS (square tube)';
   return 'Other';
 }
+// Marvel (MMPL) prefers a particular shop nomenclature: lowercase type words,
+// "x" between sizes, "Ms" for mild steel, equal-leg angles shown as leg×thk.
+const MARVEL_WORD = { angle:'angle', flat:'flat', round_bar:'bright rod od', square_bar:'sq Bar', block:'sq Bar', rhs:'rec tube', shs:'sq tube', pipe:'pipe', plate:'plate', sheet:'sheet', chequered:'Chequred plate', coil:'plate', channel:'ismc', beam:'ismb' };
 // Build code / name / size / unit-weight / stock-unit from the RM selections.
-function rmBuild(materialKey, sectionKey, d1, d2, d3, spec) {
+// `marvel` switches the generated name to the MMPL shop nomenclature.
+function rmBuild(materialKey, sectionKey, d1, d2, d3, spec, marvel) {
   const M = RM_MATERIALS.find(m => m.key === materialKey) || RM_MATERIALS[RM_MATERIALS.length - 1];
   const S = RM_SECTIONS.find(s => s.key === sectionKey) || RM_SECTIONS[RM_SECTIONS.length - 1];
   const geo = S.dims.length > 0;
   const a = parseFloat(d1) || 0, b = parseFloat(d2) || 0, c = parseFloat(d3) || 0;
   let sizeSpec, weight = null, dimCode;
   if (geo) {
-    const parts = [d1, d2, d3].slice(0, S.dims.length).filter(x => x !== '' && x != null).map(x => ('' + x).trim());
-    sizeSpec = parts.join('×');
+    let parts = [d1, d2, d3].slice(0, S.dims.length).filter(x => x !== '' && x != null).map(x => ('' + x).trim());
+    // Marvel: an equal-leg angle (A = B) is written leg × thk, e.g. 40×3
+    if (marvel && sectionKey === 'angle' && parts.length === 3 && parseFloat(parts[0]) === parseFloat(parts[1])) parts = [parts[0], parts[2]];
+    sizeSpec = parts.join(marvel ? 'x' : '×');
     dimCode = parts.join('X');
     if (S.calc) { const w = S.calc({ a, b, c }, M.rho); weight = w > 0 ? Math.round(w * 1000) / 1000 : null; }
   } else {
@@ -40339,9 +40347,11 @@ function rmBuild(materialKey, sectionKey, d1, d2, d3, spec) {
     dimCode = sizeSpec.toUpperCase().replace(/[^A-Z0-9]+/g, '');
   }
   const noTypeInName = ['fastener', 'consumable', 'other'].includes(S.key);
+  const short = (marvel && M.key === 'MS') ? 'Ms' : M.short;
+  const typeWord = (marvel && MARVEL_WORD[sectionKey]) ? MARVEL_WORD[sectionKey] : S.label.replace(/ \(.*\)$/, '').replace(/ \/ .*$/, '');
   const name = (noTypeInName
-    ? ((M.short ? M.short + ' ' : '') + sizeSpec)
-    : ((M.short ? M.short + ' ' : '') + S.label.replace(/ \(.*\)$/, '') + ' ' + sizeSpec)).trim();
+    ? ((short ? short + ' ' : '') + sizeSpec)
+    : ((short ? short + ' ' : '') + typeWord + ' ' + sizeSpec)).trim();
   const code = [M.abbr, S.abbr, dimCode].filter(Boolean).join('-');
   return { code, name, size_spec: sizeSpec, unit_weight: weight, uom: S.unit };
 }
@@ -40452,7 +40462,7 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
   // section + sizes. Runs only in RM mode and only when a section is chosen.
   useEffect(() => {
     if (form.category !== 'raw_material' || !form.section_type) return;
-    const b = rmBuild(form.material, form.section_type, form.dim1, form.dim2, form.dim3, form.spec);
+    const b = rmBuild(form.material, form.section_type, form.dim1, form.dim2, form.dim3, form.spec, /marvel/i.test(plant?.name || ''));
     setForm(f => ({ ...f, code: b.code, name: b.name, size_spec: b.size_spec, uom: b.uom,
       unit_weight: b.unit_weight != null ? b.unit_weight : f.unit_weight }));
   }, [form.category, form.material, form.section_type, form.dim1, form.dim2, form.dim3, form.spec]);
@@ -44279,7 +44289,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
         // replaces the supplier's free-text name (once the sizes are entered), so
         // the same material from any supplier lands on one standard stock item.
         if (/marvel/i.test(plant?.name || '') && f.section) {
-          const built = rmBuild(f.material || 'MS', f.section, f.d1, f.d2, f.d3, f.spec);
+          const built = rmBuild(f.material || 'MS', f.section, f.d1, f.d2, f.d3, f.spec, true);
           if ((built.size_spec || '').trim()) { payload.name = built.name.trim(); payload.material = f.material || 'MS'; payload.section = f.section; }
         }
         payload.uom = 'kg';
@@ -44852,7 +44862,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
                       const secKey = lfVal(i, 'section', 'plate');
                       const S = RM_SECTIONS.find(s => s.key === secKey);
                       if (!S) return '';
-                      const built = rmBuild(lfVal(i, 'material', 'MS'), secKey, lfVal(i, 'd1', ''), lfVal(i, 'd2', ''), lfVal(i, 'd3', ''), lfVal(i, 'spec', ''));
+                      const built = rmBuild(lfVal(i, 'material', 'MS'), secKey, lfVal(i, 'd1', ''), lfVal(i, 'd2', ''), lfVal(i, 'd3', ''), lfVal(i, 'spec', ''), true);
                       const hasSize = (built.size_spec || '').trim() !== '';
                       return html`<div style="margin-top:6px;background:var(--teal-50);border:1px solid var(--teal-200);border-radius:6px;padding:7px 9px">
                         <div style="font-size:10px;font-weight:700;color:var(--teal-800);text-transform:uppercase;letter-spacing:.3px;margin-bottom:5px">📐 Standard name — enter the sizes</div>
