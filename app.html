@@ -21281,6 +21281,7 @@ function IssueMaterialModal({ plant, project, mode = 'issue', onClose, onSaved }
   const isRet = mode === 'return';
   const [item, setItem] = useState(null);        // full stock item row
   const [qty, setQty] = useState('');
+  const [pcsUsed, setPcsUsed] = useState('');    // pieces issued/returned (optional)
   const [price, setPrice] = useState('');        // last bought price, editable
   const [priceKnown, setPriceKnown] = useState(true);
   const [note, setNote] = useState('');
@@ -21288,10 +21289,10 @@ function IssueMaterialModal({ plant, project, mode = 'issue', onClose, onSaved }
   const [err, setErr] = useState('');
 
   const onPick = async (id, p) => {
-    if (!id) { setItem(null); setPrice(''); return; }
-    setErr('');
+    if (!id) { setItem(null); setPrice(''); setPcsUsed(''); return; }
+    setErr(''); setPcsUsed('');
     const [full, rate] = await Promise.all([
-      sb.from('mcp_stocks_items').select('id, code, name, uom, unit_weight, size_spec, current_qty').eq('id', id).single(),
+      sb.from('mcp_stocks_items').select('id, code, name, uom, unit_weight, size_spec, current_qty, current_pcs').eq('id', id).single(),
       sb.rpc('last_purchase_rate', { p_item_id: id }),
     ]);
     setItem(full.data || p || { id });
@@ -21314,8 +21315,15 @@ function IssueMaterialModal({ plant, project, mode = 'issue', onClose, onSaved }
     const { data, error } = await sb.rpc(isRet ? 'return_material_from_project' : 'issue_material_to_project', {
       p_project_id: project.id, p_item_id: item.id, p_qty: qN, p_note: note.trim() || null, p_price: pN > 0 ? pN : null,
     });
+    if (error || data?.success === false) { setBusy(false); setErr(error?.message || data?.error || (isRet ? 'Could not return.' : 'Could not issue.')); return; }
+    // Adjust the running piece count (issue reduces, return adds back).
+    const pc = parseFloat(pcsUsed) || 0;
+    if (pc > 0) {
+      const { data: cur } = await sb.from('mcp_stocks_items').select('current_pcs').eq('id', item.id).maybeSingle();
+      const now = parseFloat(cur?.current_pcs) || 0;
+      await sb.from('mcp_stocks_items').update({ current_pcs: isRet ? now + pc : Math.max(0, now - pc) }).eq('id', item.id);
+    }
     setBusy(false);
-    if (error || data?.success === false) { setErr(error?.message || data?.error || (isRet ? 'Could not return.' : 'Could not issue.')); return; }
     showToast(isRet ? '↩ Returned to stock · project credited' : '✓ Issued to project · stock reduced');
     onSaved();
   };
@@ -21330,12 +21338,14 @@ function IssueMaterialModal({ plant, project, mode = 'issue', onClose, onSaved }
         ${item && html`
           <div style="display:flex;gap:8px;flex-wrap:wrap;font-size:11px;color:var(--slate-500);margin:-4px 2px 8px">
             <span>In stock: <b style=${'color:' + (avail > 0 ? 'var(--teal-700)' : 'var(--rose-600)')}>${fmtNum(avail)} ${item.uom || ''}</b></span>
+            ${(parseFloat(item.current_pcs) || 0) > 0 ? html`<span>· <b style="color:var(--teal-700)">${fmtNum(item.current_pcs)} pcs</b></span>` : ''}
             ${item.size_spec ? html`<span>· Size: ${item.size_spec}</span>` : ''}
             ${uw != null && uw > 0 ? html`<span>· ${fmtNum(uw)} kg/${item.uom || 'unit'}</span>` : ''}
           </div>`}
-        <div class="field-row" style="display:flex;gap:10px">
-          <div class="field" style="flex:1"><label>Qty used (${item?.uom || 'qty'}) *</label><input type="number" step="any" value=${qty} onInput=${e => setQty(e.target.value)} placeholder="0" /></div>
-          <div class="field" style="flex:1"><label>Price / ${item?.uom || 'unit'}${priceKnown ? ' · last bought' : ''}</label><input type="number" step="any" value=${price} onInput=${e => setPrice(e.target.value)} placeholder="0" /></div>
+        <div class="field-row" style="display:flex;gap:10px;flex-wrap:wrap">
+          <div class="field" style="flex:1;min-width:90px"><label>Qty ${isRet ? 'returned' : 'used'} (${item?.uom || 'qty'}) *</label><input type="number" step="any" value=${qty} onInput=${e => setQty(e.target.value)} placeholder="0" /></div>
+          <div class="field" style="flex:1;min-width:80px"><label>Pieces${isRet ? ' returned' : ' used'}</label><input type="number" step="any" value=${pcsUsed} onInput=${e => setPcsUsed(e.target.value)} placeholder="opt." title="How many pieces — reduces the item's piece count" /></div>
+          <div class="field" style="flex:1;min-width:90px"><label>Price / ${item?.uom || 'unit'}${priceKnown ? ' · last bought' : ''}</label><input type="number" step="any" value=${price} onInput=${e => setPrice(e.target.value)} placeholder="0" /></div>
         </div>
         ${item && !priceKnown && html`<div style="font-size:11px;color:var(--amber-700);background:var(--amber-50);border:1px solid var(--amber-200);border-radius:6px;padding:6px 8px;margin-bottom:8px">No purchase price on record for this item — type the price so the cost is captured.</div>`}
         <div class="field"><label>Note (optional)</label><input type="text" value=${note} onInput=${e => setNote(e.target.value)} placeholder="e.g. cut for 20-leaf wagon" /></div>
@@ -28754,7 +28764,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
     // 'stock' line (StockItemPicker from mcp_stocks_items). DC-out rows
     // tagged 'stock' carry a stock_item_id that the cascade trigger uses
     // to deduct stock without name guessing.
-    items: [{ kind: 'stock', pickcat: 'raw_material', part_id: '', stock_item_id: '', machine_id: '', project_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '', approx_value: '' }],
+    items: [{ kind: 'stock', pickcat: 'raw_material', part_id: '', stock_item_id: '', machine_id: '', project_id: '', name: '', hsn: '', qty: '', uom: 'nos', pcs: '', rate: '', amount: '', approx_value: '' }],
     cgst_pct: 9,
     sgst_pct: 9,
     igst_pct: 18,
@@ -28805,7 +28815,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
   }, []);
 
   const setItem = (i, patch) => { if (showOverride) { setShowOverride(false); setErr(''); } setForm(f => ({ ...f, items: f.items.map((x, idx) => idx === i ? { ...x, ...patch } : x) })); };
-  const addItem = () => setForm(f => ({ ...f, items: [...f.items, { kind: 'stock', pickcat: 'raw_material', part_id: '', stock_item_id: '', machine_id: '', project_id: '', name: '', hsn: '', qty: '', uom: 'nos', rate: '', amount: '', approx_value: '' }] }));
+  const addItem = () => setForm(f => ({ ...f, items: [...f.items, { kind: 'stock', pickcat: 'raw_material', part_id: '', stock_item_id: '', machine_id: '', project_id: '', name: '', hsn: '', qty: '', uom: 'nos', pcs: '', rate: '', amount: '', approx_value: '' }] }));
   const removeItem = (i) => setForm(f => ({ ...f, items: f.items.length <= 1 ? f.items : f.items.filter((_, idx) => idx !== i) }));
   const recalcAmount = (i) => {
     const it = form.items[i];
@@ -28919,6 +28929,7 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
           hsn: it.hsn || null,
           qty: parseFloat(it.qty),
           uom: it.uom || 'nos',
+          pcs: (parseFloat(it.pcs) || 0) || null,
           unit_weight: uw,
           weight: gw,
           gross_weight: gw,
@@ -29020,6 +29031,19 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
             const { data: cur } = await sb.from('mcp_stocks_items').select('pieces').eq('id', sid).single();
             await sb.from('mcp_stocks_items').update({ pieces: coilsApplyIssue(cur?.pieces, byItem[sid]) }).eq('id', sid);
           } catch (_) { /* best-effort — the item page flags any coil-list drift */ }
+        }
+      }
+      // Reduce each stock item's running piece count by the pieces sent on this DC.
+      const pcsLines = validItems.filter(it => it.kind === 'stock' && it.stock_item_id && (parseFloat(it.pcs) || 0) > 0);
+      if (pcsLines.length) {
+        const byItem = {};
+        pcsLines.forEach(it => { byItem[it.stock_item_id] = (byItem[it.stock_item_id] || 0) + (parseFloat(it.pcs) || 0); });
+        for (const sid in byItem) {
+          try {
+            const { data: cur } = await sb.from('mcp_stocks_items').select('current_pcs').eq('id', sid).maybeSingle();
+            const now = parseFloat(cur?.current_pcs) || 0;
+            await sb.from('mcp_stocks_items').update({ current_pcs: Math.max(0, now - byItem[sid]) }).eq('id', sid);
+          } catch (_) { /* best-effort — piece count is a running aid, not the stock-value anchor */ }
         }
       }
       showToast((isInvoice ? '🧾 Invoice ' : (isReturnable ? '🔁 RDC ' : '📦 DC ')) + docNo + ' created');
@@ -29132,6 +29156,12 @@ function SalesDocCreateForm({ plant, me, kind, previewNumber, customers, vendors
                 ${isInvoice && html`<input type="number" step="any" min=${0} value=${it.amount} onChange=${e => setItem(idx, { amount: e.target.value })} placeholder="Amount ₹" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px;font-weight:600" />`}
                 ${!isInvoice && html`<input type="number" step="any" min=${0} value=${it.approx_value} onChange=${e => setItem(idx, { approx_value: e.target.value, _approxAuto: false })} placeholder="Approx value ₹" title="Auto = qty × last bought price · edit to override" style="padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />`}
               </div>
+              ${it.kind === 'stock' && it.stock_item_id && html`
+                <div style="margin-top:6px;display:flex;align-items:center;gap:6px">
+                  <span style="font-size:11px;color:var(--slate-500);white-space:nowrap">📦 Pieces sent</span>
+                  <input type="number" step="any" min=${0} value=${it.pcs || ''} onChange=${e => setItem(idx, { pcs: e.target.value })} placeholder="opt." title="How many pieces — reduces the item's piece count in stock" style="width:92px;padding:6px 8px;border:1px solid var(--slate-200);border-radius:5px;font-size:12px" />
+                </div>
+              `}
               ${it.kind === 'stock' && it.stock_item_id && ['mtr', 'ft'].includes((it.uom || '').toLowerCase()) && it._hasRods && html`
                 <div style="margin-top:6px">
                   <button type="button" class="btn small" onClick=${() => setRodPickFor({ idx, stock_item_id: it.stock_item_id })} style="background:var(--teal-50);color:var(--teal-700);border:1px solid var(--teal-200);font-size:12px">🪵 ${Array.isArray(it._rodRows) && it._rodRows.length ? 'Rods picked · ' + fmtNum(parseFloat(it.qty) || 0) + ' ' + it.uom + ' — change' : 'Pick rods (whole / cut)'}</button>
@@ -39250,7 +39280,12 @@ function Stocks({ plant, me, activeUnit, accessibleUnits, navAction }) {
   const stockExtras = (i) => {
     const parts = [];
     const w = parseFloat(i.unit_weight) || 0;
-    if (w > 0) parts.push(fmtNum(Math.round(parseFloat(i.current_qty || 0) * w * 100) / 100) + ' kg');
+    if (w > 0 && (i.uom || '').toLowerCase() !== 'kg') parts.push(fmtNum(Math.round(parseFloat(i.current_qty || 0) * w * 100) / 100) + ' kg');
+    // Running piece count (for items bought by weight + count). The rod/coil
+    // breakdown below is shown instead when it exists.
+    const pcN = parseFloat(i.current_pcs) || 0;
+    const hasBreakdown = Array.isArray(i.pieces) && i.pieces.length && i.pieces[0];
+    if (pcN > 0 && !hasBreakdown) parts.push(fmtNum(pcN) + ' pc' + (pcN === 1 ? '' : 's'));
     if (Array.isArray(i.pieces) && i.pieces.length && i.pieces[0]) {
       const cnt = i.pieces.reduce((s, p) => s + (parseFloat(p.count) || 0), 0);
       if (cnt > 0) {
@@ -40495,6 +40530,7 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
         payload.size_spec = form.size_spec || null;
         payload.unit_weight = num(form.unit_weight);
         payload.rate_per_kg = num(form.rate_per_kg);
+        if (form.current_pcs !== '' && form.current_pcs != null) payload.current_pcs = parseFloat(form.current_pcs) || 0;
         // Coil is tracked in kg; its weight-per-unit is 1 so stock value = qty(kg) × ₹/kg.
         if (form.section_type === 'coil') { payload.uom = 'kg'; payload.unit_weight = 1; }
         // Keep unit_cost (₹ per stock unit) consistent with ₹/kg × unit-weight.
@@ -40608,6 +40644,11 @@ function ItemModal({ plant, me, activeUnit, editTarget, allItems, defaultCategor
               </div>
             ` : rmSec ? html`
               <div class="field"><label>Description *</label><input type="text" required value=${form.spec} onInput=${e => { const v = e.target.value; setForm(f => ({ ...f, spec: v })); }} placeholder=${rmSec.spec || ''} /></div>
+            ` : ''}
+            ${isEdit ? html`
+              <div class="field"><label>Pieces in stock <span style="color:var(--slate-400);font-weight:400">· running count (optional)</span></label>
+                <input type="number" step="any" min=${0} value=${form.current_pcs ?? ''} onInput=${e => { const v = e.target.value; setForm(f => ({ ...f, current_pcs: v })); }} placeholder="0" title="How many pieces are physically in stock — corrects the running piece count" />
+              </div>
             ` : ''}
             ${form.section_type && html`
               <div class="card" style="background:var(--teal-50);border-color:var(--teal-200);padding:10px 12px;margin-bottom:10px">
@@ -44272,6 +44313,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
     const kind = f.kind || 'stock';
     const payload = { kind };
     let rmStruct = null; // Marvel: sizes to write onto the stock item after receive (RPC doesn't store dims)
+    let recvPcs = 0;     // pieces received on this line → added to the item's running piece count
     // Name the user may have corrected (AI sometimes extracts a wrong name).
     const editedName = (f.name != null && String(f.name).trim() !== '') ? String(f.name).trim() : '';
     if (kind === 'stock') {
@@ -44304,6 +44346,7 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
         payload.rate_per_kg = totalKg > 0 ? round3(amount / totalKg) : null;
         payload.unit_cost = totalKg > 0 ? Math.round((amount / totalKg) * 100) / 100 : null;
         payload.pieces = pcs;
+        recvPcs = parseFloat(pcs) || 0;
         if (!(totalKg > 0)) { showToast('Enter the weight in kg for this line'); return; }
       } else {
         // Tools / parts / consumables tracked in pieces.
@@ -44326,10 +44369,16 @@ function DocumentDetail({ plant, me, doc: initialDoc, vendors, onClose }) {
       await sb.from('mcp_logistics_documents').update({ items: newItems }).eq('id', doc.id);
     }
     const { data, error } = await sb.rpc('receive_bill_line', { p_doc_id: doc.id, p_idx: i, p_line: payload });
-    // Store the structured sizes on the stock item so a bill-received item is as
-    // complete as one made in the item editor (the receive RPC doesn't take dims).
-    if (!error && data?.success !== false && rmStruct && data?.stock_item) {
-      await sb.from('mcp_stocks_items').update(rmStruct).eq('id', data.stock_item);
+    // After receive: write the structured sizes (the RPC doesn't take dims) and
+    // add the received pieces to the item's running piece count.
+    if (!error && data?.success !== false && data?.stock_item) {
+      const patch = {};
+      if (rmStruct) Object.assign(patch, rmStruct);
+      if (recvPcs > 0) {
+        const { data: cur } = await sb.from('mcp_stocks_items').select('current_pcs').eq('id', data.stock_item).maybeSingle();
+        patch.current_pcs = (parseFloat(cur?.current_pcs) || 0) + recvPcs;
+      }
+      if (Object.keys(patch).length) await sb.from('mcp_stocks_items').update(patch).eq('id', data.stock_item);
     }
     setSavingLine(m => ({ ...m, [i]: false }));
     if (error || data?.success === false) { showToast('Failed: ' + (error?.message || data?.error || '')); return; }
